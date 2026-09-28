@@ -15,6 +15,7 @@
     "env:set:smtp": "bun ../../scripts/set-auth-smtp-secret.ts",
     "env:validate:prod": "dotenvx validate -f .env.production -fk ../../.env.keys",
     "cf:typegen": "wrangler types",
+    "stripe:bootstrap": "dotenvx run -f .env.dev -fk ../../.env.keys -- bun ../../scripts/stripe-bootstrap.ts",
     "db:migrate:local": "wrangler d1 migrations apply openbot-auth --local",
     "db:migrate:remote": "wrangler d1 migrations apply openbot-auth --remote",
     "typecheck": "bun ../../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json",

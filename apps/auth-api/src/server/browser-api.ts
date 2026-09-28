@@ -1,7 +1,9 @@
 import { isAvatarMimeType } from "@openbot/contracts/avatar-images";
+import { parseBillingPortalRequest } from "@openbot/contracts/billing";
 import { type DynamicRecord, isBoolean, isNumber, isString } from "@openbot/contracts/runtime-values";
 import { type AuthService, AuthServiceError } from "./auth-service";
 import { AvatarUploadError, readAvatarUpload, removeAccountAvatar, storeAccountAvatar } from "./avatar-storage";
+import { BILLING_UNAVAILABLE_STATE, BillingError, type BillingService } from "./billing-service";
 import { sha256 } from "./crypto";
 import { readJsonObject } from "./json-body";
 import { type RemoteControlPlane, RemoteControlPlaneError } from "./remote-control-plane";
@@ -43,6 +45,8 @@ export interface BrowserApiServices {
   /** The stored logo of one host version, or null. The handler checks membership and the version first. */
   hostLogo: (hostId: string, version: string) => Promise<Response | null>;
   inviteEmailDelivery: () => TeamInviteEmailDelivery | null;
+  /** The billing service, or null when this deployment has no Stripe key. */
+  billing: () => Pick<BillingService, "getState" | "createPortal"> | null;
   avatarBucket: () => R2Bucket;
   signalUrl: () => string;
   sourceIp: (request: Request) => string;
@@ -244,11 +248,40 @@ async function handleAccount(
     return json(await removeAccountAvatar(services.auth, services.avatarBucket(), token, user));
   if (path === "v1/me/sessions" && request.method === "GET")
     return json({ sessions: await services.auth.listAccountSessions(token) });
+  if (path.startsWith("v1/me/billing")) return handleBilling(request, path, user, services);
   // A session ID is a UUID, so the segment needs no decoding; the service refuses any other value.
   const [, sessionId] = /^v1\/me\/sessions\/([^/]+)$/u.exec(path) ?? [];
   if (sessionId !== undefined && request.method === "DELETE") {
     await services.auth.revokeAccountSession(token, sessionId);
     return new Response(null, { status: 204, headers: { "Cache-Control": "no-store" } });
+  }
+  return null;
+}
+
+/**
+ * The bearer `/v1/me/billing...` routes for a browser. Stripe sends the user back to `/app`, not to the
+ * desktop return page. Returns null for any other path.
+ */
+async function handleBilling(
+  request: Request,
+  path: string,
+  user: AuthUser,
+  services: BrowserApiServices,
+): Promise<Response | null> {
+  const origin = new URL(request.url).origin;
+  const billing = services.billing();
+  try {
+    if (path === "v1/me/billing" && request.method === "GET")
+      return json(billing ? await billing.getState(user.id) : BILLING_UNAVAILABLE_STATE);
+    if (path === "v1/me/billing/portal" && request.method === "POST") {
+      if (!billing) return failure(503, "billing_unavailable", "Billing is not available.");
+      const input = parseBillingPortalRequest(await readJsonObject(request));
+      if (!input) return failure(400, "invalid_billing_request", "The billing request is invalid.");
+      return json({ url: await billing.createPortal(user.id, input, "web", origin) });
+    }
+  } catch (error) {
+    if (error instanceof BillingError) return failure(error.status, error.code, error.message);
+    throw error;
   }
   return null;
 }

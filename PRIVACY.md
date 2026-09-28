@@ -161,6 +161,10 @@ The service stores:
   the account ID, the local agent ID and the unpublish time, so publishing the same agent again
   gives back the same link. Deleting the account removes them. Templates do not include
   workspace files, memories, conversations, or integration credentials.
+- billing records when the account starts a paid plan: the Stripe customer ID and currency, and for
+  each subscription the Stripe subscription ID, plan, billing period, currency, status, period end,
+  and whether it ends at the period end. The service also keeps the ID, type and receive time of each
+  Stripe webhook event for 7 days, to ignore a repeated event. These records hold no card data.
 
 The service does not store plaintext one-time codes, account session tokens, or team authentication
 tickets in D1. It returns a new plaintext secret only to the client that requested it. The desktop
@@ -240,6 +244,14 @@ Cloudflare processes account and configuration API requests. It does not carry T
 message, command, Remote Desktop media, or Remote Desktop input traffic. Cloudflare and the email
 provider can keep their own security, delivery, and network logs under their own policies. These
 provider logs are outside the OpenBot application database and its daily maintenance task.
+
+Paid server plans use Stripe. You enter card and billing details on Stripe's pages, not in OpenBot.
+Stripe sends the account service the subscription state, the plan, its price, the period, and the
+account and server IDs that the subscription names, never the card number. When you manage billing,
+the account service sends Stripe your Stripe customer ID, and the subscription ID of the plan you
+change or cancel, to open the Stripe Customer Portal (`billing.stripe.com`). Stripe keeps the
+customer, invoices and payment records under its own policy, also after the subscription ends.
+Billing is off, and Stripe receives nothing, when the account service has no Stripe key.
 
 ## Data stored on the OpenBot computer
 

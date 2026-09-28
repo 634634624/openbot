@@ -16,6 +16,7 @@
 
 import type { ManagedProviderId } from "./agent-providers";
 import type { AppLanguagePreference, SetAppLanguagePreferenceInput } from "./app-language";
+import type { BillingPortalRequest, BillingState } from "./billing";
 import type { AddedAgent, AgentAdminSettings, UpdateAgentAdminSettingsInput } from "./ipc-agent-admin";
 import type { AgentAnalytics, AgentAnalyticsInput } from "./ipc-agent-analytics";
 import type { AgentIpcRequest, ScopedAgentEvent } from "./ipc-agent-events";
@@ -544,6 +545,12 @@ export const IPC_ENDPOINTS = {
     publish: request<PublishHostedSiteInput, HostedSiteSummary>()("hosted-sites:publish"),
     replace: request<ReplaceHostedSiteInput, HostedSiteSummary>()("hosted-sites:replace"),
     delete: request<DeleteHostedSiteInput, void>()("hosted-sites:delete"),
+  },
+  // The account's Stripe subscription. The main process gets the Checkout or Portal URL from the
+  // account server and opens it in the browser, so the renderer never sends a URL.
+  billing: {
+    getState: request<undefined, BillingState>()("billing:get-state"),
+    openPortal: request<BillingPortalRequest, void>()("billing:open-portal"),
   },
   marketplaceAgents: {
     list: request<MarketplaceAgentQuery | undefined, MarketplaceAgentPage>()("marketplace-agents:list"),

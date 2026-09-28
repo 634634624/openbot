@@ -1,0 +1,254 @@
+import {
+  BILLING_INTERVALS,
+  BILLING_PLAN_IDS,
+  type BillingInterval,
+  type BillingPlanId,
+  billingLookupKey,
+} from "@openbot/contracts/billing";
+import { createOpenBotLogger, toLogValue } from "@openbot/logging";
+import { z } from "zod";
+
+/**
+ * Creates the Stripe catalog that the account server reads: one Product for each plan, and one Price
+ * for each plan and interval with the lookup key `openbot_{plan}_{interval}`. It also sets the
+ * Customer Portal features. Run it again at any time: it changes only what differs.
+ *
+ *   STRIPE_SECRET_KEY=sk_test_... bun scripts/stripe-bootstrap.ts [--live]
+ *
+ * Without `--live` it refuses a live key.
+ */
+
+const logger = createOpenBotLogger("stripe-bootstrap");
+const STRIPE_API_VERSION = "2025-03-31.basil";
+
+/** Monthly amounts in EUR cents. USD uses the same numbers. PLN is EUR ×4. A year costs 12 months less 20%. */
+const MONTHLY_EUR_CENTS: Record<BillingPlanId, number> = { starter: 2000, standard: 5000, pro: 10000 };
+const PLAN_NAME: Record<BillingPlanId, string> = { starter: "Starter", standard: "Standard", pro: "Pro" };
+
+/** The events that the webhook endpoint must receive. */
+export const BILLING_WEBHOOK_EVENTS = [
+  "checkout.session.completed",
+  "customer.subscription.created",
+  "customer.subscription.updated",
+  "customer.subscription.deleted",
+  "customer.subscription.paused",
+  "customer.subscription.resumed",
+  "invoice.paid",
+  "invoice.payment_failed",
+] as const;
+
+export interface PriceAmounts {
+  eur: number;
+  usd: number;
+  pln: number;
+}
+
+export function billingPriceAmounts(plan: BillingPlanId, interval: BillingInterval): PriceAmounts {
+  const eur = interval === "month" ? MONTHLY_EUR_CENTS[plan] : Math.round(MONTHLY_EUR_CENTS[plan] * 12 * 0.8);
+  return { eur, usd: eur, pln: eur * 4 };
+}
+
+const productSchema = z.object({ id: z.string(), active: z.boolean() });
+const priceSchema = z.object({
+  id: z.string(),
+  product: z.string(),
+  lookup_key: z.string().nullable(),
+  currency: z.string(),
+  unit_amount: z.number().int().nullable(),
+  recurring: z.object({ interval: z.string() }).nullable(),
+  currency_options: z.record(z.string(), z.object({ unit_amount: z.number().int().nullable() })).optional(),
+});
+type Price = z.infer<typeof priceSchema>;
+const priceListSchema = z.object({ data: z.array(priceSchema) });
+const portalConfigurationListSchema = z.object({ data: z.array(z.object({ id: z.string() })) });
+
+class StripeAdmin {
+  constructor(private readonly secretKey: string) {}
+
+  async request<T>(
+    method: "GET" | "POST",
+    path: string,
+    body: URLSearchParams | null,
+    schema: z.ZodType<T>,
+  ): Promise<T> {
+    const response = await fetch(`https://api.stripe.com${path}`, {
+      method,
+      headers: {
+        Authorization: `Bearer ${this.secretKey}`,
+        "Stripe-Version": STRIPE_API_VERSION,
+        ...(body ? { "Content-Type": "application/x-www-form-urlencoded" } : {}),
+      },
+      ...(body ? { body: body.toString() } : {}),
+      signal: AbortSignal.timeout(20_000),
+    });
+    const value = await response.json().catch(() => null);
+    if (!response.ok) {
+      // Stripe's message names the request parameter at fault. It holds no key and no customer data here.
+      const error = z.object({ error: z.object({ message: z.string().optional() }) }).safeParse(value);
+      throw new Error(
+        `Stripe ${method} ${path.split("?")[0]} failed with ${response.status}: ${error.data?.error.message ?? "no message"}`,
+      );
+    }
+    return schema.parse(value);
+  }
+
+  async findProduct(id: string): Promise<z.infer<typeof productSchema> | null> {
+    try {
+      return await this.request("GET", `/v1/products/${id}`, null, productSchema);
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("failed with 404")) return null;
+      throw error;
+    }
+  }
+}
+
+function productId(plan: BillingPlanId): string {
+  return `openbot_${plan}`;
+}
+
+async function ensureProduct(stripe: StripeAdmin, plan: BillingPlanId): Promise<void> {
+  const id = productId(plan);
+  const body = new URLSearchParams({
+    name: `OpenBot ${PLAN_NAME[plan]}`,
+    active: "true",
+    "metadata[openbot_plan]": plan,
+  });
+  const existing = await stripe.findProduct(id);
+  if (existing) {
+    await stripe.request("POST", `/v1/products/${id}`, body, productSchema);
+    logger.info(`Product ${id} is up to date.`);
+    return;
+  }
+  body.set("id", id);
+  await stripe.request("POST", "/v1/products", body, productSchema);
+  logger.info(`Created product ${id}.`);
+}
+
+function priceMatches(price: Price, plan: BillingPlanId, interval: BillingInterval, amounts: PriceAmounts): boolean {
+  return (
+    price.product === productId(plan) &&
+    price.currency === "eur" &&
+    price.unit_amount === amounts.eur &&
+    price.recurring?.interval === interval &&
+    price.currency_options?.usd?.unit_amount === amounts.usd &&
+    price.currency_options?.pln?.unit_amount === amounts.pln
+  );
+}
+
+/**
+ * A Stripe Price amount cannot change. When the amounts differ, this creates a new Price and moves the
+ * lookup key to it. Current subscriptions keep the old Price until they change plan.
+ */
+async function ensurePrice(
+  stripe: StripeAdmin,
+  existing: readonly Price[],
+  plan: BillingPlanId,
+  interval: BillingInterval,
+): Promise<string> {
+  const lookupKey = billingLookupKey(plan, interval);
+  const amounts = billingPriceAmounts(plan, interval);
+  const current = existing.find((price) => price.lookup_key === lookupKey);
+  if (current && priceMatches(current, plan, interval, amounts)) {
+    logger.info(`Price ${lookupKey} is up to date.`);
+    return current.id;
+  }
+  const body = new URLSearchParams({
+    product: productId(plan),
+    currency: "eur",
+    unit_amount: String(amounts.eur),
+    "recurring[interval]": interval,
+    lookup_key: lookupKey,
+    transfer_lookup_key: "true",
+    "currency_options[usd][unit_amount]": String(amounts.usd),
+    "currency_options[pln][unit_amount]": String(amounts.pln),
+    "metadata[openbot_plan]": plan,
+    "metadata[openbot_interval]": interval,
+  });
+  const created = await stripe.request("POST", "/v1/prices", body, priceSchema);
+  logger.info(`${current ? "Replaced" : "Created"} price ${lookupKey}.`);
+  return created.id;
+}
+
+/**
+ * Portal sessions use the default configuration, and the API cannot create a default one: Stripe makes
+ * it when someone saves the Customer Portal settings in the Dashboard. So this updates it only.
+ */
+async function updatePortalConfiguration(
+  stripe: StripeAdmin,
+  prices: Record<BillingPlanId, string[]>,
+): Promise<boolean> {
+  const list = await stripe.request(
+    "GET",
+    "/v1/billing_portal/configurations?is_default=true&limit=1",
+    null,
+    portalConfigurationListSchema,
+  );
+  const configuration = list.data[0];
+  if (!configuration) return false;
+  const body = new URLSearchParams({
+    "features[invoice_history][enabled]": "true",
+    "features[payment_method_update][enabled]": "true",
+    "features[subscription_cancel][enabled]": "true",
+    "features[subscription_cancel][mode]": "at_period_end",
+    "features[subscription_update][enabled]": "true",
+    "features[subscription_update][proration_behavior]": "create_prorations",
+  });
+  body.append("features[subscription_update][default_allowed_updates][]", "price");
+  BILLING_PLAN_IDS.forEach((plan, index) => {
+    body.set(`features[subscription_update][products][${index}][product]`, productId(plan));
+    for (const price of prices[plan]) body.append(`features[subscription_update][products][${index}][prices][]`, price);
+  });
+  await stripe.request(
+    "POST",
+    `/v1/billing_portal/configurations/${configuration.id}`,
+    body,
+    z.object({ id: z.string() }),
+  );
+  logger.info("Updated the default Customer Portal configuration.");
+  return true;
+}
+
+async function main(args: readonly string[]): Promise<void> {
+  const secretKey = process.env.STRIPE_SECRET_KEY?.trim();
+  if (!secretKey) throw new Error("Set STRIPE_SECRET_KEY to a Stripe secret key.");
+  const live = args.includes("--live");
+  if (!live && !/^(sk|rk)_test_/u.test(secretKey)) {
+    throw new Error("STRIPE_SECRET_KEY is not a test-mode key. Add --live to change the live catalog.");
+  }
+  const stripe = new StripeAdmin(secretKey);
+
+  const query = new URLSearchParams({ limit: "100" });
+  for (const plan of BILLING_PLAN_IDS) {
+    for (const interval of BILLING_INTERVALS) query.append("lookup_keys[]", billingLookupKey(plan, interval));
+  }
+  query.append("expand[]", "data.currency_options");
+  const existing = (await stripe.request("GET", `/v1/prices?${query}`, null, priceListSchema)).data;
+
+  const prices: Record<BillingPlanId, string[]> = { starter: [], standard: [], pro: [] };
+  for (const plan of BILLING_PLAN_IDS) {
+    await ensureProduct(stripe, plan);
+    for (const interval of BILLING_INTERVALS) prices[plan].push(await ensurePrice(stripe, existing, plan, interval));
+  }
+
+  const portalUpdated = await updatePortalConfiguration(stripe, prices);
+  const lines = [
+    "Webhook endpoint: <account server origin>/v1/stripe/webhook",
+    `Events: ${BILLING_WEBHOOK_EVENTS.join(", ")}`,
+    "Local development: stripe listen --forward-to localhost:<port>/v1/stripe/webhook",
+    "Put the signing secret in STRIPE_WEBHOOK_SECRET.",
+  ];
+  if (!portalUpdated) {
+    lines.push(
+      "No default Customer Portal configuration exists yet. Save the Customer Portal settings once in the",
+      "Stripe Dashboard (Settings > Billing > Customer portal), then run this script again.",
+    );
+  }
+  for (const line of lines) logger.info(line);
+}
+
+if (import.meta.main) {
+  void main(process.argv.slice(2)).catch((error) => {
+    logger.error("Stripe bootstrap failed.", toLogValue(error));
+    process.exitCode = 1;
+  });
+}

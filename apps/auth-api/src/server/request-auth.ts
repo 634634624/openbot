@@ -2,6 +2,7 @@ import { env, waitUntil } from "cloudflare:workers";
 import { AgentMarketplace, AgentMarketplaceError } from "./agent-marketplace";
 import { AgentTemplates } from "./agent-templates";
 import { AuthService, AuthServiceError } from "./auth-service";
+import { BillingError, BillingService } from "./billing-service";
 import { D1AuthRepository } from "./d1-auth-repository";
 import { createEmailCodeDelivery, createTeamInviteEmailDelivery } from "./email-delivery";
 import { HostedSiteInputError } from "./hosted-site-contract";
@@ -66,6 +67,24 @@ export function requestHostedSiteService(): HostedSiteService {
     bindings.SITE_REPORT_HASH_SECRET,
     bindings.SITE_LOCAL_ORIGIN,
   );
+}
+
+/** The billing service, or null when this deployment has no Stripe key. */
+export function requestBillingService(): BillingService | null {
+  const bindings = requireWorkerBindings(env);
+  const secretKey = bindings.STRIPE_SECRET_KEY?.trim();
+  if (!secretKey) return null;
+  return new BillingService({
+    database: bindings.DB,
+    secretKey,
+    webhookSecret: bindings.STRIPE_WEBHOOK_SECRET?.trim() || null,
+    fetch: (input, init) => fetch(input, init),
+  });
+}
+
+export function billingErrorResponse(error: unknown): Response {
+  if (error instanceof BillingError) return apiError(error.status, error.code, error.message);
+  return authErrorResponse(error);
 }
 
 export function requireSitePublishingEnabled(): void {

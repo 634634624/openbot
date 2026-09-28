@@ -25,6 +25,7 @@ import { agentImportIpcHandlers } from "./ipc/agent-import-handlers";
 import { agentTemplateIpcHandlers } from "./ipc/agent-template-handlers";
 import { appIpcHandlers } from "./ipc/app-handlers";
 import { attachmentIpcHandlers } from "./ipc/attachment-handlers";
+import { billingIpcHandlers } from "./ipc/billing-handlers";
 import { browserIpcHandlers } from "./ipc/browser-handlers";
 import { channelMemoryIpcHandlers } from "./ipc/channel-memory-handlers";
 import { channelRoutineIpcHandlers } from "./ipc/channel-routine-handlers";
@@ -352,6 +353,7 @@ function registerIpcHandlers({
   centralAuth,
   skills,
   hostedSites,
+  billing,
   customProviderChanges,
   customAgentChanges,
   providerDetection,
@@ -401,6 +403,7 @@ function registerIpcHandlers({
     ...accountIpcHandlers({ centralAuth, host }),
     ...skillIpcHandlers({ skills, getMainWindow, translate: language.translate }),
     ...hostedSiteIpcHandlers({ hostedSites, getMainWindow, translate: language.translate }),
+    ...billingIpcHandlers({ billing }),
     ...customProviderIpcHandlers(customProviderChanges),
     ...customAgentIpcHandlers(customAgentChanges),
     ...providerDetectionIpcHandlers({ detection: providerDetection, settings: providerDetectionSettings }),

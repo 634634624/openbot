@@ -62,6 +62,7 @@ import {
   decodeAppLanguagePreference,
   decodeApprovalAutomationPreference,
   decodeAppSetupState,
+  decodeBillingState,
   decodeCentralAuthState,
   decodeCustomAgentCheckResult,
   decodeCustomAgentResult,
@@ -527,6 +528,10 @@ const openbotApi: OpenBotDesktopApi = {
     publish: decodeHostedSite,
     replace: decodeHostedSite,
     delete: decodeVoid,
+  }),
+  billing: bridgeGroup(IPC_ENDPOINTS.billing, {
+    getState: decodeBillingState,
+    openPortal: decodeVoid,
   }),
   customProviders: bridgeGroup(IPC_ENDPOINTS.customProviders, {
     list: decodeCustomProviders,

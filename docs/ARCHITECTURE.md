@@ -7,7 +7,7 @@ a self-hosted Signal service, and shared packages.
 
 ```text
 apps/
-  auth-api/          Public web and /app browser entry, accounts, memberships, and connection tickets
+  auth-api/          Public web and /app browser entry, accounts, memberships, connection tickets, and billing
   mobile/            Expo React Native client for remote team hosts
   site-router/       Cloudflare Worker that serves published sites from private R2 storage
 packages/
@@ -149,6 +149,8 @@ the `media-attachments` capability; released protocol adapters keep their existi
 - `~/.codex`, `~/.claude`, `~/.grok`, and `~/.gemini` are provider-owned login and resume state. They are not OpenBot
   conversation storage.
 - D1 is the source of truth for central accounts, remote membership, invitations, and logical sessions.
+- Stripe is the source of truth for paid plans. D1 `billing_subscriptions` is a copy that the Stripe
+  webhook keeps current; see [Billing](#billing).
 - A local team host owns conversations, files, agents, and the local member projection used by Team API.
 - `openbot-approval-automation-v1.json` holds Turbo mode and the agents granted "Always allow". It
   belongs to the computer that runs the agent and never crosses the Team API, whose released
@@ -1453,6 +1455,43 @@ like a plugin link, the link itself installs nothing. The page's fallback line a
 page links `/app` with the four invitation fields, and a plugin page links `/app?plugin=<slug>`. The
 browser client removes these fields after it reads them and opens the join dialog or the marketplace
 listing. It never joins or installs without a press.
+
+## Billing
+
+Billing is per server. One account can pay for several servers; each server has its own Stripe
+subscription. The Account Worker (`apps/auth-api/src/server/billing-service.ts`) talks to the Stripe
+REST API with `fetch`; there is no Stripe SDK. The plan catalog in `packages/contracts/src/billing.ts`
+holds only the plan IDs, storage and lookup keys. The amounts are six Stripe Prices with the lookup
+keys `openbot_{plan}_{interval}`. `bun run api:stripe:bootstrap` (`scripts/stripe-bootstrap.ts`)
+creates them and the Customer Portal settings.
+
+- This page does not start a plan. The flow that makes a server starts the subscription, and must
+  set the subscription metadata `openbot_user_id` and `openbot_server_id` (`BILLING_METADATA`). The
+  webhook links a new Stripe customer to the account from `openbot_user_id`. It never moves a known
+  customer to another account, and it skips a subscription that names no account.
+- Desktop Settings → Billing and the web Billing dialog render `@openbot/ui/features/billing`: one
+  row for each open plan, with the server name, the plan, its price, and a menu to change or cancel
+  it. The price is the list price of the Stripe Price in the subscription's currency (from
+  `currency_options` when that is not the Price's base currency), before discounts and tax. The
+  webhook stores it with the subscription. The
+  account button opens the Customer Portal for the payment method and invoices.
+- Desktop calls the `billing` IPC group; the main process gets a Customer Portal URL from the Worker,
+  checks that it is a `billing.stripe.com` page, and opens it with `shell.openExternal`. The IPC takes
+  no URL. The web client does the same check before `location.assign`.
+- The change and cancel actions open the Portal flow of one subscription. The Worker first checks
+  that the subscription belongs to the account.
+- The server name comes only from a `remote_hosts` row that the same account owns. A plan whose
+  server was removed stays in the list, because Stripe bills it until the account cancels it.
+- The webhook (`/v1/stripe/webhook`) checks the Stripe signature, records the event ID to ignore a
+  repeat, and gets the subscription from Stripe again before it writes the D1 row. So the order of
+  events has no effect.
+- Without `STRIPE_SECRET_KEY` billing is off: the state is `available: false`, and the Portal route
+  and the webhook answer 503.
+
+Rule: plan limits read `getServerEntitlement` (`apps/auth-api/src/server/billing-entitlement.ts`)
+only. It decides which statuses and grace periods give a server a plan, and it counts a plan only
+for a server that the paying account owns. Do not read `billing_subscriptions` or a Stripe status in
+another place.
 
 ## macOS Host Manager
 

@@ -20,6 +20,7 @@ import { Route as SitemapDotxmlRouteImport } from './routes/sitemap[.]xml'
 import { Route as DotwellKnownAppleAppSiteAssociationRouteImport } from './routes/[.]well-known/apple-app-site-association'
 import { Route as DotwellKnownJwksDotjsonRouteImport } from './routes/[.]well-known/jwks[.]json'
 import { Route as AgentsTemplateIdRouteImport } from './routes/agents/$templateId'
+import { Route as BillingReturnRouteImport } from './routes/billing/return'
 import { Route as CompareIndexRouteImport } from './routes/compare/index'
 import { Route as CompareSlugRouteImport } from './routes/compare/$slug'
 import { Route as CompareRssDotxmlRouteImport } from './routes/compare/rss[.]xml'
@@ -58,6 +59,7 @@ import { Route as V1SitesReportsRouteImport } from './routes/v1/sites/reports'
 import { Route as V1SkillsIndexRouteImport } from './routes/v1/skills/index'
 import { Route as V1SkillsSkillIdRouteImport } from './routes/v1/skills/$skillId'
 import { Route as V1SkillsMineRouteImport } from './routes/v1/skills/mine'
+import { Route as V1StripeWebhookRouteImport } from './routes/v1/stripe/webhook'
 import { Route as V1TeamAuthRedeemRouteImport } from './routes/v1/team-auth/redeem'
 import { Route as V1TeamAuthTicketRouteImport } from './routes/v1/team-auth/ticket'
 import { Route as V1TeamHostsIceServersRouteImport } from './routes/v1/team-hosts/ice-servers'
@@ -70,6 +72,8 @@ import { Route as V1AuthEmailVerifyRouteImport } from './routes/v1/auth/email/ve
 import { Route as V1MarketplaceAgentsIndexRouteImport } from './routes/v1/marketplace/agents/index'
 import { Route as V1MarketplaceAgentsAgentIdRouteImport } from './routes/v1/marketplace/agents/$agentId'
 import { Route as V1MarketplaceAgentsMineRouteImport } from './routes/v1/marketplace/agents/mine'
+import { Route as V1MeBillingIndexRouteImport } from './routes/v1/me/billing/index'
+import { Route as V1MeBillingPortalRouteImport } from './routes/v1/me/billing/portal'
 import { Route as V1MobileAuthDevicesSessionIdRouteImport } from './routes/v1/mobile-auth/devices/$sessionId'
 import { Route as V1SkillsSkillIdContentRouteImport } from './routes/v1/skills/$skillId/content'
 import { Route as V1SkillsSkillIdIconRouteImport } from './routes/v1/skills/$skillId/icon'
@@ -156,6 +160,11 @@ const DotwellKnownJwksDotjsonRoute = DotwellKnownJwksDotjsonRouteImport.update({
 const AgentsTemplateIdRoute = AgentsTemplateIdRouteImport.update({
   id: '/agents/$templateId',
   path: '/agents/$templateId',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const BillingReturnRoute = BillingReturnRouteImport.update({
+  id: '/billing/return',
+  path: '/billing/return',
   getParentRoute: () => rootRouteImport,
 } as any)
 const CompareIndexRoute = CompareIndexRouteImport.update({
@@ -350,6 +359,11 @@ const V1SkillsMineRoute = V1SkillsMineRouteImport.update({
   path: '/v1/skills/mine',
   getParentRoute: () => rootRouteImport,
 } as any)
+const V1StripeWebhookRoute = V1StripeWebhookRouteImport.update({
+  id: '/v1/stripe/webhook',
+  path: '/v1/stripe/webhook',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const V1TeamAuthRedeemRoute = V1TeamAuthRedeemRouteImport.update({
   id: '/v1/team-auth/redeem',
   path: '/v1/team-auth/redeem',
@@ -413,6 +427,16 @@ const V1MarketplaceAgentsMineRoute = V1MarketplaceAgentsMineRouteImport.update({
   id: '/v1/marketplace/agents/mine',
   path: '/v1/marketplace/agents/mine',
   getParentRoute: () => rootRouteImport,
+} as any)
+const V1MeBillingIndexRoute = V1MeBillingIndexRouteImport.update({
+  id: '/billing/',
+  path: '/billing/',
+  getParentRoute: () => V1MeRoute,
+} as any)
+const V1MeBillingPortalRoute = V1MeBillingPortalRouteImport.update({
+  id: '/billing/portal',
+  path: '/billing/portal',
+  getParentRoute: () => V1MeRoute,
 } as any)
 const V1MobileAuthDevicesSessionIdRoute =
   V1MobileAuthDevicesSessionIdRouteImport.update({
@@ -601,6 +625,7 @@ export interface FileRoutesByFullPath {
   '/.well-known/apple-app-site-association': typeof DotwellKnownAppleAppSiteAssociationRoute
   '/.well-known/jwks.json': typeof DotwellKnownJwksDotjsonRoute
   '/agents/$templateId': typeof AgentsTemplateIdRoute
+  '/billing/return': typeof BillingReturnRoute
   '/compare/$slug': typeof CompareSlugRoute
   '/compare/rss.xml': typeof CompareRssDotxmlRoute
   '/download/linux': typeof DownloadLinuxRoute
@@ -636,6 +661,7 @@ export interface FileRoutesByFullPath {
   '/v1/sites/reports': typeof V1SitesReportsRoute
   '/v1/skills/$skillId': typeof V1SkillsSkillIdRouteWithChildren
   '/v1/skills/mine': typeof V1SkillsMineRoute
+  '/v1/stripe/webhook': typeof V1StripeWebhookRoute
   '/v1/team-auth/redeem': typeof V1TeamAuthRedeemRoute
   '/v1/team-auth/ticket': typeof V1TeamAuthTicketRoute
   '/v1/team-hosts/ice-servers': typeof V1TeamHostsIceServersRoute
@@ -650,6 +676,7 @@ export interface FileRoutesByFullPath {
   '/v1/auth/email/verify': typeof V1AuthEmailVerifyRoute
   '/v1/marketplace/agents/$agentId': typeof V1MarketplaceAgentsAgentIdRouteWithChildren
   '/v1/marketplace/agents/mine': typeof V1MarketplaceAgentsMineRoute
+  '/v1/me/billing/portal': typeof V1MeBillingPortalRoute
   '/v1/mobile-auth/devices/$sessionId': typeof V1MobileAuthDevicesSessionIdRoute
   '/v1/skills/$skillId/content': typeof V1SkillsSkillIdContentRoute
   '/v1/skills/$skillId/icon': typeof V1SkillsSkillIdIconRoute
@@ -661,6 +688,7 @@ export interface FileRoutesByFullPath {
   '/v2/remote/invites/preview': typeof V2RemoteInvitesPreviewRoute
   '/v2/remote/resume/validate': typeof V2RemoteResumeValidateRoute
   '/v1/marketplace/agents/': typeof V1MarketplaceAgentsIndexRoute
+  '/v1/me/billing/': typeof V1MeBillingIndexRoute
   '/v2/remote/hosts/': typeof V2RemoteHostsIndexRoute
   '/v2/remote/sessions/': typeof V2RemoteSessionsIndexRoute
   '/v1/marketplace/agents/$agentId/avatar': typeof V1MarketplaceAgentsAgentIdAvatarRoute
@@ -695,6 +723,7 @@ export interface FileRoutesByTo {
   '/.well-known/apple-app-site-association': typeof DotwellKnownAppleAppSiteAssociationRoute
   '/.well-known/jwks.json': typeof DotwellKnownJwksDotjsonRoute
   '/agents/$templateId': typeof AgentsTemplateIdRoute
+  '/billing/return': typeof BillingReturnRoute
   '/compare/$slug': typeof CompareSlugRoute
   '/compare/rss.xml': typeof CompareRssDotxmlRoute
   '/download/linux': typeof DownloadLinuxRoute
@@ -730,6 +759,7 @@ export interface FileRoutesByTo {
   '/v1/sites/reports': typeof V1SitesReportsRoute
   '/v1/skills/$skillId': typeof V1SkillsSkillIdRouteWithChildren
   '/v1/skills/mine': typeof V1SkillsMineRoute
+  '/v1/stripe/webhook': typeof V1StripeWebhookRoute
   '/v1/team-auth/redeem': typeof V1TeamAuthRedeemRoute
   '/v1/team-auth/ticket': typeof V1TeamAuthTicketRoute
   '/v1/team-hosts/ice-servers': typeof V1TeamHostsIceServersRoute
@@ -744,6 +774,7 @@ export interface FileRoutesByTo {
   '/v1/auth/email/verify': typeof V1AuthEmailVerifyRoute
   '/v1/marketplace/agents/$agentId': typeof V1MarketplaceAgentsAgentIdRouteWithChildren
   '/v1/marketplace/agents/mine': typeof V1MarketplaceAgentsMineRoute
+  '/v1/me/billing/portal': typeof V1MeBillingPortalRoute
   '/v1/mobile-auth/devices/$sessionId': typeof V1MobileAuthDevicesSessionIdRoute
   '/v1/skills/$skillId/content': typeof V1SkillsSkillIdContentRoute
   '/v1/skills/$skillId/icon': typeof V1SkillsSkillIdIconRoute
@@ -755,6 +786,7 @@ export interface FileRoutesByTo {
   '/v2/remote/invites/preview': typeof V2RemoteInvitesPreviewRoute
   '/v2/remote/resume/validate': typeof V2RemoteResumeValidateRoute
   '/v1/marketplace/agents': typeof V1MarketplaceAgentsIndexRoute
+  '/v1/me/billing': typeof V1MeBillingIndexRoute
   '/v2/remote/hosts': typeof V2RemoteHostsIndexRoute
   '/v2/remote/sessions': typeof V2RemoteSessionsIndexRoute
   '/v1/marketplace/agents/$agentId/avatar': typeof V1MarketplaceAgentsAgentIdAvatarRoute
@@ -790,6 +822,7 @@ export interface FileRoutesById {
   '/.well-known/apple-app-site-association': typeof DotwellKnownAppleAppSiteAssociationRoute
   '/.well-known/jwks.json': typeof DotwellKnownJwksDotjsonRoute
   '/agents/$templateId': typeof AgentsTemplateIdRoute
+  '/billing/return': typeof BillingReturnRoute
   '/compare/$slug': typeof CompareSlugRoute
   '/compare/rss.xml': typeof CompareRssDotxmlRoute
   '/download/linux': typeof DownloadLinuxRoute
@@ -825,6 +858,7 @@ export interface FileRoutesById {
   '/v1/sites/reports': typeof V1SitesReportsRoute
   '/v1/skills/$skillId': typeof V1SkillsSkillIdRouteWithChildren
   '/v1/skills/mine': typeof V1SkillsMineRoute
+  '/v1/stripe/webhook': typeof V1StripeWebhookRoute
   '/v1/team-auth/redeem': typeof V1TeamAuthRedeemRoute
   '/v1/team-auth/ticket': typeof V1TeamAuthTicketRoute
   '/v1/team-hosts/ice-servers': typeof V1TeamHostsIceServersRoute
@@ -839,6 +873,7 @@ export interface FileRoutesById {
   '/v1/auth/email/verify': typeof V1AuthEmailVerifyRoute
   '/v1/marketplace/agents/$agentId': typeof V1MarketplaceAgentsAgentIdRouteWithChildren
   '/v1/marketplace/agents/mine': typeof V1MarketplaceAgentsMineRoute
+  '/v1/me/billing/portal': typeof V1MeBillingPortalRoute
   '/v1/mobile-auth/devices/$sessionId': typeof V1MobileAuthDevicesSessionIdRoute
   '/v1/skills/$skillId/content': typeof V1SkillsSkillIdContentRoute
   '/v1/skills/$skillId/icon': typeof V1SkillsSkillIdIconRoute
@@ -850,6 +885,7 @@ export interface FileRoutesById {
   '/v2/remote/invites/preview': typeof V2RemoteInvitesPreviewRoute
   '/v2/remote/resume/validate': typeof V2RemoteResumeValidateRoute
   '/v1/marketplace/agents/': typeof V1MarketplaceAgentsIndexRoute
+  '/v1/me/billing/': typeof V1MeBillingIndexRoute
   '/v2/remote/hosts/': typeof V2RemoteHostsIndexRoute
   '/v2/remote/sessions/': typeof V2RemoteSessionsIndexRoute
   '/v1/marketplace/agents/$agentId/avatar': typeof V1MarketplaceAgentsAgentIdAvatarRoute
@@ -886,6 +922,7 @@ export interface FileRouteTypes {
     | '/.well-known/apple-app-site-association'
     | '/.well-known/jwks.json'
     | '/agents/$templateId'
+    | '/billing/return'
     | '/compare/$slug'
     | '/compare/rss.xml'
     | '/download/linux'
@@ -921,6 +958,7 @@ export interface FileRouteTypes {
     | '/v1/sites/reports'
     | '/v1/skills/$skillId'
     | '/v1/skills/mine'
+    | '/v1/stripe/webhook'
     | '/v1/team-auth/redeem'
     | '/v1/team-auth/ticket'
     | '/v1/team-hosts/ice-servers'
@@ -935,6 +973,7 @@ export interface FileRouteTypes {
     | '/v1/auth/email/verify'
     | '/v1/marketplace/agents/$agentId'
     | '/v1/marketplace/agents/mine'
+    | '/v1/me/billing/portal'
     | '/v1/mobile-auth/devices/$sessionId'
     | '/v1/skills/$skillId/content'
     | '/v1/skills/$skillId/icon'
@@ -946,6 +985,7 @@ export interface FileRouteTypes {
     | '/v2/remote/invites/preview'
     | '/v2/remote/resume/validate'
     | '/v1/marketplace/agents/'
+    | '/v1/me/billing/'
     | '/v2/remote/hosts/'
     | '/v2/remote/sessions/'
     | '/v1/marketplace/agents/$agentId/avatar'
@@ -980,6 +1020,7 @@ export interface FileRouteTypes {
     | '/.well-known/apple-app-site-association'
     | '/.well-known/jwks.json'
     | '/agents/$templateId'
+    | '/billing/return'
     | '/compare/$slug'
     | '/compare/rss.xml'
     | '/download/linux'
@@ -1015,6 +1056,7 @@ export interface FileRouteTypes {
     | '/v1/sites/reports'
     | '/v1/skills/$skillId'
     | '/v1/skills/mine'
+    | '/v1/stripe/webhook'
     | '/v1/team-auth/redeem'
     | '/v1/team-auth/ticket'
     | '/v1/team-hosts/ice-servers'
@@ -1029,6 +1071,7 @@ export interface FileRouteTypes {
     | '/v1/auth/email/verify'
     | '/v1/marketplace/agents/$agentId'
     | '/v1/marketplace/agents/mine'
+    | '/v1/me/billing/portal'
     | '/v1/mobile-auth/devices/$sessionId'
     | '/v1/skills/$skillId/content'
     | '/v1/skills/$skillId/icon'
@@ -1040,6 +1083,7 @@ export interface FileRouteTypes {
     | '/v2/remote/invites/preview'
     | '/v2/remote/resume/validate'
     | '/v1/marketplace/agents'
+    | '/v1/me/billing'
     | '/v2/remote/hosts'
     | '/v2/remote/sessions'
     | '/v1/marketplace/agents/$agentId/avatar'
@@ -1074,6 +1118,7 @@ export interface FileRouteTypes {
     | '/.well-known/apple-app-site-association'
     | '/.well-known/jwks.json'
     | '/agents/$templateId'
+    | '/billing/return'
     | '/compare/$slug'
     | '/compare/rss.xml'
     | '/download/linux'
@@ -1109,6 +1154,7 @@ export interface FileRouteTypes {
     | '/v1/sites/reports'
     | '/v1/skills/$skillId'
     | '/v1/skills/mine'
+    | '/v1/stripe/webhook'
     | '/v1/team-auth/redeem'
     | '/v1/team-auth/ticket'
     | '/v1/team-hosts/ice-servers'
@@ -1123,6 +1169,7 @@ export interface FileRouteTypes {
     | '/v1/auth/email/verify'
     | '/v1/marketplace/agents/$agentId'
     | '/v1/marketplace/agents/mine'
+    | '/v1/me/billing/portal'
     | '/v1/mobile-auth/devices/$sessionId'
     | '/v1/skills/$skillId/content'
     | '/v1/skills/$skillId/icon'
@@ -1134,6 +1181,7 @@ export interface FileRouteTypes {
     | '/v2/remote/invites/preview'
     | '/v2/remote/resume/validate'
     | '/v1/marketplace/agents/'
+    | '/v1/me/billing/'
     | '/v2/remote/hosts/'
     | '/v2/remote/sessions/'
     | '/v1/marketplace/agents/$agentId/avatar'
@@ -1169,6 +1217,7 @@ export interface RootRouteChildren {
   DotwellKnownAppleAppSiteAssociationRoute: typeof DotwellKnownAppleAppSiteAssociationRoute
   DotwellKnownJwksDotjsonRoute: typeof DotwellKnownJwksDotjsonRoute
   AgentsTemplateIdRoute: typeof AgentsTemplateIdRoute
+  BillingReturnRoute: typeof BillingReturnRoute
   CompareSlugRoute: typeof CompareSlugRoute
   CompareRssDotxmlRoute: typeof CompareRssDotxmlRoute
   DownloadLinuxRoute: typeof DownloadLinuxRoute
@@ -1202,6 +1251,7 @@ export interface RootRouteChildren {
   V1SitesReportsRoute: typeof V1SitesReportsRoute
   V1SkillsSkillIdRoute: typeof V1SkillsSkillIdRouteWithChildren
   V1SkillsMineRoute: typeof V1SkillsMineRoute
+  V1StripeWebhookRoute: typeof V1StripeWebhookRoute
   V1TeamAuthRedeemRoute: typeof V1TeamAuthRedeemRoute
   V1TeamAuthTicketRoute: typeof V1TeamAuthTicketRoute
   V1TeamHostsIceServersRoute: typeof V1TeamHostsIceServersRoute
@@ -1315,6 +1365,13 @@ declare module '@tanstack/solid-router' {
       path: '/agents/$templateId'
       fullPath: '/agents/$templateId'
       preLoaderRoute: typeof AgentsTemplateIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/billing/return': {
+      id: '/billing/return'
+      path: '/billing/return'
+      fullPath: '/billing/return'
+      preLoaderRoute: typeof BillingReturnRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/compare/': {
@@ -1583,6 +1640,13 @@ declare module '@tanstack/solid-router' {
       preLoaderRoute: typeof V1SkillsMineRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/v1/stripe/webhook': {
+      id: '/v1/stripe/webhook'
+      path: '/v1/stripe/webhook'
+      fullPath: '/v1/stripe/webhook'
+      preLoaderRoute: typeof V1StripeWebhookRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/v1/team-auth/redeem': {
       id: '/v1/team-auth/redeem'
       path: '/v1/team-auth/redeem'
@@ -1666,6 +1730,20 @@ declare module '@tanstack/solid-router' {
       fullPath: '/v1/marketplace/agents/mine'
       preLoaderRoute: typeof V1MarketplaceAgentsMineRouteImport
       parentRoute: typeof rootRouteImport
+    }
+    '/v1/me/billing/': {
+      id: '/v1/me/billing/'
+      path: '/billing'
+      fullPath: '/v1/me/billing/'
+      preLoaderRoute: typeof V1MeBillingIndexRouteImport
+      parentRoute: typeof V1MeRoute
+    }
+    '/v1/me/billing/portal': {
+      id: '/v1/me/billing/portal'
+      path: '/billing/portal'
+      fullPath: '/v1/me/billing/portal'
+      preLoaderRoute: typeof V1MeBillingPortalRouteImport
+      parentRoute: typeof V1MeRoute
     }
     '/v1/mobile-auth/devices/$sessionId': {
       id: '/v1/mobile-auth/devices/$sessionId'
@@ -1890,11 +1968,15 @@ declare module '@tanstack/solid-router' {
 interface V1MeRouteChildren {
   V1MeAvatarRoute: typeof V1MeAvatarRoute
   V1MeProfileRoute: typeof V1MeProfileRoute
+  V1MeBillingPortalRoute: typeof V1MeBillingPortalRoute
+  V1MeBillingIndexRoute: typeof V1MeBillingIndexRoute
 }
 
 const V1MeRouteChildren: V1MeRouteChildren = {
   V1MeAvatarRoute: V1MeAvatarRoute,
   V1MeProfileRoute: V1MeProfileRoute,
+  V1MeBillingPortalRoute: V1MeBillingPortalRoute,
+  V1MeBillingIndexRoute: V1MeBillingIndexRoute,
 }
 
 const V1MeRouteWithChildren = V1MeRoute._addFileChildren(V1MeRouteChildren)
@@ -2022,6 +2104,7 @@ const rootRouteChildren: RootRouteChildren = {
     DotwellKnownAppleAppSiteAssociationRoute,
   DotwellKnownJwksDotjsonRoute: DotwellKnownJwksDotjsonRoute,
   AgentsTemplateIdRoute: AgentsTemplateIdRoute,
+  BillingReturnRoute: BillingReturnRoute,
   CompareSlugRoute: CompareSlugRoute,
   CompareRssDotxmlRoute: CompareRssDotxmlRoute,
   DownloadLinuxRoute: DownloadLinuxRoute,
@@ -2055,6 +2138,7 @@ const rootRouteChildren: RootRouteChildren = {
   V1SitesReportsRoute: V1SitesReportsRoute,
   V1SkillsSkillIdRoute: V1SkillsSkillIdRouteWithChildren,
   V1SkillsMineRoute: V1SkillsMineRoute,
+  V1StripeWebhookRoute: V1StripeWebhookRoute,
   V1TeamAuthRedeemRoute: V1TeamAuthRedeemRoute,
   V1TeamAuthTicketRoute: V1TeamAuthTicketRoute,
   V1TeamHostsIceServersRoute: V1TeamHostsIceServersRoute,

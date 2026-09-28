@@ -79,6 +79,8 @@ export const messages = defineMessages("settings", {
   "settings.tab.updates.description": "Keep OpenBot current on this computer.",
   "settings.tab.hostedSites.title": "Hosted sites",
   "settings.tab.hostedSites.description": "View and manage static sites published by your agents.",
+  "settings.tab.billing.title": "Billing",
+  "settings.tab.billing.description": "Server plans, payment method and invoices.",
   "settings.sections.label": "Settings sections",
   "settings.save.region": "Unsaved changes",
   "settings.save.notSaved": "Changes not saved",

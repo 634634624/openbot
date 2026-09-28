@@ -4,6 +4,7 @@ import type {
   AgentStatus,
   AppInfo,
   AvatarImageInput,
+  BillingDesktopApi,
   CentralAuthUser,
   CustomProviderRestart,
   CustomProviderSummary,
@@ -17,6 +18,7 @@ import type {
 import type { AppTextKey } from "@openbot/i18n";
 import {
   CircleArrowDown,
+  CreditCard,
   Globe2,
   MousePointer2,
   PanelTop,
@@ -26,6 +28,8 @@ import {
   Tabs,
   UserRound,
 } from "@openbot/ui";
+import { BillingPanel } from "@openbot/ui/features/billing/BillingPanel";
+import { createBillingStore } from "@openbot/ui/features/billing/billing-store";
 import type { CustomAgentSettingsApi } from "@openbot/ui/features/custom-providers/CustomAgentSettings";
 import type { DetectedProviderApi, ProviderDetection } from "@openbot/ui/features/custom-providers/detected-providers";
 import {
@@ -109,6 +113,7 @@ export interface SettingsModalProps {
    */
   codeLogin?: ProviderCodeLoginApi;
   hostedSitesApi?: HostedSitesDesktopApi;
+  billingApi?: BillingDesktopApi;
   /** The agents granted a standing approval, so the user can see and undo each one. */
   turboModePending?: boolean;
   onTestNotification?: () => void | Promise<void>;
@@ -125,6 +130,7 @@ export type SettingsTab =
   | "dynamic-island"
   | "computer-use"
   | "profile"
+  | "billing"
   | "mobile-connect"
   | "updates"
   | "hosted-sites";
@@ -171,6 +177,12 @@ const navItems: ReadonlyArray<SettingsNavItem> = [
     titleKey: "settings.tab.profile.title",
     descriptionKey: "settings.tab.profile.description",
     icon: UserRound,
+  },
+  {
+    value: "billing",
+    titleKey: "settings.tab.billing.title",
+    descriptionKey: "settings.tab.billing.description",
+    icon: CreditCard,
   },
   {
     value: "mobile-connect",
@@ -231,6 +243,10 @@ export function SettingsModal(props: SettingsModalProps) {
   const mobileConnect = createSettingsMobileConnectStore(props, () => activeTab() === "mobile-connect");
   const updates = createSettingsUpdatesStore(props);
   const hostedSites = createSettingsHostedSitesStore(props, () => activeTab() === "hosted-sites");
+  const billing = createBillingStore(
+    () => props.billingApi,
+    () => props.open && activeTab() === "billing",
+  );
   createEffect(
     () => props.open && activeTab() === "providers",
     (shown) => {
@@ -256,6 +272,7 @@ export function SettingsModal(props: SettingsModalProps) {
         (value === "dynamic-island" && isMac()) ||
         value === "computer-use" ||
         value === "profile" ||
+        value === "billing" ||
         value === "mobile-connect" ||
         value === "updates" ||
         value === "hosted-sites"
@@ -380,6 +397,10 @@ export function SettingsModal(props: SettingsModalProps) {
             canListSessions={Boolean(props.onListAccountSessions)}
             canRevokeSession={Boolean(props.onRevokeAccountSession)}
           />
+        </Tabs.Content>
+
+        <Tabs.Content value="billing" class="settings-modal-tab-panel" data-tab="billing">
+          <BillingPanel store={billing} available={Boolean(props.billingApi)} />
         </Tabs.Content>
 
         <Tabs.Content value="mobile-connect" class="settings-modal-tab-panel" data-tab="mobile-connect">

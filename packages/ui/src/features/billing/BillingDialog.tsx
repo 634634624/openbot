@@ -1,0 +1,46 @@
+import { Dialog, IconButton, Text, X } from "@openbot/ui";
+import type { JSX } from "@solidjs/web";
+import { useText } from "../../text";
+import { BillingPanel } from "./BillingPanel";
+import type { BillingStore } from "./billing-store";
+
+export interface BillingDialogProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  store: BillingStore;
+}
+
+/** The Billing panel in a dialog, for the web client, which has no Settings dialog. */
+export function BillingDialog(props: BillingDialogProps): JSX.Element {
+  const { t } = useText();
+
+  return (
+    <Dialog.Root open={props.open} onOpenChange={props.onOpenChange}>
+      <Dialog.Portal>
+        <Dialog.Overlay class="billing-dialog-backdrop">
+          <Dialog.Content as="section" class="billing-dialog">
+            <IconButton
+              class="billing-dialog-close"
+              label={t("common.close")}
+              variant="ghost"
+              onClick={() => props.onOpenChange(false)}
+            >
+              <X />
+            </IconButton>
+            <header class="billing-dialog-header">
+              <Dialog.Title as="h2" class="billing-dialog-title">
+                {t("billing.title")}
+              </Dialog.Title>
+              <Dialog.Description as="p">
+                <Text tone="muted">{t("billing.description")}</Text>
+              </Dialog.Description>
+            </header>
+            <div class="billing-dialog-body">
+              <BillingPanel store={props.store} available />
+            </div>
+          </Dialog.Content>
+        </Dialog.Overlay>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}

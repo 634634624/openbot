@@ -246,7 +246,8 @@ See [web client delivery](docs/web-client.md) for the release gate and focused c
 | `bun run api:images` | Draw the article artwork into `apps/auth-api/content-art/` after you add an article or change a title. Commit the result; the site build fails until it matches. Needs Electron and a GPU, so run it on your own machine. |
 | `bun run api:migrate:local` | Apply D1 migrations to the local development database. |
 | `bun run api:migrate:remote` | Apply D1 migrations to the configured remote database. |
-| `bun run api:deploy` | Build and deploy the account API to Cloudflare Workers. |
+| `bun run api:deploy` | Build and deploy the account API to Cloudflare Workers. It sets `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET` when both are in the production environment; without them billing stays off. |
+| `bun run api:stripe:bootstrap` | Create or update the Stripe plan catalog and the Customer Portal settings from `STRIPE_SECRET_KEY` in `apps/auth-api/.env.dev`. It refuses a live key unless you add `--live`. For local webhooks, run `stripe listen --forward-to localhost:<API port>/v1/stripe/webhook` and put the signing secret in `STRIPE_WEBHOOK_SECRET`. See [Billing](docs/ARCHITECTURE.md#billing). |
 | `bun run remote:up` | Build and start the self-hosted Signal, coturn, and ACME stack. |
 | `bun run remote:check` | Check the Remote API and both Docker Compose configurations. |
 | `bun run remote:check:compose` | Validate both Docker Compose configurations alone, without a running daemon. |

@@ -17,6 +17,7 @@ import { fn } from "storybook/test";
 import type { Meta, StoryObj } from "storybook-solidjs-vite";
 import { createProviderRuntimeStore } from "../src/features/provider-updates/provider-runtime-store";
 import { SettingsModal, type SettingsTab } from "../src/features/settings/SettingsModal";
+import { createMockBilling } from "../src/preview/mock-billing";
 import { createFakeCodeLogin } from "./code-login-fixture";
 import { createStoryDetection, STORY_DETECTED_PROVIDERS } from "./detected-providers-fixture";
 import { createMockOpenBot } from "./mock-openbot";
@@ -129,6 +130,7 @@ function SettingsModalStory(props: {
   initialTab?: SettingsTab;
 }) {
   const previousApi = window.openbot;
+  const billingApi = createMockBilling();
   const mock = createMockOpenBot({
     providerRuntimeSnapshot: props.providerUpdate
       ? {
@@ -241,6 +243,7 @@ function SettingsModalStory(props: {
             setMobileDevices((current) => current.filter((device) => device.sessionId !== sessionId));
           }}
           onUpdateAction={runUpdateAction}
+          billingApi={billingApi}
           agentStatus={
             props.codeSignIn
               ? codeSignInAgentStatus
@@ -444,6 +447,11 @@ export const ProviderUpdateAvailable: Story = {
 
 export const ProviderUpdateRetry: Story = {
   render: () => <SettingsModalStory initialOpen providerUpdate providerUpdateFailure initialTab="providers" />,
+};
+
+/** No plan yet. Choose a plan: the mock then shows it as active, as after a Stripe payment. */
+export const Billing: Story = {
+  render: () => <SettingsModalStory initialOpen initialTab="billing" />,
 };
 
 export const Interactive: Story = {

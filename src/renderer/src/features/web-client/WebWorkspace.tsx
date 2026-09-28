@@ -34,6 +34,8 @@ import {
 import { AccountDock } from "@openbot/ui/features/account/AccountDock";
 import { computeAgentAvatarMoods } from "@openbot/ui/features/agents/agent-avatar-mood";
 import { createFirstAgentDraft, type FirstAgentDraft } from "@openbot/ui/features/agents/FirstAgentSetup";
+import { BillingDialog } from "@openbot/ui/features/billing/BillingDialog";
+import { createBillingStore } from "@openbot/ui/features/billing/billing-store";
 import { ServerRail } from "@openbot/ui/features/servers/ServerRail";
 import { Sidebar } from "@openbot/ui/features/sidebar/Sidebar";
 import { computeSidebarAgentStates } from "@openbot/ui/features/sidebar/sidebar-agent-states";
@@ -70,6 +72,7 @@ import { WebConnectComputer } from "./WebConnectComputer";
 import { WebHostOffline } from "./WebHostOffline";
 import { WebMobileNavigation, type WebMobilePane } from "./WebMobileNavigation";
 import { createWebAccountCalls } from "./web-account";
+import { createWebBillingCalls } from "./web-billing";
 import { createWebChannelsPort } from "./web-channels-runtime";
 import { createWebWorkspace, type WebRuntimeFactory } from "./web-client-context";
 import { createWebConversationRuntime } from "./web-conversation-runtime";
@@ -121,6 +124,9 @@ type WebWorkspaceProps = {
   /** A plugin listing that a `/app?plugin=<slug>` link named. The marketplace opens on it. */
   pluginSlug?: string | null;
   onPluginSlugConsumed?: () => void;
+  /** True on a return from the Stripe Customer Portal. The Billing dialog opens on it. */
+  billingReturn?: boolean;
+  onBillingReturnConsumed?: () => void;
 };
 
 export function WebWorkspace(props: WebWorkspaceProps) {
@@ -456,6 +462,17 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
     () => props.pluginSlug,
     (slug) => {
       if (slug) setMarketplaceOpen(true);
+    },
+  );
+  const [billingOpen, setBillingOpen] = createSignal(false);
+  const billingCalls = createWebBillingCalls(props.accountFetch);
+  const billing = createBillingStore(() => billingCalls, billingOpen);
+  createEffect(
+    () => props.billingReturn,
+    (billingReturn) => {
+      if (!billingReturn) return;
+      setBillingOpen(true);
+      props.onBillingReturnConsumed?.();
     },
   );
   const saveFile = createWebFileSaver();
@@ -888,6 +905,7 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
                 onLogout={signOut}
                 onOpenExternal={openWebDestination}
                 onOpenProfile={profileAgentId() ? openProfile : undefined}
+                onOpenBilling={() => setBillingOpen(true)}
                 onOpenSettings={
                   workspace.state.host
                     ? (trigger) => {
@@ -995,6 +1013,7 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
                   />
                 )}
               </Show>
+              <BillingDialog open={billingOpen()} onOpenChange={setBillingOpen} store={billing} />
               <ChannelCreateOverlay />
               <GlobalSearchOverlay
                 open={searchOpen()}

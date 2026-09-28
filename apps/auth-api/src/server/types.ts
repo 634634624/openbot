@@ -30,6 +30,8 @@ export interface WorkerBindings {
   REMOTE_SIGNAL_URL?: string;
   REMOTE_AUTH_WEBHOOK_URL?: string;
   REMOTE_AUTH_WEBHOOK_SECRET?: string;
+  STRIPE_SECRET_KEY?: string;
+  STRIPE_WEBHOOK_SECRET?: string;
 }
 
 function isWorkerBindings(value: unknown): value is WorkerBindings {

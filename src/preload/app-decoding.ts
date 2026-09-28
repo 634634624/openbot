@@ -5,6 +5,7 @@
 // carries, so a value the renderer reads always has the shape its type says.
 
 import { isAgentTemplateId } from "@openbot/contracts/agent-template-links";
+import { type BillingState, parseBillingState } from "@openbot/contracts/billing";
 import { parseHostedSiteSummary } from "@openbot/contracts/hosted-sites";
 import {
   type AccountSession,
@@ -269,6 +270,12 @@ export function decodeHostedSite(value: unknown): HostedSiteSummary {
 export function decodeHostedSites(value: unknown): HostedSiteSummary[] {
   if (!Array.isArray(value)) throw new Error("Invalid hosted site list response.");
   return value.map(decodeHostedSite);
+}
+
+export function decodeBillingState(value: unknown): BillingState {
+  const state = parseBillingState(value);
+  if (!state) throw new Error("Invalid billing state response.");
+  return state;
 }
 
 /**

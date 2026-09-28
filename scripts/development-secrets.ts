@@ -60,6 +60,13 @@ SITE_REPORT_HASH_SECRET=${developmentSecret()}
 REMOTE_AUTH_WEBHOOK_SECRET=${developmentSecret()}
 REMOTE_TICKET_PRIVATE_JWK=${tickets.privateJwk}
 REMOTE_TICKET_PUBLIC_JWKS=${tickets.publicJwks}
+
+# Billing stays off while STRIPE_SECRET_KEY is blank. To try it, put a Stripe test-mode key
+# (sk_test_...) here, run \`bun run api:stripe:bootstrap\` once, and put the
+# signing secret that \`stripe listen --forward-to localhost:<port>/v1/stripe/webhook\` prints in
+# STRIPE_WEBHOOK_SECRET.
+STRIPE_SECRET_KEY=
+STRIPE_WEBHOOK_SECRET=
 `;
 }
 

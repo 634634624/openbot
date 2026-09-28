@@ -61,6 +61,7 @@ import { AgentTemplateService } from "./agent-template-service";
 import { HostAnalytics } from "./analytics";
 import { readAnalyticsPreference } from "./analytics-preference-store";
 import { ApprovalAutomation, readApprovalAutomation } from "./approval-automation-store";
+import { BillingDesktopService } from "./billing-service";
 import { BrowserPictureInPicture } from "./browser-picture-in-picture";
 import { BrowserViewClient } from "./browser-view-client";
 import { CentralAuthManager, readCentralAuthApiUrl, readMobileConnectApiUrl } from "./central-auth-manager";
@@ -258,6 +259,7 @@ export interface ApplicationServices {
   centralAuth: CentralAuthManager;
   skills: SkillMarketplaceService;
   hostedSites: HostedSiteDesktopService;
+  billing: BillingDesktopService;
   customProviders: CustomProviderStore;
   customProviderChanges: CustomProviderChanges;
   customAgentChanges: CustomAgentChanges;
@@ -422,6 +424,7 @@ export async function createApplicationServices({
   await skillCreator.syncAll(store.list());
   await dataSkill.syncAll(store.list());
   const hostedSites = new HostedSiteDesktopService(centralAuth);
+  const billing = new BillingDesktopService(centralAuth, (url) => shell.openExternal(url));
   const sidebarLayout = new SidebarLayoutStore(join(app.getPath("userData"), SIDEBAR_LAYOUT_FILE));
   await sidebarLayout.initialize();
   const mailbox = new MailboxStore(app.getPath("userData"), store.sharedRoot, store.database);
@@ -1250,6 +1253,7 @@ export async function createApplicationServices({
     centralAuth,
     skills,
     hostedSites,
+    billing,
     customProviders,
     customProviderChanges,
     customAgentChanges,

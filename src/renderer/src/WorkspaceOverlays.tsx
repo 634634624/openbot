@@ -397,6 +397,7 @@ function AppSettings(props: AccountProps) {
         providerHostName={providerAdminServerId() === undefined ? undefined : activeServer()?.name}
         codeLogin={providerDownloads() ? codeLogin : undefined}
         hostedSitesApi={appPort().hostedSites}
+        billingApi={appPort().billing}
         turboModePending={turboModePending()}
         onTestNotification={sendTestNotification}
         onOpenNotificationSettings={openNotificationSettings}

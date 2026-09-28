@@ -34,6 +34,7 @@ async function main(): Promise<void> {
   await putRequiredSecret("REMOTE_TICKET_PRIVATE_JWK");
   await putRequiredSecret("REMOTE_TICKET_PUBLIC_JWKS");
   await putRequiredSecret("REMOTE_AUTH_WEBHOOK_SECRET");
+  await putOptionalSecretPair("STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET");
   await run(wranglerExecutable, ["d1", "migrations", "apply", "DB", "--remote", ...environmentArgs], {
     label: "Remote D1 migrations",
   });
@@ -53,6 +54,23 @@ async function putRequiredSecret(name: string): Promise<void> {
     input: `${value}\n`,
     label: `${name} secret`,
   });
+}
+
+/**
+ * Billing is optional: the Worker turns it off without these secrets. Set both or neither, because a
+ * key without its webhook secret takes payments that never reach the database.
+ */
+async function putOptionalSecretPair(first: string, second: string): Promise<void> {
+  const present = [first, second].filter((name) => process.env[name]?.trim());
+  if (present.length === 0) {
+    logger.info(`${first} and ${second} are not set. Billing stays off.`);
+    return;
+  }
+  if (present.length === 1) {
+    throw new Error(`Set both ${first} and ${second} in the decrypted production environment, or neither.`);
+  }
+  await putRequiredSecret(first);
+  await putRequiredSecret(second);
 }
 
 async function run(
