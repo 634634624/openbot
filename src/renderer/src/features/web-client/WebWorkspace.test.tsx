@@ -65,6 +65,7 @@ function harness(overrides: Partial<WebWorkspaceRuntime> = {}) {
     markRead: vi.fn().mockResolvedValue({ unreadCount: 0, firstUnreadMessageId: null, throughMessageId: null }),
     send: vi.fn().mockResolvedValue(undefined),
     stop: vi.fn(),
+    setTyping: vi.fn(),
     queue: vi.fn(async (agentId: string) => ({ agentId, deliveries: [] })),
     editQueue: vi.fn(),
     cancelQueued: vi.fn(),
