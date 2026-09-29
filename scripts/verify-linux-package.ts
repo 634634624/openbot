@@ -54,11 +54,28 @@ await Promise.all(
   ),
 );
 
-// Voice and remote desktop are not built for Linux. These two assertions are the regression guard
-// for the platform split of `extraResources`: if either ever returns to the shared list, the Linux
-// build either fails outright on a missing source or ships a runtime it cannot use.
+// Voice is not built for Linux. This assertion is the regression guard for the platform split of
+// `extraResources`: if it ever returns to the shared list, the Linux build either fails outright
+// on a missing source or ships a runtime it cannot use.
 await assertAbsent(resolve(resourcesPath, "whisper"), "Voice transcription is not available on Linux");
-await assertAbsent(resolve(resourcesPath, "remote-desktop-runtime"), "Remote desktop is not available on Linux");
+// The remote desktop runtime is built for x64 only, and only for this platform.
+if (architecture === "x64") {
+  await Promise.all(
+    ["sunshine", "web-server", "streamer", "static/stream.html"].map((name) =>
+      access(resolve(resourcesPath, "remote-desktop-runtime/linux/x64", name)),
+    ),
+  );
+  await Promise.all(
+    ["darwin", "win32"].map((name) =>
+      assertAbsent(resolve(resourcesPath, "remote-desktop-runtime", name), "Only this platform's runtime ships"),
+    ),
+  );
+} else {
+  await assertAbsent(
+    resolve(resourcesPath, "remote-desktop-runtime"),
+    "Remote desktop is not available on Linux arm64",
+  );
+}
 
 // Providers and the tunnel are downloaded on demand, exactly as on macOS and Windows.
 await Promise.all(

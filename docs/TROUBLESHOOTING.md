@@ -52,10 +52,12 @@ local access on the other side of it.
 
 ## Voice prompts or remote desktop are missing on Linux
 
-Neither is available in the Linux build. The Whisper transcription binary and the Sunshine remote
-desktop runtime are built for macOS and Windows only, so the microphone control is not drawn and
-remote desktop reports itself as unavailable. Everything else works as it does on the other
-platforms.
+The Linux build has no Whisper transcription binary, so the microphone control is not drawn.
+
+Remote desktop on Linux needs the x64 AppImage and an X11 session. Sunshine captures the X11 screen
+and sends mouse and keyboard input through the XTest extension. Under Wayland, or with no `DISPLAY`,
+remote desktop reports that it needs an X11 session. Log in with an Xorg session, or start OpenBot
+under `xvfb-run` on a server. The arm64 AppImage does not include the runtime.
 
 ## Computer Use is unavailable
 

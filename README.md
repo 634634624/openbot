@@ -71,7 +71,8 @@ On the first start from an AppImage, OpenBot writes `~/.local/share/applications
 and `~/.local/share/icons/openbot.png`, which is what lets an `openbot://` link - an invitation, or
 a plugin listing - open the app and gives the launcher an icon that stays after the app exits. Delete the two files to undo it.
 
-Voice prompts and remote desktop are not available on Linux.
+Voice prompts are not available on Linux. Remote desktop works on Linux x64 in an X11 session,
+such as Xorg or Xvfb. It does not work under Wayland, and the arm64 AppImage does not include it.
 
 > [!IMPORTANT]
 > The Windows preview is not code-signed. Windows can show an `Unknown publisher` or SmartScreen

@@ -123,6 +123,10 @@ linux:
   extraResources:
     - from: build/linux/openbot.apparmor
       to: linux/openbot.apparmor
+    # Only the x64 build installs this runtime. For arm64 the directory does not exist, and
+    # electron-builder skips a missing source with a warning.
+    - from: build/remote-desktop-runtime
+      to: remote-desktop-runtime
     - from: build/cua-driver/linux/${arch}
       to: cua-driver/linux/${arch}
   # Electron takes its Linux app id from `desktopName` in package.json, and the window manager
