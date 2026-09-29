@@ -398,6 +398,8 @@ jobs:
           OPENPANEL_CLIENT_ID: ${{ secrets.OPENPANEL_CLIENT_ID }}
           OPENPANEL_CLIENT_SECRET: ${{ secrets.OPENPANEL_CLIENT_SECRET }}
           HOSTED_SERVER_TEMPLATE: ${{ vars.HOSTED_SERVER_TEMPLATE }}
+          APNS_PRIVATE_KEY: ${{ secrets.APNS_PRIVATE_KEY }}
+          APNS_KEY_ID: ${{ secrets.APNS_KEY_ID }}
         run: |
           secrets_path="$RUNNER_TEMP/openbot-worker-secrets.json"
           umask 077
@@ -429,6 +431,8 @@ jobs:
               ["BOAT_API_KEY", "BOAT_WEBHOOK_SECRET"],
               ["OPENPANEL_CLIENT_ID", "OPENPANEL_CLIENT_SECRET"],
               ["HOSTED_SERVER_TEMPLATE"],
+              // The Live Activity relay stays off until both are set.
+              ["APNS_PRIVATE_KEY", "APNS_KEY_ID"],
             ]) {
               const present = names.filter((name) => process.env[name]?.trim());
               if (present.length === 0) continue;

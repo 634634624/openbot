@@ -52,7 +52,9 @@
     // servers only.
     "HOSTED_SERVERS_ENABLED": "true",
     // Each account can buy a server in production. Put account IDs here to limit creates to them.
-    "HOSTED_SERVERS_ALLOWED_USER_IDS": "*"
+    "HOSTED_SERVERS_ALLOWED_USER_IDS": "*",
+    "APNS_TEAM_ID": "ZTRDTUL87R",
+    "APNS_TOPIC": "run.openbot.mobile"
   },
   "d1_databases": [
     {
@@ -99,6 +101,11 @@
       "name": "SITE_REPORT_RATE_LIMITER",
       "namespace_id": "2026083101",
       "simple": { "limit": 10, "period": 60 }
+    },
+    {
+      "name": "LIVE_ACTIVITY_RATE_LIMITER",
+      "namespace_id": "2026092901",
+      "simple": { "limit": 300, "period": 60 }
     }
   ],
   "env": {
@@ -167,6 +174,11 @@
           "name": "SITE_REPORT_RATE_LIMITER",
           "namespace_id": "2026083102",
           "simple": { "limit": 10, "period": 60 }
+        },
+        {
+          "name": "LIVE_ACTIVITY_RATE_LIMITER",
+          "namespace_id": "2026092902",
+          "simple": { "limit": 300, "period": 60 }
         }
       ]
     },
@@ -205,7 +217,9 @@
         "REMOTE_TICKET_KEY_ID": "openbot-remote-1",
         "REMOTE_SIGNAL_URL": "wss://signal.openbot.run/v1/signal",
         "REMOTE_AUTH_WEBHOOK_URL": "https://signal.openbot.run/internal/auth-events",
-        "HOSTED_SERVERS_ENABLED": "true"
+        "HOSTED_SERVERS_ENABLED": "true",
+        "APNS_TEAM_ID": "ZTRDTUL87R",
+        "APNS_TOPIC": "run.openbot.mobile"
       },
       "d1_databases": [
         {
@@ -249,6 +263,11 @@
           "name": "SITE_REPORT_RATE_LIMITER",
           "namespace_id": "2026083103",
           "simple": { "limit": 10, "period": 60 }
+        },
+        {
+          "name": "LIVE_ACTIVITY_RATE_LIMITER",
+          "namespace_id": "2026092903",
+          "simple": { "limit": 300, "period": 60 }
         }
       ]
     }
