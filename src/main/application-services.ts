@@ -356,7 +356,7 @@ export async function createApplicationServices({
     platform: process.platform,
     preferencePath: join(app.getPath("userData"), DYNAMIC_ISLAND_PREFERENCE_FILE),
     createWindow: createDynamicIslandWindow,
-    loadWindow: loadDynamicIslandRenderer,
+    loadWindow: (window, display) => loadDynamicIslandRenderer(window, display, appVariant),
     getDisplays: () => screen.getAllDisplays(),
     getMainWindow: windows.getMainWindow,
     ensureMainWindow: windows.ensureMainWindow,
