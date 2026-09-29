@@ -275,7 +275,7 @@ named snapshot access. The script:
 
 1. creates a builder sandbox with `noEnv`;
 2. uploads `scripts/hosting/` and runs `provision.sh` with `sudo`. It installs Xvfb, D-Bus,
-   gnome-keyring and the Electron libraries, checks the AppImage SHA-256, unpacks the AppImage to
+   gnome-keyring, the Electron libraries and the remote desktop runtime libraries, checks the AppImage SHA-256, unpacks the AppImage to
    `/opt/OpenBot/app`, adds an AppArmor profile that lets Chromium make user namespaces, and
    enables `openbot.service`;
 3. checks that OpenBot did not start and that no profile or claim exists;

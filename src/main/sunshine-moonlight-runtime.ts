@@ -271,7 +271,7 @@ export type RemoteRuntimeSpawn = (executable: string, args: string[], options: S
 interface SunshineMoonlightRuntimeOptions {
   paths: RemoteDesktopRuntimePaths;
   stateDirectory: string;
-  platform: "darwin" | "win32";
+  platform: "darwin" | "win32" | "linux";
   credentials: { username: string; password: string };
   getDisplays: () => RemoteDesktopDisplay[];
   getIceServers: () => Promise<RemoteDesktopIceServer[]>;
@@ -529,6 +529,9 @@ export class SunshineMoonlightRuntime {
       `cert = ${join(this.#options.stateDirectory, "sunshine-cert.pem")}`,
       `log_path = ${join(this.#options.stateDirectory, "sunshine.log")}`,
       ...(this.#selectedDisplayId ? [`output_name = ${this.#selectedDisplayId}`] : []),
+      // The Linux runtime is built with X11 capture and no hardware encoder, so Sunshine does not
+      // probe the others.
+      ...(this.#options.platform === "linux" ? ["capture = x11", "encoder = software"] : []),
     ];
     await Promise.all([
       writeFile(join(this.#options.stateDirectory, "sunshine.conf"), `${values.join("\n")}\n`, { mode: 0o600 }),
