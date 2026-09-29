@@ -152,6 +152,12 @@ export interface ProviderClientContext {
    */
   readonly providerStateDirectory?: string;
   /**
+   * Variables an agent's tools run with, beyond the user's own environment: today the paths that
+   * point `gh` and `git` at the built-in GitHub connection. Paths only, never a secret, because a
+   * provider process can outlive the token. Read at each spawn; empty while nothing is connected.
+   */
+  readonly agentEnvironment?: (inherited?: NodeJS.ProcessEnv) => Readonly<Record<string, string>>;
+  /**
    * The saved custom agents with their environment values, read when an agent's process starts.
    * Only the `acp` driver reads it. Optional for the same reason as `reportMcpDrops`: without it no
    * custom agent is saved.
@@ -239,6 +245,7 @@ export const BUILT_IN_PROVIDER_DRIVERS: readonly BuiltInProviderDriver[] = [
         context.mcpToolRuntimes,
         context.mcpAuthorization,
         context.providerStateDirectory,
+        context.agentEnvironment,
       ),
     authState: (account) => ({ kind: "claude", email: account?.email ?? null }),
     validateAccount: () => undefined,
@@ -273,6 +280,7 @@ export const BUILT_IN_PROVIDER_DRIVERS: readonly BuiltInProviderDriver[] = [
         context.mcpToolRuntimes,
         context.mcpAuthorization,
         confinement,
+        context.agentEnvironment,
       ),
     createProfileClient: (cli, requestTimeoutMs) => new GrokAgentClient(cli, requestTimeoutMs, true),
     authState: (account) => ({ kind: "grok", email: account?.email ?? null }),
@@ -295,6 +303,7 @@ export const BUILT_IN_PROVIDER_DRIVERS: readonly BuiltInProviderDriver[] = [
         env: {},
         ...(confinement ? { confine: (target) => confineSpawnTarget(target, confinement, openCodeStatePaths()) } : {}),
         extraEnv: () => ({
+          ...context.agentEnvironment?.(),
           ...opencodeEnv(cli, context),
           ...openCodeConfigEnv({}, context.customProviders),
           ...(confinement ? OPENCODE_CONFINED_ENV : {}),
@@ -341,6 +350,7 @@ export const BUILT_IN_PROVIDER_DRIVERS: readonly BuiltInProviderDriver[] = [
         ...(confinement
           ? { confine: (target) => confineSpawnTarget(target, confinement, antigravityStatePaths()) }
           : {}),
+        extraEnv: () => ({ ...context.agentEnvironment?.() }),
         signInMessage: sourceText("error.provider.antigravitySignIn"),
         servesModel: context.servesModel,
         mcpServers: context.mcpServers,
@@ -412,6 +422,14 @@ function customAgentChild(
     ...(profileGeneration
       ? {}
       : {
+          // A variable the user saved on this agent wins over the GitHub connection's. The
+          // `GIT_CONFIG_*` entries count on from the user's own, so they always apply.
+          extraEnv: () =>
+            Object.fromEntries(
+              Object.entries(context.agentEnvironment?.({ ...process.env, ...env }) ?? {}).filter(
+                ([name]) => name.startsWith("GIT_CONFIG_") || !(name in env),
+              ),
+            ),
           mcpServers: context.mcpServers,
           reportMcpDrops: context.reportMcpDrops,
           mcpToolRuntimes: context.mcpToolRuntimes,
