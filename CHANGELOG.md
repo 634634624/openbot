@@ -6,6 +6,65 @@ All notable changes to OpenBot will be documented here. The project follows
 
 ## [Unreleased]
 
+## [0.25.2] - 2026-09-29
+
+### Added
+
+- Every member of a joined server can import agents from Grok Bot, not only the owner of the computer.
+  Open **Server settings → Import** on a joined server in the desktop app or the browser client. The
+  export must be a .zip under 100 MB. When the server already has a skill of the export, the agent of a
+  member uses that skill and the import says so.
+- The host keeps the Lock Screen activity of a joined iPhone current while iOS stops the OpenBot app
+  in the background. It encrypts each update for that phone before it goes through the OpenBot
+  account service and Apple, so neither can read it. The host keeps the phone's push token in memory
+  only, for the session that gave it.
+- Enter a promotion code on the payment page when you start a plan for a hosted server.
+- Connect an AI provider before you make the first agent on a server that you own or manage. Before,
+  a new server opened on the agent form with no provider connected.
+- Sign a server in to Claude and Grok from your own device, when the server has no browser that you
+  can see, such as a hosted server. Claude shows a code on its page that you paste into OpenBot.
+- Connect GitHub in Server settings > Connectors. Every agent on this computer then gets the GitHub
+  tools, and `gh` and `git` sign in as you, in the repositories where you install the OpenBot GitHub
+  App. The panel lists these repositories. You do not need a personal access token.
+- In the repositories where you can push, GitHub shows the issues, pull requests and comments that
+  an agent makes with the GitHub tools as `openbotgit[bot]`, not as you. OpenBot gets short-lived tokens for this from
+  the OpenBot account service, which keeps no token. `gh` still acts as you.
+- Use remote desktop on a Linux x64 host in an X11 session, including a hosted server. Wayland is not supported.
+- On a hosted server, remote desktop shows the full server desktop with its window manager, so a click moves between windows.
+
+### Changed
+
+- In a dev or preview build, the OpenBot logo on the Dynamic Island has the color of that build, as
+  the Dock icon does. Two OpenBot apps that are open at the same time are easier to tell apart.
+- Show a new loading screen in the browser app: a small crew of agents hops while OpenBot loads,
+  and jumps out when it is ready.
+- Show the OpenBot logo while the desktop app starts, and fade it out when the app is ready.
+- Show how long the agent's activity line has stayed the same when it stays for more than 5 seconds,
+  so a slow step no longer looks like a stopped agent.
+- Show "Using an app on this computer…" while a Computer Use action runs, and "Deciding the next
+  step in the app…" while the model chooses the next one. Before, both showed a general tool text.
+- Tell agents to go directly to the named application and action with Computer Use, without
+  listing other applications or reading the same window again.
+- Log the time that the Computer Use driver takes to answer each call, and each call that gets no
+  answer, so a slow step shows whether the driver or the model used the time.
+
+### Fixed
+
+- The logo color of a dev or preview build matches its app icon. Before, the logo in the app was
+  orange or bright green, and the app icon was gold or soft green.
+- A Grok agent answers again after you sign in to Grok with a different account or change the xAI
+  API key. Before, each message in an earlier chat failed with "reasoning `encrypted_content` was
+  not issued to this caller". Now OpenBot starts a new Grok session that keeps the chat history, and
+  sends your message again.
+- On Windows at a display scale other than 100%, the Computer Use border goes around the full
+  window. Before, only the top and left edges were on the screen.
+- The Computer Use border stays on the window while the agent thinks between two steps, and goes
+  away when the turn ends, fails, or is cancelled.
+- When an OpenCode model request fails, the error tells why: a rate limit, a billing problem with
+  the provider account, a failure on the provider's side, or no network connection. Each error
+  tells you what to do, and whether waiting helps. Before, every cause showed as
+  "Internal error:" followed by the provider's text (#1163).
+
 ## [0.25.1] - 2026-09-29
 
 ### Added
