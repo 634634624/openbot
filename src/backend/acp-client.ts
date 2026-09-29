@@ -22,10 +22,11 @@ import {
 } from "@agentclientprotocol/sdk";
 import { agentProviderName } from "@openbot/contracts/agent-providers";
 import { type DynamicRecord, isBoolean, isString } from "@openbot/contracts/runtime-values";
-import { sourceText } from "@openbot/i18n/source";
+import { type SourceMessages, sourceText } from "@openbot/i18n/source";
 import { redactText } from "@openbot/logging";
 import { acpPlanSteps, PLAN_UPDATED_METHOD } from "./agent/plan-updates";
 import { elicitationOptions, elicitationValue, secretElicitationField } from "./agent/prompts";
+import { isUsageLimitDiagnostic } from "./agent/provider-diagnostics";
 import { AgentProcessExitError, type AgentProvider } from "./agent-client";
 import { type AgentCliInfo, cliSpawnTarget } from "./cli";
 import { IdleThreadPool } from "./idle-thread-pool";
@@ -1158,7 +1159,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
           ? `OpenCode rejected the selected model's credentials. Update or remove the OpenCode Go key in Settings. If you signed in through the OpenCode CLI, reconnect that provider there. Then retry or choose another model.\n${detail}`
           : this.provider === "opencode" && isOpenCodeServiceFailure(error)
             ? sourceText("error.provider.opencodeServiceFailure")
-            : detail;
+            : this.#openCodeRequestFailure(error, detail);
       this.emit("notification", {
         method: "error",
         params: { threadId: thread.id, turnId: turn.id, message },
@@ -1171,6 +1172,28 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     thread.turns.push({ id: turn.id, status, items: turn.messages });
     thread.activeTurn = null;
     this.#threads.markIdle(thread);
+  }
+
+  /**
+   * OpenCode retries a rate limit or a provider failure by itself. When it stops, it fails the prompt
+   * with the provider's text behind `Internal error:`, so a billing refusal, a rate limit and an
+   * offline computer all read as one failure of OpenBot, and the user could not tell whether
+   * waiting helps (#1163). The kind comes first; the provider's own text follows it.
+   */
+  #openCodeRequestFailure(error: unknown, detail: string): string {
+    if (this.provider !== "opencode" || !(error instanceof RequestError) || error.code !== -32603) return detail;
+    const reason = error.message.replace(/^Internal error:\s*/u, "");
+    // The usage notice reports an exhausted usage limit, and it reads the whole text to find one.
+    if (isUsageLimitDiagnostic(reason)) return detail;
+    const key = OPENCODE_REQUEST_FAILURES.find(([, pattern]) => pattern.test(reason))?.[0];
+    if (!key) return detail;
+    // The renderer shows its generic sentence for text over 400 characters.
+    const characters = Array.from(this.#redact(reason));
+    const shown =
+      characters.length > OPENCODE_FAILURE_DETAIL_LIMIT
+        ? `${characters.slice(0, OPENCODE_FAILURE_DETAIL_LIMIT - 1).join("")}…`
+        : characters.join("");
+    return sourceText(key, { detail: shown });
   }
 
   async #requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
@@ -1535,6 +1558,31 @@ class MissingOpenCodeSessionError extends Error {
 function isOpenCodeServiceFailure(error: unknown): boolean {
   return error instanceof RequestError && error.code === -32603 && /\bOpenCode service failure\b/.test(error.message);
 }
+
+const OPENCODE_FAILURE_DETAIL_LIMIT = 200;
+
+/**
+ * The kind of a model request that OpenCode gave up on, first match wins. A provider gateway
+ * reports each kind as `Upstream request failed: <reason>`, so billing and the rate limit come
+ * first. The provider's own failure comes before the network: a gateway that could not reach its
+ * model was reached by this computer. Text that names no kind, such as OpenCode's own "Free usage
+ * exceeded, subscribe to Go", is shown as it is.
+ */
+const OPENCODE_REQUEST_FAILURES = [
+  [
+    "error.provider.opencodeBilling",
+    /\bno payment method\b|\binsufficient (?:account )?(?:funds|balance)\b|\bpayment required\b/iu,
+  ],
+  ["error.provider.opencodeRateLimited", /\brate[ _-]?limit|\btoo many requests\b/iu],
+  [
+    "error.provider.opencodeProviderFailed",
+    /\binternal server error\b|\bservice unavailable\b|\bendpoint is unavailable\b|\bbad gateway\b|\bgateway time-?out\b|\boverloaded\b|\bupstream request failed\b/iu,
+  ],
+  [
+    "error.provider.opencodeNetwork",
+    /\b(?:cannot|unable to|could not) connect\b|\bfetch failed\b|\bfailed to fetch\b|\bgetaddrinfo\b|\b(?:ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT)\b|\bsocket hang up\b/iu,
+  ],
+] as const satisfies readonly (readonly [keyof SourceMessages, RegExp])[];
 
 function isAuthenticationError(error: unknown): boolean {
   return /auth|login|credential|token|unauthori[sz]ed|api key/i.test(
