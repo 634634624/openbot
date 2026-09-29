@@ -1041,6 +1041,14 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
   }
 
   /**
+   * When the oldest running agent turn started, or null while none runs. The Computer Use rim is up
+   * only for an action made since then.
+   */
+  earliestRunningTurnStartedAt(): number | null {
+    return this.#turn.earliestRunningTurnStartedAt();
+  }
+
+  /**
    * GitHub was connected, disconnected or expired. The same treatment as the Computer Use entry,
    * and the processes that read the `gh` and `git` variables only at spawn start again.
    */

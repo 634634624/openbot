@@ -110,6 +110,8 @@ import { HostedSiteDesktopService } from "./hosted-site-service";
 import { LanguageService } from "./language-service";
 import type { MacHapticFeedback } from "./mac-haptic-feedback";
 import {
+  computerUseDesktopPoint,
+  computerUseDesktopRect,
   computerUseDisplays,
   createComputerUseHighlightWindow,
   createComputerUsePermissionHelpWindow,
@@ -726,14 +728,32 @@ export async function createApplicationServices({
     displays: computerUseDisplays,
     // The driver's own cursor on one screen, OpenBot's inside this overlay on more than one. The
     // runtime answers `null` for the screen it draws itself, so only one cursor is ever drawn.
-    readPointer: () => cuaDriver.lastPointer(COMPUTER_USE_CURSOR_MAX_AGE_MS),
+    readPointer: () => {
+      const pointer = cuaDriver.lastPointer(COMPUTER_USE_CURSOR_MAX_AGE_MS);
+      return pointer ? computerUseDesktopPoint(pointer) : null;
+    },
     readTarget: async (previous) => {
       if (!cuaDriver.mcpServerForProviders()) return null;
-      const session = liveSession(await computerUseReads.sessions());
+      // The rim marks work in progress, so it goes down with the last turn: completed, failed or
+      // cancelled. The driver's lease outlives the turn, so only an action made while a turn that
+      // still runs was running counts: a lease left by the turn before would put the rim over a
+      // turn that does not touch the desktop. Neither a lease nor an action names its agent, so the
+      // oldest running turn is the bound: a newer turn of another agent does not hide this one's
+      // rim. `service` is built below; the controller starts only after it.
+      const turnStartedAt = service.earliestRunningTurnStartedAt();
+      if (turnStartedAt === null) return null;
+      const session = liveSession(await computerUseReads.sessions(), (Date.now() - turnStartedAt) / 1000);
       if (!session) return null;
       const windows = await computerUseReads.listWindows();
       const action = cuaDriver.lastAction(COMPUTER_USE_ACTION_MAX_AGE_MS);
-      return chooseTarget({ windows, session, action, ownPid: process.pid, previous });
+      return chooseTarget({
+        windows,
+        session,
+        action,
+        ownPid: process.pid,
+        previous,
+        toDesktop: computerUseDesktopRect,
+      });
     },
   });
   // Before the daemon stops, so the rim is gone rather than left over a window nothing drives, and
