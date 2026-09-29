@@ -13,14 +13,14 @@ import { normalizeEmailAddress } from "@openbot/contracts/validation";
 import { OpenPanelBase, type OpenPanelOptions } from "@openpanel/web";
 
 export const OPENPANEL_API_URL = "https://analytics.openbot.run/api";
-export const OPENPANEL_CLIENT_ID = "6c989975-87ef-4f0c-857e-ab449a65b5c2";
+const OPENPANEL_CLIENT_ID = "6c989975-87ef-4f0c-857e-ab449a65b5c2";
 const MAX_PENDING_EVENTS = 100;
-export const ANALYTICS_SCHEMA_VERSION = 5;
+const ANALYTICS_SCHEMA_VERSION = 5;
 
-export type ServerKind = "local" | "remote" | "unknown";
-export type AnalyticsResult = "succeeded" | "failed";
+type ServerKind = "local" | "remote" | "unknown";
+type AnalyticsResult = "succeeded" | "failed";
 
-export interface AgentAnalyticsProperties {
+interface AgentAnalyticsProperties {
   provider: AgentProviderId;
   model: AgentModelId;
   reasoning_effort: AgentReasoningEffort;
@@ -80,6 +80,7 @@ export interface DesktopAnalyticsEvents {
     action:
       | "server_selected"
       | "server_joined"
+      | "server_left"
       | "identity_saved"
       | "published"
       | "unpublished"
@@ -309,6 +310,7 @@ const EVENT_ACTIONS: Partial<Record<AnalyticsEventName, readonly string[]>> = {
   team_action: [
     "server_selected",
     "server_joined",
+    "server_left",
     "identity_saved",
     "published",
     "unpublished",
@@ -386,10 +388,12 @@ export function sanitizeDesktopAnalyticsEvent(
   properties: DesktopAnalyticsEvents[AnalyticsEventName],
 ): SanitizedAnalyticsProperties {
   const allowed = EVENT_PROPERTY_ALLOWLIST[name];
+  // A custom agent's model id starts with the id the user gave it, so only the kind is sent.
+  const customAgent = "provider" in properties && properties.provider === "acp";
   return Object.fromEntries(
     Object.entries(properties).flatMap(([key, value]) => {
       if (value === undefined || !allowed.some((item) => item === key)) return [];
-      const safeValue = sanitizeDesktopProperty(name, key, value);
+      const safeValue = customAgent && key === "model" ? "custom" : sanitizeDesktopProperty(name, key, value);
       return safeValue === undefined ? [] : [[key, safeValue]];
     }),
   );

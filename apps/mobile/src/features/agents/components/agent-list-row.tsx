@@ -4,7 +4,7 @@ import { BlurView } from "expo-blur";
 import { Link, router } from "expo-router";
 import { Typography } from "heroui-native";
 import { useThemeColor } from "heroui-native/hooks";
-import { type PropsWithChildren, useEffect, useId, useRef } from "react";
+import { type PropsWithChildren, useEffect, useId, useMemo, useRef } from "react";
 import { Platform, StyleSheet, View } from "react-native";
 import Animated, {
   Easing,
@@ -18,14 +18,19 @@ import Animated, {
 } from "react-native-reanimated";
 import Svg, { Defs, LinearGradient, Rect, Stop } from "react-native-svg";
 import { useUniwind } from "uniwind";
+import { useAgentChatPreview } from "@/features/agents/components/agent-chat-preview";
 import { useAgentContextMenu } from "@/features/agents/components/agent-context-menu";
 import { AgentPinAvatar } from "@/features/agents/components/agent-pin-avatar";
 import { AgentPinSwipeRow } from "@/features/agents/components/agent-pin-swipe-row";
-import { type AgentAvatarLocation, useAgentPinTransition } from "@/features/agents/components/agent-pin-transition";
+import { useAgentPinTransition } from "@/features/agents/components/agent-pin-transition";
 import { BloubAvatar } from "@/features/agents/components/bloub-avatar";
 import { ChatLinkPressable } from "@/features/agents/components/chat-link-pressable";
+import { useChatSectionMenu } from "@/features/agents/components/use-chat-section-menu";
+import { markdownPreviewText } from "@/features/chat/model/chat-markdown-parser";
+import { useAgentUnread } from "@/features/workspace/components/use-live-workspace";
 import { type MobileAgent, useMobileWorkspace } from "@/features/workspace/context/mobile-workspace-context";
 import { canToggleAgentPin } from "@/features/workspace/model/agent-pins";
+import { useText } from "@/shared/lib/text";
 
 const AnimatedRect = Animated.createAnimatedComponent(Rect);
 const EASE_OUT = Easing.bezier(0.23, 1, 0.32, 1);
@@ -82,117 +87,131 @@ function AgentRowTextReveal({ active, children }: PropsWithChildren<{ active: bo
 }
 
 interface AgentListRowProps {
-  avatarLocation?: AgentAvatarLocation;
   agent: MobileAgent;
-  dismissToChat?: boolean;
   enableActions?: boolean;
-  enableZoomTransition?: boolean;
+  /**
+   * Opens the chat instead of the row's own link, for a row outside the home list. Such a row
+   * has no zoom source and does not stand in for the home row's avatar.
+   */
+  onOpen?: () => void;
   leftInset?: number;
   rightInset?: number;
 }
 
 export function AgentListRow({
-  avatarLocation = "row",
   agent,
-  dismissToChat = false,
   enableActions = true,
-  enableZoomTransition = true,
+  onOpen,
   leftInset = 20,
   rightInset = 20,
 }: AgentListRowProps) {
+  const { t } = useText();
   const { theme } = useUniwind();
   const [background] = useThemeColor(["background"]);
-  const { unreadAgentIds, pinnedAgentIds, pinnedChannelIds } = useMobileWorkspace();
-  const { startAgentNavigationAnimated, toggleAgentPinAnimated, transition } = useAgentPinTransition();
+  const { pinnedAgentIds, pinnedChannelIds } = useMobileWorkspace();
+  const { toggleAgentPinAnimated, transition } = useAgentPinTransition();
   const editMenu = useRef<MenuComponentRef>(null);
+  const sectionMenu = useChatSectionMenu(agent.serverId, agent.id);
   const agentContextMenu = useAgentContextMenu(agent);
-  const isUnread = unreadAgentIds.includes(agent.id);
+  const agentChatPreview = useAgentChatPreview(agent);
+  const previewLine = useMemo(() => markdownPreviewText(agent.preview), [agent.preview]);
+  const isUnread = useAgentUnread(agent.id);
   const isUnpinTarget = transition?.chatId === agent.id && transition.target === "row";
-  const avatar = (
-    <AgentPinAvatar agentId={agent.id} location={avatarLocation} size={54}>
-      <BloubAvatar
-        agentId={agent.id}
-        serverId={agent.serverId}
-        hue={agent.avatarHue}
-        seed={agent.avatarSeed}
-        size={54}
-        animateIdle={false}
-      />
-    </AgentPinAvatar>
+  const bloub = (
+    <BloubAvatar
+      agentId={agent.id}
+      serverId={agent.serverId}
+      hue={agent.avatarHue}
+      seed={agent.avatarSeed}
+      size={54}
+      animateIdle={false}
+    />
+  );
+  const avatar = onOpen ? (
+    bloub
+  ) : (
+    <Link.AppleZoom>
+      <AgentPinAvatar agentId={agent.id} location="row" size={54}>
+        {bloub}
+      </AgentPinAvatar>
+    </Link.AppleZoom>
   );
 
-  const handleOpen = () => {
-    if (dismissToChat) startAgentNavigationAnimated(agent.id, avatarLocation);
-  };
-
-  const linkTrigger = (
-    <Link.Trigger>
-      <ChatLinkPressable
-        accessibilityLabel={`Open chat with ${agent.name}${agent.title.trim() ? `, ${agent.title.trim()}` : ""}`}
-        accessibilityRole="button"
-        accessibilityActions={enableActions ? [{ name: "pin", label: `Pin ${agent.name}` }] : undefined}
-        onAccessibilityAction={
-          enableActions
-            ? (event) => {
-                if (event.nativeEvent.actionName === "pin") toggleAgentPinAnimated(agent.id);
-              }
-            : undefined
-        }
-        className="w-full"
-        onLongPress={enableActions && Platform.OS === "android" ? () => editMenu.current?.show() : undefined}
-      >
-        {({ pressed }) => (
-          <View
-            className="min-h-20 w-full flex-row items-center gap-3 py-1"
-            style={{
-              backgroundColor: background,
-              opacity: pressed ? 0.58 : 1,
-              paddingLeft: leftInset,
-              paddingRight: rightInset,
-            }}
-          >
-            {enableZoomTransition ? <Link.AppleZoom>{avatar}</Link.AppleZoom> : avatar}
-            <AgentRowTextReveal active={isUnpinTarget}>
-              <View className="min-w-0 flex-1 gap-1">
-                <View className="gap-0">
-                  <View className="flex-row items-center gap-2">
-                    {isUnread ? <View className="size-2 rounded-full bg-accent" /> : null}
-                    <Typography.Paragraph className="min-w-0 flex-1" weight="semibold" numberOfLines={2}>
-                      {agent.name}
-                    </Typography.Paragraph>
-                    <Typography.Paragraph type="body-xs" className="text-muted">
-                      {agent.updatedLabel}
-                    </Typography.Paragraph>
-                  </View>
-                  {agent.title.trim() ? (
-                    <Typography.Paragraph type="body-xs" className="-mt-1.5 text-muted" numberOfLines={2}>
-                      {agent.title.trim()}
-                    </Typography.Paragraph>
-                  ) : null}
+  const row = (
+    <ChatLinkPressable
+      chatId={onOpen ? undefined : agent.id}
+      accessibilityLabel={
+        agent.title.trim()
+          ? t("mobile.agent.list.openWithTitle", { name: agent.name, title: agent.title.trim() })
+          : t("mobile.agent.list.open", { name: agent.name })
+      }
+      accessibilityRole="button"
+      accessibilityActions={
+        enableActions ? [{ name: "pin", label: t("mobile.agent.pin.pinNamed", { name: agent.name }) }] : undefined
+      }
+      onAccessibilityAction={
+        enableActions
+          ? (event) => {
+              if (event.nativeEvent.actionName === "pin") toggleAgentPinAnimated(agent.id);
+            }
+          : undefined
+      }
+      className="w-full"
+      onPressIn={enableActions ? agentChatPreview.onPressIn : undefined}
+      onLongPress={enableActions && Platform.OS === "android" ? () => editMenu.current?.show() : undefined}
+      onPress={onOpen}
+    >
+      {({ pressed }) => (
+        <View
+          className="min-h-20 w-full flex-row items-center gap-3 py-1"
+          style={{
+            backgroundColor: background,
+            opacity: pressed ? 0.58 : 1,
+            paddingLeft: leftInset,
+            paddingRight: rightInset,
+          }}
+        >
+          {avatar}
+          <AgentRowTextReveal active={isUnpinTarget}>
+            <View className="min-w-0 flex-1 gap-1">
+              <View className="gap-0">
+                <View className="flex-row items-center gap-2">
+                  {isUnread ? <View className="size-2 rounded-full bg-accent" /> : null}
+                  <Typography.Paragraph className="min-w-0 flex-1" weight="semibold" numberOfLines={2}>
+                    {agent.name}
+                  </Typography.Paragraph>
+                  <Typography.Paragraph type="body-xs" className="text-muted">
+                    {agent.updatedLabel}
+                  </Typography.Paragraph>
                 </View>
-                <Typography.Paragraph type="body-xs" className="text-text-secondary -mt-1" numberOfLines={1}>
-                  {agent.preview}
-                </Typography.Paragraph>
+                {agent.title.trim() ? (
+                  <Typography.Paragraph type="body-xs" className="-mt-1.5 text-muted" numberOfLines={2}>
+                    {agent.title.trim()}
+                  </Typography.Paragraph>
+                ) : null}
               </View>
-            </AgentRowTextReveal>
-          </View>
-        )}
-      </ChatLinkPressable>
-    </Link.Trigger>
+              <Typography.Paragraph type="body-xs" className="text-text-secondary -mt-1" numberOfLines={1}>
+                {previewLine}
+              </Typography.Paragraph>
+            </View>
+          </AgentRowTextReveal>
+          {enableActions ? agentChatPreview.measurer : null}
+        </View>
+      )}
+    </ChatLinkPressable>
   );
+  if (onOpen) return row;
 
-  const href = {
-    pathname: "/chat/[agentId]" as const,
-    params: dismissToChat ? { avatarTransition: "search", agentId: agent.id } : { agentId: agent.id },
-  };
+  const href = { pathname: "/chat/[agentId]" as const, params: { agentId: agent.id } };
   const agentLink = enableActions ? (
-    <Link href={href} asChild dismissTo={dismissToChat} onPress={handleOpen}>
-      {linkTrigger}
+    <Link href={href} asChild>
+      <Link.Trigger>{row}</Link.Trigger>
+      {agentChatPreview.preview}
       {agentContextMenu}
     </Link>
   ) : (
-    <Link href={href} asChild dismissTo={dismissToChat} onPress={handleOpen}>
-      {linkTrigger}
+    <Link href={href} asChild>
+      <Link.Trigger>{row}</Link.Trigger>
     </Link>
   );
 
@@ -209,8 +228,9 @@ export function AgentListRow({
           ref={editMenu}
           colorScheme={theme === "dark" ? "dark" : "light"}
           shouldOpenOnLongPress
-          actions={[{ id: "edit", title: "Info" }]}
+          actions={[...sectionMenu.androidActions, { id: "edit", title: t("mobile.agent.menu.info") }]}
           onPressAction={({ nativeEvent }) => {
+            sectionMenu.onAction(nativeEvent.event);
             if (nativeEvent.event === "edit")
               router.push({
                 pathname: "/agent-info/[agentId]",

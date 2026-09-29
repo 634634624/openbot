@@ -2,6 +2,8 @@ import { expandChatTagReferences } from "../chat-tag-references";
 import { type AgentEvent, isAgentEvent } from "../ipc-agent-events";
 import { isTeamRealtimeEvent, type TeamRealtimeEvent } from "../ipc-team-host";
 import { isBoolean, isDynamicRecord, isNumber, isString } from "../runtime-values";
+import { restoreBrowserSecretMetadata } from "./browser-secret-v1";
+import { eventConversationKey, withConversationPlans } from "./conversation-plan-v4";
 import {
   toCurrentAgentKeys,
   toCurrentAgentKeysObjectForPath,
@@ -32,7 +34,12 @@ export function decodeTeamProtocolV4BaseCurrentEvent(value: unknown): TeamProtoc
   const decoded = decodeTeamProtocolV4BaseEvent(value);
   if (decoded.kind !== "known") return decoded;
   const decodedValue: TeamProtocolV4BaseJsonValue = JSON.parse(JSON.stringify(decoded.event));
-  const current = toCurrentAgentKeys(decodedValue);
+  let current: unknown;
+  try {
+    current = withEventConversationPlans(restoreBrowserSecretMetadata(toCurrentAgentKeys(decodedValue), value), value);
+  } catch {
+    return { kind: "invalid", type: decoded.event.type };
+  }
   return isAgentEvent(current) || isTeamRealtimeEvent(current)
     ? { kind: "known", event: current }
     : { kind: "invalid", type: decoded.event.type };
@@ -40,7 +47,7 @@ export function decodeTeamProtocolV4BaseCurrentEvent(value: unknown): TeamProtoc
 
 export function encodeTeamProtocolV4BaseCurrentEvent(
   event: AgentEvent | TeamRealtimeEvent,
-  options: { preserveSemanticTags?: boolean } = {},
+  options: { preserveSemanticTags?: boolean; preserveBrowserSecrets?: boolean } = {},
 ): string | null {
   // `turn-progress` bypasses the frozen codec, so it needs the vocabulary swap applied by hand.
   if (event.type === "turn-progress") return JSON.stringify(toWireAgentKeys(JSON.parse(JSON.stringify(event))));
@@ -48,7 +55,24 @@ export function encodeTeamProtocolV4BaseCurrentEvent(
   const wireValue = toWireAgentKeys(currentValue);
   const downconvertedValue = options.preserveSemanticTags ? wireValue : downconvertCurrentTags(wireValue);
   const decoded = decodeTeamProtocolV4BaseEvent(downconvertedValue);
-  return decoded.kind === "known" ? encodeTeamProtocolV4BaseEvent(decoded.event) : null;
+  if (decoded.kind !== "known") return null;
+  const encoded = encodeTeamProtocolV4BaseEvent(decoded.event);
+  if (!encoded || (!options.preserveBrowserSecrets && !eventConversationKey(event.type))) return encoded;
+  const output = withEventConversationPlans(JSON.parse(encoded), wireValue);
+  return JSON.stringify(options.preserveBrowserSecrets ? restoreBrowserSecretMetadata(output, wireValue) : output);
+}
+
+/** Puts the plans of a conversation event beside its frozen projection. See `withConversationPlans`. */
+function withEventConversationPlans(
+  projected: TeamProtocolV4BaseJsonValue,
+  source: unknown,
+): TeamProtocolV4BaseJsonValue {
+  if (projected === null || Array.isArray(projected) || typeof projected !== "object") return projected;
+  if (!isDynamicRecord(source)) return projected;
+  const key = eventConversationKey(projected.type);
+  const conversation = key ? projected[key] : undefined;
+  if (!key || conversation === undefined) return projected;
+  return { ...projected, [key]: withConversationPlans(conversation, source[key]) };
 }
 
 export function encodeTeamProtocolV4BaseCurrentHttpRequest(

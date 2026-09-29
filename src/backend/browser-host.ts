@@ -1,19 +1,17 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readFile, rename, rm, writeFile } from "node:fs/promises";
+import { isIP } from "node:net";
 import { basename, extname, join } from "node:path";
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import type {
   BrowserBounds,
-  BrowserControlAction,
-  BrowserControlDetailAction,
-  BrowserControlSession,
   BrowserControlState,
   BrowserEnvironment,
   BrowserImageMode,
   BrowserJsonValue,
   BrowserNavigationDirection,
   BrowserPreview,
+  BrowserSecretRequest,
   BrowserSnapshot,
   BrowserTab,
   BrowserTarget,
@@ -21,10 +19,13 @@ import type {
   BrowserVisibilityInput,
 } from "@openbot/contracts/ipc";
 import { isNumber, isString } from "@openbot/contracts/runtime-values";
+import { sourceText } from "@openbot/i18n/source";
 import { createOpenBotLogger, redactText, toLogValue } from "@openbot/logging";
 import {
-  app,
-  BrowserWindow,
+  type BrowserWindow,
+  type BrowserWindowConstructorOptions,
+  clipboard,
+  Menu,
   type NativeImage,
   type Session,
   session,
@@ -32,11 +33,38 @@ import {
   WebContentsView,
   webContents,
 } from "electron";
-import { BrowserCdpEngine, type BrowserUploadAssignment, type SnapshotReadResult } from "./browser-cdp";
+import { writeJsonFileAtomically } from "./atomic-json-file";
+import {
+  BrowserCdpEngine,
+  type BrowserScreencastFrame,
+  type BrowserUploadAssignment,
+  type BrowserViewportInput,
+  type SnapshotReadResult,
+} from "./browser-cdp";
+import { BrowserControlSessions } from "./browser-control-sessions";
 import { BrowserDiagnostics } from "./browser-diagnostics";
-import { applySiteIdentity } from "./browser-identity";
+import {
+  type BrowserHostTab,
+  type BrowserPreviewPage,
+  currentTabUrl,
+  type KeepQueueBlocked,
+  restoreWebContentsFocus,
+  toPublicTab,
+} from "./browser-host-tab";
+import { describeBrowserTarget, navigateAndWait } from "./browser-navigation";
+import {
+  browserLoadOptions,
+  browserRequestHeaders,
+  diagnosticUrl,
+  isAllowedBrowserPermission,
+  isAllowedMainUrl,
+  logUrlHost,
+  normalizeBrowserUrl,
+  preferredBrowserLanguageCodes,
+} from "./browser-policy";
 import { BrowserRecorder } from "./browser-recorder";
 import {
+  browserContextMenuItems,
   EDITABLE_FOCUS_SCRIPT,
   isCloseBrowserTabShortcut,
   isCollapseBrowserShortcut,
@@ -47,14 +75,28 @@ import {
   type BrowserTabOwner,
   defaultBrowserEnvironment,
   isPersistableBrowserUrl,
-  isSafeViewportSize,
-  MAX_PHYSICAL_VIEWPORT_PIXELS,
   persistentBrowserUrl,
+  readBrowserState,
   reownStoredBrowserTab,
-  type StoredBrowserTab,
-  storedBrowserTab,
+  resolveEnvironment,
+  type StoredBrowserStateV2,
 } from "./browser-state";
-import { type BrowserDynamicToolHooks, browserInputAction, browserToolTimeout } from "./browser-tool-actions";
+import {
+  boundEngineOperation,
+  enqueueTabOperation,
+  isTimeoutError,
+  readTabSnapshot,
+  remainingTime,
+  runTabAction,
+  runTabEvaluation,
+  unwindStalledOperation,
+} from "./browser-tab-operations";
+import {
+  type BrowserDynamicToolHooks,
+  type BrowserInputCall,
+  browserInputAction,
+  browserToolTimeout,
+} from "./browser-tool-actions";
 import {
   type BrowserToolArguments,
   type BrowserToolCall,
@@ -63,6 +105,7 @@ import {
 } from "./browser-tools";
 import type { DynamicToolCallParams, DynamicToolResult } from "./protocol";
 import { isRecord } from "./protocol";
+import { withTimeout } from "./with-timeout";
 
 interface BrowserHostEvents {
   changed: [tabs: BrowserTab[], activeTabId: string | null];
@@ -70,23 +113,27 @@ interface BrowserHostEvents {
   documentChanged: [tabId: string, documentIds: ReadonlySet<string>];
 }
 
-type KeepQueueBlocked = (promise: Promise<unknown>) => void;
-
 const MAX_ENCODED_CAPTURE_PIXELS = 4_194_304;
-const ACTION_POST_DISPATCH_TIMEOUT_MS = 10_000;
-/**
- * How long an operation that missed its deadline gets to unwind on its own before the debugger is
- * detached under it, and again to unwind after the detach. Long enough that a renderer which is
- * merely slower than the deadline it was given is never cancelled, short enough that the tab's queue
- * is not held by a renderer that will never answer.
- */
-const OPERATION_UNWIND_GRACE_MS = 1_000;
 /**
  * How long enumerating a tab's documents may take before it is unwound. It runs off a navigation
  * rather than a tool call, so no caller is waiting on it and nothing else supplies a deadline -- but
  * it is queued on the tab, so whatever the agent does next waits behind it.
  */
 const DOCUMENT_ENUMERATION_TIMEOUT_MS = 10_000;
+/**
+ * How long a preview request waits for a new frame before it answers with the last one. The card
+ * asks again three seconds after each answer, and the capture keeps running, so the next request
+ * gets the frame that was late.
+ */
+const PREVIEW_STALE_AFTER_MS = 1_000;
+/**
+ * The live view's frames. The quality is what a page of text survives on a slow link, and the size
+ * is the client's panel rather than the host's monitor: a frame larger than the panel that draws it
+ * is bytes nobody sees.
+ */
+const VIEW_FRAME_QUALITY = 60;
+const VIEW_FRAME_MAX_WIDTH = 1_280;
+const VIEW_FRAME_MAX_HEIGHT = 800;
 
 interface BrowserConsoleMessageDetails {
   level: "info" | "warning" | "error" | "debug";
@@ -95,47 +142,61 @@ interface BrowserConsoleMessageDetails {
 }
 
 const logger = createOpenBotLogger("browser-host");
+const BROWSER_WEB_PREFERENCES = {
+  sandbox: true,
+  contextIsolation: true,
+  nodeIntegration: false,
+  nodeIntegrationInSubFrames: false,
+  nodeIntegrationInWorker: false,
+  webviewTag: false,
+  webSecurity: true,
+  allowRunningInsecureContent: false,
+};
 
-interface InternalTab {
-  id: string;
-  view: WebContentsView;
-  requestedUrl: string;
-  ownerThreadId: string | null;
-  ownerAgentId: string | null;
-  revision: number;
-  queue: Promise<unknown>;
-  focusOnVisible: boolean;
-  environment: BrowserEnvironment;
-  engine: BrowserCdpEngine;
-  diagnostics: BrowserDiagnostics;
-  recording: boolean;
-}
-
-/**
- * The file is always rewritten as v2. A v1 file is still read -- `storedBrowserTab` accepts both owner
- * spellings, and a tab that arrives without an environment is given the default rather than dropped.
- */
-interface StoredBrowserStateV2 {
-  version: 2;
-  activeTabId: string | null;
-  tabs: Array<StoredBrowserTab & { environment: BrowserEnvironment }>;
+export interface PreparedBrowserSecret {
+  request: BrowserSecretRequest;
+  submit(secret: string): Promise<"submitted" | "takeover">;
+  cancel(): void;
 }
 
 type BrowserAction = BrowserToolArguments<"act">["action"];
 
+type BrowserToolName = BrowserToolCall["tool"];
+type BrowserToolCallOf<Name extends BrowserToolName> = Extract<BrowserToolCall, { tool: Name }>;
+type BrowserToolHandlers = {
+  [Name in BrowserToolName]: (
+    call: BrowserToolCallOf<Name>,
+    params: DynamicToolCallParams,
+    hooks: BrowserDynamicToolHooks,
+  ) => Promise<DynamicToolResult>;
+};
+
+// The generic name keeps each handler paired with its own call type.
+function runBrowserTool<Name extends BrowserToolName>(
+  handlers: BrowserToolHandlers,
+  tool: Name,
+  call: BrowserToolCallOf<Name>,
+  params: DynamicToolCallParams,
+  hooks: BrowserDynamicToolHooks,
+): Promise<DynamicToolResult> {
+  return handlers[tool](call, params, hooks);
+}
+
+async function rejectTakeoverTool(): Promise<DynamicToolResult> {
+  throw new Error("Browser takeover is handled by the agent service, not the browser host.");
+}
+
 export class BrowserHost {
-  static readonly CONTROL_IDLE_GRACE_MS = 1_200;
+  static readonly CONTROL_IDLE_GRACE_MS = BrowserControlSessions.IDLE_GRACE_MS;
   readonly #window: BrowserWindow;
   readonly #session: Session;
   readonly #downloadsRoot: string;
   readonly #statePath: string;
-  readonly #tabs = new Map<string, InternalTab>();
+  readonly #tabs = new Map<string, BrowserHostTab>();
   readonly #closingTabDrains = new Map<string, Promise<void>>();
   readonly #listeners = new Set<(...args: BrowserHostEvents["changed"]) => void>();
-  readonly #controlListeners = new Set<(...args: BrowserHostEvents["controlChanged"]) => void>();
   readonly #documentListeners = new Set<(...args: BrowserHostEvents["documentChanged"]) => void>();
-  readonly #controlSessions = new Map<string, BrowserControlSession>();
-  readonly #controlTimers = new Map<string, NodeJS.Timeout>();
+  readonly #controls = new BrowserControlSessions();
   readonly #reservedDownloadPaths = new Set<string>();
   readonly #recorder: BrowserRecorder;
   #activeTabId: string | null = null;
@@ -190,7 +251,7 @@ export class BrowserHost {
     const state = await readBrowserState(this.#statePath);
     if (state.tabs.length === 0) return;
 
-    const tabs: InternalTab[] = [];
+    const tabs: BrowserHostTab[] = [];
     for (const saved of state.tabs) {
       const stored = reownStoredBrowserTab(saved, agents);
       const ownerAgentId =
@@ -207,19 +268,28 @@ export class BrowserHost {
     this.#syncAttachedView();
     this.#emitChanged();
 
-    const restoreTab = async (tab: InternalTab) => {
-      await tab.view.webContents.loadURL("about:blank");
+    const restoreTab = async (tab: BrowserHostTab) => {
+      await tab.contents.loadURL("about:blank");
       await tab.engine.setEnvironment(tab.environment);
       await tab.engine.navigate(tab.requestedUrl);
-      tab.view.webContents.navigationHistory.clear();
+      tab.contents.navigationHistory.clear();
     };
+    for (const tab of tabs) tab.pendingRestore = () => restoreTab(tab);
     const activeTab = this.#activeTabId ? this.#tabs.get(this.#activeTabId) : undefined;
-    const activeReady = activeTab ? restoreTab(activeTab).catch(() => undefined) : Promise.resolve();
-    if (activeTab) activeTab.queue = activeReady;
+    if (activeTab) this.#wake(activeTab);
+    // A view that never navigated is a debugger target that never answers, which stops a CDP client
+    // from attaching to the app. A blank page answers, and costs far less than the saved page.
     for (const tab of tabs) {
-      if (tab === activeTab) continue;
-      tab.queue = activeReady.then(() => restoreTab(tab)).catch(() => undefined);
+      if (tab.pendingRestore) void tab.contents.loadURL("about:blank").catch(() => undefined);
     }
+  }
+
+  /** Starts the held-back first load of a restored tab, once, ahead of anything else queued on it. */
+  #wake(tab: BrowserHostTab): void {
+    const pending = tab.pendingRestore;
+    if (!pending) return;
+    tab.pendingRestore = undefined;
+    tab.queue = tab.queue.then(pending).catch(() => undefined);
   }
 
   onChanged(listener: (...args: BrowserHostEvents["changed"]) => void): () => void {
@@ -228,8 +298,7 @@ export class BrowserHost {
   }
 
   onControlChanged(listener: (...args: BrowserHostEvents["controlChanged"]) => void): () => void {
-    this.#controlListeners.add(listener);
-    return () => this.#controlListeners.delete(listener);
+    return this.#controls.onChanged(listener);
   }
 
   onDocumentChanged(listener: (...args: BrowserHostEvents["documentChanged"]) => void): () => void {
@@ -238,32 +307,21 @@ export class BrowserHost {
   }
 
   getControlState(): BrowserControlState {
-    return {
-      sessions: [...this.#controlSessions.values()]
-        .sort((left, right) => left.startedAt.localeCompare(right.startedAt))
-        .map((session) => ({ ...session })),
-    };
+    return this.#controls.state();
   }
 
   endControl(threadId: string, turnId: string): void {
-    const id = controlSessionId(threadId, turnId);
-    const timer = this.#controlTimers.get(id);
-    if (timer) clearTimeout(timer);
-    this.#controlTimers.delete(id);
-    if (!this.#controlSessions.delete(id)) return;
-    this.#emitControlChanged();
+    this.#controls.end(threadId, turnId);
   }
 
   clearControls(): void {
-    for (const timer of this.#controlTimers.values()) clearTimeout(timer);
-    this.#controlTimers.clear();
-    if (this.#controlSessions.size === 0) return;
-    this.#controlSessions.clear();
-    this.#emitControlChanged();
+    this.#controls.clear();
   }
 
   listTabs(): BrowserTab[] {
-    return [...this.#tabs.values()].map((tab) => toPublicTab(tab));
+    return [...this.#tabs.values()]
+      .filter((tab) => !tab.closing && !tab.contents.isDestroyed())
+      .map((tab) => toPublicTab(tab));
   }
 
   get activeTabId(): string | null {
@@ -303,14 +361,10 @@ export class BrowserHost {
     focus = false,
   ): Promise<BrowserTab> {
     if (!this.#hasTabCapacity(ownerThreadId, ownerAgentId)) {
-      throw new Error(`The browser can have up to ${INPUT_LIMITS.browserTabs} open tabs.`);
+      throw new Error(sourceText("error.backend.browserTabLimit", { limit: INPUT_LIMITS.browserTabs }));
     }
     const normalizedUrl = normalizeBrowserUrl(url);
-    const focusedContents = focus ? null : webContents.getFocusedWebContents();
-    const previouslyFocused =
-      focusedContents && ![...this.#tabs.values()].some((candidate) => candidate.view.webContents === focusedContents)
-        ? focusedContents
-        : null;
+    const previouslyFocused = focus ? null : this.#focusedContentsOutsideTabs();
     const tab = this.#createTab(randomUUID(), normalizedUrl, ownerThreadId, ownerAgentId);
 
     this.#tabs.set(tab.id, tab);
@@ -318,22 +372,22 @@ export class BrowserHost {
     this.#activeTabId = tab.id;
     tab.focusOnVisible = focus;
     this.#syncAttachedView();
-    if (!focus) restoreWebContentsFocus(previouslyFocused, tab.view.webContents);
+    if (!focus) restoreWebContentsFocus(previouslyFocused, tab.contents);
     this.#emitChanged();
     await this.#persistState();
 
     try {
-      await tab.view.webContents.loadURL(normalizedUrl, browserLoadOptions());
+      await tab.contents.loadURL(normalizedUrl, browserLoadOptions());
       if (focus) {
         this.#focusTab(tab);
         setImmediate(() => this.#focusTab(tab));
-      } else restoreWebContentsFocus(previouslyFocused, tab.view.webContents);
+      } else restoreWebContentsFocus(previouslyFocused, tab.contents);
     } catch (error) {
       if (this.#tabs.get(tab.id) === tab) {
         this.#unmountView(tab.view);
         this.#tabs.delete(tab.id);
         tab.engine.destroy();
-        tab.view.webContents.close();
+        tab.contents.close();
         if (this.#activeTabId === tab.id) {
           this.#activeTabId = this.#tabs.keys().next().value ?? null;
         }
@@ -341,7 +395,7 @@ export class BrowserHost {
       }
       this.#emitChanged();
       await this.#persistState();
-      throw new Error(`Unable to open ${normalizedUrl}: ${String(error)}`);
+      throw new Error(sourceText("error.backend.browserOpenFailed", { url: normalizedUrl, reason: String(error) }));
     }
 
     return toPublicTab(tab);
@@ -366,26 +420,31 @@ export class BrowserHost {
 
   async navigate(tabId: string, direction: BrowserNavigationDirection): Promise<void> {
     await this.#enqueue(tabId, async (tab) => {
-      await navigateAndWait(tab.view.webContents, () => navigateHistory(tab.view.webContents, direction));
+      await navigateAndWait(tab.contents, () => navigateHistory(tab.contents, direction));
     });
   }
 
   async loadUrl(tabId: string, url: string): Promise<void> {
     const normalizedUrl = normalizeBrowserUrl(url);
-    await this.#enqueue(tabId, async (tab) => {
-      await navigateAndWait(tab.view.webContents, () =>
-        tab.view.webContents.loadURL(normalizedUrl, browserLoadOptions()),
-      );
-      this.#focusTab(tab);
-    });
+    await this.#enqueue(
+      tabId,
+      async (tab) => {
+        await navigateAndWait(tab.contents, () => tab.contents.loadURL(normalizedUrl, browserLoadOptions()));
+        this.#focusTab(tab);
+      },
+      true,
+    );
   }
 
   async reload(tabId: string): Promise<void> {
-    await this.#enqueue(tabId, async (tab) =>
-      navigateAndWait(tab.view.webContents, () => {
-        tab.view.webContents.reload();
-        return true;
-      }),
+    await this.#enqueue(
+      tabId,
+      async (tab) =>
+        navigateAndWait(tab.contents, () => {
+          tab.contents.reload();
+          return true;
+        }),
+      true,
     );
   }
 
@@ -396,19 +455,32 @@ export class BrowserHost {
     const closedIndex = tabIds.indexOf(tabId);
     this.#unmountView(tab.view);
     this.#tabs.delete(tabId);
+    const childDrains = [...this.#tabs.values()]
+      .filter((child) => child.openerTabId === tabId)
+      .map((child) => this.close(child.id));
     this.#takeoverTabIds.delete(tabId);
 
     if (this.#activeTabId === tabId) {
-      this.#activeTabId = tabIds[closedIndex + 1] ?? tabIds[closedIndex - 1] ?? null;
+      this.#activeTabId =
+        (tab.openerTabId && this.#tabs.has(tab.openerTabId) ? tab.openerTabId : null) ??
+        tabIds.slice(closedIndex + 1).find((id) => this.#tabs.has(id)) ??
+        tabIds
+          .slice(0, closedIndex)
+          .reverse()
+          .find((id) => this.#tabs.has(id)) ??
+        null;
+      const active = this.#activeTabId ? this.#tabs.get(this.#activeTabId) : undefined;
+      if (active) active.focusOnVisible = true;
     }
     this.#syncAttachedView();
     this.#emitChanged();
     const destroy = tab.queue.then(async () => {
+      await Promise.all(childDrains);
       try {
         await this.#recorder.discard(tabId, "tab-closed");
       } finally {
         tab.engine.destroy();
-        if (!tab.view.webContents.isDestroyed()) tab.view.webContents.close();
+        if (!tab.contents.isDestroyed()) tab.contents.close();
       }
     });
     this.#closingTabDrains.set(tab.id, destroy);
@@ -424,18 +496,189 @@ export class BrowserHost {
 
   async beginTakeover(tabId: string): Promise<void> {
     const tab = this.#tabs.get(tabId);
-    if (!tab) throw new Error("Browser tab not found.");
+    if (!tab) throw new Error(sourceText("error.backend.browserTabNotFound"));
     tab.engine.invalidateReferences();
     this.#takeoverTabIds.add(tabId);
+    this.#syncAttachedView();
     tab.diagnostics.clearDiagnostics();
     this.#emitChanged();
     try {
-      await this.#enqueue(tabId, () => this.#recorder.discard(tabId, "tab-closed"));
+      await this.#enqueue(tabId, () => this.#recorder.discard(tabId, "tab-closed"), true);
     } catch (error) {
       tab.diagnostics.clearDiagnostics();
       this.#takeoverTabIds.delete(tabId);
       throw error;
     }
+  }
+
+  async prepareSecret(params: DynamicToolCallParams): Promise<PreparedBrowserSecret> {
+    const call = parseBrowserToolCall("submit_secret", params.arguments);
+    if (call.tool !== "submit_secret") throw new Error("Invalid secure authentication request.");
+    const args = call.args;
+    this.#requireToolTab(params, args.tabId);
+    const tab = this.#requireTab(args.tabId);
+    if (tab.secret) throw new Error(sourceText("error.backend.authActive"));
+    const url = new URL(currentTabUrl(tab));
+    if (url.protocol !== "https:") throw new Error(sourceText("error.backend.authHttpsRequired"));
+    this.#requireIsolatedFromConnectedTabs(tab, url.origin);
+    if (args.method !== "password" && args.digits === 0) throw new Error(sourceText("error.backend.authDigitsRange"));
+    if (
+      (args.method === "password" && args.targets.length !== 1) ||
+      (args.targets.length !== 1 && args.targets.length !== args.digits) ||
+      (args.submission === "click") !== Boolean(args.submitTarget)
+    )
+      throw new Error("Invalid authentication targets.");
+    const protection = { origin: url.origin, submitted: false, replaced: false, running: false };
+    tab.secret = protection;
+    this.#invalidateViews(tab);
+    this.#syncAttachedView();
+    try {
+      const entry = await this.#enqueue(
+        args.tabId,
+        async (_tab, keepQueueBlocked) => {
+          await this.#recorder.discard(args.tabId, "requested");
+          tab.diagnostics.clearDiagnostics();
+          return boundEngineOperation(
+            tab,
+            tab.engine.prepareSecret(args.targets, url.origin, args.submission, args.submitTarget),
+            10_000,
+            "Authentication target resolution timed out.",
+            keepQueueBlocked,
+          );
+        },
+        true,
+      );
+      return {
+        // Password cards do not use digits; keep public metadata within its released bounds.
+        request: { method: args.method, origin: url.origin, digits: args.method === "password" ? 6 : args.digits },
+        cancel: () => {
+          if (tab.secret === protection && !protection.submitted) {
+            tab.secret = undefined;
+            this.#syncAttachedView();
+            this.#emitChanged();
+          }
+        },
+        submit: async (secret) => {
+          if (tab.secret !== protection || protection.submitted)
+            throw new Error(sourceText("error.backend.authExpired"));
+          // A connected page can navigate to the secret's site while the card is open.
+          this.#requireIsolatedFromConnectedTabs(tab, url.origin);
+          if (args.method !== "password" && !new RegExp(`^[0-9]{${args.digits}}$`, "u").test(secret))
+            throw new Error(sourceText("error.backend.authDigitsRequired"));
+          protection.submitted = true;
+          this.#invalidateViews(tab);
+          protection.running = true;
+          this.#syncAttachedView();
+          let kept = false;
+          try {
+            await this.#enqueue(
+              args.tabId,
+              async (_tab, keepQueueBlocked) => {
+                await boundEngineOperation(
+                  tab,
+                  entry.enter(secret),
+                  10_000,
+                  "Authentication submission timed out.",
+                  keepQueueBlocked,
+                );
+                if (!protection.replaced) {
+                  await new Promise<void>((resolve) => {
+                    const contents = tab.contents;
+                    const finish = () => {
+                      clearTimeout(timer);
+                      contents.off("did-navigate", finish);
+                      contents.off("destroyed", finish);
+                      resolve();
+                    };
+                    const timer = setTimeout(finish, 5_000);
+                    contents.once("did-navigate", finish);
+                    contents.once("destroyed", finish);
+                  });
+                }
+                if (!protection.replaced) {
+                  // A reload would restart a single-page sign-in at its first step. Keep the
+                  // document when its fields are empty and nothing a snapshot reads shows the value.
+                  const cleared = await boundEngineOperation(
+                    tab,
+                    entry.clear(secret),
+                    10_000,
+                    "Authentication field cleanup timed out.",
+                    keepQueueBlocked,
+                  ).catch(() => false);
+                  if (cleared && !protection.replaced) kept = true;
+                }
+                if (!protection.replaced && !kept) {
+                  // Load with GET rather than replaying a possible form POST. Keep capture
+                  // blocked until navigation has replaced the document and this operation ends.
+                  await boundEngineOperation(
+                    tab,
+                    navigateAndWait(tab.contents, () => tab.contents.loadURL(currentTabUrl(tab), browserLoadOptions())),
+                    10_000,
+                    "Authentication page reload timed out.",
+                    keepQueueBlocked,
+                  );
+                }
+              },
+              true,
+            );
+          } finally {
+            protection.running = false;
+            tab.diagnostics.clearDiagnostics();
+            if (protection.replaced) {
+              tab.contents.navigationHistory.clear();
+              tab.secret = undefined;
+              this.#syncAttachedView();
+            } else if (kept) {
+              tab.secretDocument = true;
+              tab.secret = undefined;
+              this.#syncAttachedView();
+            }
+            this.#emitChanged();
+          }
+          return protection.replaced || kept ? "submitted" : "takeover";
+        },
+      };
+    } catch {
+      tab.secret = undefined;
+      this.#syncAttachedView();
+      throw new Error("Secure authentication is unavailable. Use browser takeover.");
+    }
+  }
+
+  /**
+   * Pages in one opener group can keep references to each other's documents, including a document
+   * that received a secret and was later replaced. The browser blocks that access between sites, so
+   * secure input is allowed in a connected tab only when no frame in another connected tab has the
+   * secret's site.
+   */
+  #requireIsolatedFromConnectedTabs(tab: BrowserHostTab, origin: string): void {
+    if (!tab.hasSharedBrowsingContext) return;
+    const site = approximateSite(origin);
+    for (const connected of this.#connectedTabs(tab)) {
+      if (connected === tab || connected.contents.isDestroyed()) continue;
+      const origins = connected.contents.mainFrame.framesInSubtree.map((frame) => frame.origin);
+      if (origins.some((frameOrigin) => frameOrigin !== "null" && approximateSite(frameOrigin) === site))
+        throw new Error(
+          "Secure input is unavailable while a connected popup or opener tab shows the same site. Use takeover.",
+        );
+    }
+  }
+
+  #requireNoSecretDocument(tab: BrowserHostTab, action: string): void {
+    if ([...this.#connectedTabs(tab)].some((connected) => connected.secretDocument))
+      throw new Error(
+        `${action} is unavailable while a page that received a secret is open. Use snapshots and actions until it navigates.`,
+      );
+  }
+
+  #connectedTabs(tab: BrowserHostTab): Set<BrowserHostTab> {
+    const connected = new Set([tab]);
+    for (const current of connected) {
+      for (const candidate of this.#tabs.values()) {
+        if (candidate.openerTabId === current.id || candidate.id === current.openerTabId) connected.add(candidate);
+      }
+    }
+    return connected;
   }
 
   endTakeover(tabId: string): void {
@@ -445,6 +688,7 @@ export class BrowserHost {
       tab.diagnostics.clearDiagnostics();
     }
     this.#takeoverTabIds.delete(tabId);
+    this.#syncAttachedView();
     this.#emitChanged();
   }
 
@@ -460,7 +704,7 @@ export class BrowserHost {
   async snapshot(tabId: string): Promise<BrowserSnapshot> {
     return this.#enqueue(tabId, async (tab, keepQueueBlocked) => {
       const revision = tab.revision + 1;
-      return (await this.#readSnapshot(tab, revision, keepQueueBlocked)).snapshot;
+      return (await readTabSnapshot(tab, revision, keepQueueBlocked)).snapshot;
     });
   }
 
@@ -493,11 +737,11 @@ export class BrowserHost {
               return;
             case "back":
             case "forward":
-              await navigateAndWait(tab.view.webContents, () => navigateHistory(tab.view.webContents, action.type));
+              await navigateAndWait(tab.contents, () => navigateHistory(tab.contents, action.type));
               return;
             case "reload":
-              await navigateAndWait(tab.view.webContents, () => {
-                tab.view.webContents.reload();
+              await navigateAndWait(tab.contents, () => {
+                tab.contents.reload();
                 return true;
               });
           }
@@ -506,13 +750,7 @@ export class BrowserHost {
         // answers none of them never reaches -- and re-resolving a ref fingerprints the element in
         // the frame that owns it, so a page wedged after the snapshot hangs the dispatch itself.
         const dispatchTimeout = Math.max(1, deadline - Date.now());
-        await this.#boundEngineOperation(
-          tab,
-          dispatch(),
-          dispatchTimeout,
-          "Browser action timed out.",
-          keepQueueBlocked,
-        );
+        await boundEngineOperation(tab, dispatch(), dispatchTimeout, "Browser action timed out.", keepQueueBlocked);
         const settleTimeout = Math.max(1, deadline - Date.now());
         const settleCompletion = tab.engine.settle(settleTimeout);
         try {
@@ -524,7 +762,7 @@ export class BrowserHost {
           if (!isTimeoutError(error)) throw error;
           // The action fails from here as it always did, so nothing else is using the session and the
           // unwind can start at once.
-          keepQueueBlocked(this.#unwindStalledOperation(tab, settleCompletion));
+          keepQueueBlocked(unwindStalledOperation(tab, settleCompletion));
           throw error;
         }
         tab.diagnostics.action({
@@ -542,13 +780,13 @@ export class BrowserHost {
         throw error;
       }
       const nextRevision = tab.revision + 1;
-      return (await this.#readSnapshot(tab, nextRevision, keepQueueBlocked)).snapshot;
+      return (await readTabSnapshot(tab, nextRevision, keepQueueBlocked)).snapshot;
     });
   }
 
   async screenshot(tabId: string): Promise<string> {
     return this.#enqueue(tabId, async (tab, keepQueueBlocked) => {
-      const image = await this.#boundEngineOperation(
+      const image = await boundEngineOperation(
         tab,
         tab.engine.screenshot(),
         10_000,
@@ -559,9 +797,43 @@ export class BrowserHost {
     });
   }
 
+  /**
+   * A preview waits behind whatever the agent does on the tab, and its capture resizes the page twice,
+   * which a heavy single-page application answers slowly. So while the tab is busy, or while a capture
+   * takes longer than `PREVIEW_STALE_AFTER_MS`, the card gets the last frame of the same page instead.
+   */
   async capturePreview(tabId: string): Promise<BrowserPreview> {
-    return this.#enqueue(tabId, async (tab, keepQueueBlocked) => {
-      const image = await this.#boundEngineOperation(
+    const tab = this.#requireTab(tabId);
+    if (tab.secret?.submitted) throw new Error("Browser inspection is protected during authentication. Use takeover.");
+    const cached = savedPreview(tab);
+    if (cached && tab.pendingOperations > 0) return cached;
+    const started = this.#previewCapture(tab);
+    // A navigation during the capture makes its frame show the page before it, so take one more,
+    // and fail rather than show the wrong page when that one is also out of date.
+    const capture = started.frame.then((frame) => {
+      if (showsCurrentPage(tab, started)) return frame;
+      const retry = this.#previewCapture(tab);
+      return retry.frame.then((retried) => {
+        if (!showsCurrentPage(tab, retry)) throw new Error(sourceText("error.backend.browserPreviewPageChanged"));
+        return retried;
+      });
+    });
+    if (!cached) return capture;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // After a navigation during the capture the saved frame shows the wrong page, so the preview waits.
+    const stale = new Promise<BrowserPreview>((resolve) => {
+      timer = setTimeout(() => {
+        if (savedPreview(tab) === cached) resolve(cached);
+      }, PREVIEW_STALE_AFTER_MS);
+    });
+    return Promise.race([capture, stale]).finally(() => clearTimeout(timer));
+  }
+
+  #previewCapture(tab: BrowserHostTab): BrowserPreviewPage & { frame: Promise<BrowserPreview> } {
+    if (tab.previewCapture && showsCurrentPage(tab, tab.previewCapture)) return tab.previewCapture;
+    const page = currentPreviewPage(tab);
+    const frame = this.#enqueue(tab.id, async (_tab, keepQueueBlocked) => {
+      const image = await boundEngineOperation(
         tab,
         tab.engine.screenshot(),
         10_000,
@@ -586,9 +858,285 @@ export class BrowserHost {
       });
       const preview = cropped.resize({ width: 960, height: 600, quality: "good" });
       const dataUrl = `data:image/jpeg;base64,${preview.toJPEG(72).toString("base64")}`;
-      return { dataUrl, width: 960, height: 600 };
+      const frame = { dataUrl, width: 960, height: 600 };
+      if (showsCurrentPage(tab, page)) tab.preview = { ...page, frame };
+      return frame;
     });
+    const capture = { ...page, frame };
+    tab.previewCapture = capture;
+    void frame
+      .finally(() => {
+        if (tab.previewCapture === capture) tab.previewCapture = undefined;
+      })
+      .catch(() => undefined);
+    return capture;
   }
+
+  /**
+   * A live view of a tab, for a member who is not at this computer.
+   *
+   * The frames do not go through the tab's operation queue. A queued frame is a frame that arrives
+   * after whatever the agent is doing has finished, which is exactly the picture the still-image
+   * route already gave; the point of the view is that the page moves while the agent works.
+   */
+  #invalidateViews(tab: BrowserHostTab): void {
+    tab.captureGeneration += 1;
+    for (const invalidate of [...tab.viewInvalidations]) invalidate();
+  }
+
+  /** `onEnded` gets the reason to show when the view stops before its stop function is called. */
+  async startView(
+    tabId: string,
+    onFrame: (frame: BrowserScreencastFrame) => void,
+    onEnded?: (reason: string) => void,
+  ): Promise<() => Promise<void>> {
+    const tab = this.#requireTab(tabId);
+    if (tab.secret?.submitted) throw new Error(sourceText("error.backend.browserViewProtected"));
+    const generation = tab.captureGeneration;
+    let invalidated = false;
+    const invalidate = () => {
+      invalidated = true;
+      tab.viewInvalidations.delete(invalidate);
+      onEnded?.("Authentication changed the browser view. Open a new view to continue.");
+    };
+    tab.viewInvalidations.add(invalidate);
+    try {
+      const stop = await tab.engine.startScreencast(
+        { quality: VIEW_FRAME_QUALITY, maxWidth: VIEW_FRAME_MAX_WIDTH, maxHeight: VIEW_FRAME_MAX_HEIGHT },
+        (frame) => {
+          if (!tab.secret?.submitted && tab.captureGeneration === generation) onFrame(frame);
+        },
+        (error) => {
+          tab.viewInvalidations.delete(invalidate);
+          logger.warn("The live browser view stopped.", { error: toLogValue(error) });
+          onEnded?.("The live browser view stopped. Open a new view to continue.");
+        },
+      );
+      let stopped = false;
+      const stopOnce = async () => {
+        tab.viewInvalidations.delete(invalidate);
+        if (stopped) return;
+        stopped = true;
+        await stop();
+      };
+      if (invalidated) await stopOnce();
+      return stopOnce;
+    } catch (error) {
+      tab.viewInvalidations.delete(invalidate);
+      throw error;
+    }
+  }
+
+  /**
+   * Input from the person watching that view. It is not queued either, for the same reason a local
+   * click on the visible tab is not: a pointer that answers when the agent's turn ends is not a
+   * pointer. Anything that can change the page clears the references the agent's last snapshot
+   * handed out, the way taking the tab over does, so the agent takes a fresh one rather than acting
+   * on an element the person moved.
+   */
+  async dispatchViewInput(tabId: string, input: BrowserViewportInput): Promise<void> {
+    const tab = this.#requireTab(tabId);
+    if (tab.secret?.submitted) throw new Error(sourceText("error.backend.browserInputProtected"));
+    if (input.type !== "pointer" || input.action !== "move") tab.engine.invalidateReferences();
+    await tab.engine.dispatchViewportInput(input);
+  }
+
+  readonly #toolHandlers: BrowserToolHandlers = {
+    open: async ({ args }, params) => {
+      const tab = await this.open(args.url, params.threadId, params.ownerAgentId ?? null);
+      this.#controls.updateTab(params, tab.id);
+      return textResult({ tab });
+    },
+    list_tabs: async (_call, params) => textResult(this.#toolTabs(params)),
+    status: async (_call, params) => {
+      const control = {
+        sessions: this.getControlState().sessions.filter((session) => session.threadId === params.threadId),
+      };
+      return textResult({ ...this.#toolTabs(params), control });
+    },
+    snapshot: async ({ args }, params) => {
+      const tabId = args.tabId;
+      this.#requireToolTab(params, tabId);
+      const mode = args.image ?? "auto";
+      const capture = await this.#enqueue(tabId, async (tab, keepQueueBlocked) => {
+        const result = await readTabSnapshot(tab, tab.revision + 1, keepQueueBlocked);
+        const includeImage = mode === "always" || (mode === "auto" && result.recommendImage);
+        if (!includeImage) return { result, imageUrl: null };
+        const image = await boundEngineOperation(
+          tab,
+          tab.engine.screenshot(),
+          10_000,
+          "Browser screenshot timed out.",
+          keepQueueBlocked,
+        );
+        return { result, imageUrl: boundedCaptureDataUrl(image) };
+      });
+      return this.#snapshotResult(capture.result, mode, capture.imageUrl);
+    },
+    navigate: async ({ args }, params) => {
+      const tabId = args.tabId;
+      this.#requireToolTab(params, tabId);
+      const url = args.url;
+      const direction = args.direction;
+      if (!url && !direction) throw new Error("navigate requires url or direction.");
+      const timeoutMs = browserToolTimeout(args.timeoutMs);
+      return textResult(
+        await this.#runAction(
+          tabId,
+          "navigate",
+          undefined,
+          async (tab, deadline) => {
+            const operationTimeout = remainingTime(deadline, "Browser navigate timed out.");
+            if (url) {
+              const normalizedUrl = normalizeBrowserUrl(url);
+              tab.requestedUrl = normalizedUrl;
+              await navigateAndWait(
+                tab.contents,
+                () => tab.contents.loadURL(normalizedUrl, browserLoadOptions()),
+                operationTimeout,
+              );
+            } else if (direction === "reload") {
+              await navigateAndWait(
+                tab.contents,
+                () => {
+                  tab.contents.reload();
+                  return true;
+                },
+                operationTimeout,
+              );
+            } else if (direction) {
+              await navigateAndWait(tab.contents, () => navigateHistory(tab.contents, direction), operationTimeout);
+            }
+          },
+          timeoutMs,
+        ),
+      );
+    },
+    click: (call, params, hooks) => this.#runInputTool(call, params, hooks),
+    type: (call, params, hooks) => this.#runInputTool(call, params, hooks),
+    press: (call, params, hooks) => this.#runInputTool(call, params, hooks),
+    hover: (call, params, hooks) => this.#runInputTool(call, params, hooks),
+    scroll: (call, params, hooks) => this.#runInputTool(call, params, hooks),
+    select_option: (call, params, hooks) => this.#runInputTool(call, params, hooks),
+    set_checked: (call, params, hooks) => this.#runInputTool(call, params, hooks),
+    drag: (call, params, hooks) => this.#runInputTool(call, params, hooks),
+    upload_files: (call, params, hooks) => this.#runInputTool(call, params, hooks),
+    wait_for: async ({ args }, params) => {
+      const tabId = args.tabId;
+      this.#requireToolTab(params, tabId);
+      const condition = {
+        target: args.target,
+        text: args.text,
+        url: args.url,
+        state: args.state,
+      };
+      if (!condition.target && !condition.text && !condition.url && !condition.state)
+        throw new Error("wait_for requires a condition.");
+      const timeoutMs = browserToolTimeout(args.timeoutMs);
+      return textResult(
+        await this.#enqueue(tabId, async (tab, keepQueueBlocked) => {
+          const timeoutMessage = "Browser wait condition timed out.";
+          const deadline = Date.now() + timeoutMs;
+          // The engine checks this deadline between commands, which a frame that answers none of
+          // them never reaches.
+          const waitTimeout = remainingTime(deadline, timeoutMessage);
+          await boundEngineOperation(
+            tab,
+            tab.engine.waitFor(condition, waitTimeout),
+            waitTimeout,
+            timeoutMessage,
+            keepQueueBlocked,
+          );
+          return (
+            await readTabSnapshot(
+              tab,
+              tab.revision + 1,
+              keepQueueBlocked,
+              remainingTime(deadline, timeoutMessage),
+              timeoutMessage,
+            )
+          ).snapshot;
+        }),
+      );
+    },
+    evaluate: async ({ args }, params) => {
+      this.#requireToolTab(params, args.tabId);
+      return textResult(
+        await this.#runEvaluation(
+          args.tabId,
+          args.expression,
+          args.awaitPromise ?? true,
+          browserToolTimeout(args.timeoutMs),
+        ),
+      );
+    },
+    set_environment: async ({ args }, params) => {
+      const tabId = args.tabId;
+      this.#requireToolTab(params, tabId);
+      return textResult(
+        await this.#enqueue(tabId, async (tab, keepQueueBlocked) => {
+          const environment = resolveEnvironment(args, tab.environment, tab.view.getBounds());
+          // This also bounds the engine's rollback if applying the environment fails.
+          await boundEngineOperation(
+            tab,
+            tab.engine.setEnvironment(environment),
+            10_000,
+            "Browser environment change timed out.",
+            keepQueueBlocked,
+          );
+          tab.environment = environment;
+          await this.#persistState();
+          this.#emitChanged();
+          return (await readTabSnapshot(tab, tab.revision + 1, keepQueueBlocked)).snapshot;
+        }),
+      );
+    },
+    recording_start: async ({ args }, params) => {
+      const tabId = args.tabId;
+      this.#requireToolTab(params, tabId);
+      await this.#enqueue(tabId, (tab) => {
+        this.#requireNoSecretDocument(tab, "Recording");
+        return this.#recorder.start(tabId, tab.contents);
+      });
+      return textResult({ recording: true, tabId, limits: { durationMs: 300_000, bytes: 104_857_600 } });
+    },
+    recording_stop: async ({ args }, params) => {
+      const tabId = args.tabId;
+      this.#requireToolTab(params, tabId);
+      return textResult({ artifact: await this.#enqueue(tabId, () => this.#recorder.stop(tabId)) });
+    },
+    act: async ({ args }, params) => {
+      this.#requireToolTab(params, args.tabId);
+      return textResult(await this.act(args.tabId, args.revision, args.action));
+    },
+    screenshot: async ({ args }, params) => {
+      this.#requireToolTab(params, args.tabId);
+      const imageUrl = await this.screenshot(args.tabId);
+      return { success: true, contentItems: [{ type: "inputImage", imageUrl }] };
+    },
+    close_tab: async ({ args }, params) => {
+      const tabId = args.tabId;
+      // Checked only for a tab that exists, so closing an id that is already gone stays a silent
+      // success and a repeated close is idempotent.
+      const tab = this.#tabs.get(tabId);
+      if (tab) {
+        this.#requireToolTab(params, tabId);
+        logger.info("Agent closed a browser tab.", {
+          tabId,
+          host: logUrlHost(tab.requestedUrl),
+          agentId: params.ownerAgentId ?? null,
+        });
+      }
+      await this.close(tabId);
+      return textResult({ closed: true });
+    },
+    // Published in BROWSER_TOOL_DEFINITIONS like every other tool, but answered by the agent
+    // service, which intercepts the namespace before the call reaches a host. Reaching here
+    // means a caller bypassed that, and silently succeeding would tell the model the user had
+    // been asked for control when nobody was.
+    submit_secret: rejectTakeoverTool,
+    request_takeover: rejectTakeoverTool,
+  };
 
   async handleDynamicTool(
     params: DynamicToolCallParams,
@@ -596,234 +1144,8 @@ export class BrowserHost {
   ): Promise<DynamicToolResult> {
     try {
       const call = parseBrowserToolCall(params.tool, params.arguments);
-      this.#beginControl(params, call);
-      switch (call.tool) {
-        case "open": {
-          const { args } = call;
-          const url = args.url;
-          const tab = await this.open(url, params.threadId, params.ownerAgentId ?? null);
-          this.#updateControlTab(params, tab.id);
-          return textResult({ tab });
-        }
-        case "list_tabs": {
-          const tabs = this.listTabs().filter((tab) => this.#canUseToolTab(params, tab));
-          const activeTabId = tabs.some((tab) => tab.id === this.#activeTabId)
-            ? this.#activeTabId
-            : (tabs.at(-1)?.id ?? null);
-          return textResult({ tabs, activeTabId });
-        }
-        case "status": {
-          const tabs = this.listTabs().filter((tab) => this.#canUseToolTab(params, tab));
-          const activeTabId = tabs.some((tab) => tab.id === this.#activeTabId)
-            ? this.#activeTabId
-            : (tabs.at(-1)?.id ?? null);
-          const control = {
-            sessions: this.getControlState().sessions.filter((session) => session.threadId === params.threadId),
-          };
-          return textResult({ tabs, activeTabId, control });
-        }
-        case "snapshot": {
-          const { args } = call;
-          const tabId = args.tabId;
-          this.#requireToolTab(params, tabId);
-          const mode = args.image ?? "auto";
-          const capture = await this.#enqueue(tabId, async (tab, keepQueueBlocked) => {
-            const result = await this.#readSnapshot(tab, tab.revision + 1, keepQueueBlocked);
-            const includeImage = mode === "always" || (mode === "auto" && result.recommendImage);
-            if (!includeImage) return { result, imageUrl: null };
-            const image = await this.#boundEngineOperation(
-              tab,
-              tab.engine.screenshot(),
-              10_000,
-              "Browser screenshot timed out.",
-              keepQueueBlocked,
-            );
-            return { result, imageUrl: boundedCaptureDataUrl(image) };
-          });
-          return this.#snapshotResult(capture.result, mode, capture.imageUrl);
-        }
-        case "navigate": {
-          const { args } = call;
-          const tabId = args.tabId;
-          this.#requireToolTab(params, tabId);
-          const url = args.url;
-          const direction = args.direction;
-          if (!url && !direction) throw new Error("navigate requires url or direction.");
-          const timeoutMs = browserToolTimeout(args.timeoutMs);
-          return textResult(
-            await this.#runAction(
-              tabId,
-              "navigate",
-              undefined,
-              async (tab, deadline) => {
-                const operationTimeout = remainingTime(deadline, "Browser navigate timed out.");
-                if (url) {
-                  const normalizedUrl = normalizeBrowserUrl(url);
-                  tab.requestedUrl = normalizedUrl;
-                  await navigateAndWait(
-                    tab.view.webContents,
-                    () => tab.view.webContents.loadURL(normalizedUrl, browserLoadOptions()),
-                    operationTimeout,
-                  );
-                } else if (direction === "reload") {
-                  await navigateAndWait(
-                    tab.view.webContents,
-                    () => {
-                      tab.view.webContents.reload();
-                      return true;
-                    },
-                    operationTimeout,
-                  );
-                } else if (direction) {
-                  await navigateAndWait(
-                    tab.view.webContents,
-                    () => navigateHistory(tab.view.webContents, direction),
-                    operationTimeout,
-                  );
-                }
-              },
-              timeoutMs,
-            ),
-          );
-        }
-        case "click":
-        case "type":
-        case "press":
-        case "hover":
-        case "scroll":
-        case "select_option":
-        case "set_checked":
-        case "drag":
-        case "upload_files": {
-          this.#requireToolTab(params, call.args.tabId);
-          const action = browserInputAction(call, hooks);
-          return textResult(
-            await this.#runAction(
-              call.args.tabId,
-              action.name,
-              action.target,
-              (tab, deadline, markDispatched) => action.run(tab.engine, deadline, markDispatched),
-              browserToolTimeout(call.args.timeoutMs),
-              call.tool === "upload_files" ? hooks.onUploadOperationStarted : undefined,
-            ),
-          );
-        }
-        case "wait_for": {
-          const { args } = call;
-          const tabId = args.tabId;
-          this.#requireToolTab(params, tabId);
-          const target = args.target;
-          const condition = {
-            target,
-            text: args.text,
-            url: args.url,
-            state: args.state,
-          };
-          if (!condition.target && !condition.text && !condition.url && !condition.state)
-            throw new Error("wait_for requires a condition.");
-          const timeoutMs = browserToolTimeout(args.timeoutMs);
-          return textResult(
-            await this.#enqueue(tabId, async (tab, keepQueueBlocked) => {
-              const timeoutMessage = "Browser wait condition timed out.";
-              const deadline = Date.now() + timeoutMs;
-              // The engine checks this deadline between commands, which a frame that answers none of
-              // them never reaches.
-              const waitTimeout = remainingTime(deadline, timeoutMessage);
-              await this.#boundEngineOperation(
-                tab,
-                tab.engine.waitFor(condition, waitTimeout),
-                waitTimeout,
-                timeoutMessage,
-                keepQueueBlocked,
-              );
-              return (
-                await this.#readSnapshot(
-                  tab,
-                  tab.revision + 1,
-                  keepQueueBlocked,
-                  remainingTime(deadline, timeoutMessage),
-                  timeoutMessage,
-                )
-              ).snapshot;
-            }),
-          );
-        }
-        case "evaluate": {
-          const { args } = call;
-          const tabId = args.tabId;
-          this.#requireToolTab(params, tabId);
-          const expression = args.expression;
-          const awaitPromise = args.awaitPromise ?? true;
-          return textResult(
-            await this.#runEvaluation(tabId, expression, awaitPromise, browserToolTimeout(args.timeoutMs)),
-          );
-        }
-        case "set_environment": {
-          const { args } = call;
-          const tabId = args.tabId;
-          this.#requireToolTab(params, tabId);
-          return textResult(
-            await this.#enqueue(tabId, async (tab, keepQueueBlocked) => {
-              const environment = resolveEnvironment(args, tab.environment, tab.view.getBounds());
-              // This also bounds the engine's rollback if applying the environment fails.
-              await this.#boundEngineOperation(
-                tab,
-                tab.engine.setEnvironment(environment),
-                10_000,
-                "Browser environment change timed out.",
-                keepQueueBlocked,
-              );
-              tab.environment = environment;
-              await this.#persistState();
-              this.#emitChanged();
-              return (await this.#readSnapshot(tab, tab.revision + 1, keepQueueBlocked)).snapshot;
-            }),
-          );
-        }
-        case "recording_start": {
-          const { args } = call;
-          const tabId = args.tabId;
-          this.#requireToolTab(params, tabId);
-          await this.#enqueue(tabId, (tab) => this.#recorder.start(tabId, tab.view.webContents));
-          return textResult({ recording: true, tabId, limits: { durationMs: 300_000, bytes: 104_857_600 } });
-        }
-        case "recording_stop": {
-          const { args } = call;
-          const tabId = args.tabId;
-          this.#requireToolTab(params, tabId);
-          return textResult({ artifact: await this.#enqueue(tabId, () => this.#recorder.stop(tabId)) });
-        }
-        case "act": {
-          const { args } = call;
-          const tabId = args.tabId;
-          this.#requireToolTab(params, tabId);
-          const revision = args.revision;
-          const action = args.action;
-          return textResult(await this.act(tabId, revision, action));
-        }
-        case "screenshot": {
-          const { args } = call;
-          const tabId = args.tabId;
-          this.#requireToolTab(params, tabId);
-          const imageUrl = await this.screenshot(tabId);
-          return { success: true, contentItems: [{ type: "inputImage", imageUrl }] };
-        }
-        case "close_tab": {
-          const { args } = call;
-          const tabId = args.tabId;
-          if (this.#tabs.has(tabId)) this.#requireToolTab(params, tabId);
-          await this.close(tabId);
-          return textResult({ closed: true });
-        }
-        case "request_takeover":
-          // Published in BROWSER_TOOL_DEFINITIONS like every other tool, but answered by the agent
-          // service, which intercepts the namespace before the call reaches a host. Reaching here
-          // means a caller bypassed that, and silently succeeding would tell the model the user had
-          // been asked for control when nobody was.
-          throw new Error("Browser takeover is handled by the agent service, not the browser host.");
-        default:
-          return call satisfies never;
-      }
+      this.#controls.begin(params, call);
+      return await runBrowserTool(this.#toolHandlers, call.tool, call, params, hooks);
     } catch (error) {
       return {
         success: false,
@@ -833,8 +1155,35 @@ export class BrowserHost {
         contentItems: [{ type: "inputText", text: redactText(String(error)) }],
       };
     } finally {
-      this.#finishControl(params);
+      this.#controls.finish(params);
     }
+  }
+
+  #toolTabs(params: DynamicToolCallParams): { tabs: BrowserTab[]; activeTabId: string | null } {
+    const tabs = this.listTabs().filter((tab) => this.#canUseToolTab(params, tab));
+    const activeTabId = tabs.some((tab) => tab.id === this.#activeTabId)
+      ? this.#activeTabId
+      : (tabs.at(-1)?.id ?? null);
+    return { tabs, activeTabId };
+  }
+
+  async #runInputTool(
+    call: BrowserInputCall,
+    params: DynamicToolCallParams,
+    hooks: BrowserDynamicToolHooks,
+  ): Promise<DynamicToolResult> {
+    this.#requireToolTab(params, call.args.tabId);
+    const action = browserInputAction(call, hooks);
+    return textResult(
+      await this.#runAction(
+        call.args.tabId,
+        action.name,
+        action.target,
+        (tab, deadline, markDispatched) => action.run(tab.engine, deadline, markDispatched),
+        browserToolTimeout(call.args.timeoutMs),
+        call.tool === "upload_files" ? hooks.onUploadOperationStarted : undefined,
+      ),
+    );
   }
 
   async resolveUploadTarget(params: DynamicToolCallParams): Promise<BrowserUploadAssignment> {
@@ -847,7 +1196,7 @@ export class BrowserHost {
       // This preflight scans every frame for the input, so an unresponsive one holds it open exactly
       // as it would the upload itself -- and it is queued ahead of that bounded upload, so without a
       // bound of its own the tab never reaches the operation the timeout was meant to protect.
-      this.#boundEngineOperation(
+      boundEngineOperation(
         tab,
         tab.engine.resolveUploadTarget(target),
         timeoutMs,
@@ -871,7 +1220,7 @@ export class BrowserHost {
       this.#unmountView(tab.view);
       const drain = tab.queue.then(() => {
         tab.engine.destroy();
-        if (!tab.view.webContents.isDestroyed()) tab.view.webContents.close();
+        if (!tab.contents.isDestroyed()) tab.contents.close();
       });
       activeTabDrains.push(drain);
       tab.queue = drain.catch(() => undefined);
@@ -880,8 +1229,7 @@ export class BrowserHost {
     const recorderDestruction = Promise.allSettled(tabDrains).then(() => this.#recorder.destroy());
     this.#tabs.clear();
     this.#listeners.clear();
-    this.clearControls();
-    this.#controlListeners.clear();
+    this.#controls.dispose();
     this.#documentListeners.clear();
     const results = await Promise.allSettled([
       this.#session.cookies.flushStore(),
@@ -907,36 +1255,42 @@ export class BrowserHost {
     ownerThreadId: string | null,
     ownerAgentId: string | null,
     environment: BrowserEnvironment = defaultBrowserEnvironment(),
-  ): InternalTab {
+    popupOptions?: BrowserWindowConstructorOptions,
+  ): BrowserHostTab {
     if (this.#destroyPromise) throw new Error("BrowserHost is shutting down.");
-    const view = this.#createView();
+    const view = this.#createView(popupOptions);
     this.#mountView(view);
     const diagnostics = new BrowserDiagnostics();
     return {
       id,
       view,
+      contents: view.webContents,
+      popup: popupOptions !== undefined,
       requestedUrl,
       ownerThreadId,
       ownerAgentId,
       revision: 0,
       queue: Promise.resolve(),
+      pendingOperations: 0,
       focusOnVisible: false,
       environment,
       engine: new BrowserCdpEngine(view.webContents),
       diagnostics,
       recording: false,
+      captureGeneration: 0,
+      documents: 0,
+      viewInvalidations: new Set(),
     };
   }
 
-  #createView(): WebContentsView {
+  #createView(popupOptions?: BrowserWindowConstructorOptions): WebContentsView {
     const view = new WebContentsView({
+      ...(popupOptions?.webContents ? { webContents: popupOptions.webContents } : {}),
       webPreferences: {
+        ...popupOptions?.webPreferences,
+
         session: this.#session,
-        sandbox: true,
-        contextIsolation: true,
-        nodeIntegration: false,
-        webSecurity: true,
-        allowRunningInsecureContent: false,
+        ...BROWSER_WEB_PREFERENCES,
       },
     });
     view.webContents.setAudioMuted(true);
@@ -955,8 +1309,8 @@ export class BrowserHost {
       });
     });
     this.#session.webRequest.onCompleted((details) => {
-      const tab = [...this.#tabs.values()].find((candidate) => candidate.view.webContents.id === details.webContentsId);
-      if (!tab) return;
+      const tab = [...this.#tabs.values()].find((candidate) => candidate.contents.id === details.webContentsId);
+      if (!tab || tab.secret) return;
       tab.diagnostics.add({
         kind: "network",
         level: details.statusCode >= 400 ? "error" : "info",
@@ -968,8 +1322,8 @@ export class BrowserHost {
       if (details.statusCode >= 400) this.#emitChanged();
     });
     this.#session.webRequest.onErrorOccurred((details) => {
-      const tab = [...this.#tabs.values()].find((candidate) => candidate.view.webContents.id === details.webContentsId);
-      if (!tab) return;
+      const tab = [...this.#tabs.values()].find((candidate) => candidate.contents.id === details.webContentsId);
+      if (!tab || tab.secret) return;
       tab.diagnostics.add({
         kind: "network",
         level: "error",
@@ -979,9 +1333,15 @@ export class BrowserHost {
       });
       this.#emitChanged();
     });
-    this.#session.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
-    this.#session.setPermissionCheckHandler(() => false);
-    this.#session.on("will-download", (_event, item) => {
+    this.#session.setPermissionRequestHandler((_webContents, permission, callback) =>
+      callback(isAllowedBrowserPermission(permission)),
+    );
+    this.#session.setPermissionCheckHandler((_webContents, permission) => isAllowedBrowserPermission(permission));
+    this.#session.on("will-download", (event, item, contents) => {
+      if ([...this.#tabs.values()].some((tab) => tab.secret && tab.contents === contents)) {
+        event.preventDefault();
+        return;
+      }
       const safeName = basename(item.getFilename()).replace(/[^a-zA-Z0-9._ -]/g, "_");
       const downloadPath = uniqueDownloadPath(
         this.#downloadsRoot,
@@ -994,9 +1354,20 @@ export class BrowserHost {
     });
   }
 
-  #bindTabEvents(tab: InternalTab): void {
-    const contents = tab.view.webContents;
+  #bindTabEvents(tab: BrowserHostTab): void {
+    const contents = tab.contents;
     const changed = () => this.#emitChanged();
+    contents.on("close", () => {
+      tab.closing = true;
+    });
+    contents.once("destroyed", () => {
+      // Finish native destruction before removing the view and draining queued work.
+      setImmediate(() => {
+        void this.close(tab.id).catch((error) =>
+          logger.warn("Unable to clean up browser tab", { error: toLogValue(error) }),
+        );
+      });
+    });
     let documentGeneration = 0;
     contents.on("did-frame-navigate", (_event, _url, _code, _status, isMainFrame) => {
       const generation = ++documentGeneration;
@@ -1010,7 +1381,7 @@ export class BrowserHost {
       // one stops the tab for good -- and this runs off a navigation, where no caller's deadline
       // covers it.
       void this.#enqueue(tab.id, (queuedTab, keepQueueBlocked) =>
-        this.#boundEngineOperation(
+        boundEngineOperation(
           queuedTab,
           queuedTab.engine.documentIds(),
           DOCUMENT_ENUMERATION_TIMEOUT_MS,
@@ -1056,6 +1427,37 @@ export class BrowserHost {
       event.preventDefault();
       setImmediate(() => void this.close(tab.id).catch(() => undefined));
     });
+    contents.on("context-menu", (event, params) => {
+      const items = browserContextMenuItems({
+        selectionText: params.selectionText,
+        isEditable: params.isEditable,
+        linkURL: params.linkURL,
+        srcURL: params.srcURL,
+        mediaType: params.mediaType,
+      });
+      if (items.length === 0) return;
+      event.preventDefault();
+      const window = this.#mountedViews.get(tab.view);
+      if (!window || window.isDestroyed()) return;
+      // The edit entries name the page explicitly rather than taking an Electron role: a role acts
+      // on whichever contents hold focus when the item is picked, and the right-click that opened
+      // the menu may have landed on a page the user had not focused.
+      const onPage = (act: (target: WebContents) => void) => () => {
+        if (!contents.isDestroyed()) act(contents);
+      };
+      Menu.buildFromTemplate(
+        items.map((item) => {
+          if (item === "separator") return { type: "separator" } as const;
+          if (item === "copy-link") return { label: "Copy Link", click: () => clipboard.writeText(params.linkURL) };
+          if (item === "copy-image-address")
+            return { label: "Copy Image Address", click: () => clipboard.writeText(params.srcURL) };
+          if (item === "cut") return { label: "Cut", click: onPage((target) => target.cut()) };
+          if (item === "copy") return { label: "Copy", click: onPage((target) => target.copy()) };
+          if (item === "paste") return { label: "Paste", click: onPage((target) => target.paste()) };
+          return { label: "Select All", click: onPage((target) => target.selectAll()) };
+        }),
+      ).popup({ window });
+    });
     contents.on("did-start-loading", changed);
     contents.on("dom-ready", () => {
       // Keep page content at the same width when the viewport scrollbar appears or disappears.
@@ -1063,23 +1465,24 @@ export class BrowserHost {
       void contents.insertCSS(":where(html) { scrollbar-gutter: stable; }").catch(() => undefined);
     });
     contents.on("did-stop-loading", () => {
+      if (tab.closing || contents.isDestroyed()) return;
       changed();
       void this.#syncViewBackground(tab);
     });
     contents.on("console-message", (...eventArgs) => {
-      if (this.#takeoverTabIds.has(tab.id)) return;
+      if (this.#takeoverTabIds.has(tab.id) || tab.secret) return;
       const details = readConsoleMessage(eventArgs);
       if (!details) return;
       tab.diagnostics.add({
         kind: "console",
         level: details.level,
-        message: details.message.slice(0, 2_000),
+        message: details.message,
         url: diagnosticUrl(details.sourceId),
       });
       if (details.level === "error") this.#emitChanged();
     });
     contents.on("did-fail-load", (_event, code, description, url, isMainFrame) => {
-      if (!isMainFrame || code === -3) return;
+      if (!isMainFrame || code === -3 || tab.secret) return;
       tab.diagnostics.add({
         kind: "load",
         level: "error",
@@ -1090,6 +1493,20 @@ export class BrowserHost {
     });
     contents.on("page-title-updated", changed);
     contents.on("did-navigate", (_event, url) => {
+      tab.documents += 1;
+      if (tab.secretDocument) {
+        tab.secretDocument = false;
+        contents.navigationHistory.clear();
+      }
+      if (tab.secret?.submitted) {
+        tab.secret.replaced = true;
+        if (!tab.secret.running) {
+          contents.navigationHistory.clear();
+          tab.secret = undefined;
+          this.#syncAttachedView();
+          tab.diagnostics.clearDiagnostics();
+        }
+      }
       if (this.#tabs.get(tab.id) !== tab) return;
       if (isPersistableBrowserUrl(url)) tab.requestedUrl = persistentBrowserUrl(url);
       tab.revision += 1;
@@ -1110,11 +1527,86 @@ export class BrowserHost {
       if (!event.isMainFrame) return;
       if (!isAllowedMainUrl(event.url)) event.preventDefault();
     });
-    contents.setWindowOpenHandler(({ url }) => {
-      // Auth popups (for example Continue with Google) start from a user click.
-      // Open the new tab in front with keyboard focus so the user can log in at once.
-      if (isAllowedMainUrl(url)) void this.open(url, tab.ownerThreadId, tab.ownerAgentId, true);
-      return { action: "deny" };
+    contents.setWindowOpenHandler(({ url, referrer, postBody, disposition }) => {
+      if (this.#destroyPromise || this.#tabs.get(tab.id) !== tab) return { action: "deny" };
+      const unsupported = !["foreground-tab", "background-tab", "new-window"].includes(disposition);
+      const failure = tab.secret
+        ? sourceText("error.backend.popupSecureInput")
+        : unsupported
+          ? sourceText("error.backend.popupUnsupportedType")
+          : !isAllowedMainUrl(url)
+            ? sourceText("error.backend.popupUnsupportedAddress")
+            : !this.#hasTabCapacity(tab.ownerThreadId, tab.ownerAgentId)
+              ? sourceText("error.backend.popupTabLimit")
+              : undefined;
+      if (failure) {
+        tab.popupFailure = { id: randomUUID(), message: failure };
+        this.#emitChanged();
+        return { action: "deny" };
+      }
+      // Electron supplies the opener preferences and navigates the returned contents itself.
+      // Reopening the URL loses WindowProxy, POST bodies, and OAuth callback messages.
+      let popup: BrowserHostTab | undefined;
+      return {
+        action: "allow",
+        // The host owns cleanup. Electron otherwise destroys children on opener reload too.
+        outlivesOpener: true,
+        overrideBrowserWindowOptions: {
+          webPreferences: { ...BROWSER_WEB_PREFERENCES, session: this.#session },
+        },
+        createWindow: (options) => {
+          if (popup) return popup.contents;
+          popup = this.#createTab(
+            randomUUID(),
+            url,
+            tab.ownerThreadId,
+            tab.ownerAgentId,
+            structuredClone(tab.environment),
+            options,
+          );
+          // Chromium exposes no opener for noopener/noreferrer requests.
+          if (options.webContents?.opener) {
+            popup.openerTabId = tab.id;
+            popup.hasSharedBrowsingContext = true;
+            tab.hasSharedBrowsingContext = true;
+          }
+          this.#tabs.set(popup.id, popup);
+          this.#bindTabEvents(popup);
+          tab.popupFailure = undefined;
+          this.#activeTabId = popup.id;
+          popup.focusOnVisible = true;
+          this.#syncAttachedView();
+          this.#emitChanged();
+          this.#schedulePersist();
+          const created = popup;
+          created.queue = created.engine.setEnvironment(created.environment).catch((error) => {
+            logger.warn("Unable to apply popup environment", { error: toLogValue(error) });
+          });
+          // Links without a native guest need an explicit load; native guests already own
+          // their navigation, including POST data and the opener WindowProxy.
+          if (!options.webContents) {
+            void created.contents
+              .loadURL(url, {
+                httpReferrer: referrer,
+                ...(postBody
+                  ? {
+                      postData: postBody.data,
+                      extraHeaders: `content-type: ${postBody.contentType}${postBody.boundary ? `; boundary=${postBody.boundary}` : ""}`,
+                    }
+                  : {}),
+              })
+              .catch(() => {
+                if (this.#tabs.get(tab.id) !== tab) return;
+                tab.popupFailure = {
+                  id: randomUUID(),
+                  message: sourceText("error.backend.popupLoadFailed"),
+                };
+                this.#emitChanged();
+              });
+          }
+          return created.contents;
+        },
+      };
     });
   }
 
@@ -1134,9 +1626,9 @@ export class BrowserHost {
    * have; a preload or a permanent debugger attach would answer synchronously but weaken the
    * sandboxed view or fight the automation recorder.
    */
-  #collapseOnEscape(tab: InternalTab): void {
+  #collapseOnEscape(tab: BrowserHostTab): void {
     if (!this.#collapsesOnEscape(tab)) return;
-    const frame = tab.view.webContents.focusedFrame ?? tab.view.webContents.mainFrame;
+    const frame = tab.contents.focusedFrame ?? tab.contents.mainFrame;
     if (!frame || frame.isDestroyed()) return;
     void frame
       .executeJavaScript(EDITABLE_FOCUS_SCRIPT, true)
@@ -1153,13 +1645,13 @@ export class BrowserHost {
   }
 
   /** Whether this tab is the page the expanded browser shows in the main window. */
-  #collapsesOnEscape(tab: InternalTab): boolean {
+  #collapsesOnEscape(tab: BrowserHostTab): boolean {
     return this.#target === "main" && this.#visible && this.#activeTabId === tab.id && this.#attachedView === tab.view;
   }
 
-  async #syncViewBackground(tab: InternalTab): Promise<void> {
+  async #syncViewBackground(tab: BrowserHostTab): Promise<void> {
     try {
-      const background = await tab.view.webContents.executeJavaScript(
+      const background = await tab.contents.executeJavaScript(
         `(() => {
           const transparent = "rgba(0, 0, 0, 0)";
           const body = document.body ? getComputedStyle(document.body).backgroundColor : transparent;
@@ -1173,260 +1665,6 @@ export class BrowserHost {
     } catch {
       // Navigation can replace the document before its background is read.
     }
-  }
-
-  async #readSnapshot(
-    tab: InternalTab,
-    revision: number,
-    keepQueueBlocked: KeepQueueBlocked,
-    timeoutMs = 10_000,
-    timeoutMessage = "Browser snapshot timed out.",
-  ): Promise<SnapshotReadResult> {
-    const history = tab.diagnostics.snapshot();
-    const completion = tab.engine.snapshot({
-      tabId: tab.id,
-      revision,
-      environment: tab.environment,
-      diagnostics: history.diagnostics,
-      actions: history.actions,
-    });
-    // A snapshot walks every frame, so it is one of the engine operations a single unresponsive
-    // renderer can hold open forever.
-    const result = await this.#boundEngineOperation(tab, completion, timeoutMs, timeoutMessage, keepQueueBlocked);
-    tab.revision = revision;
-    return result;
-  }
-
-  /**
-   * Bounds an engine operation in wall-clock time and unwinds what it left behind. Electron's
-   * `sendCommand` carries no timeout of its own and the engine's own deadlines are checked between
-   * commands, so a frame whose renderer never answers leaves the operation pending forever however
-   * short a deadline it was given. Returning a timeout to the caller is not enough on its own: the
-   * queue waits on every promise given to `keepQueueBlocked`, so a command left outstanding means
-   * nothing on this tab ever runs again -- navigation, takeover, close and host shutdown all queue
-   * behind that drain.
-   */
-  #boundEngineOperation<T>(
-    tab: InternalTab,
-    completion: Promise<T>,
-    timeoutMs: number,
-    timeoutMessage: string,
-    keepQueueBlocked: KeepQueueBlocked,
-  ): Promise<T> {
-    let unwound: Promise<void> | undefined;
-    const bounded = withTimeout(completion, timeoutMs, timeoutMessage).catch((error) => {
-      if (isTimeoutError(error)) unwound = this.#unwindStalledOperation(tab, completion);
-      throw error;
-    });
-    keepQueueBlocked(Promise.allSettled([bounded]).then(() => unwound));
-    return bounded;
-  }
-
-  /**
-   * Gives an operation that missed its deadline a moment to unwind, and detaches the debugger if it
-   * will not. Detaching is the only cancellation primitive there is, and it is a blunt one: it takes
-   * the whole session down, so a command still in flight when the next one attaches over the top of it
-   * fails with `target closed while handling command` -- one operation away from the timeout that
-   * caused it. Most timeouts do not need it at all, because a deadline shorter than the page is the
-   * ordinary case and a live renderer answers what is outstanding in a few milliseconds. So the wait
-   * comes first, the detach only if the wait expires, and a second wait after it, so the queue
-   * advances into an attached debugger rather than one being torn down. When the recorder holds the
-   * debugger there is nothing to detach and the wait stands, because the command really is still
-   * outstanding.
-   */
-  async #unwindStalledOperation(tab: InternalTab, completion: Promise<unknown>): Promise<void> {
-    const settled = Promise.allSettled([completion]);
-    if (await finishesWithin(settled, OPERATION_UNWIND_GRACE_MS)) return;
-    if (!tab.engine.cancelPendingCommands()) {
-      await settled;
-      return;
-    }
-    await finishesWithin(settled, OPERATION_UNWIND_GRACE_MS);
-  }
-
-  async #runAction(
-    tabId: string,
-    action: string,
-    target: BrowserTarget | undefined,
-    operation: (tab: InternalTab, deadline: number, markDispatched: () => void) => Promise<void>,
-    timeoutMs = 10_000,
-    onOperationStarted?: (completion: Promise<void>) => void,
-  ): Promise<BrowserSnapshot> {
-    const tab = this.#requireTab(tabId);
-    const started = tab.queue.then(() => {
-      const focusedContents = webContents.getFocusedWebContents();
-      const previouslyFocused =
-        focusedContents && ![...this.#tabs.values()].some((candidate) => candidate.view.webContents === focusedContents)
-          ? focusedContents
-          : null;
-      const deadline = Date.now() + timeoutMs;
-      const timeoutMessage = `Browser ${action} timed out.`;
-      const snapshotDrains: Promise<unknown>[] = [];
-      let stalledSettle: Promise<void> | undefined;
-      let actionRecorded = false;
-      let dispatched = false;
-      let cancellationConfirmed = false;
-      const operationCompletion = (async () => {
-        let highlighted = false;
-        try {
-          tab.view.webContents.focus();
-          if (target && target.kind !== "point") {
-            highlighted = await tab.engine.highlight(target).then(
-              () => true,
-              () => false,
-            );
-          }
-          remainingTime(deadline, timeoutMessage);
-          await operation(tab, deadline, () => {
-            dispatched = true;
-          });
-        } finally {
-          if (highlighted && !cancellationConfirmed) await tab.engine.hideHighlight().catch(() => undefined);
-        }
-      })();
-      onOperationStarted?.(operationCompletion);
-      const boundedOperation = withTimeout(
-        operationCompletion,
-        Math.max(0, deadline - Date.now()),
-        timeoutMessage,
-      ).catch(async (error) => {
-        if (!isTimeoutError(error)) throw error;
-        cancellationConfirmed = tab.engine.cancelPendingCommands();
-        if (dispatched && !cancellationConfirmed) await operationCompletion;
-        throw error;
-      });
-      const response = boundedOperation
-        .then(async () => {
-          const settleTimeout = Math.max(1, deadline - Date.now());
-          const settleCompletion = tab.engine.settle(settleTimeout);
-          try {
-            // Settling bounds its own waiting with timers, but the commands it sends to each frame are
-            // not bounded by them, so an unresponsive frame holds the action's response open and the
-            // queue with it.
-            await withTimeout(settleCompletion, settleTimeout, timeoutMessage);
-          } catch (error) {
-            if (!isTimeoutError(error)) throw error;
-            // The settle may still be waiting on a frame that never answers, and unwinding it can go
-            // as far as detaching the debugger -- which the post-dispatch snapshot below is about to
-            // use. So the unwind is left to the drain, once the rest of the action has finished with
-            // the session.
-            stalledSettle = settleCompletion;
-            if (tab.view.webContents.isLoading()) await tab.engine.stopLoading().catch(() => undefined);
-          }
-          tab.diagnostics.action({
-            action,
-            target: target ? describeBrowserTarget(target) : undefined,
-            outcome: "success",
-            ...(Date.now() >= deadline
-              ? { detail: "Action completed; page settling exceeded the requested timeout." }
-              : {}),
-          });
-          actionRecorded = true;
-          const snapshot = (
-            await this.#readSnapshot(
-              tab,
-              tab.revision + 1,
-              (promise) => snapshotDrains.push(promise),
-              ACTION_POST_DISPATCH_TIMEOUT_MS,
-              timeoutMessage,
-            )
-          ).snapshot;
-          return snapshot;
-        })
-        .catch((error) => {
-          if (!actionRecorded) {
-            tab.diagnostics.action({
-              action,
-              target: target ? describeBrowserTarget(target) : undefined,
-              outcome: "error",
-              detail: String(error).slice(0, 2_000),
-            });
-          }
-          throw error;
-        })
-        .finally(() => restoreWebContentsFocus(previouslyFocused, tab.view.webContents));
-      snapshotDrains.push(
-        Promise.allSettled([response]).then(() =>
-          stalledSettle ? this.#unwindStalledOperation(tab, stalledSettle) : undefined,
-        ),
-      );
-      const drained = Promise.allSettled([response])
-        .then(() =>
-          cancellationConfirmed ? undefined : Promise.allSettled([operationCompletion]).then(() => undefined),
-        )
-        .then(() => (tab.view.webContents.isLoading() ? tab.engine.stopLoading().catch(() => undefined) : undefined))
-        .then(() => Promise.allSettled(snapshotDrains))
-        .then(() => undefined);
-      return { drained, response };
-    });
-    const result = started.then(({ response }) => response);
-    tab.queue = started.then(
-      ({ drained }) => drained,
-      () => undefined,
-    );
-    return result;
-  }
-
-  async #runEvaluation(
-    tabId: string,
-    expression: string,
-    awaitPromise: boolean,
-    timeoutMs: number,
-  ): Promise<BrowserJsonValue> {
-    const tab = this.#requireTab(tabId);
-    const started = tab.queue.then(() => {
-      const deadline = Date.now() + timeoutMs;
-      const timeoutMessage = "Browser evaluate timed out.";
-      let unwound: Promise<void> | undefined;
-      const operationCompletion = tab.engine.evaluate(
-        expression,
-        awaitPromise,
-        remainingTime(deadline, timeoutMessage),
-      );
-      // `awaitPromise` is what CDP's own execution timeout does not bound: an expression evaluating
-      // to a promise the page never settles leaves the command pending forever, and `drained` waits
-      // on that promise, so the tab's queue never advances -- which would also block takeover, close
-      // and shutdown.
-      const boundedOperation = withTimeout(
-        operationCompletion,
-        remainingTime(deadline, timeoutMessage),
-        timeoutMessage,
-      ).catch((error) => {
-        if (isTimeoutError(error)) unwound = this.#unwindStalledOperation(tab, operationCompletion);
-        throw error;
-      });
-      const response = boundedOperation
-        .then(async (value) => {
-          const settleTimeout = remainingTime(deadline, timeoutMessage);
-          // Same unbounded commands as the action path settles through; the evaluation itself has
-          // already returned here, so unwinding this one only releases the drain sooner.
-          const settleCompletion = tab.engine.settle(settleTimeout);
-          await withTimeout(settleCompletion, settleTimeout, timeoutMessage).catch((error) => {
-            if (isTimeoutError(error)) unwound = this.#unwindStalledOperation(tab, settleCompletion);
-            throw error;
-          });
-          tab.diagnostics.action({ action: "evaluate", outcome: "success" });
-          return value;
-        })
-        .catch((error) => {
-          tab.diagnostics.action({
-            action: "evaluate",
-            outcome: "error",
-            detail: String(error).slice(0, 2_000),
-          });
-          throw error;
-        });
-      const drained = Promise.allSettled([response])
-        .then(() => unwound ?? Promise.allSettled([operationCompletion]).then(() => undefined))
-        .then(() => undefined);
-      return { drained, response };
-    });
-    const result = started.then(({ response }) => response);
-    tab.queue = started.then(
-      ({ drained }) => drained,
-      () => undefined,
-    );
-    return result;
   }
 
   #snapshotResult(result: SnapshotReadResult, mode: BrowserImageMode, imageUrl: string | null): DynamicToolResult {
@@ -1448,8 +1686,18 @@ export class BrowserHost {
 
   #syncAttachedView(): void {
     const tab = this.#activeTabId ? this.#tabs.get(this.#activeTabId) : null;
+    if (tab) this.#wake(tab);
     const targetWindow = this.#target === "picture-in-picture" ? this.#pictureInPictureWindow : this.#window;
-    if (!this.#visible || !this.#bounds || !tab || !targetWindow || targetWindow.isDestroyed()) {
+    if (
+      !this.#visible ||
+      !this.#bounds ||
+      !tab ||
+      tab.closing ||
+      tab.contents.isDestroyed() ||
+      (tab.secret?.submitted && !this.#takeoverTabIds.has(tab.id)) ||
+      !targetWindow ||
+      targetWindow.isDestroyed()
+    ) {
       this.#attachedView?.setVisible(false);
       return;
     }
@@ -1476,11 +1724,11 @@ export class BrowserHost {
       }),
     );
     tab.view.setVisible(true);
-    tab.view.webContents.invalidate();
+    tab.contents.invalidate();
     this.#raisePictureInPictureOverlay();
     if (tab.focusOnVisible) {
       tab.focusOnVisible = false;
-      tab.view.webContents.focus();
+      tab.contents.focus();
     }
   }
 
@@ -1492,16 +1740,16 @@ export class BrowserHost {
     window.contentView.addChildView(overlay);
   }
 
-  #focusTab(tab: InternalTab): void {
+  #focusTab(tab: BrowserHostTab): void {
     if (
       this.#tabs.get(tab.id) !== tab ||
       this.#activeTabId !== tab.id ||
       !tab.view.getVisible() ||
-      tab.view.webContents.isDestroyed()
+      tab.contents.isDestroyed()
     ) {
       return;
     }
-    tab.view.webContents.focus();
+    tab.contents.focus();
   }
 
   #mountView(view: WebContentsView, window = this.#window): void {
@@ -1527,15 +1775,24 @@ export class BrowserHost {
     if (this.#attachedView === view) this.#attachedView = null;
   }
 
-  #requireTab(tabId: string): InternalTab {
+  #requireTab(tabId: string): BrowserHostTab {
     const tab = this.#tabs.get(tabId);
     if (!tab) throw new Error(`Unknown browser tab: ${tabId}`);
+    this.#wake(tab);
     return tab;
   }
 
   #requireToolTab(params: DynamicToolCallParams, tabId: string): void {
     const tab = this.listTabs().find((candidate) => candidate.id === tabId);
     if (!tab || !this.#canUseToolTab(params, tab)) throw new Error(`Unknown browser tab: ${tabId}`);
+    // The user holds this tab. `AgentService` already refuses an agent's browser tools while its own
+    // takeover is outstanding, but that check is agent-wide and only covers callers that go through
+    // the agent service; this one is per tab and holds for every caller of a tabId-bearing tool.
+    // A distinct message matters: telling the model the tab vanished, while the user is part-way
+    // through a login on it, invites an `open` and a second tab onto the same flow.
+    if (this.#tabs.get(tabId)?.secret)
+      throw new Error("Browser inspection is protected during authentication. Use takeover.");
+    if (this.#takeoverTabIds.has(tabId)) throw new Error(`Browser tab is under user takeover: ${tabId}`);
   }
 
   #canUseToolTab(params: DynamicToolCallParams, tab: BrowserTab): boolean {
@@ -1547,79 +1804,58 @@ export class BrowserHost {
 
   #enqueue<T>(
     tabId: string,
-    operation: (tab: InternalTab, keepQueueBlocked: KeepQueueBlocked) => Promise<T>,
+    operation: (tab: BrowserHostTab, keepQueueBlocked: KeepQueueBlocked) => Promise<T>,
+    allowProtected = false,
   ): Promise<T> {
-    const tab = this.#requireTab(tabId);
-    const started = tab.queue.then(() => {
-      const drains: Promise<unknown>[] = [];
-      const result = operation(tab, (promise) => drains.push(promise));
-      const drained = result
-        .catch(() => undefined)
-        .then(() => Promise.allSettled(drains))
-        .then(() => undefined);
-      return { drained, result };
-    });
-    const result = started.then(({ result }) => result);
-    tab.queue = started.then(
-      ({ drained }) => drained,
-      () => undefined,
+    return enqueueTabOperation(this.#requireTab(tabId), operation, allowProtected);
+  }
+
+  async #runAction(
+    tabId: string,
+    action: string,
+    target: BrowserTarget | undefined,
+    operation: (tab: BrowserHostTab, deadline: number, markDispatched: () => void) => Promise<void>,
+    timeoutMs?: number,
+    onOperationStarted?: (completion: Promise<void>) => void,
+  ): Promise<BrowserSnapshot | { tabId: string; closed: true; openerTabId?: string }> {
+    return runTabAction(
+      this.#requireTab(tabId),
+      () => this.#focusedContentsOutsideTabs(),
+      action,
+      target,
+      operation,
+      timeoutMs,
+      onOperationStarted,
     );
-    return result;
+  }
+
+  async #runEvaluation(
+    tabId: string,
+    expression: string,
+    awaitPromise: boolean,
+    timeoutMs: number,
+  ): Promise<BrowserJsonValue> {
+    const tab = this.#requireTab(tabId);
+    return runTabEvaluation(
+      tab,
+      () => this.#requireNoSecretDocument(tab, "Page evaluation"),
+      expression,
+      awaitPromise,
+      timeoutMs,
+    );
+  }
+
+  /** The app contents that has focus, unless it is one of the browser's own tabs. */
+  #focusedContentsOutsideTabs(): WebContents | null {
+    const focusedContents = webContents.getFocusedWebContents();
+    return focusedContents && ![...this.#tabs.values()].some((candidate) => candidate.contents === focusedContents)
+      ? focusedContents
+      : null;
   }
 
   #emitChanged(): void {
     const tabs = this.listTabs();
     for (const listener of this.#listeners) listener(tabs, this.#activeTabId);
-  }
-
-  #beginControl(params: DynamicToolCallParams, call: BrowserToolCall): void {
-    const id = controlSessionId(params.threadId, params.turnId);
-    const timer = this.#controlTimers.get(id);
-    if (timer) clearTimeout(timer);
-    this.#controlTimers.delete(id);
-    const previous = this.#controlSessions.get(id);
-    this.#controlSessions.set(id, {
-      id,
-      threadId: params.threadId,
-      turnId: params.turnId,
-      callId: params.callId,
-      tabId: "tabId" in call.args ? call.args.tabId : null,
-      action: browserControlAction(call),
-      detailAction: browserControlDetailAction(params.tool),
-      phase: "acting",
-      startedAt: previous?.startedAt ?? new Date().toISOString(),
-    });
-    this.#emitControlChanged();
-  }
-
-  #finishControl(params: DynamicToolCallParams): void {
-    const id = controlSessionId(params.threadId, params.turnId);
-    const current = this.#controlSessions.get(id);
-    if (!current || current.callId !== params.callId) return;
-    this.#controlSessions.set(id, { ...current, phase: "waiting" });
-    this.#emitControlChanged();
-    const timer = setTimeout(() => {
-      this.#controlTimers.delete(id);
-      const latest = this.#controlSessions.get(id);
-      if (!latest || latest.callId !== params.callId || latest.phase !== "waiting") return;
-      this.#controlSessions.delete(id);
-      this.#emitControlChanged();
-    }, BrowserHost.CONTROL_IDLE_GRACE_MS);
-    timer.unref();
-    this.#controlTimers.set(id, timer);
-  }
-
-  #updateControlTab(params: DynamicToolCallParams, tabId: string): void {
-    const id = controlSessionId(params.threadId, params.turnId);
-    const current = this.#controlSessions.get(id);
-    if (!current || current.callId !== params.callId) return;
-    this.#controlSessions.set(id, { ...current, tabId });
-    this.#emitControlChanged();
-  }
-
-  #emitControlChanged(): void {
-    const state = this.getControlState();
-    for (const listener of this.#controlListeners) listener(state);
   }
 
   #schedulePersist(): void {
@@ -1632,219 +1868,37 @@ export class BrowserHost {
     const state: StoredBrowserStateV2 = {
       version: 2,
       activeTabId: this.#activeTabId,
-      tabs: [...this.#tabs.values()].map((tab) => ({
-        id: tab.id,
-        url: persistentBrowserUrl(currentTabUrl(tab)),
-        ownerThreadId: tab.ownerThreadId,
-        ownerAgentId: tab.ownerAgentId,
-        environment: tab.environment,
-      })),
+      tabs: [...this.#tabs.values()]
+        .filter((tab) => !tab.closing && !tab.contents.isDestroyed())
+        .map((tab) => ({
+          id: tab.id,
+          url: tab.secret?.origin ?? persistentBrowserUrl(currentTabUrl(tab), { popup: tab.popup }),
+          ownerThreadId: tab.ownerThreadId,
+          ownerAgentId: tab.ownerAgentId,
+          environment: tab.environment,
+        })),
     };
     this.#persistQueue = this.#persistQueue
       .catch(() => undefined)
       .then(async () => {
-        const temporaryPath = `${this.#statePath}.${randomUUID()}.tmp`;
-        try {
-          await writeFile(temporaryPath, `${JSON.stringify(state)}\n`, {
-            encoding: "utf8",
-            mode: 0o600,
-          });
-          await rename(temporaryPath, this.#statePath);
-        } finally {
-          await rm(temporaryPath, { force: true }).catch(() => undefined);
-        }
+        await writeJsonFileAtomically(this.#statePath, state);
       });
     return this.#persistQueue;
   }
 }
 
-function controlSessionId(threadId: string, turnId: string): string {
-  return `${threadId}:${turnId}`;
+function currentPreviewPage(tab: BrowserHostTab): BrowserPreviewPage {
+  return { url: currentTabUrl(tab), document: tab.documents, generation: tab.captureGeneration };
 }
 
-function restoreWebContentsFocus(previous: WebContents | null, controlled: WebContents): void {
-  const current = webContents.getFocusedWebContents();
-  if (current && current !== controlled) return;
-  if (previous && !previous.isDestroyed()) {
-    const window = BrowserWindow.fromWebContents(previous);
-    if (window && !window.isDestroyed()) window.focus();
-    previous.focus();
-  }
+function showsCurrentPage(tab: BrowserHostTab, page: BrowserPreviewPage): boolean {
+  const current = currentPreviewPage(tab);
+  return page.url === current.url && page.document === current.document && page.generation === current.generation;
 }
 
-function browserControlAction(call: BrowserToolCall): BrowserControlAction {
-  switch (call.tool) {
-    case "open":
-      return "open";
-    case "list_tabs":
-      return "list-tabs";
-    case "snapshot":
-      return "snapshot";
-    case "screenshot":
-      return "screenshot";
-    case "close_tab":
-      return "close-tab";
-    case "status":
-      return "list-tabs";
-    case "navigate":
-      if (call.args.direction === "back") return "back";
-      if (call.args.direction === "forward") return "forward";
-      if (call.args.direction === "reload") return "reload";
-      return "open";
-    case "click":
-      return "click";
-    case "type":
-      return "type";
-    case "press":
-      return "key";
-    case "hover":
-      return "click";
-    case "scroll":
-      return "scroll";
-    case "select_option":
-      return "click";
-    case "set_checked":
-      return "click";
-    case "drag":
-      return "click";
-    case "upload_files":
-      return "type";
-    case "wait_for":
-      return "snapshot";
-    case "evaluate":
-      return "snapshot";
-    case "set_environment":
-      return "snapshot";
-    case "recording_start":
-      return "screenshot";
-    case "recording_stop":
-      return "screenshot";
-    case "act":
-      return call.args.action.type;
-    default:
-      return "snapshot";
-  }
-}
-
-function browserControlDetailAction(tool: string): BrowserControlDetailAction | undefined {
-  switch (tool) {
-    case "status":
-    case "navigate":
-    case "press":
-    case "hover":
-    case "drag":
-      return tool;
-    case "select_option":
-      return "select-option";
-    case "set_checked":
-      return "set-checked";
-    case "upload_files":
-      return "upload-files";
-    case "wait_for":
-      return "wait-for";
-    case "evaluate":
-      return "evaluate";
-    case "set_environment":
-      return "set-environment";
-    case "recording_start":
-      return "recording-start";
-    case "recording_stop":
-      return "recording-stop";
-    default:
-      return undefined;
-  }
-}
-
-function normalizeBrowserUrl(input: string): string {
-  const value = input.trim();
-  if (!value) throw new Error("A browser URL is required.");
-  if (value.length > INPUT_LIMITS.browserUrl) throw new Error("The browser URL is too long.");
-  const withProtocol = /^[a-z][a-z0-9+.-]*:/i.test(value) ? value : `https://${value}`;
-  const url = new URL(withProtocol);
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error("Only HTTP(S) browser URLs are allowed.");
-  }
-  return url.toString();
-}
-
-function browserLoadOptions(): { extraHeaders: string } {
-  return { extraHeaders: "Cache-Control: no-cache\nPragma: no-cache" };
-}
-
-function browserRequestHeaders(url: string, requestHeaders: Record<string, string>): Record<string, string> {
-  const headers = applySiteIdentity(url, requestHeaders);
-  setRequestHeader(headers, "Accept-Language", preferredBrowserLanguages());
-  return headers;
-}
-
-function preferredBrowserLanguages(): string {
-  return preferredBrowserLanguageCodes()
-    .split(",")
-    .map((language, index) => (index === 0 ? language : `${language};q=${Math.max(1 - index * 0.1, 0.1).toFixed(1)}`))
-    .join(",");
-}
-
-function preferredBrowserLanguageCodes(): string {
-  const languages = app.getPreferredSystemLanguages();
-  return (languages.length > 0 ? languages : [app.getLocale()]).join(",");
-}
-
-function setRequestHeader(headers: Record<string, string>, name: string, value: string): void {
-  const existingName = Object.keys(headers).find((candidate) => candidate.toLowerCase() === name.toLowerCase());
-  if (existingName && existingName !== name) delete headers[existingName];
-  headers[name] = value;
-}
-
-async function readBrowserState(path: string): Promise<StoredBrowserStateV2> {
-  try {
-    const parsed = JSON.parse(await readFile(path, "utf8"));
-    if (!isRecord(parsed) || (parsed.version !== 1 && parsed.version !== 2)) {
-      return { version: 2, activeTabId: null, tabs: [] };
-    }
-    const tabs = Array.isArray(parsed.tabs)
-      ? parsed.tabs
-          .map(storedBrowserTab)
-          .filter((tab) => tab !== null)
-          .map((tab) => ({
-            ...tab,
-            url: persistentBrowserUrl(tab.url),
-            // A v1 file never wrote an environment, so anything sitting under that key in one is not
-            // ours to trust -- the tab starts from the default instead.
-            environment: (parsed.version === 2 ? tab.environment : undefined) ?? defaultBrowserEnvironment(),
-          }))
-      : [];
-    return {
-      version: 2,
-      activeTabId: isString(parsed.activeTabId) ? parsed.activeTabId : null,
-      tabs: tabs.filter((tab, index) => tabs.findIndex((candidate) => candidate.id === tab.id) === index),
-    };
-  } catch (error) {
-    if (isMissingFile(error) || error instanceof SyntaxError) {
-      return { version: 2, activeTabId: null, tabs: [] };
-    }
-    throw error;
-  }
-}
-
-function isMissingFile(error: unknown): error is NodeJS.ErrnoException {
-  return error instanceof Error && "code" in error && error.code === "ENOENT";
-}
-
-function isAllowedMainUrl(value: string): boolean {
-  return value === "about:blank" || isPersistableBrowserUrl(value);
-}
-
-function diagnosticUrl(value: string): string | undefined {
-  try {
-    const url = new URL(value);
-    url.username = "";
-    url.password = "";
-    url.search = "";
-    url.hash = "";
-    return url.toString().slice(0, INPUT_LIMITS.browserUrl);
-  } catch {
-    return undefined;
-  }
+/** The saved preview frame, when it still shows the tab's current page. */
+function savedPreview(tab: BrowserHostTab): BrowserPreview | null {
+  return tab.preview && showsCurrentPage(tab, tab.preview) ? tab.preview.frame : null;
 }
 
 function validateBounds(bounds: BrowserBounds): BrowserBounds {
@@ -1857,34 +1911,15 @@ function validateBounds(bounds: BrowserBounds): BrowserBounds {
   };
 }
 
-function toPublicTab(tab: InternalTab): BrowserTab {
-  const environment =
-    tab.environment.viewport.mode === "fill"
-      ? {
-          ...tab.environment,
-          viewport: {
-            ...tab.environment.viewport,
-            width: tab.view.getBounds().width,
-            height: tab.view.getBounds().height,
-          },
-        }
-      : tab.environment;
-  return {
-    id: tab.id,
-    title: tab.view.webContents.getTitle() || "New tab",
-    url: currentTabUrl(tab),
-    loading: tab.view.webContents.isLoading(),
-    ownerThreadId: tab.ownerThreadId,
-    ownerAgentId: tab.ownerAgentId,
-    environment,
-    recording: tab.recording,
-    diagnosticErrorCount: tab.diagnostics.errorCount,
-  };
-}
-
-function currentTabUrl(tab: InternalTab): string {
-  const currentUrl = tab.view.webContents.getURL();
-  return isPersistableBrowserUrl(currentUrl) ? currentUrl : tab.requestedUrl;
+/**
+ * Returns the last two host labels, or the whole host for an IP address. Without the public suffix
+ * list, this can join two sites (for example under `co.uk`) but never splits one site, so a match
+ * can only refuse secure input, not permit it.
+ */
+function approximateSite(origin: string): string {
+  const hostname = new URL(origin).hostname;
+  if (isIP(hostname.replace(/^\[|\]$/gu, "")) !== 0) return hostname;
+  return hostname.split(".").slice(-2).join(".");
 }
 
 function readConsoleMessage(args: unknown[]): BrowserConsoleMessageDetails | null {
@@ -1908,68 +1943,6 @@ function readConsoleMessage(args: unknown[]): BrowserConsoleMessageDetails | nul
   };
 }
 
-function resolveEnvironment(
-  value: BrowserToolArguments<"set_environment">,
-  current: BrowserEnvironment,
-  bounds: BrowserBounds,
-): BrowserEnvironment {
-  const preset = value.preset;
-  const presetSize = presetDimensions(preset);
-  const explicitScale = value.deviceScaleFactor !== undefined;
-  const scaleConvertsFill =
-    explicitScale && (preset === "fill" || (preset === undefined && current.viewport.mode === "fill"));
-  const requestedWidth =
-    value.width ??
-    presetSize?.width ??
-    (preset === "fill" || scaleConvertsFill ? bounds.width : current.viewport.width);
-  const requestedHeight =
-    value.height ??
-    presetSize?.height ??
-    (preset === "fill" || scaleConvertsFill ? bounds.height : current.viewport.height);
-  const width = Math.round(requestedWidth);
-  const height = Math.round(requestedHeight);
-  const mode =
-    preset === "fill" && !explicitScale
-      ? "fill"
-      : preset || value.width !== undefined || value.height !== undefined || explicitScale
-        ? "custom"
-        : current.viewport.mode;
-  const minimumWidth = mode === "fill" ? 1 : 320;
-  const minimumHeight = mode === "fill" ? 1 : 240;
-  if (
-    width < minimumWidth ||
-    width > INPUT_LIMITS.browserDimension ||
-    height < minimumHeight ||
-    height > INPUT_LIMITS.browserDimension
-  ) {
-    throw new Error("Viewport dimensions are outside the supported range.");
-  }
-  // Fill clears the device metrics override, so it cannot inherit a custom emulation scale.
-  const scale =
-    mode === "fill" ? 1 : (value.deviceScaleFactor ?? presetSize?.scale ?? current.viewport.deviceScaleFactor);
-  if (scale < 0.5 || scale > 4) throw new Error("deviceScaleFactor must be between 0.5 and 4.");
-  if (!isSafeViewportSize(width, height, scale)) {
-    throw new Error(`The physical viewport must not exceed ${MAX_PHYSICAL_VIEWPORT_PIXELS.toLocaleString()} pixels.`);
-  }
-  const resolvedPreset =
-    preset === "desktop" || preset === "tablet" || preset === "mobile"
-      ? preset
-      : preset === "custom" || preset === "fill"
-        ? null
-        : current.viewport.preset;
-  return {
-    viewport: {
-      mode,
-      width,
-      height,
-      deviceScaleFactor: scale,
-      preset: resolvedPreset,
-    },
-    colorScheme: value.colorScheme ?? current.colorScheme,
-    reducedMotion: value.reducedMotion ?? current.reducedMotion,
-  };
-}
-
 function boundedCaptureDataUrl(image: NativeImage): string {
   const size = image.getSize();
   if (size.width <= 0 || size.height <= 0) throw new Error("Browser screenshot is empty.");
@@ -1985,34 +1958,6 @@ function boundedCaptureDataUrl(image: NativeImage): string {
     .toDataURL();
 }
 
-function describeBrowserTarget(target: BrowserTarget): string {
-  switch (target.kind) {
-    case "ref":
-      return `ref ${target.ref}@${target.revision}`;
-    case "role":
-      return `${target.role}${target.name ? ` “${target.name}”` : ""}`;
-    case "text":
-      return `text “${target.text}”`;
-    case "css":
-      return `css ${target.selector}`;
-    case "point":
-      return `point ${target.x},${target.y}`;
-  }
-}
-
-function presetDimensions(preset: "fill" | "desktop" | "tablet" | "mobile" | "custom" | undefined) {
-  switch (preset) {
-    case "desktop":
-      return { width: 1440, height: 900, scale: 1 };
-    case "tablet":
-      return { width: 820, height: 1180, scale: 2 };
-    case "mobile":
-      return { width: 390, height: 844, scale: 3 };
-    default:
-      return null;
-  }
-}
-
 function navigateHistory(contents: WebContents, direction: BrowserNavigationDirection): boolean {
   const history = contents.navigationHistory;
   const offset = direction === "back" ? -1 : 1;
@@ -2021,93 +1966,6 @@ function navigateHistory(contents: WebContents, direction: BrowserNavigationDire
   if (!entry?.url) return false;
   history.goToOffset(offset);
   return true;
-}
-
-async function navigateAndWait(
-  contents: WebContents,
-  initiate: () => boolean | Promise<unknown>,
-  timeoutMs = 10_000,
-): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    let started = false;
-    let inPlace = false;
-    let settled = false;
-    let timedOut = false;
-    let initiationPending = false;
-    let timer: NodeJS.Timeout;
-    const cleanup = () => {
-      clearTimeout(timer);
-      contents.off("did-start-navigation", didStartNavigation);
-      contents.off("did-stop-loading", didStopLoading);
-      contents.off("did-navigate-in-page", didNavigateInPage);
-      contents.off("did-fail-load", didFailLoad);
-      contents.off("destroyed", destroyed);
-    };
-    const finish = (error?: unknown) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      if (error) reject(error);
-      else resolve();
-    };
-    const complete = () => {
-      finish(timedOut ? new Error("Navigation timed out.") : undefined);
-    };
-    const didStartNavigation = (_event: unknown, _url: string, isInPlace: boolean, isMainFrame: boolean) => {
-      if (!isMainFrame) return;
-      started = true;
-      inPlace = isInPlace;
-    };
-    const didStopLoading = () => {
-      if (started && !inPlace) complete();
-    };
-    const didNavigateInPage = (_event: unknown, _url: string, isMainFrame: boolean) => {
-      if (started && inPlace && isMainFrame) complete();
-    };
-    const didFailLoad = (_event: unknown, code: number, description: string, _url: string, isMainFrame: boolean) => {
-      if (!started || !isMainFrame) return;
-      finish(timedOut ? new Error("Navigation timed out.") : new Error(`Navigation failed (${code}): ${description}`));
-    };
-    const destroyed = () => {
-      finish(new Error("Browser tab was closed during navigation."));
-    };
-    contents.on("did-start-navigation", didStartNavigation);
-    contents.on("did-stop-loading", didStopLoading);
-    contents.on("did-navigate-in-page", didNavigateInPage);
-    contents.on("did-fail-load", didFailLoad);
-    contents.once("destroyed", destroyed);
-    timer = setTimeout(() => {
-      timedOut = true;
-      try {
-        const navigationWasActive = started || contents.isLoading();
-        contents.stop();
-        if (!navigationWasActive && !initiationPending) complete();
-      } catch (error) {
-        finish(error);
-      }
-    }, timeoutMs);
-    timer.unref();
-    try {
-      const initiation = initiate();
-      if (initiation === false) {
-        complete();
-      } else if (initiation !== true) {
-        initiationPending = true;
-        void initiation.then(
-          () => {
-            initiationPending = false;
-            if (!contents.isLoading()) complete();
-          },
-          (error) => {
-            initiationPending = false;
-            finish(timedOut ? new Error("Navigation timed out.") : error);
-          },
-        );
-      }
-    } catch (error) {
-      finish(error);
-    }
-  });
 }
 
 function textResult(value: unknown): DynamicToolResult {
@@ -2124,36 +1982,4 @@ function uniqueDownloadPath(root: string, name: string, reserved: Set<string>): 
     const candidate = join(root, suffix === 1 ? name : `${stem} (${suffix})${extension}`);
     if (!reserved.has(candidate) && !existsSync(candidate)) return candidate;
   }
-}
-
-async function withTimeout<T>(promise: Promise<T>, milliseconds: number, message: string): Promise<T> {
-  let timeout: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<never>((_resolve, reject) => {
-        timeout = setTimeout(() => reject(new Error(message)), milliseconds);
-      }),
-    ]);
-  } finally {
-    if (timeout) clearTimeout(timeout);
-  }
-}
-
-/** Resolves to whether the work settled before the bound, rather than throwing when it did not. */
-async function finishesWithin(work: Promise<unknown>, milliseconds: number): Promise<boolean> {
-  return await withTimeout(work, milliseconds, "Browser operation unwind timed out.").then(
-    () => true,
-    () => false,
-  );
-}
-
-function isTimeoutError(error: unknown): boolean {
-  return error instanceof Error && /timed out/i.test(error.message);
-}
-
-function remainingTime(deadline: number, message: string): number {
-  const remaining = deadline - Date.now();
-  if (remaining <= 0) throw new Error(message);
-  return remaining;
 }

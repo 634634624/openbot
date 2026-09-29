@@ -21,6 +21,7 @@ import {
   type UpdateChannelMemoryInput,
 } from "@openbot/contracts/ipc";
 import { isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
+import { sourceText } from "@openbot/i18n/source";
 import { z } from "zod";
 import { ChannelHistory, type ChannelTextModel } from "./channel-history";
 import { ChannelMemoryStore } from "./channel-memory-store";
@@ -159,8 +160,7 @@ export class ChannelService {
             if (assignment.state !== "starting" || assignment.turnId || !assignment.deliveryId) return false;
             return this.mailbox.getDelivery(assignment.deliveryId)?.delivery.status === "starting";
           });
-          if (uncertain)
-            throw new Error("The channel has an unconfirmed assignment start. Check its outcome before deleting it.");
+          if (uncertain) throw new Error(sourceText("error.backend.channelUnconfirmedStart"));
           await this.interruptTasks(
             channelId,
             this.store.tasks(channelId).filter((task) => !terminal(task)),
@@ -210,18 +210,18 @@ export class ChannelService {
     const known = this.hooks.agents();
     if (command.type === "save") {
       const existing = this.store.exists(command.channelId) ? this.store.get(command.channelId) : null;
-      // A deleted agent stays in the membership list, and the settings panel offers to remove it.
-      // Only a member the draft adds has to be available: rejecting the ones already stored would
+      // Agent deletion removes the agent from each channel, but a database from an older version can
+      // still hold a deleted member, and the settings panel offers to remove it. Only a member the draft adds has to be available: rejecting the ones already stored would
       // hold every later save of the channel, so the reader could not remove the first of two
       // deleted members, or edit any other field.
       // A save that edits an open channel must never bring a deleted one back. Settings save on
       // every field, so a save can still be queued behind the deletion of its own channel, and it
       // carries the whole draft: it would restore the name, the instructions and the members.
-      if (!existing && command.update) throw new Error("Channel not found.");
+      if (!existing && command.update) throw new Error(sourceText("error.backend.channelNotFound"));
       const members = new Set(existing?.members.map((member) => member.agentId));
       for (const member of command.draft.members)
         if (!members.has(member.agentId) && !known.some((agent) => agent.id === member.agentId))
-          throw new Error("A channel member is unavailable.");
+          throw new Error(sourceText("error.backend.channelMemberUnavailable"));
       const channel = existing ?? this.store.create(command.channelId, command.draft);
       const assigned = this.store
         .tasks(channel.id)
@@ -269,7 +269,7 @@ export class ChannelService {
       await this.interruptTasks(channel.id, tasks);
       return result;
     }
-    if (channel.archived) throw new Error("Restore this channel before sending messages or changing tasks.");
+    if (channel.archived) throw new Error(sourceText("error.backend.channelArchived"));
     if (command.type === "send") {
       if (command.recipientAgentId) this.requireMember(channel, command.recipientAgentId);
       const id = randomUUID();
@@ -290,13 +290,14 @@ export class ChannelService {
           })
         : null;
       const current = committed ? this.store.get(channel.id) : channel;
-      if (current.archived) throw new Error("Restore this channel before sending messages or changing tasks.");
+      if (current.archived) throw new Error(sourceText("error.backend.channelArchived"));
       const text = committed?.text ?? command.text;
       const messages = this.store.messages(current.id);
       const referenced = command.replyToMessageId
         ? messages.find((message) => message.id === command.replyToMessageId)
         : undefined;
-      if (command.replyToMessageId && !referenced) throw new Error("The referenced channel message is unavailable.");
+      if (command.replyToMessageId && !referenced)
+        throw new Error(sourceText("error.backend.channelReferenceUnavailable"));
       const allTasks = this.store.tasks(current.id);
       const open = allTasks.filter((task) => !terminal(task));
       const previous = referenced?.taskId
@@ -384,10 +385,10 @@ export class ChannelService {
     }
     const tasks = this.store.tasks(channel.id);
     const selected = tasks.find((task) => task.id === command.taskId);
-    if (!selected) throw new Error("Channel task not found.");
-    if (terminal(selected)) throw new Error("This task is already complete.");
+    if (!selected) throw new Error(sourceText("error.backend.channelTaskNotFound"));
+    if (terminal(selected)) throw new Error(sourceText("error.backend.channelTaskComplete"));
     if (command.type === "reassign") {
-      if (!command.recipientAgentId) throw new Error("Select an agent.");
+      if (!command.recipientAgentId) throw new Error(sourceText("error.backend.channelSelectAgent"));
       this.requireMember(channel, command.recipientAgentId);
     }
     // `stop` and `resume` hold the whole run below the selected task. `reassign` gives one task
@@ -557,9 +558,9 @@ export class ChannelService {
         // One eligible member is not a decision. Routing costs a full turn of the lead's own model,
         // so it runs only when there is a choice to make. This is silent on purpose: a dispatch
         // message exists to make a model's choice auditable, and no model was asked here.
-        const eligible = this.eligibleMembers(channel);
-        if (eligible.length === 1) {
-          task = { ...task, ownerAgentId: eligible[0] };
+        const [onlyMember, ...otherMembers] = this.eligibleMembers(channel);
+        if (onlyMember && otherMembers.length === 0) {
+          task = { ...task, ownerAgentId: onlyMember };
           this.store.update(channel, { tasks: [task] });
           channel = this.store.get(channelId);
         }
@@ -568,7 +569,7 @@ export class ChannelService {
         const revision = this.routingState(channelId);
         const lead = this.hooks.agents().find((agent) => agent.id === channel.leadAgentId);
         try {
-          if (!lead) throw new ChannelRoutingError("Choose an available channel lead or assign this task to a member.");
+          if (!lead) throw new ChannelRoutingError(sourceText("error.backend.channelLeadRequired"));
           // The channel summary that member turns already maintain stands in for the transcript.
           // Only the messages it does not yet cover are sent whole, and only the last few of those.
           const summary = this.store.summary(channelId);
@@ -606,9 +607,7 @@ export class ChannelService {
             }),
           ].join("\n");
           if (prompt.length > ROUTING_PROMPT_CHARACTERS)
-            throw new ChannelRoutingError(
-              "This request exceeds the routing context limit. Select a member or send a shorter request.",
-            );
+            throw new ChannelRoutingError(sourceText("error.backend.channelRoutingTooLong"));
           const response = await this.hooks.generate(lead, prompt);
           if (this.#deletedChannels.has(channelId)) return;
           if (this.routingState(channelId) !== revision) {
@@ -621,15 +620,16 @@ export class ChannelService {
             decision = ROUTING_DECISION.parse(response);
           } catch (error) {
             if (!(error instanceof StructuredOutputError)) throw error;
-            throw new ChannelRoutingError("Choose a member for this task.");
+            throw new ChannelRoutingError(sourceText("error.backend.channelTaskMemberRequired"));
           }
           if ("taskId" in decision) {
             const existing = this.store
               .tasks(channelId)
               .find((item) => item.id === decision.taskId && item.id !== task?.id && !terminal(item));
-            if (!existing?.ownerAgentId) throw new ChannelRoutingError("Choose a member for this request.");
+            if (!existing?.ownerAgentId)
+              throw new ChannelRoutingError(sourceText("error.backend.channelRequestMemberRequired"));
             this.requireMember(channel, existing.ownerAgentId);
-            const source = this.store.messages(channelId).find((item) => item.id === task?.requestMessageId);
+            const source = task ? this.store.message(channelId, task.requestMessageId) : null;
             const affected = descendants(this.store.tasks(channelId), existing.id);
             this.store.update(channel, {
               tasks: [
@@ -756,7 +756,7 @@ export class ChannelService {
       // now only serves a task an earlier version queued with its drafts still open: it turns
       // those drafts into attachments and rewrites the stored request. Every other dispatch -
       // a resume, or a hand-off to another task - re-sends the committed copies instead.
-      const request = this.store.messages(channelId).find((message) => message.id === task.requestMessageId);
+      const request = this.store.message(channelId, task.requestMessageId);
       const ownsRequest = request?.taskId === task.id;
       const committing = ownsRequest && task.attachmentDraftIds.length > 0;
       try {
@@ -771,7 +771,7 @@ export class ChannelService {
         });
         if (this.#deletedChannels.has(channelId)) return;
         const delivery = receipt.deliveries[0];
-        if (!delivery) throw new Error("Channel delivery was not created.");
+        if (!delivery) throw new Error(sourceText("error.backend.channelDeliveryNotCreated"));
         assignment.deliveryId = delivery.id;
         // The assignment reserved the host before attachment copying. Keep its delivery ahead
         // of normal messages that arrived during that await, or the reservation would leave the
@@ -849,6 +849,20 @@ export class ChannelService {
   }
 
   /**
+   * Whether any channel holds the host: an assignment still starting, running or queued, or a
+   * task queued or running. Paused, waiting and failed tasks do not hold anything; they resume
+   * from durable rows after a restart.
+   */
+  hasActiveWork(): boolean {
+    if (this.store.hasAssignmentInState(ACTIVE_ASSIGNMENT_STATES)) return true;
+    return this.store
+      .ids()
+      .some((channelId) =>
+        this.store.tasks(channelId).some((task) => task.state === "queued" || task.state === "running"),
+      );
+  }
+
+  /**
    * The channel work the queue of `agentId` is waiting behind, or null when no channel holds the
    * host.
    *
@@ -894,6 +908,26 @@ export class ChannelService {
       }
   }
 
+  /**
+   * Takes every agent without a record out of each channel's members. Agent deletion calls this, and
+   * so does startup, for members that older versions and an interrupted deletion left behind.
+   *
+   * The lead moves the way the settings panel moves it: to the first member that stays. A task the
+   * deleted agent owned needs nothing here, because the pump pauses a task whose owner is gone.
+   */
+  removeDeletedMembers(agentIds: ReadonlySet<string>): void {
+    for (const channelId of this.store.ids()) {
+      const channel = this.store.get(channelId);
+      const members = channel.members.filter((member) => agentIds.has(member.agentId));
+      if (members.length === channel.members.length) continue;
+      const leadAgentId = members.some((member) => member.agentId === channel.leadAgentId)
+        ? channel.leadAgentId
+        : (members[0]?.agentId ?? null);
+      this.store.update({ ...channel, members, leadAgentId });
+      this.publish(channelId);
+    }
+  }
+
   deliveryUncertain(deliveryId: string): void {
     const assignment = this.store.assignmentForDelivery(deliveryId);
     if (!assignment || !activeAssignment(assignment)) return;
@@ -927,6 +961,10 @@ export class ChannelService {
           assignment = { ...assignment, deliveryId: context.delivery.id };
           this.store.update(this.store.get(channelId), { assignments: [assignment] });
         }
+        // The boot recovery settles each orphaned delivery before this runs, so one that still starts
+        // or runs is a live turn of this run: on another provider, or on an agent's own process that
+        // outlived a restart of the shared one.
+        if (context?.delivery.status === "starting" || context?.delivery.status === "running") continue;
         if (
           context?.delivery.status === "queued" &&
           task?.state === "queued" &&
@@ -974,10 +1012,10 @@ export class ChannelService {
     if (this.#deletedChannels.has(channel.id)) return null;
     const task = this.store.tasks(channel.id).find((item) => item.id === assignment.taskId);
     if (!task || channel.archived || task.revision !== assignment.taskRevision || task.state !== "queued")
-      throw new Error("This channel assignment has been stopped or replaced.");
+      throw new Error(sourceText("error.backend.channelAssignmentStopped"));
     this.requireMember(channel, assignment.agentId);
     const agent = this.hooks.agents().find((item) => item.id === assignment.agentId);
-    if (!agent) throw new Error("The assigned agent is unavailable.");
+    if (!agent) throw new Error(sourceText("error.backend.channelAssigneeUnavailable"));
     const context = this.store.context(channel.id, agent.id);
     const history = await this.#history.prepare(
       task,
@@ -992,7 +1030,7 @@ export class ChannelService {
       current.state !== "queued" ||
       this.store.get(channel.id).archived
     )
-      throw new Error("This channel assignment has changed.");
+      throw new Error(sourceText("error.backend.channelAssignmentChanged"));
     this.store.update(this.store.get(channel.id), {
       assignments: [
         { ...assignment, throughSequence: history.throughSequence, summaryVersion: history.summaryVersion },
@@ -1202,11 +1240,7 @@ export class ChannelService {
     const operationId = `tool:${turnId}:${callId}`;
     if (this.store.database.commandResult(`channels:${operationId}`) !== undefined) return { accepted: true };
     if (tool === "channel_result") {
-      if (
-        this.store
-          .messages(channelId)
-          .some((item) => item.id === `channel-result-${assignment.id}-revision-${assignment.taskRevision}`)
-      )
+      if (this.store.message(channelId, `channel-result-${assignment.id}-revision-${assignment.taskRevision}`))
         return { accepted: true };
       if (!isString(args.text) || !args.text.trim() || args.text.length > 100_000)
         throw new Error("Provide a task result.");
@@ -1256,7 +1290,7 @@ export class ChannelService {
     this.requireMember(channel, args.recipientAgentId);
     if (args.recipientAgentId === agentId) throw new Error("Choose another channel member.");
     const sourceMessageIds = args.sourceMessageIds;
-    if (sourceMessageIds.some((id) => !this.store.messages(channelId).some((message) => message.id === id)))
+    if (sourceMessageIds.some((id) => !this.store.message(channelId, id)))
       throw new Error("A source message is unavailable.");
     const root = tasks.find((item) => item.id === task.rootTaskId);
     if (!root) throw new Error("The root task is unavailable.");
@@ -1480,7 +1514,7 @@ export class ChannelService {
       !channel.members.some((member) => member.agentId === agentId) ||
       !this.hooks.agents().some((agent) => agent.id === agentId)
     )
-      throw new Error("Select an available member of this channel.");
+      throw new Error(sourceText("error.backend.channelMemberRequired"));
   }
 
   private waitForAssignmentTerminal(channelId: string, assignmentId: string): Promise<void> {
@@ -1551,7 +1585,7 @@ export class ChannelService {
 
   deleteMemory(input: DeleteChannelMemoryInput): void {
     this.store.get(input.channelId);
-    if (!this.memories.delete(input.channelId, input.memoryId)) throw new Error("This memory no longer exists.");
+    if (!this.memories.delete(input.channelId, input.memoryId)) throw new Error(sourceText("error.backend.memoryGone"));
     this.hooks.memoriesChanged?.(input.channelId);
   }
 

@@ -1,7 +1,22 @@
+import { BROWSER_SECRET_CAPABILITY } from "../ipc-browser-secret";
 import { CHANNEL_DELETE_CAPABILITY } from "../ipc-chat-channels";
 import { MCP_SERVERS_CAPABILITY } from "../ipc-mcp-servers";
+import { STORAGE_CAPABILITY } from "../ipc-storage";
+import { AGENT_ADMIN_CAPABILITY } from "./agent-admin-v1";
+import { AGENT_INSTALL_CAPABILITY } from "./agent-install-v1";
+import { AGENT_UPDATE_CAPABILITY } from "./agent-update-v1";
+import { TEAM_BROWSER_NAVIGATION_CAPABILITY } from "./browser-navigation-v1";
+import { TEAM_BROWSER_VIEW_CAPABILITY, TEAM_BROWSER_VIEW_FRAME_POINT_CAPABILITY } from "./browser-view-v1";
+import { CONTEXT_RESET_CAPABILITY } from "./context-reset-v1";
+import { HOST_ADMIN_CAPABILITY } from "./host-admin-v1";
+import { HOST_UPDATE_CAPABILITY } from "./host-update-v1";
+import { PROVIDERS_ADMIN_CAPABILITY } from "./providers-v1";
+import { PROVIDERS_RUNTIMES_V2_CAPABILITY } from "./providers-v2";
 import { TEAM_QUEUE_EDIT_CAPABILITY } from "./queue-edit-v1";
-import { TEAM_PROTOCOL_V4_CAPABILITIES } from "./v4";
+import { SHARED_TABLES_CAPABILITY } from "./shared-tables-v1";
+import { SKILLS_ADMIN_CAPABILITY } from "./skills-admin-v1";
+import { SKILLS_EVENTS_CAPABILITY } from "./skills-events-v1";
+import { TEAM_PROTOCOL_V5_CAPABILITIES } from "./v5";
 
 export const TEAM_SEMANTIC_TAGS_CAPABILITY = "installed-skills";
 export const TEAM_AGENT_ACTIVITY_CAPABILITY = "agent-activity";
@@ -15,11 +30,42 @@ export const TEAM_MODEL_SCOPED_USAGE_CAPABILITY = "model-scoped-usage";
 export const TEAM_AGENT_CREATE_MODEL_CAPABILITY = "agent-create-model";
 export const TEAM_MEDIA_ATTACHMENTS_CAPABILITY = "media-attachments";
 export const TEAM_EML_ATTACHMENTS_CAPABILITY = "eml-attachments";
-export { CHANNEL_DELETE_CAPABILITY, MCP_SERVERS_CAPABILITY };
+/**
+ * Frozen optional member-leave-v1 contract: a bodyless `POST /v1/team/leave` answered with 204. The
+ * caller, a member or an admin, removes their own membership with the same effects as an admin's
+ * `DELETE /v1/team/members/:id`: the member row and every session of it go, on every device. The
+ * owner is refused. A host without the capability answers 404, and the client only logs out.
+ * Widening any of it needs a second capability string.
+ */
+export const TEAM_MEMBER_LEAVE_CAPABILITY = "member-leave-v1";
+export {
+  AGENT_ADMIN_CAPABILITY,
+  AGENT_INSTALL_CAPABILITY,
+  AGENT_UPDATE_CAPABILITY,
+  CHANNEL_DELETE_CAPABILITY,
+  CONTEXT_RESET_CAPABILITY,
+  HOST_ADMIN_CAPABILITY,
+  HOST_UPDATE_CAPABILITY,
+  MCP_SERVERS_CAPABILITY,
+  PROVIDERS_ADMIN_CAPABILITY,
+  PROVIDERS_RUNTIMES_V2_CAPABILITY,
+  SHARED_TABLES_CAPABILITY,
+  SKILLS_ADMIN_CAPABILITY,
+  SKILLS_EVENTS_CAPABILITY,
+  STORAGE_CAPABILITY,
+  TEAM_BROWSER_NAVIGATION_CAPABILITY,
+  TEAM_BROWSER_VIEW_CAPABILITY,
+  TEAM_BROWSER_VIEW_FRAME_POINT_CAPABILITY,
+};
 
 export const TEAM_CURRENT_CAPABILITIES = [
-  ...TEAM_PROTOCOL_V4_CAPABILITIES,
+  BROWSER_SECRET_CAPABILITY,
+  ...TEAM_PROTOCOL_V5_CAPABILITIES,
+  "remote-desktop-setup",
   TEAM_QUEUE_EDIT_CAPABILITY,
+  TEAM_BROWSER_NAVIGATION_CAPABILITY,
+  TEAM_BROWSER_VIEW_CAPABILITY,
+  TEAM_BROWSER_VIEW_FRAME_POINT_CAPABILITY,
   "agent-profile-generation",
   "agent-analytics",
   "host-analytics",
@@ -33,6 +79,19 @@ export const TEAM_CURRENT_CAPABILITIES = [
   "channel-chats-v1",
   CHANNEL_DELETE_CAPABILITY,
   MCP_SERVERS_CAPABILITY,
+  STORAGE_CAPABILITY,
+  AGENT_ADMIN_CAPABILITY,
+  SKILLS_ADMIN_CAPABILITY,
+  SKILLS_EVENTS_CAPABILITY,
+  SHARED_TABLES_CAPABILITY,
+  AGENT_INSTALL_CAPABILITY,
+  PROVIDERS_ADMIN_CAPABILITY,
+  PROVIDERS_RUNTIMES_V2_CAPABILITY,
+  HOST_ADMIN_CAPABILITY,
+  AGENT_UPDATE_CAPABILITY,
+  TEAM_MEMBER_LEAVE_CAPABILITY,
+  CONTEXT_RESET_CAPABILITY,
+  HOST_UPDATE_CAPABILITY,
 ] as const;
 
 export type TeamCurrentCapability = (typeof TEAM_CURRENT_CAPABILITIES)[number];

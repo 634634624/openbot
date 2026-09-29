@@ -173,7 +173,7 @@ describe("OpenBot connected desktop shell", () => {
     await fireEvent.click(await screen.findByRole("button", { name: "Refresh providers" }));
     expect(screen.getByRole("button", { name: "Checking providers" })).toBeDisabled();
     expect(screen.queryByRole("button", { name: /^Install / })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Next" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Next" })).not.toBeInTheDocument();
 
     expect(finishRefresh).toBeTypeOf("function");
     finishRefresh?.({
@@ -363,7 +363,7 @@ describe("OpenBot connected desktop shell", () => {
     await fireEvent.input(await screen.findByRole("textbox", { name: "One-time code" }), {
       target: { value: "ABCD-EFGH" },
     });
-    expect(window.openbot.auth.verifyEmailCode).toHaveBeenCalledWith("challenge-1", "ABCD-EFGH");
+    expect(window.openbot.auth.verifyEmailCode).toHaveBeenCalledWith({ challengeId: "challenge-1", code: "ABCD-EFGH" });
     expect(trackAnalytics).toHaveBeenCalledWith("account_sign_in_started", { result: "code_sent" });
     expect(trackAnalytics).toHaveBeenCalledWith("account_sign_in_completed", { result: "succeeded" });
     expect(await screen.findByText("Verified. Opening OpenBot…")).toBeInTheDocument();
@@ -470,7 +470,7 @@ describe("OpenBot connected desktop shell", () => {
     expect(await screen.findByRole("heading", { name: "New agent" })).toBeInTheDocument();
   });
 
-  it("guides signed-out users before enabling chat", async () => {
+  it("blocks chat for signed-out users", async () => {
     vi.mocked(window.openbot.agent.getStatus).mockResolvedValueOnce({
       phase: "blocked",
       cliVersion: "0.144.1",
@@ -481,10 +481,9 @@ describe("OpenBot connected desktop shell", () => {
     });
     render(() => <App />);
 
-    expect(await screen.findByText("Agent CLI setup required")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByLabelText("Message Chief")).toHaveAttribute("contenteditable", "false"));
     expect(screen.queryByRole("listbox", { name: /helping with most/i })).not.toBeInTheDocument();
-    expect(screen.getByLabelText("Message Chief")).toHaveAttribute("contenteditable", "false");
-    fireEvent.click(screen.getByRole("button", { name: "Setup guide" }));
-    await waitFor(() => expect(window.openbot.openExternal).toHaveBeenCalledWith("agent-setup"));
+    expect(screen.queryByText("Agent CLI setup required")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Setup guide" })).not.toBeInTheDocument();
   });
 });

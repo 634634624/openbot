@@ -1,7 +1,12 @@
+import type { AgentProfile } from "@openbot/ui/data";
+import { type AgentActivityLabel, nextAgentActivityLabel } from "@openbot/ui/features/conversation/AgentActivity";
+import {
+  agentActivityExitDelay,
+  agentActivityExitDuration,
+  agentActivityShowDelay,
+} from "@openbot/ui/features/conversation/activity-timing";
+import { currentText } from "@openbot/ui/text";
 import { createEffect, createMemo, createSignal, onCleanup, untrack } from "solid-js";
-import type { AgentProfile } from "../../../data";
-import { type AgentActivityPresentation, nextAgentActivityPresentation } from "../AgentActivity";
-import { agentActivityExitDelay, agentActivityExitDuration, agentActivityShowDelay } from "../activity-timing";
 import type { ConversationProps } from "../conversation-types";
 
 export interface RenderedAgentActivity {
@@ -9,13 +14,13 @@ export interface RenderedAgentActivity {
   agent: AgentProfile | undefined;
   detail: string | null;
   phase: "active" | "exiting";
-  presentation: AgentActivityPresentation;
+  label: AgentActivityLabel;
 }
 
 export interface ActivityStoreDeps {
   props: ConversationProps;
   activeDeliveries: () => Array<{ id: string }>;
-  agentActivityPresentations: Map<string, { activityId: string; presentation: AgentActivityPresentation }>;
+  agentActivityLabels: Map<string, { activityId: string; label: AgentActivityLabel }>;
 }
 
 export function createActivityStore(deps: ActivityStoreDeps) {
@@ -24,7 +29,8 @@ export function createActivityStore(deps: ActivityStoreDeps) {
   const streamingAgentMessage = createMemo(() => {
     for (let index = deps.props.messages.length - 1; index >= 0; index -= 1) {
       const message = deps.props.messages[index];
-      if (message?.author === "agent" && message.streaming) return message;
+      // A plan streams for the whole turn. It is not the text that the turn writes now.
+      if (message?.author === "agent" && message.streaming && message.kind !== "plan") return message;
     }
     return null;
   });
@@ -70,19 +76,19 @@ export function createActivityStore(deps: ActivityStoreDeps) {
   });
   const activeActivityDetail = createMemo(() => {
     const hold = heldByOwnChannelWork();
-    if (hold) return `Working in ${hold.channelName}`;
+    if (hold) return currentText().t("chat.activity.workingIn", { channel: hold.channelName });
     return latestActiveCommentary() ?? (deps.props.activityDetail?.trim() || null);
   });
   const agentActivity = createMemo<"Working" | null>(() => (activeActivityId() ? "Working" : null));
-  const activityPresentation = createMemo<AgentActivityPresentation | null>(() => {
+  const activityLabel = createMemo<AgentActivityLabel | null>(() => {
     const agentId = deps.props.agent?.id;
     const activityId = activeActivityId();
     if (!agentId || !activityId) return null;
-    const previous = deps.agentActivityPresentations.get(agentId);
-    if (previous?.activityId === activityId) return previous.presentation;
-    const presentation = nextAgentActivityPresentation(previous?.presentation);
-    deps.agentActivityPresentations.set(agentId, { activityId, presentation });
-    return presentation;
+    const previous = deps.agentActivityLabels.get(agentId);
+    if (previous?.activityId === activityId) return previous.label;
+    const label = nextAgentActivityLabel(previous?.label);
+    deps.agentActivityLabels.set(agentId, { activityId, label });
+    return label;
   });
   let agentActivityShowTimer: number | undefined;
   let agentActivityExitDelayTimer: number | undefined;
@@ -106,19 +112,19 @@ export function createActivityStore(deps: ActivityStoreDeps) {
     () => ({
       activityId: activeActivityId(),
       agent: deps.props.agent,
-      presentation: activityPresentation(),
+      label: activityLabel(),
     }),
-    ({ activityId, agent, presentation }) => {
+    ({ activityId, agent, label }) => {
       clearAgentActivityShowTimer();
       clearAgentActivityExitDelayTimer();
       clearAgentActivityExitTimer();
-      if (activityId && presentation) {
+      if (activityId && label) {
         const nextActivity = {
           activityId,
           agent,
           detail: untrack(activeActivityDetail),
           phase: "active" as const,
-          presentation,
+          label,
         };
         const current = untrack(renderedAgentActivity);
         if (current?.agent?.id === agent?.id) {
@@ -189,8 +195,6 @@ export function createActivityStore(deps: ActivityStoreDeps) {
     activeActivityId,
     activeActivityDetail,
     agentActivity,
-    activityPresentation,
+    activityLabel,
   };
 }
-
-export type ActivityStore = ReturnType<typeof createActivityStore>;

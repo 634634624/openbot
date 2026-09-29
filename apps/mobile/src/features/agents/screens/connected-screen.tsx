@@ -1,12 +1,22 @@
 import { type MenuAction, MenuView } from "@expo/ui/community/menu";
-import type { ChannelSummary } from "@openbot/contracts/ipc";
-import { router, Stack } from "expo-router";
+import type { SidebarLayoutSnapshot } from "@openbot/contracts/ipc";
+import { type Href, router, Stack } from "expo-router";
 import { Button, Typography } from "heroui-native";
 import { useThemeColor } from "heroui-native/hooks";
 import { Bot, Layers3, Plus, Search, WifiOff } from "lucide-react-native";
-import { useMemo } from "react";
-import { FlatList, Pressable, View } from "react-native";
-import Animated, { Easing, FadeIn, FadeOut, ReduceMotion } from "react-native-reanimated";
+import { useLayoutEffect, useMemo, useState } from "react";
+import { Pressable, View } from "react-native";
+import Animated, {
+  cancelAnimation,
+  Easing,
+  FadeIn,
+  LinearTransition,
+  ReduceMotion,
+  useAnimatedStyle,
+  useSharedValue,
+  withTiming,
+} from "react-native-reanimated";
+import { scheduleOnRN } from "react-native-worklets";
 import {
   type AgentListRevealState,
   AgentListRowReveal,
@@ -15,41 +25,110 @@ import {
 import { AgentListRow } from "@/features/agents/components/agent-list-row";
 import { useAgentPinTransition } from "@/features/agents/components/agent-pin-transition";
 import { PinnedAgentsGrid } from "@/features/agents/components/pinned-agents-grid";
+import { SidebarSectionHeader } from "@/features/agents/components/sidebar-section-header";
 import { ChannelListRow } from "@/features/channels/components/channel-list";
 import { useChannels } from "@/features/channels/components/use-channels";
 import { useAppDrawer } from "@/features/servers/components/app-drawer-shell";
 import { ConnectionHeaderStatus } from "@/features/workspace/components/connection-header-status";
-import { type MobileAgent, useMobileWorkspace } from "@/features/workspace/context/mobile-workspace-context";
+import { useMobileWorkspace } from "@/features/workspace/context/mobile-workspace-context";
+import { mobileSidebarItems } from "@/features/workspace/model/sidebar-layout";
 import { useAppLoadingOverlay, useScreenLoadingLabel } from "@/shared/components/app-loading-overlay";
+import { haptics } from "@/shared/lib/haptics";
 import { isAndroid, isIOS } from "@/shared/lib/platform";
+import { useText } from "@/shared/lib/text";
 
 const EASE_OUT = Easing.bezier(0.23, 1, 0.32, 1);
-const EASE_IN_OUT = Easing.bezier(0.77, 0, 0.175, 1);
-const ROW_ENTER = FadeIn.duration(180).easing(EASE_IN_OUT).reduceMotion(ReduceMotion.System);
-const ROW_EXIT = FadeOut.duration(120).easing(EASE_OUT).reduceMotion(ReduceMotion.System);
-// Agent search is not available in the current mobile release, so keep its entry points hidden until it is ready.
-const IS_AGENT_SEARCH_ENABLED = false;
+const ROW_ENTER = FadeIn.duration(180).easing(EASE_OUT).reduceMotion(ReduceMotion.System);
+const LIST_REFLOW = LinearTransition.duration(240).easing(EASE_OUT).reduceMotion(ReduceMotion.System);
 
 function TransitioningChatRow({
   chatId,
   children,
   index,
   reveal,
+  collapsed,
 }: {
   chatId: string;
   children: React.ReactNode;
   index: number;
   reveal: AgentListRevealState;
+  collapsed: boolean;
 }) {
   const { transition } = useAgentPinTransition();
   const isTarget = transition?.chatId === chatId && transition.target === "row";
-  const isSource = transition?.chatId === chatId && transition.source === "row";
+
+  const [initiallyExpanded] = useState(!collapsed);
+  const [contentMounted, setContentMounted] = useState(!collapsed);
+  const [measuredHeight, setMeasuredHeight] = useState<number | null>(null);
+  const height = useSharedValue(0);
+  useLayoutEffect(() => {
+    if (!collapsed) setContentMounted(true);
+    if (measuredHeight === null) return;
+    let active = true;
+    const releaseContent = () => {
+      if (active) setContentMounted(false);
+    };
+    height.set(
+      withTiming(
+        collapsed ? 0 : measuredHeight,
+        {
+          duration: 240,
+          easing: EASE_OUT,
+          reduceMotion: ReduceMotion.System,
+        },
+        (finished) => {
+          if (finished && collapsed) scheduleOnRN(releaseContent);
+        },
+      ),
+    );
+    return () => {
+      active = false;
+      cancelAnimation(height);
+    };
+  }, [collapsed, height, measuredHeight]);
+  const bodyStyle = useAnimatedStyle(() => ({
+    height: measuredHeight === null && initiallyExpanded ? undefined : height.get(),
+    overflow: "hidden",
+  }));
+  // Derive the fade from the same height, so a reversed toggle cannot leave
+  // opacity and the accordion at different points in their transitions.
+  const contentStyle = useAnimatedStyle(() => ({
+    opacity:
+      measuredHeight !== null && measuredHeight > 0
+        ? Math.min(1, Math.max(0, height.get() / measuredHeight))
+        : initiallyExpanded
+          ? 1
+          : 0,
+  }));
 
   return (
-    <Animated.View entering={isTarget ? ROW_ENTER : undefined} exiting={isSource ? ROW_EXIT : undefined}>
-      <AgentListRowReveal index={index} reveal={reveal} skip={isTarget}>
-        {children}
-      </AgentListRowReveal>
+    <Animated.View
+      style={bodyStyle}
+      pointerEvents={collapsed ? "none" : "auto"}
+      accessibilityElementsHidden={collapsed}
+      importantForAccessibility={collapsed ? "no-hide-descendants" : "auto"}
+    >
+      {contentMounted ? (
+        <Animated.View
+          style={[
+            measuredHeight === null && initiallyExpanded
+              ? undefined
+              : { position: "absolute", top: 0, left: 0, right: 0 },
+            contentStyle,
+          ]}
+          onLayout={({ nativeEvent }) => {
+            const nextHeight = nativeEvent.layout.height;
+            if (measuredHeight === null && initiallyExpanded) height.set(nextHeight);
+            setMeasuredHeight(nextHeight);
+          }}
+        >
+          <Animated.View collapsable={false} entering={isTarget ? ROW_ENTER : undefined}>
+            <AgentListRowReveal index={index} reveal={reveal} skip={isTarget}>
+              {children}
+            </AgentListRowReveal>
+          </Animated.View>
+        </Animated.View>
+      ) : null}
     </Animated.View>
   );
 }
@@ -76,10 +155,18 @@ function HeaderIconButton({
   );
 }
 
+function openFromMenu(href: Href): void {
+  void haptics.impact("soft");
+  router.push(href);
+}
+
 export function ConnectedScreen() {
+  const { t, sourceText } = useText();
   const { isLoaderPresent } = useAppLoadingOverlay();
   const { openDrawer } = useAppDrawer();
   const {
+    sidebarByServer,
+    refreshServer,
     agents,
     activeAgents,
     activeServer,
@@ -92,6 +179,8 @@ export function ConnectedScreen() {
     serverDirectoryState,
     servers,
   } = useMobileWorkspace();
+  const [collapsedByServer, setCollapsedByServer] = useState<Record<string, ReadonlySet<string>>>({});
+  const collapsedSectionIds = collapsedByServer[activeServer.id];
   const channels = useChannels(activeServer.id);
   const channelAgents = useMemo(
     () => new Map(agents.filter((agent) => agent.serverId === activeServer.id).map((agent) => [agent.id, agent])),
@@ -109,7 +198,7 @@ export function ConnectedScreen() {
   // belongs to this screen while it is the route on top.
   useScreenLoadingLabel(
     "/connected",
-    showLoader ? (hasSelectedServer ? "Connecting to server" : "Loading your servers") : null,
+    showLoader ? t(hasSelectedServer ? "mobile.agent.home.connecting" : "mobile.agent.home.loadingServers") : null,
   );
   const pinnedAgents = pinnedAgentIds
     .map((agentId) => activeAgents.find((agent) => agent.id === agentId))
@@ -121,52 +210,114 @@ export function ConnectedScreen() {
     (channel) => !channel.archived && !hiddenChannelIds.includes(channel.id) && pinnedChannelIds.includes(channel.id),
   );
   const hasPins = pinnedAgents.length + pinnedChannels.length > 0;
-  const unpinnedAgents = activeAgents.filter((agent) => !pinnedAgentIds.includes(agent.id));
-  const items: ({ kind: "agent"; agent: MobileAgent } | { kind: "channel"; channel: ChannelSummary })[] = [
-    ...channels.channels
-      .filter(
-        (channel) =>
-          !hiddenChannelIds.includes(channel.id) && !channel.archived && !pinnedChannelIds.includes(channel.id),
-      )
-      .map((channel) => ({ kind: "channel" as const, channel })),
-    ...unpinnedAgents.map((agent) => ({ kind: "agent" as const, agent })),
-  ];
-  const listReveal = useAgentListReveal(listReady, items.length + (hasPins ? 1 : 0));
+  const unpinnedAgents = useMemo(
+    () => activeAgents.filter((agent) => !pinnedAgentIds.includes(agent.id)),
+    [activeAgents, pinnedAgentIds],
+  );
+  const sidebar = sidebarByServer[activeServer.id];
+  const items = useMemo(
+    () =>
+      mobileSidebarItems(
+        sidebar?.layout ?? null,
+        unpinnedAgents,
+        channels.channels.filter(
+          (channel) =>
+            !hiddenChannelIds.includes(channel.id) && !channel.archived && !pinnedChannelIds.includes(channel.id),
+        ),
+        undefined,
+        t,
+      ),
+    [sidebar?.layout, unpinnedAgents, channels.channels, hiddenChannelIds, pinnedChannelIds, t],
+  );
+  const visibleSectionIds = items.filter((item) => item.kind === "section").map((item) => item.id);
+  const listReveal = useAgentListReveal(listReady, activeServer.id);
+  // Collapse keeps stable list cells and changes their heights on the UI thread.
+  // Enable cell reflow again when a host layout update moves agents or sections.
+  const [collapseLayout, setCollapseLayout] = useState<SidebarLayoutSnapshot | null>(null);
+  const collapsedChatIds = useMemo(() => {
+    const ids = new Set<string>();
+    let sectionCollapsed = false;
+    for (const item of items) {
+      if (item.kind === "section") sectionCollapsed = collapsedSectionIds?.has(item.id) ?? false;
+      else if (sectionCollapsed) ids.add(item.id);
+    }
+    return ids;
+  }, [items, collapsedSectionIds]);
   const optionsActions = useMemo<MenuAction[]>(
     () => [
-      { id: "add-agent", title: "Add agent" },
-      ...(channels.supported ? [{ id: "add-channel", title: "New channel" }] : []),
-      ...(hasHiddenChats ? [{ id: "hidden-chats", title: "Hidden chats" }] : []),
+      { id: "add-agent", title: t("mobile.agent.home.addAgent") },
+      ...(sidebar?.layout ? [{ id: "add-section", title: t("mobile.agent.sectionForm.newTitle") }] : []),
+      ...(channels.supported ? [{ id: "add-channel", title: t("mobile.agent.home.newChannel") }] : []),
+      ...(hasHiddenChats ? [{ id: "hidden-chats", title: t("mobile.agent.hidden.title") }] : []),
     ],
-    [hasHiddenChats, channels.supported],
+    [hasHiddenChats, channels.supported, sidebar?.layout, t],
   );
 
   return (
     <View className="flex-1 bg-background">
       {listReady ? (
-        <FlatList
+        <Animated.FlatList
+          key={activeServer.id}
+          onLayout={listReveal.onLayout}
+          itemLayoutAnimation={listReveal.finished && sidebar?.layout !== collapseLayout ? LIST_REFLOW : undefined}
+          skipEnteringExitingAnimations
+          removeClippedSubviews={false}
           className="flex-1 bg-background"
           alwaysBounceVertical={false}
-          contentContainerClassName={items.length > 0 ? "pb-safe-offset-8 pt-3" : "grow pb-safe-offset-8 pt-3"}
+          contentContainerClassName={items.length > 0 ? "pb-safe-offset-4" : "grow pb-safe-offset-4"}
           // Keep the native header inset even when short content cannot scroll or bounce.
           contentInsetAdjustmentBehavior="always"
           data={items}
-          keyExtractor={(item) => (item.kind === "agent" ? `agent:${item.agent.id}` : `channel:${item.channel.id}`)}
-          renderItem={({ item, index }) => (
-            <TransitioningChatRow
-              chatId={item.kind === "agent" ? item.agent.id : item.channel.id}
-              index={index + (hasPins ? 1 : 0)}
-              reveal={listReveal}
-            >
-              {item.kind === "channel" ? (
-                <ChannelListRow channel={item.channel} serverId={activeServer.id} agents={channelAgents} />
-              ) : (
-                <AgentListRow agent={item.agent} leftInset={15} rightInset={24} />
-              )}
-            </TransitioningChatRow>
-          )}
+          keyExtractor={(item) => `${item.kind}:${item.id}`}
+          renderItem={({ item, index }) =>
+            item.kind === "section" ? (
+              <AgentListRowReveal index={index + (hasPins ? 1 : 0)} reveal={listReveal}>
+                <SidebarSectionHeader
+                  key={`${activeServer.id}:${item.id}`}
+                  id={item.id}
+                  name={item.name}
+                  empty={item.empty}
+                  visibleSectionIds={visibleSectionIds}
+                  collapsed={collapsedSectionIds?.has(item.id) ?? false}
+                  onToggle={() => {
+                    setCollapseLayout(sidebar?.layout ?? null);
+                    setCollapsedByServer((current) => {
+                      const next = new Set(current[activeServer.id]);
+                      if (next.has(item.id)) next.delete(item.id);
+                      else next.add(item.id);
+                      return { ...current, [activeServer.id]: next };
+                    });
+                  }}
+                />
+              </AgentListRowReveal>
+            ) : (
+              <TransitioningChatRow
+                chatId={item.kind === "agent" ? item.agent.id : item.channel.id}
+                index={index + (hasPins ? 1 : 0)}
+                reveal={listReveal}
+                collapsed={collapsedChatIds.has(item.id)}
+              >
+                {item.kind === "channel" ? (
+                  <ChannelListRow channel={item.channel} serverId={activeServer.id} agents={channelAgents} />
+                ) : (
+                  <AgentListRow agent={item.agent} leftInset={15} rightInset={24} />
+                )}
+              </TransitioningChatRow>
+            )
+          }
           ListHeaderComponent={
             <AgentListRowReveal index={0} reveal={listReveal}>
+              {sidebar?.error ? (
+                <View className="gap-2 px-4">
+                  <Typography.Paragraph className="text-danger-text">{sourceText(sidebar.error)}</Typography.Paragraph>
+                  <Button
+                    variant="secondary"
+                    onPress={() => void refreshServer(activeServer.id).catch(() => undefined)}
+                  >
+                    <Button.Label>{t("mobile.agent.home.retrySections")}</Button.Label>
+                  </Button>
+                </View>
+              ) : null}
               <PinnedAgentsGrid agents={pinnedAgents}>
                 {pinnedChannels.length
                   ? pinnedChannels.map((channel) => (
@@ -189,13 +340,13 @@ export function ConnectedScreen() {
                   <WifiOff color={mutedColor} size={28} strokeWidth={1.6} />
                 </View>
                 <View className="items-center gap-1.5">
-                  <Typography.Heading type="h4">Couldn’t load your servers</Typography.Heading>
+                  <Typography.Heading type="h4">{t("mobile.agent.home.serversFailed")}</Typography.Heading>
                   <Typography.Paragraph align="center" className="text-text-secondary">
-                    {serverDirectoryError ?? "Check that the desktop app is running and try again."}
+                    {serverDirectoryError ? sourceText(serverDirectoryError) : t("mobile.agent.home.serversFailedBody")}
                   </Typography.Paragraph>
                 </View>
                 <Button size="md" variant="secondary" onPress={() => void refreshServers().catch(() => undefined)}>
-                  <Button.Label>Try again</Button.Label>
+                  <Button.Label>{t("common.tryAgain")}</Button.Label>
                 </Button>
               </View>
             ) : servers.length === 0 ? (
@@ -204,26 +355,26 @@ export function ConnectedScreen() {
                   <Layers3 color={mutedColor} size={28} strokeWidth={1.6} />
                 </View>
                 <View className="items-center gap-1.5">
-                  <Typography.Heading type="h4">No servers available</Typography.Heading>
+                  <Typography.Heading type="h4">{t("mobile.agent.home.noServers")}</Typography.Heading>
                   <Typography.Paragraph align="center" className="text-text-secondary">
-                    Connect the desktop app again or join a remote server.
+                    {t("mobile.agent.home.noServersBody")}
                   </Typography.Paragraph>
                 </View>
               </View>
             ) : !hasSelectedServer ? (
               <View className="flex-1 items-center justify-center gap-5 px-8 py-16">
-                <Typography.Heading type="h4">Choose a server</Typography.Heading>
+                <Typography.Heading type="h4">{t("mobile.agent.home.chooseServer")}</Typography.Heading>
                 <Button size="md" variant="secondary" onPress={openDrawer}>
-                  <Button.Label>Open servers</Button.Label>
+                  <Button.Label>{t("mobile.agent.home.openServers")}</Button.Label>
                 </Button>
               </View>
             ) : activeAgents.length === 0 && activeServer.state !== "online" ? (
               <View className="flex-1 items-center justify-center gap-5 px-8 py-16">
                 <WifiOff color={mutedColor} size={28} strokeWidth={1.6} />
                 <View className="items-center gap-1.5">
-                  <Typography.Heading type="h4">Waiting for connection</Typography.Heading>
+                  <Typography.Heading type="h4">{t("mobile.agent.home.waiting")}</Typography.Heading>
                   <Typography.Paragraph align="center" className="text-text-secondary">
-                    The agent list will load once this server is connected.
+                    {t("mobile.agent.home.waitingBody")}
                   </Typography.Paragraph>
                 </View>
               </View>
@@ -233,14 +384,21 @@ export function ConnectedScreen() {
                   <Bot color={mutedColor} size={30} strokeWidth={1.6} />
                 </View>
                 <View className="items-center gap-1.5">
-                  <Typography.Heading type="h4">No agents on this server</Typography.Heading>
+                  <Typography.Heading type="h4">{t("mobile.agent.home.noAgents")}</Typography.Heading>
                   <Typography.Paragraph align="center" className="text-text-secondary">
-                    Add an agent to start working from your phone.
+                    {t("mobile.agent.home.noAgentsBody")}
                   </Typography.Paragraph>
                 </View>
-                <Button size="md" variant="secondary" onPress={() => router.push("/add-agent")}>
+                <Button
+                  size="md"
+                  variant="secondary"
+                  onPress={() => {
+                    void haptics.impact("soft");
+                    router.push("/add-agent");
+                  }}
+                >
                   <Plus color={iconColor} size={18} strokeWidth={2} />
-                  <Button.Label>Add agent</Button.Label>
+                  <Button.Label>{t("mobile.agent.home.addAgent")}</Button.Label>
                 </Button>
               </View>
             ) : null
@@ -253,7 +411,7 @@ export function ConnectedScreen() {
           headerLeft: isAndroid
             ? () => (
                 <View className="flex-row items-center gap-2">
-                  <HeaderIconButton accessibilityLabel="Open servers" onPress={openDrawer}>
+                  <HeaderIconButton accessibilityLabel={t("mobile.agent.home.openServers")} onPress={openDrawer}>
                     <Layers3 color={iconColor} size={22} strokeWidth={1.8} />
                   </HeaderIconButton>
                   <ConnectionHeaderStatus server={hasSelectedServer ? activeServer : undefined} />
@@ -263,14 +421,20 @@ export function ConnectedScreen() {
           headerRight: isAndroid
             ? () => (
                 <View className="flex-row items-center gap-1">
-                  {IS_AGENT_SEARCH_ENABLED ? (
-                    <HeaderIconButton accessibilityLabel="Search agents" onPress={() => router.push("/search-agents")}>
-                      <Search color={iconColor} size={22} strokeWidth={1.9} />
-                    </HeaderIconButton>
-                  ) : null}
+                  <HeaderIconButton
+                    accessibilityLabel={t("mobile.agent.home.searchAgents")}
+                    onPress={() => {
+                      void haptics.impact("soft");
+                      router.push("/search-agents");
+                    }}
+                  >
+                    <Search color={iconColor} size={22} strokeWidth={1.9} />
+                  </HeaderIconButton>
                   <MenuView
                     actions={optionsActions}
                     onPressAction={(event) => {
+                      if (event.nativeEvent.event === "add-section")
+                        router.push({ pathname: "/section-form", params: { serverId: activeServer.id } });
                       if (event.nativeEvent.event === "add-agent") router.push("/add-agent");
                       if (event.nativeEvent.event === "add-channel")
                         router.push({ pathname: "/add-channel", params: { serverId: activeServer.id } });
@@ -279,7 +443,7 @@ export function ConnectedScreen() {
                     style={{ height: 44, width: 44 }}
                   >
                     <View
-                      accessibilityLabel="Chat options"
+                      accessibilityLabel={t("mobile.agent.home.chatOptions")}
                       accessibilityRole="button"
                       accessible
                       className="size-11 items-center justify-center rounded-full"
@@ -304,24 +468,38 @@ export function ConnectedScreen() {
             </Stack.Toolbar.View>
           </Stack.Toolbar>
           <Stack.Toolbar placement="right">
-            {IS_AGENT_SEARCH_ENABLED ? (
-              <Stack.Toolbar.Button icon="magnifyingglass" onPress={() => router.push("/search-agents")} />
-            ) : null}
-            <Stack.Toolbar.Menu icon="plus" accessibilityLabel="Chat options">
-              <Stack.Toolbar.MenuAction icon="plus.circle" onPress={() => router.push("/add-agent")}>
-                Add agent
+            <Stack.Toolbar.Button
+              icon="magnifyingglass"
+              accessibilityLabel={t("mobile.agent.home.searchAgents")}
+              separateBackground
+              onPress={() => {
+                void haptics.impact("soft");
+                router.push("/search-agents");
+              }}
+            />
+            <Stack.Toolbar.Menu icon="plus" accessibilityLabel={t("mobile.agent.home.chatOptions")} separateBackground>
+              <Stack.Toolbar.MenuAction icon="plus.circle" onPress={() => openFromMenu("/add-agent")}>
+                {t("mobile.agent.home.addAgent")}
               </Stack.Toolbar.MenuAction>
+              {sidebar?.layout ? (
+                <Stack.Toolbar.MenuAction
+                  icon="folder.badge.plus"
+                  onPress={() => openFromMenu({ pathname: "/section-form", params: { serverId: activeServer.id } })}
+                >
+                  {t("mobile.agent.sectionForm.newTitle")}
+                </Stack.Toolbar.MenuAction>
+              ) : null}
               {channels.supported ? (
                 <Stack.Toolbar.MenuAction
                   icon="number"
-                  onPress={() => router.push({ pathname: "/add-channel", params: { serverId: activeServer.id } })}
+                  onPress={() => openFromMenu({ pathname: "/add-channel", params: { serverId: activeServer.id } })}
                 >
-                  New channel
+                  {t("mobile.agent.home.newChannel")}
                 </Stack.Toolbar.MenuAction>
               ) : null}
               {hasHiddenChats ? (
-                <Stack.Toolbar.MenuAction icon="eye.slash" onPress={() => router.push("/hidden-chats")}>
-                  Hidden chats
+                <Stack.Toolbar.MenuAction icon="eye.slash" onPress={() => openFromMenu("/hidden-chats")}>
+                  {t("mobile.agent.hidden.title")}
                 </Stack.Toolbar.MenuAction>
               ) : null}
             </Stack.Toolbar.Menu>

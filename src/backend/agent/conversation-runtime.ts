@@ -1,7 +1,8 @@
+import { sortConversationMessages } from "@openbot/contracts/conversation-order";
 import type { AgentEvent, AgentSummary, ConversationSnapshot } from "@openbot/contracts/ipc";
+import { sourceText } from "@openbot/i18n/source";
 import type { AgentClient } from "../agent-client";
 import type { AgentStore } from "../agent-store";
-import { sortConversationMessages } from "../conversation-snapshots";
 import type { OpenBotDatabase } from "../openbot-database";
 import { conversationContentSignature } from "./delivery-content";
 
@@ -250,6 +251,13 @@ export class ConversationRuntime {
     this.#loadedThreads.delete(externalThreadId);
   }
 
+  /** Forgets the sessions one stopped process held, and leaves those of every other provider loaded. */
+  unloadClientThreads(client: AgentClient): void {
+    for (const [externalThreadId, owner] of this.#loadedThreads) {
+      if (owner === client) this.#loadedThreads.delete(externalThreadId);
+    }
+  }
+
   /**
    * Every provider session this agent holds: its own chat, and each channel thread it runs. The
    * developer instructions are written when a session loads, so a change of the profile or of the
@@ -260,6 +268,16 @@ export class ConversationRuntime {
     for (const [externalThreadId, owner] of this.#threadToAgent) {
       if (owner === agentId) this.#loadedThreads.delete(externalThreadId);
     }
+  }
+
+  /** Every loaded provider session of this agent, its channel threads included, with its client. */
+  loadedAgentThreads(agentId: string): Array<[externalThreadId: string, client: AgentClient]> {
+    const loaded: Array<[string, AgentClient]> = [];
+    for (const [externalThreadId, owner] of this.#threadToAgent) {
+      const client = owner === agentId ? this.#loadedThreads.get(externalThreadId) : undefined;
+      if (client) loaded.push([externalThreadId, client]);
+    }
+    return loaded;
   }
 
   forgetExecutionThread(threadId: string): void {
@@ -332,7 +350,7 @@ export class ConversationRuntime {
 
   requireKnownAgent(agentId: string): AgentSummary {
     const agent = this.#listAgents().find((candidate) => candidate.id === agentId);
-    if (!agent) throw new Error(`Unknown agent: ${agentId}`);
+    if (!agent) throw new Error(sourceText("error.agent.unknown", { id: agentId }));
     return agent;
   }
 }

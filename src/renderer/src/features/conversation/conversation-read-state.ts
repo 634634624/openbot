@@ -5,12 +5,13 @@ import type {
   DirectMessage,
 } from "@openbot/contracts/ipc";
 import {
+  CONTEXT_RESET_ITEM_TYPE,
   HOSTED_SITE_EVENT_ITEM_TYPE_PREFIX,
   ROUTINE_EVENT_ITEM_TYPE_PREFIX,
   ROUTINE_RUN_EVENT_ITEM_TYPE_PREFIX,
   SKILL_EVENT_ITEM_TYPE_PREFIX,
 } from "@openbot/contracts/ipc";
-import type { AgentMessage } from "../../data";
+import type { AgentMessage } from "@openbot/ui/data";
 
 /**
  * What the renderer has already asked main to mark read, per conversation. A
@@ -31,7 +32,8 @@ export function isRoutineEventItem(message: { itemType?: string }): boolean {
     message.itemType?.startsWith(ROUTINE_EVENT_ITEM_TYPE_PREFIX) === true ||
     message.itemType?.startsWith(ROUTINE_RUN_EVENT_ITEM_TYPE_PREFIX) === true ||
     message.itemType?.startsWith(HOSTED_SITE_EVENT_ITEM_TYPE_PREFIX) === true ||
-    message.itemType?.startsWith(SKILL_EVENT_ITEM_TYPE_PREFIX) === true
+    message.itemType?.startsWith(SKILL_EVENT_ITEM_TYPE_PREFIX) === true ||
+    message.itemType === CONTEXT_RESET_ITEM_TYPE
   );
 }
 
@@ -49,6 +51,7 @@ function isIncoming(message: { itemType?: string }, fromUser: boolean): boolean 
     !fromUser &&
     message.itemType !== "commentary" &&
     message.itemType !== "agent_attachment" &&
+    message.itemType !== "plan" &&
     !isRoutineEventItem(message)
   );
 }

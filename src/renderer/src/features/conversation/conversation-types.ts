@@ -8,16 +8,22 @@ import type {
   AvatarImageInput,
   BrowserControlState,
   BrowserTab,
+  CustomAgentSummary,
   CustomProviderSummary,
   DraftAttachment,
   FilePreview,
   ProviderRuntimeStatus,
   QueueSnapshot,
+  RoutineFields,
   ServerSummary,
   TeamPresenceSnapshot,
   UpdateAgentInput,
 } from "@openbot/contracts/ipc";
-import type { AgentMessage, AgentProfile } from "../../data";
+import type { AgentMessage, AgentProfile } from "@openbot/ui/data";
+import type { BrowserViewRuntime } from "@openbot/ui/features/browser/BrowserLiveView";
+import type { AccountProfilePanelProps } from "@openbot/ui/features/settings/AccountProfilePanel";
+import type { JSX } from "@solidjs/web";
+import type { ConversationRuntime } from "./conversation-runtime";
 
 /**
  * What a conversation is, as data. These live apart from `ConversationView.tsx`
@@ -34,6 +40,12 @@ export interface ConversationTarget {
 }
 
 export interface ConversationProps {
+  runtime?: ConversationRuntime;
+  notice?: JSX.Element;
+  onOpenUsage?: (trigger: HTMLButtonElement) => void;
+  onOpenMarketplace?: () => void;
+  platform?: import("@openbot/contracts/ipc").AppInfo["platform"];
+
   agentStatus: AgentStatus;
   /**
    * The plan windows for the active agent's provider and model, when the account dock has them.
@@ -49,6 +61,8 @@ export interface ConversationProps {
    * its provider - the same path `providerRuntimeStatuses` above already takes.
    */
   customProviders?: readonly CustomProviderSummary[];
+  /** The user's own ACP agents on this computer, for the model picker's Custom tab. */
+  customAgents?: readonly CustomAgentSummary[];
   onDownloadProvider?: (provider: AgentProviderId) => void | Promise<void>;
   onCancelProviderDownload?: (provider: AgentProviderId) => void | Promise<void>;
   onConnectProvider?: (provider: AgentProviderId) => void | Promise<void>;
@@ -61,6 +75,8 @@ export interface ConversationProps {
   agent: AgentProfile | undefined;
   agents: AgentProfile[];
   availableRoutineIds?: readonly string[];
+  /** The agent's routines, for the chat card of a routine the agent created or changed. */
+  routines?: readonly RoutineFields[];
   modelOptions: AgentModelOption[];
   messages: AgentMessage[];
   messageReferences?: Record<string, AgentMessage>;
@@ -74,8 +90,21 @@ export interface ConversationProps {
   activeTurnId: string | null | undefined;
   activityDetail?: string;
   skillsMarketplaceOpen?: boolean;
+  /**
+   * True while a surface that can add or remove one of the host's MCP servers is open: the server
+   * settings dialog and the marketplace, where a plugin installs its app. The composer reads the
+   * list again when the last of them closes, so a server added there can be tagged without a
+   * restart.
+   */
+  mcpSettingsOpen?: boolean;
   globalOverlayOpen: boolean;
   settingsRequest: { agentId: string; nonce: number } | null;
+  /** The account Profile panel, for a client that has no settings dialog. `profileRequest` opens it. */
+  accountProfile?: Pick<
+    AccountProfilePanelProps,
+    "account" | "onUpdateAccountName" | "onUpdateAccountAvatar" | "onListAccountSessions" | "onRevokeAccountSession"
+  >;
+  profileRequest?: { agentId: string; nonce: number } | null;
   messageFocusRequest: { agentId: string; messageId: string; nonce: number } | null;
   queue: QueueSnapshot | undefined;
   browserTabs: BrowserTab[];
@@ -88,6 +117,8 @@ export interface ConversationProps {
    */
   workspaceCovered?: boolean;
   browserControlState: BrowserControlState;
+  /** Optional browser stream adapter for a non-Electron client. */
+  browserRuntime?: BrowserViewRuntime;
   server: ServerSummary | undefined;
   presence: TeamPresenceSnapshot;
   currentUserEmail: string;
@@ -116,6 +147,23 @@ export interface ConversationProps {
   onAnswerPrompt: (answers: Record<string, string[]>) => Promise<boolean>;
   onPromptResolutionPresented?: (agentId: string, turnId: string, requestId: string | number) => void;
   onRespondToApproval: (decision: "accept" | "decline") => Promise<boolean>;
+  /**
+   * Grants the agent a standing approval and accepts the request in hand. Absent where the grant
+   * cannot be given: the approval widens the agent's access, or the agent belongs to a remote
+   * server, whose own computer holds that choice.
+   */
+  onAlwaysAllowApproval?: () => Promise<boolean>;
+  /**
+   * Whether this agent acts without asking, by Turbo mode or by its own grant. Shown in the header,
+   * because standing consent the user cannot see is consent they cannot take back.
+   */
+  agentAutoApproves?: boolean;
+  /** Turbo mode covers every agent, so the per-agent switch is read-only while it is on. */
+  agentAutoApproveLocked?: boolean;
+  /** Absent for a remote agent: its own computer holds that choice. */
+  onSetAgentAutoApprove?: (autoApprove: boolean) => Promise<void>;
+  /** Starts a new chat with the agent. Absent when its host does not serve `context-reset-v1`. */
+  onClearAgentContext?: () => Promise<void>;
   onRespondToBrowserTakeover: (decision: "complete" | "cancel") => Promise<boolean>;
   onCancelQueuedMessage: (deliveryId: string) => void;
   onSteerQueuedMessage: (deliveryId: string) => void;
@@ -130,7 +178,6 @@ export interface ConversationProps {
   onActivateBrowserTab: (tabId: string) => void;
   onCloseBrowserTab: (tabId: string) => void | Promise<void>;
   onOpenRemoteDesktop: (serverId: string, trigger: HTMLElement) => Promise<void>;
-  onOpenAgentSetup: () => Promise<void>;
   onStop: () => void;
 }
 
@@ -145,7 +192,7 @@ export interface ComposerDraft {
  * the main process reads; an attachment is named by its record, because its bytes arrive over
  * `previewUrl` and "open externally" goes through the attachment handler instead of a path.
  */
-export type SidebarFilePreviewSource =
+type SidebarFilePreviewSource =
   | { kind: "shared"; path: string }
   | { kind: "workspace"; path: string }
   | { kind: "attachment"; attachment: AttachmentSummary };
@@ -156,4 +203,12 @@ export interface SidebarFilePreview {
   preview: FilePreview;
 }
 
-export type RightPanelMode = "none" | "browser" | "browser-expanded" | "browser-pip" | "settings" | "file-preview";
+export type RightPanelMode =
+  | "none"
+  | "browser"
+  | "browser-expanded"
+  | "browser-pip"
+  | "settings"
+  | "profile"
+  | "file-preview"
+  | "files";

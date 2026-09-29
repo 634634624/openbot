@@ -1,7 +1,8 @@
 import type { ChannelMessage, ChannelPage } from "@openbot/contracts/ipc";
 import { channelRoutingConversationEventItemType } from "@openbot/contracts/ipc";
-import { describe, expect, it } from "vitest";
-import type { AgentProfile } from "../../data";
+import type { AgentProfile } from "@openbot/ui/data";
+import { assert, describe, expect, it } from "vitest";
+import { mergeChannelPage } from "./channel-page-merge";
 import { channelTimelineEntries, firstUnreadChannelMessageId, isOwnChannelAuthor } from "./channel-timeline";
 
 const now = new Date(2026, 8, 9, 14, 0);
@@ -98,8 +99,8 @@ describe("channelTimelineEntries", () => {
       options,
     );
     expect(entries.map((entry) => entry.author.kind)).toEqual(["you", "agent"]);
-    expect(entries[0].message.author).toBe("you");
-    expect(entries[1].author.agent?.id).toBe(chief.id);
+    expect(entries[0]?.message.author).toBe("you");
+    expect(entries[1]?.author.agent?.id).toBe(chief.id);
   });
 
   it("draws another person of the team as an author, not as the reader", () => {
@@ -116,7 +117,7 @@ describe("channelTimelineEntries", () => {
       (id) => id === "local",
       options,
     );
-    expect(entries[0].author).toMatchObject({ kind: "agent", name: "Ada" });
+    expect(entries[0]?.author).toMatchObject({ kind: "agent", name: "Ada" });
   });
 
   it("draws the lead routing dispatch as activity that names the member it went to", () => {
@@ -135,13 +136,13 @@ describe("channelTimelineEntries", () => {
       () => false,
       options,
     );
-    expect(entries[0].message.actionMarker).toMatchObject({
+    expect(entries[0]?.message.actionMarker).toMatchObject({
       kind: "channel-routing",
       action: "assigned",
       agentId: "ada",
     });
     // Activity carries no author block: the row draws no face and no name of its own.
-    expect(entries[0].showAuthor).toBe(false);
+    expect(entries[0]?.showAuthor).toBe(false);
   });
 
   it("leaves an ordinary agent message without an activity marker", () => {
@@ -159,8 +160,10 @@ describe("channelTimelineEntries", () => {
       () => false,
       options,
     );
-    expect(entries[0].message.actionMarker).toBeUndefined();
-    expect(entries[0].author).toMatchObject({ kind: "agent", name: "Chief", agent: chief, avatarSeed: undefined });
+    const [entry] = entries;
+    assert(entry);
+    expect(entry.message.actionMarker).toBeUndefined();
+    expect(entry.author).toMatchObject({ kind: "agent", name: "Chief", agent: chief, avatarSeed: undefined });
   });
 
   it("names the author again under a routing receipt", () => {
@@ -199,7 +202,7 @@ describe("channelTimelineEntries", () => {
       () => true,
       options,
     );
-    expect(entries[0].author).toMatchObject({ kind: "agent", name: "Channel" });
+    expect(entries[0]?.author).toMatchObject({ kind: "agent", name: "Channel" });
   });
 
   it("hides the repeated name inside a run by one author", () => {
@@ -228,8 +231,8 @@ describe("channelTimelineEntries", () => {
       () => false,
       options,
     );
-    expect(entries[1].dayMarker).toBe("Today 12:01 AM");
-    expect(entries[1].showAuthor).toBe(true);
+    expect(entries[1]?.dayMarker).toBe("Today 12:01 AM");
+    expect(entries[1]?.showAuthor).toBe(true);
   });
 
   it("seeds the face of a deleted author from its id", () => {
@@ -246,8 +249,10 @@ describe("channelTimelineEntries", () => {
       () => false,
       options,
     );
-    expect(entries[0].author).toMatchObject({ name: "Sales Outbound", avatarSeed: "agent-gone" });
-    expect(entries[0].author.agent).toBeUndefined();
+    const [entry] = entries;
+    assert(entry);
+    expect(entry.author).toMatchObject({ name: "Sales Outbound", avatarSeed: "agent-gone" });
+    expect(entry.author.agent).toBeUndefined();
   });
 
   it("marks a streaming message so the bubble can reveal it", () => {
@@ -265,7 +270,7 @@ describe("channelTimelineEntries", () => {
       () => false,
       options,
     );
-    expect(entries[0].message.streaming).toBe(true);
+    expect(entries[0]?.message.streaming).toBe(true);
   });
 
   it("starts the unread part the counted number of messages back", () => {
@@ -370,5 +375,55 @@ describe("isOwnChannelAuthor", () => {
     expect(isOwnChannelAuthor("local-user:user-1", host)).toBe(true);
     expect(isOwnChannelAuthor("member-2", host)).toBe(false);
     expect(isOwnChannelAuthor("local-user:user-2", host)).toBe(false);
+  });
+});
+
+function pageMessage(sequence: number): ChannelMessage {
+  return {
+    id: `m${sequence}`,
+    channelId: "channel-1",
+    sequence,
+    author: { kind: "member", id: "person", name: "You" },
+    taskId: null,
+    superseded: false,
+    message: {
+      id: `m${sequence}`,
+      author: "user",
+      text: `Message ${sequence}`,
+      createdAt: "2026-09-09T12:00:00.000Z",
+      status: "completed",
+      replyToMessageId: null,
+    },
+  };
+}
+
+describe("mergeChannelPage", () => {
+  it("keeps the loaded transcript when the fetched window continues it", () => {
+    const merged = mergeChannelPage([pageMessage(1), pageMessage(2)], [pageMessage(3), pageMessage(4)]);
+    expect(merged.messages.map((item) => item.sequence)).toEqual([1, 2, 3, 4]);
+    expect(merged.takeFetchedCursor).toBe(false);
+  });
+
+  it("keeps the loaded transcript when the fetched window overlaps it", () => {
+    const merged = mergeChannelPage(
+      [pageMessage(1), pageMessage(2), pageMessage(3)],
+      [pageMessage(2), pageMessage(3), pageMessage(4)],
+    );
+    expect(merged.messages.map((item) => item.sequence)).toEqual([1, 2, 3, 4]);
+    expect(merged.takeFetchedCursor).toBe(false);
+  });
+
+  it("drops the loaded transcript when messages arrived between the two blocks", () => {
+    // Sequences 3 to 9 are outside the fetched window and outside the loaded block. Keeping the
+    // loaded block would leave them unreachable, because its cursor starts below sequence 1.
+    const merged = mergeChannelPage([pageMessage(1), pageMessage(2)], [pageMessage(10), pageMessage(11)]);
+    expect(merged.messages.map((item) => item.sequence)).toEqual([10, 11]);
+    expect(merged.takeFetchedCursor).toBe(true);
+  });
+
+  it("takes the fetched window and its cursor when nothing is loaded below it", () => {
+    const merged = mergeChannelPage([], [pageMessage(1), pageMessage(2)]);
+    expect(merged.messages.map((item) => item.sequence)).toEqual([1, 2]);
+    expect(merged.takeFetchedCursor).toBe(true);
   });
 });

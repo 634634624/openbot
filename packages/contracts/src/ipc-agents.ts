@@ -11,7 +11,34 @@ import {
 import { type AgentProviderId, isAgentProvider } from "./ipc-agent-status";
 import { isBoundedString, isIdentifier } from "./ipc-bounded-values";
 import type { SidebarLayoutSnapshot } from "./ipc-sidebar-layout";
-import { isBoolean, isDynamicRecord, isNumber } from "./runtime-values";
+import { isBoolean, isDynamicRecord, isNumber, isOneOf } from "./runtime-values";
+
+/**
+ * How far an agent may reach on this computer. `workspace` limits writes to the agent's workspace, the
+ * shared folder and the temporary folders; `full` is the unrestricted access every agent had before the setting existed.
+ */
+export const AGENT_ACCESS_MODES = ["full", "workspace"] as const;
+export type AgentAccess = (typeof AGENT_ACCESS_MODES)[number];
+export const DEFAULT_AGENT_ACCESS: AgentAccess = "full";
+
+export function isAgentAccess(value: unknown): value is AgentAccess {
+  return isOneOf(AGENT_ACCESS_MODES, value);
+}
+
+/** Whether the agent may use Computer Use. Absent means on, as for every agent before the setting existed. */
+export function agentComputerUseEnabled(agent: Pick<AgentSummary, "computerUse">): boolean {
+  return agent.computerUse !== false;
+}
+
+/**
+ * Whether this agent runs inside the workspace sandbox now. Every provider enforces it. Codex runs the
+ * agent in its `workspace-write` sandbox. Claude runs Bash in its sandbox and asks before a file edit
+ * outside the roots. Grok and OpenCode run the agent in a provider process of its own, inside an
+ * operating system sandbox (`process-confinement.ts`); on Linux and Windows that process does not start.
+ */
+export function workspaceAccessEnforced(agent: Pick<AgentSummary, "access">): boolean {
+  return agent.access === "workspace";
+}
 
 function isMarketplaceSource(value: unknown): value is NonNullable<AgentSummary["marketplaceSource"]> {
   return (
@@ -38,6 +65,16 @@ export interface AgentSummary {
   provider: AgentProviderId;
   model: AgentModelId;
   reasoningEffort: AgentReasoningEffort;
+  /**
+   * Local-only, like Auto approve: the Team API does not carry it, so an agent read from a remote host
+   * has none. Absent means `DEFAULT_AGENT_ACCESS`.
+   */
+  access?: AgentAccess;
+  /**
+   * Whether the agent gets the Computer Use tools. Local-only, like `access`. Absent means on; see
+   * `agentComputerUseEnabled`.
+   */
+  computerUse?: boolean;
   threadId: string | null;
   workspacePath: string;
   preview: string;
@@ -65,6 +102,8 @@ export function isAgentSummary(value: unknown): value is AgentSummary {
     isAgentProvider(value.provider) &&
     isAgentModel(value.model) &&
     isReasoningEffort(value.reasoningEffort) &&
+    (value.access === undefined || isAgentAccess(value.access)) &&
+    (value.computerUse === undefined || isBoolean(value.computerUse)) &&
     (value.threadId === null || isIdentifier(value.threadId)) &&
     isBoundedString(value.workspacePath, INPUT_LIMITS.path) &&
     isBoundedString(value.preview, INPUT_LIMITS.messageText) &&
@@ -102,6 +141,8 @@ export interface UpdateAgentInput {
   provider?: AgentProviderId;
   model?: AgentModelId;
   reasoningEffort?: AgentReasoningEffort;
+  access?: AgentAccess;
+  computerUse?: boolean;
   avatarSeed?: string;
   avatarHue?: AvatarHue | null;
 }

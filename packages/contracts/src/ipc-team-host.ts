@@ -1,5 +1,6 @@
 import type { AvatarImageInput } from "./ipc-agents";
 import type { IceServer } from "./signal-protocol/messages";
+import type { HostRestartEvent, HostRestartState } from "./team-protocol/host-update-v1";
 
 // The id every IPC payload carries for "this computer" rather than a remote team server. It is a
 // wire value the main process, the preload bridge and the renderer all compare against, so it lives
@@ -31,8 +32,37 @@ export interface ServerCompatibility {
   capabilities: string[];
 }
 
+// How much of a server's agent activity reaches the desktop as an OS notification. "needs-me" keeps
+// only input requests and approvals.
+export type ServerNotificationLevel = "all" | "needs-me" | "nothing";
+export const SERVER_NOTIFICATION_LEVELS: readonly ServerNotificationLevel[] = ["all", "needs-me", "nothing"];
+
+// The timed mute choices the server menu offers. A mute without a duration lasts until it is undone.
+export const SERVER_MUTE_DURATIONS_MS: readonly number[] = [
+  15 * 60_000,
+  60 * 60_000,
+  3 * 60 * 60_000,
+  8 * 60 * 60_000,
+  24 * 60 * 60_000,
+];
+
+export interface SetServerMutedInput {
+  serverId: string;
+  muted: boolean;
+  // One of `SERVER_MUTE_DURATIONS_MS`. Absent means the mute lasts until the user undoes it.
+  durationMs?: number;
+}
+
+export interface SetServerNotificationLevelInput {
+  serverId: string;
+  level: ServerNotificationLevel;
+}
+
 export interface ServerSummary {
   notificationsMuted: boolean;
+  // Epoch milliseconds when a timed mute ends; null for no mute or a mute without an end.
+  notificationsMutedUntil: number | null;
+  notificationLevel: ServerNotificationLevel;
   id: string;
   name: string;
   kind: "local" | "remote";
@@ -45,6 +75,8 @@ export interface ServerSummary {
   compatibility?: ServerCompatibility | null;
   issue?: ServerConnectionIssue | null;
   connectionSequence?: number;
+  /** The host said it restarts into an update (`host-update-v1`). Cleared when the connection comes back. */
+  hostRestart?: { state: Exclude<HostRestartState, "none">; version: string | null } | null;
 }
 
 export interface JoinServerInput {
@@ -58,6 +90,7 @@ export interface InvitePreview {
   role: Exclude<TeamRole, "owner">;
   expiresAt: string;
   emailBound: boolean;
+  permanent: boolean;
 }
 
 export interface LoginServerInput {
@@ -223,7 +256,8 @@ export type TeamRealtimeEvent =
       senderMemberId: string;
       recipientMemberId: string;
       typing: boolean;
-    };
+    }
+  | HostRestartEvent;
 
 export type DirectMessageRealtimeEvent = Extract<TeamRealtimeEvent, { type: "team-direct-message" }>;
 
@@ -256,7 +290,7 @@ export function isTeamRealtimeEvent(value: unknown): value is TeamRealtimeEvent 
   );
 }
 
-function isTeamPresenceSnapshot(value: unknown): value is TeamPresenceSnapshot {
+export function isTeamPresenceSnapshot(value: unknown): value is TeamPresenceSnapshot {
   if (!isDynamicRecord(value) || !Array.isArray(value.members)) return false;
   return (
     (value.serverId === null || isIdentifier(value.serverId)) &&
@@ -337,6 +371,8 @@ export interface InviteSummary {
   usedAt: string | null;
   inviteUrl: string;
   email: string | null;
+  permanent: boolean;
+  useCount: number;
 }
 
 export interface TeamInviteSummary {
@@ -345,11 +381,14 @@ export interface TeamInviteSummary {
   expiresAt: string;
   usedAt: string | null;
   email: string | null;
+  permanent: boolean;
+  useCount: number;
 }
 
 export interface CreateTeamInviteInput {
   role: Exclude<TeamRole, "owner">;
   email?: string;
+  permanent?: boolean;
 }
 
 export interface TeamSessionSummary {

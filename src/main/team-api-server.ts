@@ -5,6 +5,7 @@ import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import {
   AGENT_RUNTIME_SNAPSHOT_BYTES_LIMIT,
   type AgentEvent,
+  type AgentSummary,
   AnalyticsInputError,
   type DirectConversationPage,
   type DirectConversationPageAnchor,
@@ -23,17 +24,34 @@ import {
 } from "@openbot/contracts/ipc";
 import { isString } from "@openbot/contracts/runtime-values";
 import { TEAM_API_ROUTES } from "@openbot/contracts/team-api-routes";
-import { channelEvent, channelResponse, isChannelRoute } from "@openbot/contracts/team-protocol/channels-v1";
 import {
+  AGENT_ADMIN_CAPABILITY,
+  AGENT_INSTALL_CAPABILITY,
+  AGENT_UPDATE_CAPABILITY,
   CHANNEL_DELETE_CAPABILITY,
+  HOST_ADMIN_CAPABILITY,
+  HOST_UPDATE_CAPABILITY,
   isTeamCurrentCapability,
   MCP_SERVERS_CAPABILITY,
+  PROVIDERS_ADMIN_CAPABILITY,
+  PROVIDERS_RUNTIMES_V2_CAPABILITY,
+  SHARED_TABLES_CAPABILITY,
+  SKILLS_ADMIN_CAPABILITY,
+  SKILLS_EVENTS_CAPABILITY,
+  STORAGE_CAPABILITY,
   supportsTeamSemanticTags,
   TEAM_AGENT_ACTIVITY_CAPABILITY,
   TEAM_CURRENT_CAPABILITIES,
   type TeamCurrentCapability,
 } from "@openbot/contracts/team-protocol/current";
-import { isMcpRoute, mcpResponse } from "@openbot/contracts/team-protocol/mcp-v1";
+import {
+  HOST_RESTART_EVENT,
+  type HostRestartEvent,
+  type HostRestartState,
+} from "@openbot/contracts/team-protocol/host-update-v1";
+import { teamHttpCodec } from "@openbot/contracts/team-protocol/http-codecs";
+import { optionalTeamEvent } from "@openbot/contracts/team-protocol/optional-events";
+import { teamSideRouteCodec } from "@openbot/contracts/team-protocol/side-routes";
 import {
   TEAM_APP_VERSION_HEADER,
   TEAM_PROTOCOL_V1,
@@ -45,21 +63,21 @@ import {
 import {
   decodeTeamProtocolV1CurrentClientEvent,
   encodeTeamProtocolV1CurrentEvent,
-  encodeTeamProtocolV1CurrentHttpResponse,
 } from "@openbot/contracts/team-protocol/v1-adapter";
-import { TEAM_PROTOCOL_V3 } from "@openbot/contracts/team-protocol/v3";
-import { encodeTeamProtocolV3CurrentHttpResponse } from "@openbot/contracts/team-protocol/v3-adapter";
-import { TEAM_PROTOCOL_V4 } from "@openbot/contracts/team-protocol/v4";
-import { encodeTeamProtocolV4CurrentHttpResponse } from "@openbot/contracts/team-protocol/v4-adapter";
 import { encodeTeamProtocolV4BaseCurrentEvent } from "@openbot/contracts/team-protocol/v4-base-adapter";
+import { TEAM_LOCAL_PROVIDERS_CAPABILITY, TEAM_PROTOCOL_V5 } from "@openbot/contracts/team-protocol/v5";
+import { encodeTeamProtocolV5BaseCurrentEvent } from "@openbot/contracts/team-protocol/v5-base-adapter";
+import { sourceText } from "@openbot/i18n/source";
 import { createOpenBotLogger, toLogValue } from "@openbot/logging";
 import type * as Ws from "ws";
+import { duplicateAgentIntoLayout } from "../backend/agent/duplication-gate";
 import { McpServerError } from "../backend/mcp-server-store";
 import type { TeamChatStore } from "../backend/team-chat-store";
+import { LifecycleGate } from "./lifecycle-gate";
 import { RemoteScreenError } from "./remote-screen-gateway";
 import type { TeamApiOptions, TeamApiSidebarLayout } from "./team-api/dependencies";
 import { HttpError } from "./team-api/http-error";
-import { hiddenProviderAgentIds, legacyProviderView } from "./team-api/provider-visibility";
+import { hiddenAgentView, hiddenProviderAgentIds, legacyProviderView } from "./team-api/provider-visibility";
 import type { RouteOutcome, TeamApiRequestContext } from "./team-api/request-context";
 import {
   bearerToken,
@@ -72,13 +90,22 @@ import {
   requestProtocol,
   stringField,
 } from "./team-api/request-helpers";
+import { routeAgentAdmin } from "./team-api/route-agent-admin";
+import { routeAgentInstall } from "./team-api/route-agent-install";
 import { routeAgents } from "./team-api/route-agents";
 import { routeBrowser } from "./team-api/route-browser";
 import { routeChannels } from "./team-api/route-channels";
+import { routeContextReset } from "./team-api/route-context-reset";
 import { routeDirect } from "./team-api/route-direct";
 import { routeFiles } from "./team-api/route-files";
+import { routeHostAdmin } from "./team-api/route-host-admin";
+import { routeHostUpdate } from "./team-api/route-host-update";
 import { routeMcpServers } from "./team-api/route-mcp";
+import { routeProviders } from "./team-api/route-providers";
 import { routeRemoteScreen } from "./team-api/route-remote-screen";
+import { routeSharedTables } from "./team-api/route-shared-tables";
+import { routeSkillsAdmin } from "./team-api/route-skills-admin";
+import { routeStorage } from "./team-api/route-storage";
 import { routeTeam } from "./team-api/route-team";
 import { TeamStoreError } from "./team-store";
 
@@ -129,6 +156,7 @@ export class TeamApiServer {
   readonly #options: Omit<TeamApiOptions, "sidebarLayout"> & { sidebarLayout: TeamApiSidebarLayout };
   readonly #rateLimits = new Map<string, RateEntry>();
   readonly #eventClients = new Map<Ws.WebSocket, EventClientState>();
+  #hostRestart: HostRestartEvent = { type: HOST_RESTART_EVENT, state: "none", version: null };
   readonly #responseRoutes = new WeakMap<
     ServerResponse,
     { method: string; path: string; protocol: number; capabilities: Set<string>; hiddenAgentIds?: ReadonlySet<string> }
@@ -149,11 +177,13 @@ export class TeamApiServer {
   readonly #rateLimitCapacity: number;
   readonly #now: () => number;
   #server: Server | null = null;
+  readonly #lifecycle = new LifecycleGate<number>();
   #port: number | null = null;
   #heartbeat: ReturnType<typeof setInterval> | null = null;
   #agentListener: ((event: AgentEvent) => void) | null = null;
   #sidebarLayoutListener: ((layout: SidebarLayoutSnapshot) => void) | null = null;
   #localTypingAgentId: string | null = null;
+  readonly #reportedUnrepresentableAgents = new Set<string>();
   #nextRateLimitSweepAt = 0;
 
   constructor(options: TeamApiOptions) {
@@ -166,13 +196,29 @@ export class TeamApiServer {
     return this.#port;
   }
 
-  async start(): Promise<number> {
+  // Without the gate, two starts at once open two listeners and lose one, and a stop during a start
+  // runs before the listener exists. A listener lost that way stays open for the previous account.
+  start(): Promise<number> {
+    return this.#lifecycle.start(() => this.#start());
+  }
+
+  stop(): Promise<void> {
+    return this.#lifecycle.stop(() => this.#stop());
+  }
+
+  async #start(): Promise<number> {
     if (this.#server && this.#port) return this.#port;
     this.#server = createServer((request, response) => void this.#handle(request, response));
     this.#server.on("upgrade", (request, socket, head) => {
       const url = new URL(request.url ?? "/", "http://127.0.0.1");
       if (this.#options.remoteScreen?.handlesUpgrade(url)) {
         this.#options.remoteScreen.handleUpgrade(request, socket, head, url);
+        return;
+      }
+      // Like the remote screen, and above the token check for the same reason: a tunneled view
+      // socket carries the WebRTC session this host opened it for rather than a member's token.
+      if (this.#options.browserView?.handlesUpgrade(url)) {
+        this.#options.browserView.handleUpgrade(request, socket, head, url);
         return;
       }
       const protocols = (request.headers["sec-websocket-protocol"] ?? "").split(",").map((value) => value.trim());
@@ -223,7 +269,7 @@ export class TeamApiServer {
       this.#server?.listen(0, "127.0.0.1", () => resolve());
     });
     const address = this.#server.address();
-    if (!address || isString(address)) throw new Error("Could not bind the team API.");
+    if (!address || isString(address)) throw new Error(sourceText("error.team.bindFailed"));
     this.#port = address.port;
     this.#agentListener = (event) => this.#broadcastAgentEvent(event);
     this.#options.agents.on("event", this.#agentListener);
@@ -241,7 +287,7 @@ export class TeamApiServer {
     return this.#port;
   }
 
-  async stop(): Promise<void> {
+  async #stop(): Promise<void> {
     if (this.#heartbeat) clearInterval(this.#heartbeat);
     this.#heartbeat = null;
     if (this.#agentListener) this.#options.agents.off("event", this.#agentListener);
@@ -257,6 +303,7 @@ export class TeamApiServer {
     this.#localTypingAgentId = null;
     try {
       await this.#options.remoteScreen?.stop();
+      await this.#options.browserView?.stop();
     } finally {
       // The heartbeat and the event listeners are already gone. Leaving the socket open
       // would let the next `start()` hand back its port unchanged, so the previous account
@@ -322,6 +369,20 @@ export class TeamApiServer {
       const payload = this.#encodeProviderEvent(event, connection.capabilities);
       if (payload && client.readyState === webSockets.WebSocket.OPEN) client.send(payload);
     }
+  }
+
+  /**
+   * Tells every member with `host-update-v1` that this host restarts into an update. It is outside the
+   * frozen event vocabulary, so it bypasses the encoders like a channel event does.
+   */
+  announceHostRestart(state: HostRestartState, version: string | null): void {
+    this.#hostRestart = { type: HOST_RESTART_EVENT, state, version };
+    for (const [client, connection] of this.#eventClients) this.#sendHostRestart(client, connection);
+  }
+
+  #sendHostRestart(client: Ws.WebSocket, connection: EventClientState): void {
+    if (!connection.capabilities.has(HOST_UPDATE_CAPABILITY)) return;
+    if (client.readyState === webSockets.WebSocket.OPEN) client.send(JSON.stringify(this.#hostRestart));
   }
 
   listDirectThreads(memberId: string): DirectThreadSummary[] {
@@ -460,7 +521,7 @@ export class TeamApiServer {
               identity.serverId,
             )
           : null;
-        if (!user) return this.#json(response, 401, { error: "OpenBot sign-in is required." });
+        if (!user) return this.#json(response, 401, { error: sourceText("error.team.signInRequired") });
         this.#checkRate(request, user.email);
         const result = await this.#options.store.acceptInviteWithAccount(
           stringField(body, "inviteToken", false, INPUT_LIMITS.identifier),
@@ -486,7 +547,7 @@ export class TeamApiServer {
               identity.serverId,
             )
           : null;
-        if (!user) return this.#json(response, 401, { error: "OpenBot sign-in is required." });
+        if (!user) return this.#json(response, 401, { error: sourceText("error.team.signInRequired") });
         this.#checkRate(request, user.email);
         return this.#json(response, 200, await this.#options.store.loginWithAccount(user));
       }
@@ -496,20 +557,27 @@ export class TeamApiServer {
       const token = bearerToken(request.headers.authorization);
       const authenticated = token ? this.#options.store.authenticateSession(token) : null;
       if (!authenticated || !token) {
-        return this.#json(response, 401, { error: "Authentication required." });
+        return this.#json(response, 401, { error: sourceText("error.team.authenticationRequired") });
       }
       const context = this.#requestContext(request, response, url, token, authenticated);
-      if (context.protocol < 4) {
-        const hidden = hiddenProviderAgentIds(this.#options.agents.listAgents());
-        const responseRoute = this.#responseRoutes.get(response);
-        if (responseRoute) responseRoute.hiddenAgentIds = hidden;
-        const agentId = url.pathname.match(/^\/v1\/agents\/([^/]+)/u)?.[1];
-        if (
-          (agentId && hidden.has(pathIdentifier(agentId, "agentId"))) ||
-          [url.searchParams.get("agentId"), url.searchParams.get("botId")].some((id) => id !== null && hidden.has(id))
-        ) {
-          throw new HttpError(404, "Agent not found.");
-        }
+      const agents = this.#options.agents.listAgents();
+      const hidden = hiddenProviderAgentIds(agents, context.protocol);
+      for (const id of this.#unrepresentableAgentIds(
+        agents.filter((agent) => !hidden.has(agent.id)),
+        context.protocol,
+        context.capabilities,
+      ))
+        hidden.add(id);
+      // Every protocol gets the projection, also with no hidden agent: a provider status row, a
+      // model or an auth state of a local-only provider can be in the response.
+      const responseRoute = this.#responseRoutes.get(response);
+      if (responseRoute) responseRoute.hiddenAgentIds = hidden;
+      const agentId = url.pathname.match(/^\/v1\/agents\/([^/]+)/u)?.[1];
+      if (
+        (agentId && hidden.has(pathIdentifier(agentId, "agentId"))) ||
+        [url.searchParams.get("agentId"), url.searchParams.get("botId")].some((id) => id !== null && hidden.has(id))
+      ) {
+        throw new HttpError(404, sourceText("error.team.agentNotFound"));
       }
 
       // First module that does not say "unmatched" wins, and the dispatcher then does nothing at
@@ -527,11 +595,24 @@ export class TeamApiServer {
       if ((await this.#routeBrowser(context)) === "handled") return;
       if ((await this.#routeFiles(context)) === "handled") return;
       if ((await routeChannels(context, this.#options.channels, this.#options.agents)) === "handled") return;
-      if ((await routeMcpServers(context, this.#options.mcpServers)) === "handled") return;
+      if (
+        (await routeMcpServers(context, this.#options.mcpServers, this.#options.mcpToolRuntimePreparation)) ===
+        "handled"
+      )
+        return;
+      if ((await routeStorage(context, this.#options.storage)) === "handled") return;
+      if ((await routeAgentAdmin(context, this.#options.admin)) === "handled") return;
+      if ((await routeSkillsAdmin(context, this.#options.admin)) === "handled") return;
+      if ((await routeSharedTables(context, this.#options.admin)) === "handled") return;
+      if ((await routeAgentInstall(context, this.#options.admin)) === "handled") return;
+      if ((await routeProviders(context, this.#options.admin)) === "handled") return;
+      if ((await routeHostAdmin(context, this.#options.admin)) === "handled") return;
+      if ((await routeHostUpdate(context, this.#options.admin)) === "handled") return;
+      if ((await routeContextReset(context, this.#options.agents, hidden)) === "handled") return;
       if ((await this.#routeAgents(context)) === "handled") return;
 
       // The only 404 in the Team API.
-      return this.#json(response, 404, { error: "Route not found." });
+      return this.#json(response, 404, { error: sourceText("error.team.routeNotFound") });
     } catch (error) {
       // The only catch, too. A module with its own would cut an unexpected error off from the
       // logger below and answer 400 where the failure was a 500 nobody would then ever see.
@@ -543,7 +624,7 @@ export class TeamApiServer {
         error instanceof AnalyticsInputError;
       const status =
         error instanceof HttpError || error instanceof RemoteScreenError ? error.status : expected ? 400 : 500;
-      const message = expected ? error.message : "Request failed.";
+      const message = expected ? error.message : sourceText("error.team.requestFailed");
       const code = error instanceof RemoteScreenError ? error.code : undefined;
       if (!expected) (this.#options.logger ?? logger).error("Team API request failed:", toLogValue(error));
       return this.#json(response, status, { error: message, ...(code ? { code } : {}) });
@@ -583,7 +664,7 @@ export class TeamApiServer {
   }
 
   #routeBrowser(context: TeamApiRequestContext): Promise<RouteOutcome> {
-    return routeBrowser(context, { browser: this.#options.browser });
+    return routeBrowser(context, { browser: this.#options.browser, browserView: this.#options.browserView });
   }
 
   #routeFiles(context: TeamApiRequestContext): Promise<RouteOutcome> {
@@ -606,14 +687,14 @@ export class TeamApiServer {
     const current = this.#rateLimits.get(key);
     if (!current || current.resetAt <= now) {
       if (!current && this.#rateLimits.size >= this.#rateLimitCapacity) {
-        throw new HttpError(429, "Too many sign-in attempts. Try again later.");
+        throw new HttpError(429, sourceText("error.team.tooManySignInAttempts"));
       }
       this.#rateLimits.set(key, { attempts: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
       return;
     }
     current.attempts += 1;
     if (current.attempts > RATE_LIMIT_ATTEMPTS) {
-      throw new HttpError(429, "Too many sign-in attempts. Try again later.");
+      throw new HttpError(429, sourceText("error.team.tooManySignInAttempts"));
     }
   }
 
@@ -630,19 +711,32 @@ export class TeamApiServer {
     capabilities: ReadonlySet<string>,
     options: { preserveSemanticTags?: boolean } = {},
   ): string | null {
-    if (capabilities.has("opencode")) return encodeTeamProtocolV4BaseCurrentEvent(event, options);
-    const visible = legacyProviderView(event, hiddenProviderAgentIds(this.#options.agents.listAgents()));
-    return isAgentEvent(visible) || isTeamRealtimeEvent(visible)
-      ? encodeTeamProtocolV1CurrentEvent(visible, options)
-      : null;
+    const protocol = capabilities.has(TEAM_LOCAL_PROVIDERS_CAPABILITY) ? 5 : capabilities.has("opencode") ? 4 : 1;
+    const hidden = hiddenProviderAgentIds(this.#options.agents.listAgents(), protocol);
+    const visible = protocol === 1 ? legacyProviderView(event, hidden) : hiddenAgentView(event, hidden, protocol);
+    if (!isAgentEvent(visible) && !isTeamRealtimeEvent(visible)) return null;
+    if (protocol !== 1)
+      return (protocol === 5 ? encodeTeamProtocolV5BaseCurrentEvent : encodeTeamProtocolV4BaseCurrentEvent)(visible, {
+        ...options,
+        preserveBrowserSecrets: capabilities.has("browser-secret-handoff"),
+      });
+    return encodeTeamProtocolV1CurrentEvent(visible, options);
   }
 
   #broadcastAgentEvent(event: AgentEvent): void {
     const filteredConversationPayloads = new Map<string, string>();
 
     for (const [client, connection] of this.#eventClients) {
-      const encodeEvent = (event: AgentEvent, options = {}) =>
-        this.#encodeProviderEvent(event, connection.capabilities, options);
+      // An event this client's protocol cannot describe is skipped for this client only. Thrown
+      // out of the loop, it would stop the event for every client after this one.
+      const encodeEvent = (event: AgentEvent, options = {}) => {
+        try {
+          return this.#encodeProviderEvent(event, connection.capabilities, options);
+        } catch (error) {
+          (this.#options.logger ?? logger).warn("Team API event could not be encoded:", toLogValue(error));
+          return null;
+        }
+      };
       const encodingOptions = { preserveSemanticTags: supportsTeamSemanticTags(connection.capabilities) };
       const supportsRuntimeSnapshots = connection.capabilities.has("agent-runtime-snapshots");
       const requiredCapability = eventCapability(event);
@@ -654,10 +748,10 @@ export class TeamApiServer {
       let conversationInvalidation: string | undefined;
       let queueInvalidation: string | undefined;
       let outgoing: string;
-      const channel = channelEvent(event);
-      if (channel) {
-        if (!connection.capabilities.has("channel-chats-v1")) continue;
-        outgoing = JSON.stringify(channel);
+      // `eventCapability` above has already kept an optional event from a client without its capability.
+      const optional = optionalTeamEvent(event);
+      if (optional) {
+        outgoing = JSON.stringify(optional);
       } else if (event.type === "conversation" && supportsRuntimeSnapshots) {
         conversationInvalidation ??=
           encodeEvent({
@@ -677,7 +771,7 @@ export class TeamApiServer {
           !connection.capabilities.has("routine-run-event-markers") ||
           !connection.capabilities.has("hosted-site-event-markers"))
       ) {
-        const key = `${connection.capabilities.has("opencode")}:${connection.capabilities.has("routine-event-markers")}:${connection.capabilities.has("routine-run-event-markers")}:${connection.capabilities.has("hosted-site-event-markers")}:${encodingOptions.preserveSemanticTags}`;
+        const key = `${connection.capabilities.has(TEAM_LOCAL_PROVIDERS_CAPABILITY)}:${connection.capabilities.has("opencode")}:${connection.capabilities.has("routine-event-markers")}:${connection.capabilities.has("routine-run-event-markers")}:${connection.capabilities.has("hosted-site-event-markers")}:${encodingOptions.preserveSemanticTags}`;
         let filtered = filteredConversationPayloads.get(key);
         if (!filtered) {
           filtered =
@@ -777,10 +871,13 @@ export class TeamApiServer {
           if (acceptsCapabilityDeclaration) {
             if (!event.capabilities) throw new Error("Invalid client capabilities.");
             const snapshotsWereEnabled = connection.capabilities.has("agent-runtime-snapshots");
+            const restartWasSent = connection.capabilities.has(HOST_UPDATE_CAPABILITY);
             connection.capabilities = new Set(event.capabilities.filter(isTeamCurrentCapability));
             if (connection.capabilities.has("agent-runtime-snapshots") && !snapshotsWereEnabled) {
               this.#sendRuntimeSnapshot(client, connection, false);
             }
+            // A member that connects while a restart waits learns about it here, not at the next change.
+            if (!restartWasSent && this.#hostRestart.state !== "none") this.#sendHostRestart(client, connection);
           }
           connection.includeConversationEvents = event.includeConversations;
           return;
@@ -985,35 +1082,16 @@ export class TeamApiServer {
       }
       return pending.result;
     }
-    const result = this.#performAgentDuplication(sourceAgentId, operationId).finally(() => {
+    const result = duplicateAgentIntoLayout(
+      this.#options.agents,
+      this.#options.sidebarLayout,
+      sourceAgentId,
+      operationId,
+    ).finally(() => {
       this.#duplicateRequests.delete(operationId);
     });
     this.#duplicateRequests.set(operationId, { sourceAgentId, result });
     return result;
-  }
-
-  async #performAgentDuplication(sourceAgentId: string, operationId: string): Promise<DuplicateAgentResult> {
-    const agent = await this.#options.agents.duplicateAgent(sourceAgentId, operationId);
-    try {
-      const layout = await this.#options.sidebarLayout.placeDuplicateAfter(sourceAgentId, agent.id, [
-        ...this.#options.agents.sidebarChatIds(),
-        agent.id,
-      ]);
-      return await this.#options.agents.commitAgentDuplication(agent.id, layout);
-    } catch (error) {
-      const rollbackResults = await Promise.allSettled([
-        this.#options.agents.deleteAgent(agent.id),
-        this.#options.sidebarLayout.removeAgent(agent.id),
-      ]);
-      const rollbackErrors = rollbackResults.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
-      if (rollbackErrors.length > 0) {
-        throw new AggregateError(
-          [error, ...rollbackErrors],
-          "Agent duplication failed and the incomplete copy could not be removed.",
-        );
-      }
-      throw error;
-    }
   }
 
   #requireDirectRecipient(senderMemberId: string, recipientMemberId: string): TeamMemberSummary {
@@ -1036,31 +1114,76 @@ export class TeamApiServer {
     // the headers already sent that throw could neither answer the caller nor end the request: it
     // surfaced as a hung socket and an `ERR_HTTP_HEADERS_SENT` rejection out of `#handle`'s own
     // error path. Encoding first lets that failure become the 500 the caller can read.
-    const visibleValue = status < 400 && route.hiddenAgentIds ? legacyProviderView(value, route.hiddenAgentIds) : value;
-    const body = isChannelRoute(route.path)
-      ? JSON.stringify(channelResponse(route.path, status, visibleValue))
-      : isMcpRoute(route.path)
-        ? JSON.stringify(mcpResponse(route.path, status, visibleValue))
-        : route.protocol === TEAM_PROTOCOL_V4
-          ? encodeTeamProtocolV4CurrentHttpResponse(route.method, route.path, status, visibleValue, options)
-          : route.protocol === TEAM_PROTOCOL_V3
-            ? encodeTeamProtocolV3CurrentHttpResponse(route.method, route.path, status, visibleValue, options)
-            : encodeTeamProtocolV1CurrentHttpResponse(route.method, route.path, status, visibleValue, options);
+    const visibleValue =
+      status < 400 && route.hiddenAgentIds
+        ? route.protocol < 4
+          ? legacyProviderView(value, route.hiddenAgentIds)
+          : hiddenAgentView(value, route.hiddenAgentIds, route.protocol < 5 ? 4 : 5)
+        : value;
+    const sideRoute = teamSideRouteCodec(route.path);
+    const body = sideRoute
+      ? JSON.stringify(sideRoute.response(route.path, status, visibleValue))
+      : teamHttpCodec(route.protocol).encodeResponse(route.method, route.path, status, visibleValue, options);
     response.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
     response.end(`${body}\n`);
     return "handled";
   }
 
+  /**
+   * Agents the negotiated protocol cannot describe, such as a model id a frozen codec does not
+   * accept. They are hidden like a provider an old client does not know: one such agent must not
+   * turn the whole agent list into a 500, because a remote client then cannot load the server.
+   */
+  #unrepresentableAgentIds(
+    agents: readonly AgentSummary[],
+    protocol: number,
+    capabilities: ReadonlySet<string>,
+  ): Set<string> {
+    const codec = teamHttpCodec(protocol);
+    const options = { preserveSemanticTags: supportsTeamSemanticTags(capabilities) };
+    const hidden = new Set<string>();
+    for (const agent of agents) {
+      try {
+        codec.encodeResponse("GET", TEAM_API_ROUTES.agents.all, 200, [agent], options);
+      } catch {
+        hidden.add(agent.id);
+        const key = `${protocol}:${agent.id}`;
+        if (this.#reportedUnrepresentableAgents.has(key)) continue;
+        this.#reportedUnrepresentableAgents.add(key);
+        (this.#options.logger ?? logger).warn(
+          `Team API protocol ${protocol} cannot describe agent ${agent.id}; it is hidden from these clients.`,
+        );
+      }
+    }
+    return hidden;
+  }
+
   #protocolSupport(): TeamProtocolSupportV1 {
     return {
       appVersion: this.#options.appVersion ?? "0.0.0",
-      protocol: { minimum: TEAM_PROTOCOL_V1, maximum: TEAM_PROTOCOL_V4 },
+      protocol: { minimum: TEAM_PROTOCOL_V1, maximum: TEAM_PROTOCOL_V5 },
       capabilities: TEAM_CURRENT_CAPABILITIES.filter((capability) => {
         if (capability === "channel-chats-v1" || capability === CHANNEL_DELETE_CAPABILITY)
           return this.#options.channels !== undefined;
         // Advertised only when this host can serve it: a client that negotiated it gets a route,
         // and one that did not never shows the panel.
+        if (capability === "remote-desktop-setup")
+          return this.#options.remoteScreen?.checkSetup !== undefined && this.#options.remoteScreen?.test !== undefined;
         if (capability === MCP_SERVERS_CAPABILITY) return this.#options.mcpServers !== undefined;
+        if (capability === STORAGE_CAPABILITY) return this.#options.storage !== undefined;
+        if (capability === AGENT_ADMIN_CAPABILITY) return this.#options.admin?.agents !== undefined;
+        if (capability === SKILLS_ADMIN_CAPABILITY) return this.#options.admin?.skills !== undefined;
+        if (capability === SKILLS_EVENTS_CAPABILITY) return this.#options.skills !== undefined;
+        if (capability === SHARED_TABLES_CAPABILITY) return this.#options.admin?.sharedTables !== undefined;
+        if (capability === AGENT_INSTALL_CAPABILITY)
+          return (
+            this.#options.admin?.marketplaceAgents !== undefined && this.#options.admin?.agentTemplates !== undefined
+          );
+        if (capability === AGENT_UPDATE_CAPABILITY) return this.#options.admin?.marketplaceAgents !== undefined;
+        if (capability === PROVIDERS_ADMIN_CAPABILITY || capability === PROVIDERS_RUNTIMES_V2_CAPABILITY)
+          return this.#options.admin?.providers !== undefined;
+        if (capability === HOST_ADMIN_CAPABILITY) return this.#options.admin?.identity !== undefined;
+        if (capability === HOST_UPDATE_CAPABILITY) return this.#options.admin?.update !== undefined;
         return true;
       }),
     };
@@ -1076,7 +1199,7 @@ export class TeamApiServer {
       return {
         status: 426,
         body: {
-          error: "Update this OpenBot client before connecting to this host.",
+          error: sourceText("error.team.clientUpdateRequired"),
           code: "client_update_required",
           host,
         },
@@ -1094,14 +1217,14 @@ export class TeamApiServer {
         body: { error: "Invalid Team API protocol headers.", code: "protocol_error", host },
       };
     }
-    if (protocol >= TEAM_PROTOCOL_V1 && protocol <= TEAM_PROTOCOL_V4) return null;
+    if (protocol >= TEAM_PROTOCOL_V1 && protocol <= TEAM_PROTOCOL_V5) return null;
     const clientIsOlder = protocol < TEAM_PROTOCOL_V1;
     return {
       status: 426,
       body: {
         error: clientIsOlder
-          ? "Update this OpenBot client before connecting to this host."
-          : "Update OpenBot on the host before connecting.",
+          ? sourceText("error.team.clientUpdateRequired")
+          : sourceText("error.team.hostUpdateRequired"),
         code: clientIsOlder ? "client_update_required" : "host_update_required",
         host,
         client: { appVersion: clientAppVersion, protocol },
@@ -1151,13 +1274,13 @@ function unavailableSidebarLayout(): TeamApiSidebarLayout {
       agentOrder: [],
     }),
     mutate: async () => {
-      throw new HttpError(503, "Sidebar layout is unavailable.");
+      throw new HttpError(503, sourceText("error.team.sidebarLayoutUnavailable"));
     },
     withProfileAssignment: async () => {
-      throw new Error("Sidebar layout is unavailable.");
+      throw new Error(sourceText("error.team.sidebarLayoutUnavailable"));
     },
     placeDuplicateAfter: async () => {
-      throw new HttpError(503, "Sidebar layout is unavailable.");
+      throw new HttpError(503, sourceText("error.team.sidebarLayoutUnavailable"));
     },
     removeAgent: async () => ({
       revision: 0,
@@ -1178,6 +1301,7 @@ function eventCapability(event: AgentEvent): TeamCurrentCapability | null {
     event.type === "channel-routines-changed"
   )
     return "channel-chats-v1";
+  if (event.type === "skills-changed") return SKILLS_EVENTS_CAPABILITY;
   if (event.type === "turn-progress") return TEAM_AGENT_ACTIVITY_CAPABILITY;
   if (event.type === "runtime-snapshot") return "agent-runtime-snapshots";
   if (event.type === "sidebar-layout-changed") return "sidebar-layout";

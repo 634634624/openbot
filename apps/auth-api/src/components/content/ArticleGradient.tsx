@@ -1,9 +1,8 @@
+import { cx, prefersReducedMotion } from "@openbot/ui/utils";
 import type { ShaderMount } from "@paper-design/shaders";
 import { createMemo, createSignal, onSettled } from "solid-js";
 import { articleGradient, articleGradientCss, articleGradientUniforms } from "../../lib/article-gradient";
 import { articleArtPath, type ContentArtShape, type ContentCollection } from "../../lib/content-collection";
-import { motionWelcome } from "../../lib/motion";
-import { cx } from "../../lib/utils";
 
 // Three layers, cheapest first: a CSS gradient that server-renders, the PNG baked
 // at build time over it, and — for the featured card, article artwork, or a card
@@ -50,7 +49,7 @@ import { cx } from "../../lib/utils";
 // and drawing it again would spend a context and an image encode on every card.
 
 /** Where the build-time still for this frame was baked, when one was. */
-export interface ArticleGradientArt {
+interface ArticleGradientArt {
   /** The collection the article belongs to, which is half of its image path. */
   collection: ContentCollection;
   slug: string;
@@ -142,7 +141,13 @@ export function ArticleGradient(props: ArticleGradientProps) {
    */
   const captureFrame = (): string | undefined => {
     try {
-      const url = mount?.canvasElement.toDataURL("image/webp", 0.92);
+      const canvas = mount?.canvasElement;
+      // A canvas the mount has not sized yet holds no picture, and an empty one
+      // still encodes to more than the length below rejects. A pointer that
+      // leaves in the frames between the mount and its first draw would
+      // otherwise leave the card holding a blank rectangle for good.
+      if (!canvas?.width) return undefined;
+      const url = canvas.toDataURL("image/webp", 0.92);
       return url && url.length > 512 ? url : undefined;
     } catch {
       // A lost context has nothing to read back. The layer below is still the
@@ -151,9 +156,16 @@ export function ArticleGradient(props: ArticleGradientProps) {
     }
   };
 
-  const disposeShader = () => {
+  /**
+   * Let the context go. `keepFrame` is what separates a pointer leaving from the
+   * element itself leaving: a card that a filter removes is disposing this
+   * component, and a write to a signal inside a scope being torn down is an error
+   * in Solid rather than a no-op. Nothing would read those signals afterwards
+   * anyway, so the detach path frees the context and writes nothing.
+   */
+  const disposeShader = (keepFrame = true) => {
     generation += 1;
-    if (mount) {
+    if (mount && keepFrame) {
       resumeFrame = mount.getCurrentFrame();
       const captured = captureFrame();
       // Set before the canvas goes away, so the picture under it is already the
@@ -162,7 +174,7 @@ export function ArticleGradient(props: ArticleGradientProps) {
     }
     mount?.dispose();
     mount = undefined;
-    setShaderReady(false);
+    if (keepFrame) setShaderReady(false);
   };
 
   const mountShader = async (speed = ANIMATION_SPEED, reveal = true): Promise<ShaderMount | undefined> => {
@@ -255,7 +267,9 @@ export function ArticleGradient(props: ArticleGradientProps) {
   onSettled(() => {
     const wantsArt = props.art?.shape === "card";
     const wantsPrime =
-      motionWelcome() && props.mode === "hover" && !!window.matchMedia?.("(hover: hover) and (pointer: fine)").matches;
+      !prefersReducedMotion() &&
+      props.mode === "hover" &&
+      !!window.matchMedia?.("(hover: hover) and (pointer: fine)").matches;
     // One observer does both jobs a card below the fold must wait on: putting
     // the PNG URL on, and drawing the exact first frame. Featured artwork skips
     // this and primes at once.
@@ -268,7 +282,7 @@ export function ArticleGradient(props: ArticleGradientProps) {
         : undefined;
 
     // Nothing will move, so the baked still is the whole picture.
-    if (!motionWelcome()) return stopWatching;
+    if (prefersReducedMotion()) return stopWatching;
 
     if (props.mode === "live") {
       // The still is painted first and the animation starts from it, so the
@@ -278,7 +292,7 @@ export function ArticleGradient(props: ArticleGradientProps) {
       });
       return () => {
         detached = true;
-        disposeShader();
+        disposeShader(false);
         stopWatching?.();
       };
     }
@@ -318,7 +332,7 @@ export function ArticleGradient(props: ArticleGradientProps) {
       element.removeEventListener("pointercancel", leave);
       hovered = false;
       detached = true;
-      disposeShader();
+      disposeShader(false);
       stopWatching?.();
     };
   });

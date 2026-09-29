@@ -1,7 +1,8 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { request as httpRequest } from "node:http";
+import { createServer, request as httpRequest, type Server } from "node:http";
 import { createRequire } from "node:module";
+import { hostname, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import type { Duplex } from "node:stream";
 import type {
@@ -9,17 +10,25 @@ import type {
   RemoteDesktopDisplay,
   RemoteDesktopIceServer,
   RemoteDesktopSession,
+  RemoteDesktopSetupStatus,
+  RemoteDesktopTestStatus,
 } from "@openbot/contracts/ipc";
 import { TEAM_API_ROUTES } from "@openbot/contracts/team-api-routes";
+import { sourceText } from "@openbot/i18n/source";
 import type * as Ws from "ws";
 import { z } from "zod";
+import { recordRestartActivity } from "../backend/restart-activity";
 import type { RemoteDesktopRuntimePaths } from "./remote-desktop-runtime-artifact";
-import { SunshineMoonlightRuntime, type SunshineMoonlightRuntimeState } from "./sunshine-moonlight-runtime";
+import {
+  SunshineApiError,
+  SunshineMoonlightRuntime,
+  type SunshineMoonlightRuntimeState,
+} from "./sunshine-moonlight-runtime";
+import { rawDataSize, rawDataText } from "./ws-raw-data";
 
 const GRANT_TTL_MS = 60_000;
-export const REMOTE_DESKTOP_MAX_SESSIONS = 4;
+const REMOTE_DESKTOP_MAX_SESSIONS = 4;
 const VIEWER_COOKIE = "openbotRemoteViewer";
-const MOONLIGHT_HEADER = "X-OpenBot-Remote-User";
 const MAX_PENDING_STREAM_FRAMES = 32;
 const MAX_PENDING_STREAM_BYTES = 1_048_576;
 const MAX_TIMER_DELAY_MS = 2_147_000_000;
@@ -62,6 +71,8 @@ export interface RemoteScreenRuntime {
   stop(): Promise<void>;
   // Optional: only the real runtime reads the operating system's answer.
   screenCaptureDenied?(): boolean;
+  checkSetup?: SunshineMoonlightRuntime["checkSetup"];
+  test?: SunshineMoonlightRuntime["test"];
 }
 
 export interface RemoteScreenAuditEvent {
@@ -96,10 +107,16 @@ export class RemoteScreenGateway {
   readonly #options: Required<Pick<RemoteScreenGatewayOptions, "createRuntime" | "audit" | "now">> &
     Omit<RemoteScreenGatewayOptions, "createRuntime" | "audit" | "now">;
   readonly #webSockets = new webSockets.WebSocketServer({ noServer: true });
+  readonly #localTestServers = new Map<string, Server>();
   readonly #sessions = new Map<string, ManagedRemoteScreenSession>();
   readonly #pendingStreamStarts: Array<{ sessionId: string; start: () => void }> = [];
   #runtime: RemoteScreenRuntime | null = null;
   #runtimeState: SunshineMoonlightRuntimeState | null = null;
+  #runtimeStarting: Promise<SunshineMoonlightRuntimeState> | null = null;
+  #runtimeStopping: Promise<void> | null = null;
+  #setupCheck: Promise<RemoteDesktopSetupStatus> | null = null;
+  #startingSessions = 0;
+  #testSessionId: string | null = null;
   #selectedDisplayId: string | null = null;
   #displaySwitching = false;
   // Sticky, unlike the runtime's own answer: the refusal below drops the runtime that reported it, so
@@ -137,8 +154,119 @@ export class RemoteScreenGateway {
     await this.#ensureRuntime();
     const denied = Boolean(this.#runtime?.screenCaptureDenied?.());
     this.#reportScreenRecordingDenied(denied);
-    if (this.#sessions.size === 0) await this.#stopRuntime();
+    if (this.#sessions.size === 0 && !this.#setupCheck && this.#startingSessions === 0) await this.#stopRuntime();
     return denied;
+  }
+
+  checkSetup(): Promise<RemoteDesktopSetupStatus> {
+    if (this.#setupCheck) return this.#setupCheck;
+    this.#setupCheck = this.#checkSetup().finally(() => {
+      this.#setupCheck = null;
+    });
+    return this.#setupCheck;
+  }
+
+  async #checkSetup(): Promise<RemoteDesktopSetupStatus> {
+    const result: RemoteDesktopSetupStatus = {
+      platform: this.#options.platform,
+      hostName: hostname(),
+      username: userInfo().username,
+      checkedAt: new Date(this.#options.now()).toISOString(),
+      screenRecording: "unavailable",
+      accessibility: "unavailable",
+      service: "unavailable",
+      displays: "unavailable",
+      guiSession: "unavailable",
+      restartRequired: false,
+      activeSessions: this.#sessions.size,
+      message: null,
+    };
+    if (this.#options.platform !== "darwin" || !this.#options.runtimePaths) {
+      result.message =
+        this.#options.platform !== "darwin"
+          ? sourceText("status.remote.setupMacOnly")
+          : sourceText("status.remote.setupInstallHost");
+      return result;
+    }
+    try {
+      await this.#ensureRuntime();
+      result.service = "allowed";
+      if (!this.#runtime?.checkSetup) {
+        result.message = sourceText("status.remote.setupUpdateRuntime");
+        return result;
+      }
+      try {
+        Object.assign(result, await this.#runtime.checkSetup());
+        this.#reportScreenRecordingDenied(result.screenRecording === "blocked");
+      } catch (error) {
+        const unavailable = error instanceof SunshineApiError && error.status === 404;
+        result.screenRecording =
+          result.accessibility =
+          result.guiSession =
+          result.displays =
+            unavailable ? "unavailable" : "failed";
+        result.message = unavailable
+          ? sourceText("status.remote.setupUpdateRuntime")
+          : sourceText("status.remote.setupCheckFailed");
+      }
+    } catch {
+      result.service = "failed";
+      result.message = sourceText("status.remote.setupServiceFailed");
+    } finally {
+      result.activeSessions = this.#sessions.size;
+      if (this.#sessions.size === 0 && this.#startingSessions === 0) await this.#stopRuntime();
+    }
+    return result;
+  }
+
+  async test(
+    sessionId: string,
+    memberId: string,
+    action: "start" | "status" | "stop",
+  ): Promise<RemoteDesktopTestStatus> {
+    const session = this.#sessions.get(sessionId);
+    if (!session || session.memberId !== memberId)
+      throw new RemoteScreenError(404, "session_expired", sourceText("error.remote.controlSessionNotFound"));
+    if (this.#options.platform !== "darwin" || !this.#runtime?.test)
+      throw new RemoteScreenError(503, "host_unavailable", sourceText("error.remote.testRuntimeUpdate"));
+    if (action === "start") {
+      if (this.#sessions.size !== 1 || this.#startingSessions > 0 || this.#displaySwitching || this.#testSessionId)
+        throw new RemoteScreenError(409, "session_capacity_reached", sourceText("error.remote.testOtherSessions"));
+      this.#testSessionId = sessionId;
+      try {
+        const permissions = await this.#runtime.checkSetup?.();
+        if (
+          permissions?.screenRecording !== "allowed" ||
+          permissions.accessibility !== "allowed" ||
+          permissions.guiSession !== "allowed" ||
+          permissions.displays !== "allowed" ||
+          permissions.restartRequired
+        ) {
+          throw new RemoteScreenError(503, "host_permissions_required", sourceText("error.remote.testPermissions"));
+        }
+        const status = await this.#runtime?.test?.("start");
+        if (!status)
+          throw new RemoteScreenError(404, "session_expired", sourceText("error.remote.controlSessionEnded"));
+        if (!status.active)
+          throw new RemoteScreenError(503, "host_unavailable", sourceText("error.remote.testPanelFailed"));
+        if (!this.#sessions.has(sessionId)) {
+          await this.#runtime?.test?.("stop");
+          this.#testSessionId = null;
+          throw new RemoteScreenError(404, "session_expired", sourceText("error.remote.controlSessionEnded"));
+        }
+        return status;
+      } catch (error) {
+        // The request can fail after the panel opened. Keep input contained until cleanup succeeds.
+        await this.#runtime?.test?.("stop").then(() => {
+          this.#testSessionId = null;
+        });
+        throw error;
+      }
+    }
+    if (this.#testSessionId !== sessionId) return { active: false, mouse: false, keyboard: false, code: "" };
+    const result = await this.#runtime.test(action);
+    if (action === "stop") this.#testSessionId = null;
+    return result;
   }
 
   capabilities(): RemoteDesktopCapabilities {
@@ -160,7 +288,84 @@ export class RemoteScreenGateway {
     return [...this.#sessions.values()].map((session) => structuredClone(session.snapshot));
   }
 
+  async createLocalTestSession(): Promise<RemoteDesktopSession> {
+    const server = createServer((request, response) => {
+      let url: URL;
+      try {
+        url = new URL(request.url ?? "/", "http://127.0.0.1");
+      } catch {
+        response.writeHead(400).end();
+        return;
+      }
+      if (!this.handlesHttp(url)) {
+        response.writeHead(404);
+        response.end();
+        return;
+      }
+      void this.handleHttp(request, response, url).catch(() => {
+        response.destroy();
+      });
+    });
+    server.on("upgrade", (request, socket, head) => {
+      let url: URL;
+      try {
+        url = new URL(request.url ?? "/", "http://127.0.0.1");
+      } catch {
+        socket.destroy();
+        return;
+      }
+      this.handleUpgrade(request, socket, head, url);
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", resolve);
+      });
+      const address = server.address();
+      if (!address || typeof address === "string")
+        throw new Error(sourceText("error.remote.localTestListenerUnavailable"));
+      const session = await this.createSession({
+        serverId: "local",
+        memberId: "local-setup",
+        teamSessionId: randomUUID(),
+        teamSessionExpiresAt: new Date(Date.now() + 180_000).toISOString(),
+        publicHttpBaseUrl: `http://127.0.0.1:${address.port}`,
+      });
+      this.#localTestServers.set(session.id, server);
+      return session;
+    } catch (error) {
+      server.close();
+      throw error;
+    }
+  }
+
+  testLocalSession(sessionId: string, action: "start" | "status" | "stop") {
+    if (!this.#localTestServers.has(sessionId)) throw new Error(sourceText("error.remote.localTestNotFound"));
+    return this.test(sessionId, "local-setup", action);
+  }
+
+  async closeLocalTestSession(sessionId: string): Promise<void> {
+    if (!this.#localTestServers.has(sessionId)) return;
+    await this.closeSession(sessionId);
+  }
+
   async createSession(input: {
+    serverId: string;
+    memberId: string;
+    teamSessionId: string;
+    teamSessionExpiresAt: string;
+    publicHttpBaseUrl: string;
+  }): Promise<RemoteDesktopSession> {
+    this.#startingSessions += 1;
+    try {
+      return await this.#createSession(input);
+    } finally {
+      this.#startingSessions -= 1;
+      if (this.#sessions.size === 0 && !this.#setupCheck && this.#startingSessions === 0) await this.#stopRuntime();
+    }
+  }
+
+  async #createSession(input: {
     serverId: string;
     memberId: string;
     teamSessionId: string;
@@ -169,50 +374,40 @@ export class RemoteScreenGateway {
   }): Promise<RemoteDesktopSession> {
     this.#pruneExpiredGrants();
     if (this.#sessions.size >= REMOTE_DESKTOP_MAX_SESSIONS) {
-      throw new RemoteScreenError(429, "session_capacity_reached", "The host already has four active sessions.");
+      throw new RemoteScreenError(429, "session_capacity_reached", sourceText("error.remote.sessionCapacity"));
     }
     if (this.#options.platform === "linux") {
-      throw new RemoteScreenError(503, "host_unavailable", "Remote desktop hosting is not supported on Linux.");
+      throw new RemoteScreenError(503, "host_unavailable", sourceText("error.remote.linuxUnsupported"));
     }
     if (!this.#options.runtimePaths) {
-      throw new RemoteScreenError(
-        503,
-        "host_unavailable",
-        "The Sunshine and Moonlight Web runtime is missing or is not supported on this host. Install the full OpenBot release on an Apple silicon Mac or Windows x64 host, then restart OpenBot.",
-      );
+      throw new RemoteScreenError(503, "host_unavailable", sourceText("error.remote.runtimeMissing"));
     }
+    if (this.#testSessionId)
+      throw new RemoteScreenError(409, "session_capacity_reached", sourceText("error.remote.testActive"));
     await this.#ensureRuntime();
+    if (this.#testSessionId)
+      throw new RemoteScreenError(409, "session_capacity_reached", sourceText("error.remote.testActive"));
     // The runtime starts and answers either way, so this is the only place the refusal can become a
     // failure the member sees. Without it the session is created, the stream never starts, and the
     // viewer sits at "connecting" until the member gives up.
     if (this.#runtime?.screenCaptureDenied?.()) {
-      // "Then try again" has to mean something. Sunshine reads the screen recording grant when it
-      // starts and `screenCaptureDenied` reports only what it has said since, so the refusal outlives
-      // the grant unless the process does too -- and neither `start` restarts anything, both return
-      // the state they already hold. Dropping the runtime is what makes the next attempt a fresh
-      // Sunshine that reads the new grant. A live session shares this runtime and is already being
-      // shown nothing, but ending it belongs to whoever owns it rather than to another member's
-      // failed create, and `closeSession` drops the runtime when the last one goes.
-      if (this.#sessions.size === 0) await this.#stopRuntime();
+      // The createSession lease releases an idle runtime after pending creates settle, so a new
+      // grant is read by the next process without stopping an existing member's session.
       this.#reportScreenRecordingDenied(true);
-      throw new RemoteScreenError(
-        503,
-        "host_permissions_required",
-        "The host has not allowed OpenBot to record its screen. Grant screen recording on the host, then try again.",
-      );
+      throw new RemoteScreenError(503, "host_permissions_required", sourceText("error.remote.screenRecordingDenied"));
     }
     this.#reportScreenRecordingDenied(false);
     const id = randomUUID();
     const usedStreamerSlots = new Set([...this.#sessions.values()].map((session) => session.streamerSlot));
     const streamerSlot = [1, 2, 3, 4].find((slot) => !usedStreamerSlots.has(slot));
     if (!streamerSlot) {
-      throw new RemoteScreenError(429, "session_capacity_reached", "The host already has four active sessions.");
+      throw new RemoteScreenError(429, "session_capacity_reached", sourceText("error.remote.sessionCapacity"));
     }
     const viewerGrant = randomBytes(32).toString("base64url");
     const now = this.#options.now();
     const teamSessionExpiresAt = Date.parse(input.teamSessionExpiresAt);
     if (!Number.isFinite(teamSessionExpiresAt) || teamSessionExpiresAt <= now) {
-      throw new RemoteScreenError(401, "session_expired", "The team session has expired.");
+      throw new RemoteScreenError(401, "session_expired", sourceText("error.remote.teamSessionExpired"));
     }
     const createdAt = new Date(now).toISOString();
     const snapshot: RemoteDesktopSession = {
@@ -225,7 +420,7 @@ export class RemoteScreenGateway {
       phase: "connecting",
       transport: "unknown",
       errorCode: null,
-      message: "Connecting through Sunshine…",
+      message: sourceText("status.remote.connectingSunshine"),
       createdAt,
       grantExpiresAt: new Date(now + GRANT_TTL_MS).toISOString(),
     };
@@ -255,17 +450,19 @@ export class RemoteScreenGateway {
   }
 
   async selectDisplay(displayId: string): Promise<void> {
+    if (this.#testSessionId)
+      throw new RemoteScreenError(409, "connection_failed", sourceText("error.remote.finishTestBeforeSwitch"));
     if (!this.#availableDisplays().some((display) => display.id === displayId)) {
-      throw new RemoteScreenError(400, "host_unavailable", "Remote display not found.");
+      throw new RemoteScreenError(400, "host_unavailable", sourceText("error.remote.displayNotFound"));
     }
     if (this.#displaySwitching)
-      throw new RemoteScreenError(409, "connection_failed", "A display switch is in progress.");
+      throw new RemoteScreenError(409, "connection_failed", sourceText("error.remote.displaySwitchInProgress"));
     if (displayId === this.#selectedDisplayId) return;
     this.#displaySwitching = true;
     try {
       for (const session of this.#sessions.values()) {
         session.snapshot.phase = "connecting";
-        session.snapshot.message = "Switching the shared monitor…";
+        session.snapshot.message = sourceText("status.remote.switchingMonitor");
       }
       await this.#runtime?.selectDisplay(displayId);
       this.#selectedDisplayId = displayId;
@@ -285,13 +482,12 @@ export class RemoteScreenGateway {
   }
 
   async handleHttp(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
-    const match =
+    const [, sessionId, route] =
       /^\/v1\/remote-screen\/sessions\/([A-Za-z0-9-]+)\/(viewer|authorize|viewer-state|moonlight(?:\/.*)?)$/.exec(
         url.pathname,
-      );
-    const session = match ? this.#sessions.get(match[1]) : null;
-    if (!session || !match) return sendText(response, 404, "Remote session not found.");
-    const route = match[2];
+      ) ?? [];
+    const session = sessionId === undefined ? null : this.#sessions.get(sessionId);
+    if (!session || route === undefined) return sendText(response, 404, "Remote session not found.");
     if (request.method === "GET" && route === "viewer") {
       if (!this.#runtimeState) return sendText(response, 503, "Moonlight runtime is unavailable.");
       return sendViewer(response, session.snapshot.id, session.streamerSlot, this.#runtimeState);
@@ -302,14 +498,15 @@ export class RemoteScreenGateway {
       if (!update || update.sessionId !== session.snapshot.id) {
         return sendText(response, 400, "Remote viewer state is invalid.");
       }
+      if (update.state === "connected") recordRestartActivity();
       session.snapshot.phase = update.state;
       session.snapshot.message =
         update.message ??
         (update.state === "connected"
-          ? "Remote control connected."
+          ? sourceText("status.remote.controlConnected")
           : update.state === "connecting"
-            ? "Connecting through Sunshine…"
-            : "Remote control failed.");
+            ? sourceText("status.remote.connectingSunshine")
+            : sourceText("status.remote.controlFailed"));
       if (update.transport && update.transport !== session.snapshot.transport) {
         session.snapshot.transport = update.transport;
         this.#audit(session, "transport");
@@ -335,7 +532,9 @@ export class RemoteScreenGateway {
       session.grantExpirationTimer = null;
       session.viewerCookieHash = secretHash(cookie);
       const cookiePolicy =
-        request.headers["x-forwarded-proto"] === "https" ? "; Secure; SameSite=None" : "; SameSite=Strict";
+        this.#localTestServers.has(session.snapshot.id) || request.headers["x-forwarded-proto"] === "https"
+          ? "; Secure; SameSite=None"
+          : "; SameSite=Strict";
       response.writeHead(204, {
         "Set-Cookie": `${VIEWER_COOKIE}=${cookie}; HttpOnly${cookiePolicy}; Path=${TEAM_API_ROUTES.remoteScreen.session(session.snapshot.id)}/; Max-Age=86400`,
         "Cache-Control": "no-store",
@@ -355,18 +554,19 @@ export class RemoteScreenGateway {
   }
 
   handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer, url: URL): void {
-    const match = /^\/v1\/remote-screen\/sessions\/([A-Za-z0-9-]+)\/stream$/.exec(url.pathname);
-    const session = match ? this.#sessions.get(match[1]) : null;
-    if (!session || !this.#viewerAuthorized(request, session) || !this.#runtimeState || !match) {
+    const [, sessionId] = /^\/v1\/remote-screen\/sessions\/([A-Za-z0-9-]+)\/stream$/.exec(url.pathname) ?? [];
+    const session = sessionId === undefined ? null : this.#sessions.get(sessionId);
+    if (!session || !this.#viewerAuthorized(request, session) || !this.#runtimeState) {
       socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
       socket.destroy();
       return;
     }
+    const authHeader = this.#runtimeState.authHeader;
     this.#webSockets.handleUpgrade(request, socket, head, (client) => {
       const upstreamUrl = new URL("/api/host/stream", this.#runtimeState?.baseUrl);
       upstreamUrl.protocol = "ws:";
       const upstream = new webSockets.WebSocket(upstreamUrl, {
-        headers: { [MOONLIGHT_HEADER]: moonlightRuntimeUser(session) },
+        headers: { [authHeader]: moonlightRuntimeUser(session) },
       });
       const pendingClientFrames: Array<{ data: Ws.RawData; binary: boolean }> = [];
       let pendingClientBytes = 0;
@@ -389,8 +589,9 @@ export class RemoteScreenGateway {
           streamStartAllowed = true;
           for (const frame of pendingClientFrames.splice(0)) upstream.send(frame.data, { binary: frame.binary });
           pendingClientBytes = 0;
+          recordRestartActivity();
           session.snapshot.phase = "connected";
-          session.snapshot.message = "Remote control connected.";
+          session.snapshot.message = sourceText("status.remote.controlConnected");
           this.#audit(session, "started");
         });
       });
@@ -436,6 +637,8 @@ export class RemoteScreenGateway {
         if (session.upstreamSocket === upstream) session.upstreamSocket = null;
         client.close();
         upstream.close();
+        if (this.#testSessionId === session.snapshot.id)
+          void this.closeSession(session.snapshot.id, "connection_failed");
       };
       client.once("close", close);
       upstream.once("close", close);
@@ -450,6 +653,14 @@ export class RemoteScreenGateway {
     const session = this.#sessions.get(id);
     if (!session) return;
     this.#sessions.delete(id);
+    const localServer = this.#localTestServers.get(id);
+    this.#localTestServers.delete(id);
+    localServer?.close();
+    localServer?.closeAllConnections();
+    if (this.#testSessionId === id) {
+      await this.#runtime?.test?.("stop").catch(() => undefined);
+      this.#testSessionId = null;
+    }
     this.#finishStreamStart(id);
     session.grantExpirationTimer?.cancel();
     session.teamSessionExpirationTimer.cancel();
@@ -457,7 +668,7 @@ export class RemoteScreenGateway {
     session.clientSocket?.close(4403, reason);
     session.upstreamSocket?.close();
     this.#audit(session, "ended", reason);
-    if (this.#sessions.size === 0) await this.#stopRuntime();
+    if (this.#sessions.size === 0 && !this.#setupCheck && this.#startingSessions === 0) await this.#stopRuntime();
   }
 
   async closeMemberSession(id: string, memberId: string): Promise<boolean> {
@@ -520,22 +731,47 @@ export class RemoteScreenGateway {
   // Both halves together, always: a cleared `#runtimeState` beside a live `#runtime` is what latched
   // the screen capture refusal past the grant that fixed it.
   async #stopRuntime(): Promise<void> {
-    await this.#runtime?.stop();
+    if (this.#runtimeStopping) return this.#runtimeStopping;
+    const runtime = this.#runtime;
     this.#runtime = null;
     this.#runtimeState = null;
+    this.#testSessionId = null;
+    this.#runtimeStopping = runtime?.stop() ?? Promise.resolve();
+    try {
+      await this.#runtimeStopping;
+    } finally {
+      this.#runtimeStopping = null;
+    }
   }
 
   async #ensureRuntime(): Promise<SunshineMoonlightRuntimeState> {
+    if (this.#runtimeStarting) return this.#runtimeStarting;
+    this.#runtimeStarting = this.#startRuntime();
+    try {
+      return await this.#runtimeStarting;
+    } finally {
+      this.#runtimeStarting = null;
+    }
+  }
+
+  async #startRuntime(): Promise<SunshineMoonlightRuntimeState> {
+    if (this.#runtimeStopping) await this.#runtimeStopping;
     if (this.#runtimeState) return this.#runtimeState;
     const paths = this.#options.runtimePaths;
-    if (!paths || this.#options.platform === "linux") throw new Error("Remote desktop runtime is not available.");
+    if (!paths || this.#options.platform === "linux") throw new Error(sourceText("error.remote.runtimeUnavailable"));
     this.#runtime ??= this.#options.createRuntime({
       paths,
       stateDirectory: this.#options.runtimeStateDirectory,
       platform: this.#options.platform,
       credentials: await this.#options.getRuntimeCredentials(),
       getDisplays: () => this.#options.getDisplays?.() ?? [],
-      getIceServers: this.#options.getIceServers,
+      getIceServers: async () => {
+        // Loopback tests need no account or Signal service. Keep remote ICE configuration
+        // whenever a remote session shares this runtime.
+        if (this.#sessions.size > 0 && [...this.#sessions.keys()].every((id) => this.#localTestServers.has(id)))
+          return [];
+        return this.#options.getIceServers();
+      },
       onDiagnostic: this.#options.onDiagnostic,
     });
     this.#runtimeState = await this.#runtime.start();
@@ -569,6 +805,7 @@ export class RemoteScreenGateway {
       return;
     }
     const target = new URL(`${upstreamPath}${search}`, this.#runtimeState.baseUrl);
+    const authHeader = this.#runtimeState.authHeader;
     await new Promise<void>((resolve) => {
       const upstream = httpRequest(
         target,
@@ -577,7 +814,7 @@ export class RemoteScreenGateway {
           headers: {
             accept: request.headers.accept ?? "*/*",
             "content-type": request.headers["content-type"] ?? "application/octet-stream",
-            [MOONLIGHT_HEADER]: moonlightRuntimeUser(session),
+            [authHeader]: moonlightRuntimeUser(session),
           },
         },
         (upstreamResponse) => {
@@ -666,17 +903,6 @@ function allowedMoonlightPath(path: string): boolean {
     return false;
   }
   return !path.startsWith("/api/") && !path.includes("..") && /^\/[A-Za-z0-9_./-]*$/.test(path);
-}
-
-function rawDataSize(data: Ws.RawData): number {
-  if (Array.isArray(data)) return data.reduce((total, chunk) => total + chunk.byteLength, 0);
-  return data.byteLength;
-}
-
-function rawDataText(data: Ws.RawData): string {
-  if (Array.isArray(data)) return Buffer.concat(data).toString("utf8");
-  if (data instanceof ArrayBuffer) return Buffer.from(data).toString("utf8");
-  return Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("utf8");
 }
 
 function moonlightRuntimeUser(session: ManagedRemoteScreenSession): string {

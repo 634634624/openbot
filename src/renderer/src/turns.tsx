@@ -1,5 +1,6 @@
-import type { AgentApproval, AgentEvent, QueueSnapshot } from "@openbot/contracts/ipc";
-import { createEffect, createMemo, createSignal } from "solid-js";
+import type { AgentApproval, AgentEvent, QueueSnapshot, RoutineFields } from "@openbot/contracts/ipc";
+import { currentText } from "@openbot/ui/text";
+import { createEffect, createMemo, createSignal, untrack } from "solid-js";
 import { desktopAnalytics } from "./analytics";
 import { useAnsweredPrompts } from "./answered-prompts";
 import { seededAttentionPrompts } from "./features/agents/agent-runtime-snapshot";
@@ -9,8 +10,11 @@ import { useDynamicIsland } from "./features/dynamic-island/dynamic-island-conte
 import { useServers } from "./features/servers/servers-context";
 import { createScopeGuard } from "./scope-lifetime";
 import { createSimpleContext } from "./simple-context";
+import { turnsPort } from "./turns-port";
 
 type PromptEvent = Extract<AgentEvent, { type: "prompt" }>;
+/** `current` is false while a new list loads. */
+type RoutineSnapshot = { routines: RoutineFields[]; current: boolean };
 type BrowserTakeoverEvent = Extract<AgentEvent, { type: "browser-takeover-requested" }>;
 
 /**
@@ -37,7 +41,7 @@ type BrowserTakeoverEvent = Extract<AgentEvent, { type: "browser-takeover-reques
  *   reads `liveMessages`, to tell a resolution the user has seen from one main
  *   has already persisted. It moves to `conversation` with that state.
  *
- * `completedTurnByAgent` and `routineIdsByConversation` used to survive a switch
+ * `completedTurnByAgent` and `routinesByConversation` used to survive a switch
  * because nobody cleared them; they now die with the scope, which is the
  * teardown the old list of setters kept forgetting. `completedTurnByAgent` had
  * grown for the life of the process.
@@ -56,29 +60,35 @@ const Turns = createSimpleContext({
   init: () => {
     const { activeServerId } = useServers();
     const { dynamicIslandCoordinator } = useDynamicIsland();
-    const { activeAgent, activeAgentId, agentStatus, appendUiError } = useAgents();
+    const { activeAgent, activeAgentId, agentList, agentStatus, appendUiError } = useAgents();
     const scopeIsCurrent = createScopeGuard();
 
-    // The layer-2 seed: what this server was doing the last time it was open.
-    const seed = dynamicIslandCoordinator.serverState(activeServerId());
+    // The layer-2 seed: what this server was doing the last time it was open. The scope is keyed
+    // on the server, so its id and the seed are read once.
+    const scopeServerId = untrack(activeServerId);
+    const seed = dynamicIslandCoordinator.serverState(scopeServerId);
     const [activeTurns, setActiveTurns] = createSignal<Record<string, string | null>>(seed?.activeTurns ?? {});
     const [turnProgress, setTurnProgress] = createSignal<
       Record<string, { turnId: string; detail: string } | undefined>
     >(seed?.turnProgress ?? {});
     const [failedTurns, setFailedTurns] = createSignal<Record<string, string | undefined>>(seed?.failedTurns ?? {});
     const [queues, setQueues] = createSignal<Record<string, QueueSnapshot>>(seed?.queues ?? {});
-    const [routineIdsByConversation, setRoutineIdsByConversation] = createSignal<Record<string, string[] | undefined>>(
-      {},
-    );
+    const [routinesByConversation, setRoutinesByConversation] = createSignal<
+      Record<string, RoutineSnapshot | undefined>
+    >({});
     const {
       presentedPromptResolutions,
       setPresentedPromptResolutions,
       submittedPromptRequests,
       setSubmittedPromptRequests,
-    } = useAnsweredPrompts().promptMarkersFor(activeServerId());
+    } = useAnsweredPrompts().promptMarkersFor(scopeServerId);
     const [pendingPrompts, setPendingPrompts] = createSignal<
       Record<string, PromptEvent | BrowserTakeoverEvent | undefined>
-    >(seededAttentionPrompts(seed?.pendingPrompts, presentedPromptResolutions(), submittedPromptRequests()));
+    >(
+      untrack(() =>
+        seededAttentionPrompts(seed?.pendingPrompts, presentedPromptResolutions(), submittedPromptRequests()),
+      ),
+    );
     const [pendingApprovals, setPendingApprovals] = createSignal<Record<string, AgentApproval | undefined>>(
       seed?.pendingApprovals ?? {},
     );
@@ -90,12 +100,15 @@ const Turns = createSimpleContext({
       const key = agentConversationKey(serverId, agentId);
       const request = (routineSnapshotRequests.get(key) ?? 0) + 1;
       routineSnapshotRequests.set(key, request);
-      setRoutineIdsByConversation((current) => ({ ...current, [key]: undefined }));
-      void window.openbot.agent
-        .listRoutines(agentId)
+      setRoutinesByConversation((current) => {
+        const snapshot = current[key];
+        return snapshot ? { ...current, [key]: { ...snapshot, current: false } } : current;
+      });
+      void turnsPort()
+        .agent.listRoutines(agentId)
         .then((routines) => {
           if (routineSnapshotRequests.get(key) !== request) return;
-          setRoutineIdsByConversation((current) => ({ ...current, [key]: routines.map((routine) => routine.id) }));
+          setRoutinesByConversation((current) => ({ ...current, [key]: { routines, current: true } }));
         })
         .catch(() => undefined);
     }
@@ -107,21 +120,48 @@ const Turns = createSimpleContext({
       },
     );
 
+    function loadQueue(agentId: string, serverId: string): void {
+      const queueRequest = (queueSnapshotRequests.get(agentId) ?? 0) + 1;
+      queueSnapshotRequests.set(agentId, queueRequest);
+      void turnsPort()
+        .agent.listQueue(agentId)
+        .then((queue) => {
+          if (!scopeIsCurrent() || queueSnapshotRequests.get(agentId) !== queueRequest) return;
+          setQueues((current) => ({ ...current, [agentId]: queue }));
+        })
+        .catch((error) => {
+          if (scopeIsCurrent()) appendUiError(agentId, error, currentText().t("app.errorStatus.queueLoad"), serverId);
+        });
+    }
+
     createEffect(
       () => ({ agentId: activeAgentId(), agentPhase: agentStatus().phase, serverId: activeServerId() }),
       ({ agentId, serverId }) => {
-        if (!agentId) return;
-        const queueRequest = (queueSnapshotRequests.get(agentId) ?? 0) + 1;
-        queueSnapshotRequests.set(agentId, queueRequest);
-        void window.openbot.agent
-          .listQueue(agentId)
-          .then((queue) => {
-            if (!scopeIsCurrent() || queueSnapshotRequests.get(agentId) !== queueRequest) return;
-            setQueues((current) => ({ ...current, [agentId]: queue }));
-          })
-          .catch((error) => {
-            if (scopeIsCurrent()) appendUiError(agentId, error, "Queue load failed", serverId);
-          });
+        if (agentId) loadQueue(agentId, serverId);
+      },
+    );
+
+    // The active-agent load above misses everyone else. A routine mark needs each agent's real
+    // queue sender, which a runtime snapshot does not carry.
+    createEffect(
+      () => ({
+        agentIds: agentList()
+          .map((agent) => agent.id)
+          .join("\0"),
+        agentPhase: agentStatus().phase,
+        serverId: activeServerId(),
+      }),
+      (next, previous) => {
+        if (
+          previous &&
+          next.agentIds === previous.agentIds &&
+          next.agentPhase === previous.agentPhase &&
+          next.serverId === previous.serverId
+        ) {
+          return;
+        }
+        if (!next.agentIds) return;
+        for (const agentId of next.agentIds.split("\0")) loadQueue(agentId, next.serverId);
       },
     );
 
@@ -144,7 +184,7 @@ const Turns = createSimpleContext({
         [agentId]: promptRequestKey(prompt.turnId, prompt.requestId) ?? undefined,
       }));
       try {
-        await window.openbot.agent.respondToPrompt({
+        await turnsPort().agent.respondToPrompt({
           requestId: prompt.requestId,
           answers,
         });
@@ -162,7 +202,7 @@ const Turns = createSimpleContext({
           result: "failed",
           failure_code: "response_failed",
         });
-        appendUiError(agentId, error, "Answer failed", serverId);
+        appendUiError(agentId, error, currentText().t("app.errorStatus.answer"), serverId);
         return false;
       }
     }
@@ -177,7 +217,7 @@ const Turns = createSimpleContext({
       if (!approval || String(approval.requestId) !== String(requestId)) return false;
       const analytics = desktopAnalytics.scope();
       try {
-        await window.openbot.agent.respondToApproval({
+        await turnsPort().agent.respondToApproval({
           requestId: approval.requestId,
           decision,
         });
@@ -191,7 +231,7 @@ const Turns = createSimpleContext({
           result: "failed",
           failure_code: "response_failed",
         });
-        appendUiError(agentId, error, "Approval failed", serverId);
+        appendUiError(agentId, error, currentText().t("app.errorStatus.approval"), serverId);
         return false;
       }
     }
@@ -209,11 +249,11 @@ const Turns = createSimpleContext({
       if (!agent || event?.type !== "browser-takeover-requested") return false;
       const serverId = activeServerId();
       try {
-        await window.openbot.agent.respondToBrowserTakeover({ requestId: event.request.requestId, decision });
+        await turnsPort().agent.respondToBrowserTakeover({ requestId: event.request.requestId, decision });
         setPendingPrompts((current) => ({ ...current, [agent.id]: undefined }));
         return true;
       } catch (error) {
-        appendUiError(agent.id, error, "Browser takeover failed", serverId);
+        appendUiError(agent.id, error, currentText().t("app.errorStatus.browserTakeover"), serverId);
         return false;
       }
     }
@@ -223,12 +263,12 @@ const Turns = createSimpleContext({
       if (!agent) return;
       const serverId = activeServerId();
       const analytics = desktopAnalytics.scope();
-      void window.openbot.agent
-        .cancelQueuedMessage({ agentId: agent.id, deliveryId })
+      void turnsPort()
+        .agent.cancelQueuedMessage({ agentId: agent.id, deliveryId })
         .then(() => analytics.track("queue_action", { action: "cancel", result: "succeeded" }))
         .catch((error) => {
           analytics.track("queue_action", { action: "cancel", result: "failed", failure_code: "cancel_failed" });
-          appendUiError(agent.id, error, "Cancel failed", serverId);
+          appendUiError(agent.id, error, currentText().t("app.errorStatus.cancel"), serverId);
         });
     }
 
@@ -238,12 +278,12 @@ const Turns = createSimpleContext({
       if (!agent || !turnId) return;
       const serverId = activeServerId();
       const analytics = desktopAnalytics.scope();
-      void window.openbot.agent
-        .steerQueuedMessage({ agentId: agent.id, deliveryId, expectedTurnId: turnId })
+      void turnsPort()
+        .agent.steerQueuedMessage({ agentId: agent.id, deliveryId, expectedTurnId: turnId })
         .then(() => analytics.track("queue_action", { action: "steer", result: "succeeded" }))
         .catch((error) => {
           analytics.track("queue_action", { action: "steer", result: "failed", failure_code: "steer_failed" });
-          appendUiError(agent.id, error, "Steer failed", serverId);
+          appendUiError(agent.id, error, currentText().t("app.errorStatus.steer"), serverId);
         });
     }
 
@@ -266,12 +306,12 @@ const Turns = createSimpleContext({
           keepAttachmentIds,
           attachmentDraftIds,
         };
-        await window.openbot.agent.updateQueuedMessage(input, serverId);
+        await turnsPort().agent.updateQueuedMessage(input, serverId);
         analytics.track("queue_action", { action: "edit", result: "succeeded" });
         return true;
       } catch (error) {
         analytics.track("queue_action", { action: "edit", result: "failed", failure_code: "edit_failed" });
-        appendUiError(agentId, error, "Edit failed", serverId);
+        appendUiError(agentId, error, currentText().t("app.errorStatus.edit"), serverId);
         return false;
       }
     }
@@ -281,12 +321,12 @@ const Turns = createSimpleContext({
       if (!agent) return;
       const serverId = activeServerId();
       const analytics = desktopAnalytics.scope();
-      void window.openbot.agent
-        .reorderQueue({ agentId: agent.id, deliveryIds })
+      void turnsPort()
+        .agent.reorderQueue({ agentId: agent.id, deliveryIds })
         .then(() => analytics.track("queue_action", { action: "reorder", result: "succeeded" }))
         .catch((error) => {
           analytics.track("queue_action", { action: "reorder", result: "failed", failure_code: "reorder_failed" });
-          appendUiError(agent.id, error, "Reorder failed", serverId);
+          appendUiError(agent.id, error, currentText().t("app.errorStatus.reorder"), serverId);
         });
     }
 
@@ -296,8 +336,8 @@ const Turns = createSimpleContext({
       if (!agent || !turnId) return;
       const serverId = activeServerId();
       const analytics = desktopAnalytics.scope();
-      void window.openbot.agent
-        .interrupt({ agentId: agent.id, turnId })
+      void turnsPort()
+        .agent.interrupt({ agentId: agent.id, turnId })
         .then(() => analytics.track("queue_action", { action: "interrupt", result: "succeeded" }))
         .catch((error) => {
           analytics.track("queue_action", {
@@ -305,7 +345,7 @@ const Turns = createSimpleContext({
             result: "failed",
             failure_code: "interrupt_failed",
           });
-          appendUiError(agent.id, error, "Stop failed", serverId);
+          appendUiError(agent.id, error, currentText().t("app.errorStatus.stop"), serverId);
         });
     }
 
@@ -313,10 +353,17 @@ const Turns = createSimpleContext({
       const agent = activeAgent();
       return agent ? queues()[agent.id] : undefined;
     });
-    const activeRoutineIds = createMemo(() => {
+    const activeRoutineSnapshot = createMemo(() => {
       const agent = activeAgent();
-      return agent ? routineIdsByConversation()[agentConversationKey(activeServerId(), agent.id)] : undefined;
+      return agent ? routinesByConversation()[agentConversationKey(activeServerId(), agent.id)] : undefined;
     });
+    // A routine link opens only a routine the newest list has; a deleted one must not open.
+    const activeRoutineIds = createMemo(() => {
+      const snapshot = activeRoutineSnapshot();
+      return snapshot?.current ? snapshot.routines.map((routine) => routine.id) : undefined;
+    });
+    // A chat card keeps the last list while a new one loads, so it does not blink.
+    const activeRoutines = createMemo(() => activeRoutineSnapshot()?.routines);
 
     /**
      * The seed is `dynamicIslandCoordinator.serverState(serverId)`, which is
@@ -332,7 +379,7 @@ const Turns = createSimpleContext({
       setFailedTurns,
       queues,
       setQueues,
-      routineIdsByConversation,
+      routinesByConversation,
       pendingPrompts,
       setPendingPrompts,
       presentedPromptResolutions,
@@ -345,9 +392,11 @@ const Turns = createSimpleContext({
       queueSnapshotRequests,
       activeQueue,
       activeRoutineIds,
+      activeRoutines,
       refreshRoutineIds,
       answerPrompt,
       respondToApproval,
+      respondToApprovalRequest,
       respondToBrowserTakeover,
       cancelQueuedMessage,
       steerQueuedMessage,

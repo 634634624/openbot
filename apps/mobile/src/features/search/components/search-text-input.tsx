@@ -1,19 +1,25 @@
 import { useThemeColor } from "heroui-native/hooks";
+import { useImperativeHandle, useRef } from "react";
 import { TextInput } from "react-native";
 
 import type { MobileSearchTextInputProps } from "@/features/search/components/search-text-input.types";
+import { useText } from "@/shared/lib/text";
 
-export function MobileSearchTextInput({ value, onChangeText }: MobileSearchTextInputProps) {
+export function MobileSearchTextInput({ ref, value, onChangeText }: MobileSearchTextInputProps) {
+  const { t } = useText();
+  const input = useRef<TextInput>(null);
+  useImperativeHandle(ref, () => ({ focus: () => input.current?.focus() }), []);
   const [foreground, muted] = useThemeColor(["foreground", "muted"]);
 
   return (
     <TextInput
-      accessibilityLabel="Search"
+      ref={input}
+      accessibilityLabel={t("common.search")}
       autoCapitalize="none"
       autoCorrect={false}
       autoFocus
       className="h-8 min-w-0 flex-1 font-sans text-foreground"
-      placeholder="Search"
+      placeholder={t("common.search")}
       placeholderTextColor={muted}
       returnKeyType="search"
       selectionColor={foreground}

@@ -1,6 +1,6 @@
 import { agentProviderName } from "@openbot/contracts/ipc";
 import { type DynamicRecord, isString } from "@openbot/contracts/runtime-values";
-import type { AgentProvider } from "../agent-client";
+import { type AgentProvider, RequestTimeoutError } from "../agent-client";
 import { AppServerError } from "../app-server-client";
 import { type DynamicToolCallParams, getString, isRecord, reasoningText, type ThreadItem } from "../protocol";
 
@@ -13,7 +13,12 @@ export function isArchivedThreadError(error: unknown): boolean {
 }
 
 export function isMissingProviderSessionError(error: unknown, provider: AgentProvider): boolean {
-  if ((provider !== "grok" && provider !== "opencode") || !(error instanceof Error)) return false;
+  if (
+    (provider !== "grok" && provider !== "opencode" && provider !== "antigravity" && provider !== "acp") ||
+    !(error instanceof Error)
+  ) {
+    return false;
+  }
   return (
     /\bunknown grok session\b/i.test(error.message) ||
     /\bsession\b.*\b(?:not found|does not exist|unknown)\b/i.test(error.message) ||
@@ -21,8 +26,8 @@ export function isMissingProviderSessionError(error: unknown, provider: AgentPro
   );
 }
 
-export function isRequestTimeout(error: unknown, method: string): boolean {
-  return error instanceof Error && error.message === `Codex request timed out: ${method}`;
+export function isRequestTimeout(error: unknown, method: string): error is RequestTimeoutError {
+  return error instanceof RequestTimeoutError && error.method === method;
 }
 
 export function isDynamicToolCall(value: unknown): value is DynamicToolCallParams {

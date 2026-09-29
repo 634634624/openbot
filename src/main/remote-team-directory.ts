@@ -18,7 +18,8 @@ import type {
   UpdateTeamMemberInput,
 } from "@openbot/contracts/ipc";
 import { TEAM_API_ROUTES } from "@openbot/contracts/team-api-routes";
-import type { RemoteInviteRecord, RemoteMemberRecord } from "./central-auth-manager";
+import { sourceText } from "@openbot/i18n/source";
+import type { RemoteInviteRecord, RemoteMemberRecord } from "./central-auth-records";
 import { decodeVoid } from "./remote-host-decoding";
 import type { RemoteRequestFn } from "./remote-server-client";
 import type { RemoteServerDirectory } from "./remote-server-store";
@@ -33,8 +34,8 @@ export interface RemoteControlPlaneTransport {
   listInvites(hostId: string): Promise<RemoteInviteRecord[]>;
   createInvite(
     hostId: string,
-    input: { role: "admin" | "member"; email?: string },
-  ): Promise<{ inviteId: string; token: string; expiresAt: number }>;
+    input: { role: "admin" | "member"; email?: string; permanent?: boolean },
+  ): Promise<{ inviteId: string; token: string; expiresAt: number; permanent: boolean; useCount: number }>;
   revokeInvite(inviteId: string): Promise<void>;
 }
 
@@ -92,12 +93,12 @@ export class RemoteTeamDirectory {
       return (async () => {
         const members = await this.listMembers(serverId);
         const current = members.find((member) => member.id === input.memberId);
-        if (!current || current.role === "owner") throw new Error("The remote member does not exist.");
+        if (!current || current.role === "owner") throw new Error(sourceText("error.host.memberNotFound"));
         if (input.disabled) await transport.removeMember(serverId, input.memberId);
         else
           await transport.updateMember(serverId, input.memberId, input.role ?? current.role, input.disabled === false);
         const updated = (await this.listMembers(serverId)).find((member) => member.id === input.memberId);
-        if (!updated) throw new Error("The remote member does not exist.");
+        if (!updated) throw new Error(sourceText("error.host.memberNotFound"));
         return updated;
       })();
     }
@@ -125,6 +126,8 @@ export class RemoteTeamDirectory {
             expiresAt: new Date(invite.expiresAt).toISOString(),
             usedAt: invite.usedAt === null ? null : new Date(invite.usedAt).toISOString(),
             email: invite.email,
+            permanent: invite.permanent,
+            useCount: invite.useCount,
           })),
       );
     }
@@ -137,13 +140,16 @@ export class RemoteTeamDirectory {
     return this.#request(serverId, TEAM_API_ROUTES.team.invite(inviteId), decodeVoid, { method: "DELETE" });
   }
 
-  async createInvite(serverId: string, input: { role: "admin" | "member"; email?: string }): Promise<InviteSummary> {
+  async createInvite(
+    serverId: string,
+    input: { role: "admin" | "member"; email?: string; permanent?: boolean },
+  ): Promise<InviteSummary> {
     const server = this.#servers.require(serverId);
     const transport = this.#controlPlaneFor(serverId);
     if (transport) {
       // The invitation URL carries the host fingerprint, so a host nobody has connected to yet has
       // nothing to put in it and the invitation would be unverifiable.
-      if (!server.fingerprint) throw new Error("The host must connect once before it can create invitations.");
+      if (!server.fingerprint) throw new Error(sourceText("error.remote.inviteNeedsConnection"));
       const invite = await transport.createInvite(serverId, input);
       const result: InviteSummary = {
         id: invite.inviteId,
@@ -151,6 +157,8 @@ export class RemoteTeamDirectory {
         expiresAt: new Date(invite.expiresAt).toISOString(),
         usedAt: null,
         email: input.email ?? null,
+        permanent: invite.permanent,
+        useCount: invite.useCount,
         inviteUrl: createInviteUrl({
           apiUrl: transport.controlPlaneUrl,
           serverId,
@@ -175,6 +183,9 @@ export class RemoteTeamDirectory {
       }
       return result;
     }
+    // The frozen Team API projections strip `permanent` on this transport, so the request
+    // would silently mint single-use. Fail loudly instead of handing back the wrong kind.
+    if (input.permanent) throw new Error(sourceText("error.remote.permanentInviteUnsupported"));
     return this.#request(serverId, TEAM_API_ROUTES.team.invites, decodeInviteSummary, { method: "POST", body: input });
   }
 

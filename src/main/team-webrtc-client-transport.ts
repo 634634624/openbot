@@ -2,14 +2,9 @@ import { generateKeyPairSync, randomBytes, sign, verify } from "node:crypto";
 import { EventEmitter } from "node:events";
 import type { AgentEvent, TeamRealtimeEvent } from "@openbot/contracts/ipc";
 import { isDynamicRecord, isNumber, isString } from "@openbot/contracts/runtime-values";
-import {
-  channelEvent,
-  channelRequest,
-  channelResponse,
-  isChannelRoute,
-} from "@openbot/contracts/team-protocol/channels-v1";
 import { TEAM_CURRENT_CAPABILITIES } from "@openbot/contracts/team-protocol/current";
-import { isMcpRoute, mcpRequest, mcpResponse } from "@openbot/contracts/team-protocol/mcp-v1";
+import { optionalTeamEvent } from "@openbot/contracts/team-protocol/optional-events";
+import { teamSideRouteCodec } from "@openbot/contracts/team-protocol/side-routes";
 import {
   type TeamProtocolV1CurrentEventControl,
   toWireTeamProtocolV1ClientEvent,
@@ -25,17 +20,18 @@ import {
   teamProtocolV2AuthenticationTranscript,
 } from "@openbot/contracts/team-protocol/v2";
 import {
-  decodeTeamProtocolV4CurrentEvent,
-  decodeTeamProtocolV4WebRtcHttpResponse,
-  encodeTeamProtocolV4WebRtcHttpRequest,
-} from "@openbot/contracts/team-protocol/v4-webrtc-adapter";
+  decodeTeamProtocolV5CurrentEvent,
+  decodeTeamProtocolV5WebRtcHttpResponse,
+  encodeTeamProtocolV5WebRtcHttpRequest,
+} from "@openbot/contracts/team-protocol/v5-webrtc-adapter";
+import { sourceText } from "@openbot/i18n/source";
+import type { RemoteConnectionBootstrap } from "./central-auth-manager";
 import type {
-  RemoteConnectionBootstrap,
   RemoteHostSummary,
   RemoteInvitePreview,
   RemoteInviteRecord,
   RemoteMemberRecord,
-} from "./central-auth-manager";
+} from "./central-auth-records";
 import type { TeamWebRtcBridge } from "./team-webrtc-bridge";
 import { TeamWebRtcFileTransfer } from "./team-webrtc-file-transfer";
 
@@ -61,8 +57,8 @@ interface TeamWebRtcClientTransportOptions {
   endSession: (sessionId: string) => Promise<void>;
   createInvite: (
     hostId: string,
-    input: { role: "admin" | "member"; email?: string },
-  ) => Promise<{ inviteId: string; token: string; expiresAt: number }>;
+    input: { role: "admin" | "member"; email?: string; permanent?: boolean },
+  ) => Promise<{ inviteId: string; token: string; expiresAt: number; permanent: boolean; useCount: number }>;
   listInvites: (hostId: string) => Promise<RemoteInviteRecord[]>;
   previewInvite: (token: string) => Promise<RemoteInvitePreview>;
   acceptInvite: (token: string) => Promise<{ hostId: string; membershipId: string; role: "admin" | "member" }>;
@@ -97,9 +93,24 @@ interface ActiveHost {
   } | null;
 }
 
+/**
+ * A session kept after a connect attempt failed. The control plane keeps a session until the client
+ * ends it, so the next attempt only needs a ticket for it.
+ */
+interface RetainedSession {
+  sessionId: string;
+  expiresAt: number;
+  principalId: string;
+  connected: false;
+  connecting: null;
+}
+
 export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTransportEvents> {
   readonly #options: TeamWebRtcClientTransportOptions;
   readonly #active = new Map<string, ActiveHost>();
+  // A failed attempt used to end its session, so each retry against an offline host was a create, a
+  // ticket and an end: three Worker requests and a Signal webhook. Only `disconnect` ends it now.
+  readonly #retainedSessions = new Map<string, RetainedSession>();
   readonly #files: TeamWebRtcFileTransfer;
   readonly #pending = new Map<
     string,
@@ -180,7 +191,7 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
   async leaveHost(hostId: string): Promise<void> {
     const host = (await this.#options.listHosts()).find((candidate) => candidate.hostId === hostId);
     if (!host) return;
-    if (host.role === "owner") throw new Error("The owner cannot leave this host.");
+    if (host.role === "owner") throw new Error(sourceText("error.remote.ownerCannotLeave"));
     await this.#options.removeMember(hostId, host.membershipId);
   }
 
@@ -241,6 +252,7 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
     await this.#ensureConnected(hostId);
     const method = (init.method ?? "GET").toUpperCase();
     const binary = binaryBody(init.body);
+    const sideRoute = teamSideRouteCodec(path);
     const bodyTransferId = binary
       ? await this.#files.send(hostId, {
           name: "upload",
@@ -259,14 +271,12 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
         path,
         body: binary
           ? null
-          : isChannelRoute(path)
-            ? channelRequest(path, init.body)
-            : isMcpRoute(path)
-              ? mcpRequest(path, init.body)
-              : encodeTeamProtocolV4WebRtcHttpRequest(method, path, init.body, {
-                  preserveSemanticTags: init.preserveSemanticTags,
-                  agentCreateModel: init.agentCreateModel,
-                }),
+          : sideRoute
+            ? sideRoute.request(path, init.body)
+            : encodeTeamProtocolV5WebRtcHttpRequest(method, path, init.body, {
+                preserveSemanticTags: init.preserveSemanticTags,
+                agentCreateModel: init.agentCreateModel,
+              }),
         capabilities: [...TEAM_CURRENT_CAPABILITIES],
         ...(bodyTransferId ? { bodyTransferId } : {}),
         ...(init.contentType ? { contentType: init.contentType } : {}),
@@ -275,7 +285,7 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
     const result = new Promise<TeamProtocolV2Json>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.#pending.delete(requestId);
-        reject(new TeamWebRtcRequestError(504, "remote_timeout", "The remote request timed out."));
+        reject(new TeamWebRtcRequestError(504, "remote_timeout", sourceText("error.remote.requestTimeout")));
       }, TEAM_WEBRTC_REMOTE_REQUEST_TIMEOUT_MILLISECONDS);
       this.#pending.set(requestId, { hostId, resolve, reject, timer });
     });
@@ -286,7 +296,7 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
       if (pending) {
         clearTimeout(pending.timer);
         this.#pending.delete(requestId);
-        pending.reject(error instanceof Error ? error : new Error("The remote request failed."));
+        pending.reject(error instanceof Error ? error : new Error(sourceText("error.remote.requestFailed")));
       }
     }
     const envelope = await result;
@@ -302,14 +312,12 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
     // well-formed frame whose *body* the released V3 adapter refuses, which is the same kind of
     // failure and has to carry the same code: a plain error here reads to the caller as an ordinary
     // request failure, so the host stays healthy and reconnectable while talking nonsense.
-    let body: ReturnType<typeof decodeTeamProtocolV4WebRtcHttpResponse> = null;
+    let body: ReturnType<typeof decodeTeamProtocolV5WebRtcHttpResponse> = null;
     if (!file) {
       try {
-        body = isChannelRoute(path)
-          ? channelResponse(path, envelope.status, envelope.body)
-          : isMcpRoute(path)
-            ? mcpResponse(path, envelope.status, envelope.body)
-            : decodeTeamProtocolV4WebRtcHttpResponse(method, path, envelope.status, envelope.body);
+        body = sideRoute
+          ? sideRoute.response(path, envelope.status, envelope.body)
+          : decodeTeamProtocolV5WebRtcHttpResponse(method, path, envelope.status, envelope.body);
       } catch {
         throw new TeamWebRtcRequestError(502, "protocol_error", "The host returned an invalid response body.");
       }
@@ -319,9 +327,11 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
 
   async disconnect(hostId: string): Promise<void> {
     const active = this.#active.get(hostId);
+    const sessionId = active?.sessionId || this.#retainedSessions.get(hostId)?.sessionId;
     if (active) active.cancelled = true;
     if (active?.expirationTimer) clearTimeout(active.expirationTimer);
     this.#active.delete(hostId);
+    this.#retainedSessions.delete(hostId);
     this.#files.setPeerAuthenticated(hostId, false);
     let disconnectError: unknown;
     try {
@@ -329,12 +339,13 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
     } catch (error) {
       disconnectError = error;
     }
-    if (active?.sessionId) await this.#options.endSession(active.sessionId).catch(() => undefined);
+    if (sessionId) await this.#options.endSession(sessionId).catch(() => undefined);
     if (disconnectError) throw disconnectError;
   }
 
   async stop(): Promise<void> {
-    await Promise.allSettled([...this.#active.keys()].map((hostId) => this.disconnect(hostId)));
+    const hostIds = new Set([...this.#active.keys(), ...this.#retainedSessions.keys()]);
+    await Promise.allSettled([...hostIds].map((hostId) => this.disconnect(hostId)));
     this.#options.bridge.off("connected", this.#onConnected);
     this.#options.bridge.off("disconnected", this.#onDisconnected);
     this.#options.bridge.off("data", this.#onData);
@@ -343,9 +354,15 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
     await this.#files.stop();
   }
 
+  /** Whether a transfer is moving right now, either direction. */
+  hasActiveTransfers(): boolean {
+    return this.#files.hasActiveTransfers();
+  }
+
   async #ensureConnected(hostId: string): Promise<void> {
     const principalId = this.#options.getPrincipalId();
-    let current = this.#active.get(hostId);
+    let current: ActiveHost | RetainedSession | undefined =
+      this.#active.get(hostId) ?? this.#retainedSessions.get(hostId);
     if (current?.expiresAt && current.expiresAt <= Date.now() + 30_000) {
       await this.disconnect(hostId);
       current = undefined;
@@ -371,13 +388,14 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
       throw error;
     });
     active.connecting = operation;
+    this.#retainedSessions.delete(hostId);
     this.#active.set(hostId, active);
     return operation;
   }
 
   async #connect(hostId: string, active: ActiveHost, existingSessionId: string | null): Promise<void> {
     const hostPublicKey = this.#hostPublicKeys.get(hostId);
-    if (!hostPublicKey) throw new Error("The remote host does not have a pinned device key.");
+    if (!hostPublicKey) throw new Error(sourceText("error.remote.pinnedKeyMissing"));
     const clientKeys = generateKeyPairSync("ed25519", {
       publicKeyEncoding: { type: "spki", format: "pem" },
       privateKeyEncoding: { type: "pkcs8", format: "pem" },
@@ -399,7 +417,8 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
         bootstrap = await this.#options.issueTicket(sessionId, clientPublicKey);
         await this.#assertCurrent(hostId, active, sessionId);
       } catch (error) {
-        if (!existingSessionId) throw error;
+        // Only an ended session is replaced. Another failure keeps it, so a retry costs one ticket.
+        if (!existingSessionId || !isEndedSessionError(error)) throw error;
         await this.#options.endSession(existingSessionId).catch(() => undefined);
         const session = await this.#options.startSession(hostId);
         sessionId = session.sessionId;
@@ -411,7 +430,9 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
         await this.#assertCurrent(hostId, active, sessionId);
       }
     } catch (error) {
-      if (sessionId) await this.#options.endSession(sessionId).catch(() => undefined);
+      if (sessionId && !this.#retainSession(hostId, active, sessionId)) {
+        await this.#options.endSession(sessionId).catch(() => undefined);
+      }
       throw error;
     }
     if (startedNewSession) this.#lastEventSequence.delete(hostId);
@@ -425,7 +446,7 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
       cleanupConnectionWait = cleanup;
       const timer = setTimeout(() => {
         cleanup();
-        reject(new Error("The WebRTC host did not connect."));
+        reject(new Error(sourceText("error.remote.hostDidNotConnect")));
       }, 30_000);
       const onConnected = (connectedHostId: string) => {
         if (connectedHostId !== hostId) return;
@@ -464,18 +485,32 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
       this.#scheduleExpiration(hostId, active);
     } catch (error) {
       cleanupConnectionWait();
+      const retained = this.#retainSession(hostId, active, sessionId);
       if (this.#active.get(hostId) === active) this.#active.delete(hostId);
       await this.#options.bridge.disconnect(hostId).catch(() => undefined);
-      await this.#options.endSession(sessionId).catch(() => undefined);
+      if (!retained) await this.#options.endSession(sessionId).catch(() => undefined);
       throw error;
     }
+  }
+
+  /** Keeps the session of an attempt that failed on its own. A cancelled attempt ends its session. */
+  #retainSession(hostId: string, active: ActiveHost, sessionId: string): boolean {
+    if (active.cancelled || this.#active.get(hostId) !== active) return false;
+    this.#retainedSessions.set(hostId, {
+      sessionId,
+      expiresAt: active.expiresAt,
+      principalId: active.principalId,
+      connected: false,
+      connecting: null,
+    });
+    return true;
   }
 
   async #assertCurrent(hostId: string, active: ActiveHost, sessionId: string): Promise<void> {
     if (!active.cancelled && this.#active.get(hostId) === active) return;
     await this.#options.bridge.disconnect(hostId).catch(() => undefined);
     await this.#options.endSession(sessionId).catch(() => undefined);
-    throw new Error("The remote connection was cancelled.");
+    throw new Error(sourceText("error.remote.connectionCancelled"));
   }
 
   async #sendEventControl(hostId: string, control: TeamProtocolV1CurrentEventControl): Promise<void> {
@@ -580,7 +615,9 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
       if (pending.hostId !== hostId) continue;
       clearTimeout(pending.timer);
       this.#pending.delete(requestId);
-      pending.reject(new TeamWebRtcRequestError(503, "remote_disconnected", "The WebRTC host disconnected."));
+      pending.reject(
+        new TeamWebRtcRequestError(503, "remote_disconnected", sourceText("error.remote.hostDisconnected")),
+      );
     }
     this.emit("disconnected", hostId);
   };
@@ -733,15 +770,15 @@ export class TeamWebRtcClientTransport extends EventEmitter<TeamWebRtcClientTran
         return;
       }
       if (frame.sequence !== lastSequence + 1) {
-        this.#failProtocol(hostId, "The host event sequence has a gap.");
+        this.#failProtocol(hostId, sourceText("error.remote.eventGap"));
         return;
       }
-      const optional = frame.type === "event" ? channelEvent(frame.payload) : null;
+      const optional = frame.type === "event" ? optionalTeamEvent(frame.payload) : null;
       const decoded = optional
         ? { status: "known" as const, event: optional }
-        : decodeTeamProtocolV4CurrentEvent(frame);
+        : decodeTeamProtocolV5CurrentEvent(frame);
       if (decoded.status === "invalid") {
-        this.#failProtocol(hostId, "The host returned a malformed known event.");
+        this.#failProtocol(hostId, sourceText("error.remote.malformedKnownEvent"));
         return;
       }
       if (decoded.status === "known") this.emit("event", hostId, decoded.event);
@@ -805,4 +842,9 @@ function binaryBody(value: unknown): Uint8Array | null {
   if (value instanceof Uint8Array) return value;
   if (value instanceof ArrayBuffer) return new Uint8Array(value);
   return null;
+}
+
+/** The account API answers 403 or 404 for a session that ended, expired, or does not exist. */
+function isEndedSessionError(error: unknown): boolean {
+  return error instanceof Error && "status" in error && (error.status === 403 || error.status === 404);
 }

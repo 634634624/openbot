@@ -12,22 +12,23 @@ import {
   decodeTeamProtocolV2AuthFrame,
   decodeTeamProtocolV2EventFrame,
   decodeTeamProtocolV2RpcFrame,
-  decodeTeamProtocolV4CurrentEvent,
-  decodeTeamProtocolV4WebRtcHttpResponse,
+  decodeTeamProtocolV5CurrentEvent,
+  decodeTeamProtocolV5WebRtcHttpResponse,
   encodeTeamProtocolV2Frame,
-  encodeTeamProtocolV4WebRtcHttpRequest,
+  encodeTeamProtocolV5WebRtcHttpRequest,
   TEAM_CURRENT_CAPABILITIES,
   TEAM_PROTOCOL_V2_CHANNELS,
   type TeamProtocolV2AuthFrame,
   type TeamProtocolV2Json,
   teamProtocolV2AuthenticationTranscript,
 } from "@openbot/contracts/team-protocol";
+import { optionalTeamEvent } from "@openbot/contracts/team-protocol/optional-events";
+import { teamSideRouteCodec } from "@openbot/contracts/team-protocol/side-routes";
 import {
-  channelEvent,
-  channelRequest,
-  channelResponse,
-  isChannelRoute,
-} from "@openbot/contracts/team-protocol/channels-v1";
+  type TeamProtocolV1CurrentEventControl,
+  toWireTeamProtocolV1ClientEvent,
+} from "@openbot/contracts/team-protocol/v1-adapter";
+import { sourceText } from "@openbot/i18n/source";
 import { createEd25519Identity, type Ed25519Identity, signEd25519, verifyEd25519Pem } from "./ed25519";
 import { createRemoteFileReceiver } from "./file-download";
 import { createRemoteFileSender, type RemoteFileUpload } from "./file-upload";
@@ -44,7 +45,6 @@ export type RemoteTeamCommand =
 
 export interface RemoteTeamBootstrapPayload {
   sessionId: string;
-  expiresAt: number;
   signalUrl: string;
   ticket: string;
 }
@@ -63,7 +63,7 @@ export function createRemoteCommandMailbox(publish: (commands: RemoteTeamCommand
   let target: { hostId: string; hostPublicKey: string } | null = null;
   const cancel = () => {
     for (const [commandId, entry] of pending) {
-      entry.resolve({ commandId, ok: false, error: "The server connection was replaced." });
+      entry.resolve({ commandId, ok: false, error: sourceText("error.remote.serverConnectionReplaced") });
     }
     pending.clear();
   };
@@ -107,9 +107,26 @@ export interface RemoteTeamConnectionUpdate {
   resync?: boolean;
 }
 
+/** How much of one upload command's file has been sent. */
+export interface RemoteUploadProgress {
+  commandId: string;
+  sent: number;
+  total: number;
+}
+
 export interface RemoteTeamPeerActions {
+  onHostStreamData?: (data: string | ArrayBuffer) => void;
+  /** Hears upload progress, at most once per whole percent. Optional, and never affects the upload. */
+  onUploadProgress?: (progress: RemoteUploadProgress) => Promise<void>;
   onAccountProfileChanged?: () => Promise<void>;
-  getBootstrap: (hostId: string, clientPublicKey: string) => Promise<RemoteTeamBootstrapPayload>;
+  /** The account's server list changed on another device of this account. */
+  onAccountServersChanged?: () => Promise<void>;
+  /** `existingSessionId` is a session kept from a failed attempt on the same host; reuse it when it is still active. */
+  getBootstrap: (
+    hostId: string,
+    clientPublicKey: string,
+    existingSessionId: string | null,
+  ) => Promise<RemoteTeamBootstrapPayload>;
   endSession: (sessionId: string) => Promise<void>;
   onConnectionUpdate: (update: RemoteTeamConnectionUpdate) => Promise<void>;
   onTeamEvent: (hostId: string, event: AgentEvent | TeamRealtimeEvent) => Promise<void>;
@@ -175,23 +192,39 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
   const files = createRemoteFileSender(
     async (data) => {
       const state = peer;
-      if (!state || !isPeerOnline(state)) throw new Error("The selected server is offline.");
+      if (!state || !isPeerOnline(state)) throw new Error(sourceText("error.remote.selectedServerOffline"));
       await sendPayload(state, "files", data);
     },
     () => createTeamRequestId((size) => crypto.getRandomValues(new Uint8Array(size))),
   );
   const downloads = createRemoteFileReceiver(async (data) => {
     const state = peer;
-    if (!state || !isPeerOnline(state)) throw new Error("The selected server is offline.");
+    if (!state || !isPeerOnline(state)) throw new Error(sourceText("error.remote.selectedServerOffline"));
     await sendPayload(state, "files", data);
   });
   const closingSessions = new Map<string, Promise<void>>();
+  // A failed attempt keeps its session for the next attempt on the same host. Ending it each time
+  // made every recovery attempt a create, a ticket and an end on the account Worker.
+  let retainedSession: { hostId: string; sessionId: string } | null = null;
 
   return {
+    async sendHostStreamData(data: string | ArrayBuffer) {
+      const state = peer;
+      if (!state || !isPeerOnline(state)) throw new Error(sourceText("error.remote.hostConnectionOffline"));
+      await sendPayload(state, "desktop", data);
+    },
+    cancelUpload: () => files.cancelUpload(),
+    /** Tells the host which agent this member is writing to. The host clears it after a few seconds. */
+    setTyping(agentId: string | null, typing: boolean) {
+      const state = peer;
+      if (!state || !isPeerOnline(state)) return;
+      void sendEventControl(state, { type: "team-typing", agentId, typing }).catch(() => undefined);
+    },
     execute: (command: RemoteTeamCommand) => executeCommand(command, actions),
-    dispose: () => {
+    dispose: async () => {
       active = false;
-      return closePeer(actions.current.endSession);
+      await closePeer(actions.current.endSession);
+      await releaseRetainedSession(actions.current.endSession);
     },
     setActive(value: boolean) {
       active = value;
@@ -209,14 +242,14 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
         state.needsResync ||= [...pendingRequests.values()].some(
           (request) => request.method === "GET" || request.method === "HEAD",
         );
-        rejectRequests(new Error("The app is in the background."), true);
-        if (!state.authenticated) failPeer(state, new Error("The app is in the background."), actions);
+        rejectRequests(new Error(sourceText("error.remote.appInBackground")), true);
+        if (!state.authenticated) failPeer(state, new Error(sourceText("error.remote.appInBackground")), actions);
       } else {
         if (canRecoverPeer(state)) {
           scheduleDisconnectedCheck(state, actions);
           if (!state.socket) openSignal(state, actions);
         } else if (!isPeerOnline(state)) {
-          failPeer(state, new Error("The desktop connection needs to be restored."), actions);
+          failPeer(state, new Error(sourceText("error.remote.desktopRestoreNeeded")), actions);
         } else {
           scheduleTurnRefresh(state);
           if (!state.socket) openSignal(state, actions);
@@ -246,7 +279,7 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
     if (!active || state.disconnectedTimer !== null) return;
     state.disconnectedTimer = setTimeout(() => {
       state.disconnectedTimer = null;
-      if (!isPeerOnline(state)) failPeer(state, new Error("The desktop went offline."), actions);
+      if (!isPeerOnline(state)) failPeer(state, new Error(sourceText("error.remote.desktopOffline")), actions);
     }, DISCONNECT_GRACE_MS);
   }
 
@@ -259,7 +292,7 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
     let commandGeneration = generation;
     try {
       if (command.type === "connect") {
-        if (!active) throw new Error("The app is in the background.");
+        if (!active) throw new Error(sourceText("error.remote.appInBackground"));
         if (peer && peer.hostId === command.hostId && peer.hostPublicKey === command.hostPublicKey) {
           if (canRecoverPeer(peer)) {
             const recovering = peer;
@@ -291,12 +324,19 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
       }
       if (command.type === "disconnect") {
         await closePeer(actions.current.endSession);
+        await releaseRetainedSession(actions.current.endSession);
         return { commandId: command.id, ok: true };
       }
-      const response = await request(command.method, command.path, command.body, command.upload);
+      let reported = -1;
+      const response = await request(command.method, command.path, command.body, command.upload, (sent, total) => {
+        const percent = total > 0 ? Math.floor((sent / total) * 100) : 100;
+        if (percent === reported) return;
+        reported = percent;
+        void actions.current.onUploadProgress?.({ commandId: command.id, sent, total })?.catch(() => undefined);
+      });
       return { commandId: command.id, ok: true, status: response.status, body: response.body };
     } catch (error) {
-      const message = error instanceof Error ? error.message : "The remote operation failed.";
+      const message = error instanceof Error ? error.message : sourceText("error.remote.operationFailed");
       if (command.type === "connect" && commandGeneration === generation) {
         await actions.current.onConnectionUpdate({ hostId: command.hostId, state: "offline", message });
       }
@@ -309,7 +349,7 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
   }
 
   async function connectPeer(hostId: string, hostPublicKey: string, actions: ActionsRef): Promise<void> {
-    if (!active) throw new Error("The app is in the background.");
+    if (!active) throw new Error(sourceText("error.remote.appInBackground"));
     const currentGeneration = ++generation;
     await actions.current.onConnectionUpdate({ hostId, state: "connecting", message: null });
     const identity = await createEd25519Identity((size) => crypto.getRandomValues(new Uint8Array(size)));
@@ -317,12 +357,17 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
     // must not race its revocation, even when failPeer already cleared `peer`.
     // Cleanup for a different host must never block switching servers.
     while (closingSessions.has(hostId)) await closingSessions.get(hostId);
-    if (currentGeneration !== generation || !active) throw new Error("The connection was replaced.");
+    if (currentGeneration !== generation || !active) throw new Error(sourceText("error.remote.connectionReplaced"));
     const clientPublicKey = identity.publicKeyPem;
-    const bootstrap = await actions.current.getBootstrap(hostId, clientPublicKey);
+    const existingSessionId = retainedSession?.hostId === hostId ? retainedSession.sessionId : null;
+    // Cleanup for a different host must never block switching servers.
+    void releaseRetainedSession(actions.current.endSession, hostId);
+    // A failed bootstrap keeps the session for the next attempt.
+    const bootstrap = await actions.current.getBootstrap(hostId, clientPublicKey, existingSessionId);
+    if (retainedSession?.sessionId === existingSessionId) retainedSession = null;
     if (currentGeneration !== generation || !active) {
       await actions.current.endSession(bootstrap.sessionId).catch(() => undefined);
-      throw new Error("The connection was replaced.");
+      throw new Error(sourceText("error.remote.connectionReplaced"));
     }
     const state: PeerState = {
       generation: currentGeneration,
@@ -363,7 +408,7 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
       state.connectedResolve = resolve;
       state.connectedReject = reject;
       state.connectedTimer = setTimeout(
-        () => failPeer(state, new Error("The desktop did not connect."), actions),
+        () => failPeer(state, new Error(sourceText("error.remote.desktopDidNotConnect")), actions),
         30_000,
       );
     });
@@ -430,6 +475,12 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
       void actions.current.onAccountProfileChanged?.().catch(() => undefined);
       return;
     }
+    if (message.type === "account-servers-changed") {
+      // A server list this phone cannot re-read must not break the connection the notice arrived
+      // on either: that connection is to a server this phone already has.
+      void actions.current.onAccountServersChanged?.().catch(() => undefined);
+      return;
+    }
     if (message.type === "error") {
       if (message.code === "session_revoked")
         return failPeer(state, new Error(message.message), actions, "session_revoked");
@@ -465,7 +516,7 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
       return;
     }
     if (message.type === "disconnect" && message.connectionId === state.connectionId) {
-      failPeer(state, new Error("The desktop went offline."), actions);
+      failPeer(state, new Error(sourceText("error.remote.desktopOffline")), actions);
       return;
     }
     // `peer-ready`, `turn-refresh` and a `disconnect` for someone else carry nothing this peer acts
@@ -479,7 +530,7 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
         ?.trim()
         .toUpperCase();
       if (previousFingerprint && nextFingerprint !== previousFingerprint) {
-        throw new Error("The desktop restarted. Reconnecting with a new authenticated session.");
+        throw new Error(sourceText("error.remote.desktopRestarted"));
       }
       await state.connection?.setRemoteDescription({ type: "answer", sdp: message.sdp });
     } else if (message.type === "ice-candidate") {
@@ -529,7 +580,7 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
         resyncIfNeeded(state, actions);
       }
       if (connection.connectionState === "failed" || connection.connectionState === "closed") {
-        failPeer(state, new Error("The desktop went offline."), actions);
+        failPeer(state, new Error(sourceText("error.remote.desktopOffline")), actions);
       }
     };
     return connection;
@@ -559,9 +610,9 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
         })
         .catch((error) => failPeer(state, error, actions));
     };
-    channel.onerror = () => failPeer(state, new Error(`${kind} channel failed.`), actions);
+    channel.onerror = () => failPeer(state, new Error(sourceText("error.remote.dataChannelFailed", { kind })), actions);
     channel.onclose = () => {
-      if (state.authenticated) failPeer(state, new Error("The desktop went offline."), actions);
+      if (state.authenticated) failPeer(state, new Error(sourceText("error.remote.desktopOffline")), actions);
     };
   }
 
@@ -602,8 +653,13 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
     actions: ActionsRef,
   ): Promise<void> {
     if (state.closed || peer !== state) return;
+    if (kind === "desktop") {
+      if (!state.authenticated) throw new Error("The host sent stream data before authentication.");
+      actions.current.onHostStreamData?.(data);
+      return;
+    }
     if (kind === "files") {
-      if (!state.authenticated) throw new Error("The host sent data before authentication.");
+      if (!state.authenticated) throw new Error(sourceText("error.remote.dataBeforeAuth"));
       if (!(await downloads.receive(data)) && isString(data)) files.receive(data);
       return;
     }
@@ -612,7 +668,7 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
       await handleAuthenticationFrame(state, decodeTeamProtocolV2AuthFrame(data), actions);
       return;
     }
-    if (!state.authenticated) throw new Error("The host sent data before authentication.");
+    if (!state.authenticated) throw new Error(sourceText("error.remote.dataBeforeAuth"));
     if (kind === "rpc") {
       const frame = decodeTeamProtocolV2RpcFrame(data);
       if (frame.type !== "response") throw new Error("The host returned an invalid RPC frame.");
@@ -629,14 +685,17 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
           const file = await downloads.take(frame.result.file.transferId);
           pending.resolve({ status: frame.result.status, body: { ...file } });
         } catch (error) {
-          pending.reject(error instanceof Error ? error : new Error("The attachment download failed."));
+          pending.reject(
+            error instanceof Error ? error : new Error(sourceText("error.remote.attachmentDownloadFailed")),
+          );
         }
       } else {
+        const sideRoute = teamSideRouteCodec(pending.path);
         pending.resolve({
           status: frame.result.status,
-          body: isChannelRoute(pending.path)
-            ? channelResponse(pending.path, frame.result.status, frame.result.body)
-            : decodeTeamProtocolV4WebRtcHttpResponse(
+          body: sideRoute
+            ? sideRoute.response(pending.path, frame.result.status, frame.result.body)
+            : decodeTeamProtocolV5WebRtcHttpResponse(
                 pending.method,
                 pending.path,
                 frame.result.status,
@@ -668,10 +727,10 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
       await sendEventAck(state);
       return;
     }
-    if (frame.sequence !== state.lastEventSequence + 1) throw new Error("The host event stream has a gap.");
-    const channel = channelEvent(frame.payload);
-    const decoded = channel ? { status: "known" as const, event: channel } : decodeTeamProtocolV4CurrentEvent(frame);
-    if (decoded.status === "invalid") throw new Error("The host returned a malformed event.");
+    if (frame.sequence !== state.lastEventSequence + 1) throw new Error(sourceText("error.remote.eventStreamGap"));
+    const channel = optionalTeamEvent(frame.payload);
+    const decoded = channel ? { status: "known" as const, event: channel } : decodeTeamProtocolV5CurrentEvent(frame);
+    if (decoded.status === "invalid") throw new Error(sourceText("error.remote.malformedEvent"));
     state.lastEventSequence = frame.sequence;
     if (decoded.status === "known") await actions.current.onTeamEvent(state.hostId, decoded.event);
     await sendEventAck(state);
@@ -701,7 +760,7 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
         state.hostPublicKey,
       );
       if (state.closed || peer !== state) return;
-      if (!valid) throw new Error("The desktop identity could not be verified.");
+      if (!valid) throw new Error(sourceText("error.remote.desktopIdentityNotVerified"));
       state.hostNonce = frame.hostNonce;
       await sendPayload(
         state,
@@ -728,28 +787,48 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
     await actions.current.onConnectionUpdate({ hostId: state.hostId, state: "online", message: null });
   }
 
-  async function request(method: string, path: string, body: TeamProtocolV2Json, upload?: RemoteFileUpload) {
+  async function request(
+    method: string,
+    path: string,
+    body: TeamProtocolV2Json,
+    upload?: RemoteFileUpload,
+    onUploadProgress?: (sent: number, total: number) => void,
+  ) {
     const state = peer;
     if (!state || !isPeerOnline(state)) {
       if (state && (method === "GET" || method === "HEAD")) state.needsResync = true;
-      throw new Error("The selected server is offline.");
+      throw new Error(sourceText("error.remote.selectedServerOffline"));
     }
-    const bodyTransferId = upload ? await files.upload(upload) : null;
-    if (peer !== state || !isPeerOnline(state)) throw new Error("The attachment connection changed.");
+    const delivery = upload && onUploadProgress ? trackUploadDelivery(state, onUploadProgress) : null;
+    let bodyTransferId: string | null = null;
+    try {
+      bodyTransferId = upload ? await files.upload(upload, delivery?.queued) : null;
+      if (peer !== state || !isPeerOnline(state))
+        throw new Error(sourceText("error.remote.attachmentConnectionChanged"));
+    } catch (error) {
+      delivery?.stop();
+      throw error;
+    }
     // Validate before registering a pending promise. A rejected local payload must not leave
     // an unobserved promise to reject again on timeout or disconnection.
+    const sideRoute = teamSideRouteCodec(path);
     const payloadBody = upload
       ? null
-      : isChannelRoute(path)
-        ? channelRequest(path, body)
-        : encodeTeamProtocolV4WebRtcHttpRequest(method, path, body, { preserveSemanticTags: true });
+      : sideRoute
+        ? sideRoute.request(path, body)
+        : // A caller names a provider and model on agent creation only when the host advertises
+          // `agent-create-model`, so the pair is kept whenever it is present.
+          encodeTeamProtocolV5WebRtcHttpRequest(method, path, body, {
+            preserveSemanticTags: true,
+            agentCreateModel: true,
+          });
     const requestId = createTeamRequestId((size) => crypto.getRandomValues(new Uint8Array(size)));
     const checksConnection = method === "GET" && path === TEAM_API_ROUTES.compatibility;
     const result = new Promise<{ status: number; body: TeamProtocolV2Json }>((resolve, reject) => {
       const timer = setTimeout(
         () => {
           pendingRequests.delete(requestId);
-          const error = new Error("The desktop request timed out.");
+          const error = new Error(sourceText("error.remote.desktopRequestTimeout"));
           reject(error);
           // The required compatibility read also confirms that a reused peer can answer.
           // Do not keep retrying reads on channels whose local state is stale.
@@ -780,9 +859,55 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
       if (!pending) return;
       clearTimeout(pending.timer);
       pendingRequests.delete(requestId);
-      pending.reject(error instanceof Error ? error : new Error("The request could not be sent."));
+      pending.reject(error instanceof Error ? error : new Error(sourceText("error.remote.requestNotSent")));
     });
-    return result;
+    if (!delivery) return result;
+    return result.then(
+      (response) => {
+        // The host answers only once it holds every byte, so its answer completes the ring.
+        delivery.complete();
+        return response;
+      },
+      (error: unknown) => {
+        delivery.stop();
+        throw error;
+      },
+    );
+  }
+
+  /**
+   * Upload progress as bytes that have left the phone. A chunk counts once the data channel has
+   * sent it, not when it enters the channel's buffer: that buffer takes 4 MB before it pushes
+   * back, so a photo would read as done the moment it was queued, and then wait at 100 %.
+   */
+  function trackUploadDelivery(state: PeerState, onProgress: (sent: number, total: number) => void) {
+    let queued = 0;
+    let total = 0;
+    let timer: ReturnType<typeof setInterval> | null = null;
+    const stop = () => {
+      if (timer !== null) clearInterval(timer);
+      timer = null;
+    };
+    const report = () => {
+      const buffered = state.channels.files?.bufferedAmount ?? 0;
+      // The buffer also holds frame headers, so this can read a little low, never high.
+      onProgress(Math.max(0, Math.min(total, queued - buffered)), total);
+      if (buffered === 0 && queued >= total) stop();
+    };
+    return {
+      queued(sent: number, size: number) {
+        queued = sent;
+        total = size;
+        report();
+        // Chunks stop arriving while the buffer drains, so read it until it is empty.
+        timer ??= setInterval(report, 100);
+      },
+      complete() {
+        stop();
+        if (total > 0) onProgress(total, total);
+      },
+      stop,
+    };
   }
 
   async function sendEventAck(state: PeerState): Promise<void> {
@@ -793,9 +918,21 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
     );
   }
 
+  async function sendEventControl(state: PeerState, control: TeamProtocolV1CurrentEventControl): Promise<void> {
+    await sendPayload(
+      state,
+      "events",
+      encodeTeamProtocolV2Frame({
+        version: 2,
+        type: "event-control",
+        control: toWireTeamProtocolV1ClientEvent(control),
+      }),
+    );
+  }
+
   async function sendPayload(state: PeerState, kind: ChannelKind, data: string | ArrayBuffer): Promise<void> {
     const channel = state.channels[kind];
-    if (channel?.readyState !== "open") throw new Error("The WebRTC channel is not open.");
+    if (channel?.readyState !== "open") throw new Error(sourceText("error.remote.channelNotOpen"));
     const maximumMessageSize = state.connection?.sctp?.maxMessageSize ?? Number.POSITIVE_INFINITY;
     for (const frame of encodeTeamWebRtcPayload(data, maximumMessageSize)) {
       await waitForWritable(channel);
@@ -812,7 +949,7 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
         if (settled) return;
         settled = true;
         channel.removeEventListener("bufferedamountlow", onLow);
-        reject(new Error("The WebRTC channel stayed under backpressure."));
+        reject(new Error(sourceText("error.remote.channelBackpressure")));
       }, 60_000);
       const onLow = () => {
         if (settled) return;
@@ -842,7 +979,7 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
   }
 
   function sendSignal(state: PeerState, message: SignalClientMessage): void {
-    if (state.socket?.readyState !== WebSocket.OPEN) throw new Error("Signal is offline.");
+    if (state.socket?.readyState !== WebSocket.OPEN) throw new Error(sourceText("error.remote.signalOffline"));
     state.socket.send(JSON.stringify(message));
   }
 
@@ -884,7 +1021,7 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
     code?: RemoteTeamConnectionUpdate["code"],
   ): void {
     if (state.closed || peer !== state) return;
-    const message = error instanceof Error ? error.message : "The WebRTC connection failed.";
+    const message = error instanceof Error ? error.message : sourceText("error.remote.webRtcConnectionFailed");
     rejectConnection(state, new Error(message));
     void actions.current.onConnectionUpdate({
       hostId: state.hostId,
@@ -892,7 +1029,8 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
       message,
       ...(code ? { code } : {}),
     });
-    void closePeer(actions.current.endSession);
+    // A revoked session or a host that broke the protocol starts again from a new session.
+    void closePeer(actions.current.endSession, code === undefined);
   }
 
   function rejectRequests(error: Error, readsOnly = false): void {
@@ -904,7 +1042,18 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
     }
   }
 
-  async function closePeer(endSession: (sessionId: string) => Promise<void>): Promise<void> {
+  /** Ends a kept session, unless it belongs to `keepHostId`. */
+  async function releaseRetainedSession(
+    endSession: (sessionId: string) => Promise<void>,
+    keepHostId?: string,
+  ): Promise<void> {
+    const retained = retainedSession;
+    if (!retained || retained.hostId === keepHostId) return;
+    retainedSession = null;
+    await endSession(retained.sessionId).catch(() => undefined);
+  }
+
+  async function closePeer(endSession: (sessionId: string) => Promise<void>, retainSession = false): Promise<void> {
     files.cancel();
     downloads.clear();
     const state = peer;
@@ -920,8 +1069,12 @@ export function createRemoteTeamPeer(actions: ActionsRef) {
     state.connection?.close();
     for (const decoder of Object.values(state.decoders)) decoder?.reset();
     state.channelChains = {};
-    rejectRequests(new Error("The server disconnected."));
-    rejectConnection(state, new Error("The server disconnected."));
+    rejectRequests(new Error(sourceText("error.remote.serverDisconnected")));
+    rejectConnection(state, new Error(sourceText("error.remote.serverDisconnected")));
+    if (retainSession) {
+      retainedSession = { hostId: state.hostId, sessionId: state.sessionId };
+      return;
+    }
     const cleanup = (closingSessions.get(state.hostId) ?? Promise.resolve())
       .then(() => endSession(state.sessionId))
       .catch(() => undefined);

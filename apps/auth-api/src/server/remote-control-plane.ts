@@ -1,5 +1,7 @@
+import { DEFAULT_TEAM_MEMBER_LIMIT } from "@openbot/contracts/input-limits";
 import type { MobileConnectHostBinding } from "@openbot/contracts/mobile-connect";
 import { type DynamicRecord, isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
+import type { RemoteAuthEvent } from "@openbot/contracts/signal-protocol/auth-events";
 import {
   REMOTE_TICKET_AUDIENCE,
   REMOTE_TICKET_PROTOCOL_VERSION,
@@ -15,6 +17,12 @@ const TICKET_TTL_SECONDS = 180;
 const LEGACY_SHA256_HEX_PATTERN = /^[a-f0-9]{64}$/u;
 const AUTH_EVENT_RETRY_MS = 60_000;
 const MAX_OUTSTANDING_INVITES_PER_HOST = 50;
+const MAX_PERMANENT_INVITES_PER_HOST = 5;
+// An active member keeps a seat; anyone else needs a free one. Binds: host, user, host, limit.
+const MEMBER_SEAT_AVAILABLE_SQL = `(
+  EXISTS(SELECT 1 FROM remote_memberships WHERE host_id = ? AND user_id = ? AND status = 'active')
+  OR (SELECT COUNT(*) FROM remote_memberships WHERE host_id = ? AND status = 'active') < ?
+)`;
 
 export type { RemoteMemberRole };
 
@@ -26,6 +34,12 @@ export class RemoteControlPlaneError extends Error {
   ) {
     super(message);
   }
+}
+
+/** A SQL condition and its binds, which a statement adds to its WHERE clause. */
+interface SqlCondition {
+  sql: string;
+  binds: unknown[];
 }
 
 interface RemoteHostRow {
@@ -69,6 +83,9 @@ interface RemoteInviteRow {
   expires_at: number;
   used_at: number | null;
   revoked_at: number | null;
+  // NULL means unlimited. Rows written before 0020 carry the migration default of 1.
+  max_uses: number | null;
+  use_count: number;
 }
 
 interface TicketSignerConfig {
@@ -78,9 +95,6 @@ interface TicketSignerConfig {
 }
 
 type RemoteFetch = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
-type RemoteAuthEvent =
-  | { type: "remote-auth-changed"; hostId: string; authEpoch: number }
-  | { type: "remote-session-ended"; hostId: string; sessionId: string };
 
 interface RemoteAuthEventRow {
   event_id: string;
@@ -100,12 +114,23 @@ interface RemotePublicJwks {
 export class RemoteTicketSigner {
   readonly #keyId: string;
   readonly #publicJwks: RemotePublicJwks;
-  readonly #key: ReturnType<typeof importJWK>;
+  readonly #privateJwk: JWK;
+  #key: Awaited<ReturnType<typeof importJWK>> | null = null;
 
   constructor(config: TicketSignerConfig) {
     this.#keyId = requiredIdentifier(config.keyId, "ticket key ID");
     this.#publicJwks = parseJwks(config.publicJwks, this.#keyId);
-    this.#key = importJWK(parseJwk(config.privateJwk), "ES256");
+    this.#privateJwk = parseJwk(config.privateJwk);
+  }
+
+  /**
+   * Every request in the isolate shares this signer, so only the resolved key is kept: the runtime
+   * refuses a promise that another request made. Two requests that race import the key twice, which
+   * costs one import and leaves the same key behind.
+   */
+  async #signingKey(): Promise<Awaited<ReturnType<typeof importJWK>>> {
+    this.#key ??= await importJWK(this.#privateJwk, "ES256");
+    return this.#key;
   }
 
   publicJwks(): RemotePublicJwks {
@@ -144,9 +169,27 @@ export class RemoteTicketSigner {
       .setIssuedAt(issuedAt)
       .setExpirationTime(expiresAt)
       .setAudience(REMOTE_TICKET_AUDIENCE)
-      .sign(await this.#key);
+      .sign(await this.#signingKey());
     return { ticket, expiresAt: expiresAt * 1_000 };
   }
+}
+
+/** One signer for each key: the JWKS parse and the key import are too costly for every request. */
+const ticketSigners = new Map<string, { config: TicketSignerConfig; signer: RemoteTicketSigner }>();
+
+/**
+ * Keyed by the key ID so the map holds one entry for each key, and checked against the material so
+ * a key ID that another configuration reuses -- a test, or a rotation that keeps the name -- still
+ * gets its own signer.
+ */
+function sharedTicketSigner(config: TicketSignerConfig): RemoteTicketSigner {
+  const cached = ticketSigners.get(config.keyId);
+  if (cached && cached.config.privateJwk === config.privateJwk && cached.config.publicJwks === config.publicJwks) {
+    return cached.signer;
+  }
+  const signer = new RemoteTicketSigner(config);
+  ticketSigners.set(config.keyId, { config, signer });
+  return signer;
 }
 
 export class RemoteControlPlane {
@@ -156,6 +199,7 @@ export class RemoteControlPlane {
   readonly #webhookSecret: string | null;
   readonly #fetch: RemoteFetch;
   readonly #now: () => number;
+  readonly #schedule: ((delivery: Promise<void>) => void) | null;
 
   constructor(
     bindings: Pick<
@@ -167,13 +211,13 @@ export class RemoteControlPlane {
       | "REMOTE_AUTH_WEBHOOK_URL"
       | "REMOTE_AUTH_WEBHOOK_SECRET"
     >,
-    options: { fetch?: RemoteFetch; now?: () => number } = {},
+    options: { fetch?: RemoteFetch; now?: () => number; schedule?: (delivery: Promise<void>) => void } = {},
   ) {
     if (!bindings.REMOTE_TICKET_PRIVATE_JWK || !bindings.REMOTE_TICKET_PUBLIC_JWKS || !bindings.REMOTE_TICKET_KEY_ID) {
       throw new RemoteControlPlaneError(503, "remote_not_configured", "Remote ticket signing is not configured.");
     }
     this.#database = bindings.DB;
-    this.#signer = new RemoteTicketSigner({
+    this.#signer = sharedTicketSigner({
       privateJwk: bindings.REMOTE_TICKET_PRIVATE_JWK,
       publicJwks: bindings.REMOTE_TICKET_PUBLIC_JWKS,
       keyId: bindings.REMOTE_TICKET_KEY_ID,
@@ -182,6 +226,7 @@ export class RemoteControlPlane {
     this.#webhookSecret = bindings.REMOTE_AUTH_WEBHOOK_SECRET?.trim() || null;
     this.#fetch = options.fetch ?? ((input, init) => fetch(input, init));
     this.#now = options.now ?? Date.now;
+    this.#schedule = options.schedule ?? null;
   }
 
   publicJwks(): RemotePublicJwks {
@@ -277,6 +322,10 @@ export class RemoteControlPlane {
         )
         .bind(membershipId, user.id, now, now, hostId, user.id),
       this.#authEpochEventStatement(hostId, now, user.id),
+      // Only for a host this account did not have. Publishing an existing one again rotates its
+      // credential without changing anyone's server list, and this owner's other devices would
+      // re-read the account for nothing on every start of the host.
+      ...(existing ? [] : [this.#authEventStatement({ type: "account-servers-changed", userId: user.id }, now)]),
     ]);
     if (registration.some((result) => (result.meta.changes ?? 0) !== 1)) {
       throw new RemoteControlPlaneError(403, "host_owner_mismatch", "This host belongs to another account.");
@@ -335,17 +384,69 @@ export class RemoteControlPlane {
     input: {
       hostId: string;
       role: Exclude<RemoteMemberRole, "owner">;
-      email?: string | null;
-      expiresInSeconds?: number;
+      email?: string | null | undefined;
+      expiresInSeconds?: number | undefined;
+      permanent?: boolean | undefined;
     },
   ) {
     await this.#requireRole(input.hostId, user.id, ["owner", "admin"]);
     if (input.role !== "admin" && input.role !== "member") throw invalid("invite role");
+    const permanent = input.permanent ?? false;
+    // A permanent link is a shareable URL, never an addressed message: binding it to an
+    // email would promise a restriction the token cannot enforce.
+    if (permanent && input.email?.trim()) throw invalid("permanent invite email");
+    if (permanent && input.expiresInSeconds !== undefined) throw invalid("permanent invite lifetime");
     const now = this.#now();
+    const ttl = input.expiresInSeconds ?? 7 * 24 * 60 * 60;
+    if (!permanent && (!Number.isSafeInteger(ttl) || ttl < 300 || ttl > 30 * 24 * 60 * 60)) {
+      throw invalid("invite lifetime");
+    }
+    const email = input.email?.trim().toLowerCase() || null;
+    const inviteId = crypto.randomUUID();
+    const token = randomToken();
+    const expiresAt = permanent ? PERSISTENT_SESSION_EXPIRES_AT : now + ttl * 1_000;
+    if (permanent) {
+      // The count and the insert are one statement: two concurrent requests cannot both
+      // read below the cap and then both insert.
+      const created = await this.#database
+        .prepare(
+          `INSERT INTO remote_invites(
+             invite_id, host_id, token_hash, email, role, created_by_user_id, expires_at, created_at,
+             max_uses, use_count
+           )
+           SELECT ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0
+           WHERE (
+             SELECT COUNT(*) FROM remote_invites
+             WHERE host_id = ? AND max_uses IS NULL AND revoked_at IS NULL
+           ) < ?`,
+        )
+        .bind(
+          inviteId,
+          input.hostId,
+          await sha256(token),
+          email,
+          input.role,
+          user.id,
+          expiresAt,
+          now,
+          input.hostId,
+          MAX_PERMANENT_INVITES_PER_HOST,
+        )
+        .run();
+      if ((created.meta.changes ?? 0) !== 1) {
+        throw new RemoteControlPlaneError(
+          429,
+          "invite_limit_reached",
+          "Revoke a permanent invitation link before creating another one.",
+        );
+      }
+      return { inviteId, token, expiresAt, permanent, useCount: 0 };
+    }
     const outstanding = await this.#database
       .prepare(
         `SELECT COUNT(*) AS count FROM remote_invites
-         WHERE host_id = ? AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?`,
+         WHERE host_id = ? AND max_uses IS NOT NULL
+           AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?`,
       )
       .bind(input.hostId, now)
       .first<{ count: number }>();
@@ -356,27 +457,23 @@ export class RemoteControlPlane {
         "Revoke or use an active invitation before creating another one.",
       );
     }
-    const ttl = input.expiresInSeconds ?? 7 * 24 * 60 * 60;
-    if (!Number.isSafeInteger(ttl) || ttl < 300 || ttl > 30 * 24 * 60 * 60) throw invalid("invite lifetime");
-    const email = input.email?.trim().toLowerCase() || null;
-    const inviteId = crypto.randomUUID();
-    const token = randomToken();
     await this.#database
       .prepare(
         `INSERT INTO remote_invites(
-           invite_id, host_id, token_hash, email, role, created_by_user_id, expires_at, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+           invite_id, host_id, token_hash, email, role, created_by_user_id, expires_at, created_at,
+           max_uses, use_count
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0)`,
       )
-      .bind(inviteId, input.hostId, await sha256(token), email, input.role, user.id, now + ttl * 1_000, now)
+      .bind(inviteId, input.hostId, await sha256(token), email, input.role, user.id, expiresAt, now)
       .run();
-    return { inviteId, token, expiresAt: now + ttl * 1_000 };
+    return { inviteId, token, expiresAt, permanent, useCount: 0 };
   }
 
   async listInvites(userId: string, hostId: string) {
     await this.#requireRole(hostId, userId, ["owner", "admin"]);
     const result = await this.#database
       .prepare(
-        `SELECT invite_id, email, role, expires_at, used_at, revoked_at
+        `SELECT invite_id, email, role, expires_at, used_at, revoked_at, max_uses, use_count
          FROM remote_invites WHERE host_id = ? ORDER BY created_at DESC`,
       )
       .bind(hostId)
@@ -387,15 +484,24 @@ export class RemoteControlPlane {
         expires_at: number;
         used_at: number | null;
         revoked_at: number | null;
+        max_uses: number | null;
+        use_count: number;
       }>();
-    return (result.results ?? []).map((invite) => ({
-      inviteId: invite.invite_id,
-      email: invite.email,
-      role: invite.role,
-      expiresAt: invite.expires_at,
-      usedAt: invite.used_at,
-      revokedAt: invite.revoked_at,
-    }));
+    return (result.results ?? []).map((invite) => {
+      // A permanent link stays listed after joins; a Worker from the deploy gap may have
+      // stamped used_at on one, which carries no meaning here.
+      const permanent = invite.max_uses === null;
+      return {
+        inviteId: invite.invite_id,
+        email: invite.email,
+        role: invite.role,
+        expiresAt: invite.expires_at,
+        usedAt: permanent ? null : invite.used_at,
+        revokedAt: invite.revoked_at,
+        permanent,
+        useCount: invite.use_count ?? 0,
+      };
+    });
   }
 
   async listMembers(userId: string, hostId: string) {
@@ -457,13 +563,13 @@ export class RemoteControlPlane {
     const invite = await this.#database
       .prepare(
         `SELECT i.invite_id, i.host_id, i.email, i.role, i.expires_at, i.used_at, i.revoked_at,
-                h.name, h.device_public_key
+                i.max_uses, i.use_count, h.name, h.device_public_key
          FROM remote_invites i JOIN remote_hosts h ON h.host_id = i.host_id
          WHERE i.token_hash = ? LIMIT 1`,
       )
       .bind(await sha256(requiredText(token, 512, "invite token")))
       .first<RemoteInviteRow & { name: string; device_public_key: string | null }>();
-    if (!invite || invite.used_at || invite.revoked_at || invite.expires_at <= now) {
+    if (!invite || invite.revoked_at || invite.expires_at <= now || (invite.used_at && invite.max_uses !== null)) {
       throw new RemoteControlPlaneError(404, "invite_invalid", "The invitation is invalid or expired.");
     }
     return {
@@ -473,6 +579,7 @@ export class RemoteControlPlane {
       role: invite.role,
       expiresAt: invite.expires_at,
       emailBound: Boolean(invite.email),
+      permanent: invite.max_uses === null,
       devicePublicKey: invite.device_public_key,
     };
   }
@@ -482,12 +589,13 @@ export class RemoteControlPlane {
     const tokenHash = await sha256(requiredText(token, 512, "invite token"));
     const invite = await this.#database
       .prepare(
-        `SELECT invite_id, host_id, email, role, expires_at, used_at, revoked_at
+        `SELECT invite_id, host_id, email, role, expires_at, used_at, revoked_at, max_uses, use_count
          FROM remote_invites WHERE token_hash = ? LIMIT 1`,
       )
       .bind(tokenHash)
       .first<RemoteInviteRow>();
-    if (!invite || invite.used_at || invite.revoked_at || invite.expires_at <= now) {
+    const permanent = invite?.max_uses === null;
+    if (!invite || invite.revoked_at || invite.expires_at <= now || (!permanent && invite.used_at)) {
       throw new RemoteControlPlaneError(404, "invite_invalid", "The invitation is invalid or expired.");
     }
     if (invite.email && invite.email !== user.email.trim().toLowerCase()) {
@@ -504,7 +612,9 @@ export class RemoteControlPlane {
         "The owner cannot accept a member invitation.",
       );
     }
+    await this.#requireMemberSeat(invite.host_id, user.id);
     const membershipId = crypto.randomUUID();
+    const seat = [invite.host_id, user.id, invite.host_id, DEFAULT_TEAM_MEMBER_LIMIT] as const;
     const accepted = await this.#database.batch([
       this.#database
         .prepare(
@@ -512,32 +622,56 @@ export class RemoteControlPlane {
             WHERE host_id = ?
               AND EXISTS(
                 SELECT 1 FROM remote_memberships WHERE host_id = ? AND user_id = ?
-              )`,
+              )
+              AND ${MEMBER_SEAT_AVAILABLE_SQL}`,
         )
-        .bind(now, invite.host_id, invite.host_id, user.id),
+        .bind(now, invite.host_id, invite.host_id, user.id, ...seat),
       this.#authEpochEventStatement(invite.host_id, now),
       this.#database
         .prepare(
-          `INSERT INTO remote_memberships(
-             membership_id, host_id, user_id, role, status, created_at, updated_at
-           ) SELECT ?, ?, ?, ?, 'active', ?, ?
-             FROM remote_invites
-            WHERE invite_id = ? AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?
-           ON CONFLICT(host_id, user_id) DO UPDATE SET
-             role = CASE WHEN remote_memberships.role = 'owner' THEN 'owner' ELSE excluded.role END,
-             status = 'active', updated_at = excluded.updated_at`,
+          permanent
+            ? `INSERT INTO remote_memberships(
+                 membership_id, host_id, user_id, role, status, created_at, updated_at
+               ) SELECT ?, ?, ?, ?, 'active', ?, ?
+                 FROM remote_invites
+                WHERE invite_id = ? AND revoked_at IS NULL AND expires_at > ? AND ${MEMBER_SEAT_AVAILABLE_SQL}
+               ON CONFLICT(host_id, user_id) DO UPDATE SET
+                 role = CASE WHEN remote_memberships.role = 'owner' THEN 'owner' ELSE excluded.role END,
+                 status = 'active', updated_at = excluded.updated_at`
+            : `INSERT INTO remote_memberships(
+                 membership_id, host_id, user_id, role, status, created_at, updated_at
+               ) SELECT ?, ?, ?, ?, 'active', ?, ?
+                 FROM remote_invites
+                WHERE invite_id = ? AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?
+                  AND ${MEMBER_SEAT_AVAILABLE_SQL}
+               ON CONFLICT(host_id, user_id) DO UPDATE SET
+                 role = CASE WHEN remote_memberships.role = 'owner' THEN 'owner' ELSE excluded.role END,
+                 status = 'active', updated_at = excluded.updated_at`,
         )
-        .bind(membershipId, invite.host_id, user.id, invite.role, now, now, invite.invite_id, now),
-      this.#database
-        .prepare(
-          "UPDATE remote_invites SET used_at = ? WHERE invite_id = ? AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?",
-        )
-        .bind(now, invite.invite_id, now),
+        .bind(membershipId, invite.host_id, user.id, invite.role, now, now, invite.invite_id, now, ...seat),
+      // A permanent link counts the join and stays live; a single-use link burns. A join that
+      // lost the last seat to a concurrent one leaves the invitation as it was.
+      permanent
+        ? this.#database
+            .prepare(
+              `UPDATE remote_invites SET use_count = use_count + 1
+                WHERE invite_id = ? AND revoked_at IS NULL AND expires_at > ? AND ${MEMBER_SEAT_AVAILABLE_SQL}`,
+            )
+            .bind(invite.invite_id, now, ...seat)
+        : this.#database
+            .prepare(
+              `UPDATE remote_invites SET used_at = ?
+                WHERE invite_id = ? AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?
+                  AND ${MEMBER_SEAT_AVAILABLE_SQL}`,
+            )
+            .bind(now, invite.invite_id, now, ...seat),
       this.#database
         .prepare("UPDATE remote_sessions SET ended_at = ? WHERE host_id = ? AND user_id = ? AND ended_at IS NULL")
         .bind(now, invite.host_id, user.id),
+      this.#authEventStatement({ type: "account-servers-changed", userId: user.id }, now),
     ]);
-    if ((accepted[2].meta.changes ?? 0) !== 1 || (accepted[3].meta.changes ?? 0) !== 1) {
+    if ((accepted[2]?.meta.changes ?? 0) !== 1 || (accepted[3]?.meta.changes ?? 0) !== 1) {
+      await this.#requireMemberSeat(invite.host_id, user.id);
       throw new RemoteControlPlaneError(409, "invite_already_used", "The invitation was already used.");
     }
     const membership = await this.#database
@@ -560,8 +694,10 @@ export class RemoteControlPlane {
       .first<{ host_id: string }>();
     if (!invite) throw new RemoteControlPlaneError(404, "invite_not_found", "The invitation does not exist.");
     await this.#requireRole(invite.host_id, userId, ["owner", "admin"]);
+    // The `max_uses IS NULL` arm covers a permanent link a pre-permanent Worker stamped
+    // used_at on during the migration/deploy gap; its joins never meant "consumed".
     await this.#database
-      .prepare("UPDATE remote_invites SET revoked_at = ? WHERE invite_id = ? AND used_at IS NULL")
+      .prepare("UPDATE remote_invites SET revoked_at = ? WHERE invite_id = ? AND (used_at IS NULL OR max_uses IS NULL)")
       .bind(this.#now(), inviteId)
       .run();
   }
@@ -591,35 +727,62 @@ export class RemoteControlPlane {
     const role = input.role ?? membership.role;
     if (role !== "admin" && role !== "member") throw invalid("member role");
     if (input.revoke && input.reactivate) throw invalid("member status");
+    // A role change keeps an active member active, so it needs the seat as a reactivation does.
+    const activating = !input.revoke && (input.reactivate === true || membership.status === "active");
+    if (activating && membership.status !== "active") await this.#requireMemberSeat(input.hostId, membership.user_id);
     const now = this.#now();
     const activeSessions = await this.#database
       .prepare("SELECT session_id FROM remote_sessions WHERE host_id = ? AND user_id = ? AND ended_at IS NULL")
       .bind(input.hostId, membership.user_id)
       .all<{ session_id: string }>();
-    await this.#database.batch([
+    // The writes after the membership apply only when it took its seat. A refused UPDATE leaves the
+    // member inactive, so the host keeps its auth epoch and its connections.
+    const applied = activating
+      ? {
+          sql: "EXISTS(SELECT 1 FROM remote_memberships WHERE membership_id = ? AND status = 'active')",
+          binds: [input.membershipId],
+        }
+      : undefined;
+    const changed = await this.#database.batch([
       this.#database
-        .prepare("UPDATE remote_memberships SET role = ?, status = ?, updated_at = ? WHERE membership_id = ?")
+        .prepare(
+          `UPDATE remote_memberships SET role = ?, status = ?, updated_at = ?
+            WHERE membership_id = ?${activating ? ` AND ${MEMBER_SEAT_AVAILABLE_SQL}` : ""}`,
+        )
         .bind(
           role,
-          input.revoke ? "revoked" : input.reactivate ? "active" : membership.status,
+          input.revoke ? "revoked" : activating ? "active" : membership.status,
           now,
           input.membershipId,
+          ...(activating ? [input.hostId, membership.user_id, input.hostId, DEFAULT_TEAM_MEMBER_LIMIT] : []),
         ),
       this.#database
-        .prepare("UPDATE remote_hosts SET auth_epoch = auth_epoch + 1, updated_at = ? WHERE host_id = ?")
-        .bind(now, input.hostId),
+        .prepare(
+          `UPDATE remote_hosts SET auth_epoch = auth_epoch + 1, updated_at = ?
+            WHERE host_id = ?${applied ? ` AND ${applied.sql}` : ""}`,
+        )
+        .bind(now, input.hostId, ...(applied?.binds ?? [])),
       this.#database
-        .prepare("UPDATE remote_sessions SET ended_at = ? WHERE host_id = ? AND user_id = ? AND ended_at IS NULL")
-        .bind(now, input.hostId, membership.user_id),
+        .prepare(
+          `UPDATE remote_sessions SET ended_at = ?
+            WHERE host_id = ? AND user_id = ? AND ended_at IS NULL${applied ? ` AND ${applied.sql}` : ""}`,
+        )
+        .bind(now, input.hostId, membership.user_id, ...(applied?.binds ?? [])),
       ...activeSessions.results.map((session) =>
         this.#authEventStatement(
           { type: "remote-session-ended", hostId: input.hostId, sessionId: session.session_id },
           now,
+          applied,
         ),
       ),
-      this.#authEpochEventStatement(input.hostId, now),
+      this.#authEpochEventStatement(input.hostId, now, undefined, applied),
+      // The member whose membership this is, and not the owner who changed it: a revoked server
+      // has to leave that member's list on every device they are signed in on.
+      this.#authEventStatement({ type: "account-servers-changed", userId: membership.user_id }, now, applied),
     ]);
     await this.#flushAuthEvents();
+    // A concurrent join, reactivation or revoke took the seat after the check above.
+    if (activating && (changed[0]?.meta.changes ?? 0) !== 1) throw memberLimitReached();
   }
 
   async validateMobileConnectHost(userId: string, binding: MobileConnectHostBinding): Promise<void> {
@@ -639,54 +802,67 @@ export class RemoteControlPlane {
   }
 
   async startSession(userId: string, hostId: string, authSessionHash: string) {
-    const membership = await this.#requireRole(hostId, userId, ["owner", "admin", "member"]);
     const now = this.#now();
-    await this.#database
-      .prepare(
-        "UPDATE remote_sessions SET ended_at = ? WHERE host_id = ? AND user_id = ? AND ended_at IS NULL AND expires_at <= ?",
-      )
-      .bind(now, hostId, userId, now)
-      .run();
-    const existing = await this.#database
-      .prepare(
-        `SELECT session_id, expires_at FROM remote_sessions
-         WHERE host_id = ? AND user_id = ? AND membership_id = ? AND ended_at IS NULL AND expires_at > ?
-           AND auth_session_hash = ?
-           AND EXISTS(
-             SELECT 1 FROM auth_sessions
-              WHERE token_hash = ? AND user_id = ? AND revoked_at IS NULL AND expires_at > ?
-           )
-         ORDER BY started_at DESC LIMIT 1`,
-      )
-      .bind(hostId, userId, membership.membership_id, now, authSessionHash, authSessionHash, userId, now)
-      .first<{ session_id: string; expires_at: number }>();
-    if (existing) return { sessionId: existing.session_id, hostId, expiresAt: existing.expires_at };
+    // The role check and the reusable session are one row, so the common answer costs one read.
+    const membership = this.#assertRole(
+      await this.#database
+        .prepare(
+          `SELECT m.membership_id, m.host_id, m.user_id, m.role, m.status,
+                  s.session_id AS active_session_id, s.expires_at AS active_expires_at
+           FROM remote_memberships m
+           LEFT JOIN remote_sessions s
+             ON s.host_id = m.host_id AND s.user_id = m.user_id AND s.membership_id = m.membership_id
+            AND s.ended_at IS NULL AND s.expires_at > ? AND s.auth_session_hash = ?
+            AND EXISTS(
+              SELECT 1 FROM auth_sessions
+               WHERE token_hash = ? AND user_id = ? AND revoked_at IS NULL AND expires_at > ?
+            )
+           WHERE m.host_id = ? AND m.user_id = ? AND m.status = 'active'
+           ORDER BY s.started_at DESC LIMIT 1`,
+        )
+        .bind(now, authSessionHash, authSessionHash, userId, now, hostId, userId)
+        .first<RemoteMembershipRow & { active_session_id: string | null; active_expires_at: number | null }>(),
+      ["owner", "admin", "member"],
+    );
+    if (membership.active_session_id !== null && membership.active_expires_at !== null) {
+      return { sessionId: membership.active_session_id, hostId, expiresAt: membership.active_expires_at };
+    }
     const sessionId = crypto.randomUUID();
     // Deliberate product policy: device sessions do not expire with time. Logout
     // or explicit revocation ends only this credential's sessions, not other phones.
     const expiresAt = PERSISTENT_SESSION_EXPIRES_AT;
-    await this.#database
-      .prepare(
-        `INSERT OR IGNORE INTO remote_sessions(session_id, host_id, user_id, membership_id, started_at, expires_at, auth_session_hash)
-         SELECT ?, ?, ?, ?, ?, ?, ?
-          WHERE EXISTS(
-            SELECT 1 FROM auth_sessions
-             WHERE token_hash = ? AND user_id = ? AND revoked_at IS NULL AND expires_at > ?
-          )`,
-      )
-      .bind(
-        sessionId,
-        hostId,
-        userId,
-        membership.membership_id,
-        now,
-        expiresAt,
-        authSessionHash,
-        authSessionHash,
-        userId,
-        now,
-      )
-      .run();
+    // The sweep frees the one-active-session slot, so it has to run before the insert.
+    const [, insert] = await this.#database.batch([
+      this.#database
+        .prepare(
+          "UPDATE remote_sessions SET ended_at = ? WHERE host_id = ? AND user_id = ? AND ended_at IS NULL AND expires_at <= ?",
+        )
+        .bind(now, hostId, userId, now),
+      this.#database
+        .prepare(
+          `INSERT OR IGNORE INTO remote_sessions(session_id, host_id, user_id, membership_id, started_at, expires_at, auth_session_hash)
+           SELECT ?, ?, ?, ?, ?, ?, ?
+            WHERE EXISTS(
+              SELECT 1 FROM auth_sessions
+               WHERE token_hash = ? AND user_id = ? AND revoked_at IS NULL AND expires_at > ?
+            )`,
+        )
+        .bind(
+          sessionId,
+          hostId,
+          userId,
+          membership.membership_id,
+          now,
+          expiresAt,
+          authSessionHash,
+          authSessionHash,
+          userId,
+          now,
+        ),
+    ]);
+    // The insert carries the same live-account-session guard as the read below, so one written row
+    // already proves the session may start. Only a row the insert ignored needs the read.
+    if (insert?.meta.changes === 1) return { sessionId, hostId, expiresAt };
     const active = await this.#database
       .prepare(
         `SELECT session_id, expires_at FROM remote_sessions
@@ -704,12 +880,20 @@ export class RemoteControlPlane {
     return { sessionId: active.session_id, hostId, expiresAt: active.expires_at };
   }
 
-  async endSession(userId: string, sessionId: string): Promise<void> {
+  async endSession(userId: string, sessionId: string, authSessionHash?: string): Promise<void> {
     const session = await this.#database
-      .prepare("SELECT host_id, user_id FROM remote_sessions WHERE session_id = ? AND ended_at IS NULL LIMIT 1")
+      .prepare(
+        "SELECT host_id, user_id, auth_session_hash FROM remote_sessions WHERE session_id = ? AND ended_at IS NULL LIMIT 1",
+      )
       .bind(sessionId)
-      .first<{ host_id: string; user_id: string }>();
+      .first<{ host_id: string; user_id: string; auth_session_hash: string | null }>();
     if (!session) return;
+    if (authSessionHash !== undefined && (session.user_id !== userId || session.auth_session_hash !== authSessionHash))
+      throw new RemoteControlPlaneError(
+        403,
+        "session_inactive",
+        "The remote session does not belong to this browser session.",
+      );
     if (session.user_id !== userId) await this.#requireRole(session.host_id, userId, ["owner"]);
     const now = this.#now();
     const event = { type: "remote-session-ended" as const, hostId: session.host_id, sessionId };
@@ -746,11 +930,14 @@ export class RemoteControlPlane {
     const now = this.#now();
     // The database trigger revokes the bound remote sessions and writes the
     // disconnect outbox atomically with logout, including concurrent starts.
-    const result = await this.#database
-      .prepare("UPDATE auth_sessions SET revoked_at = ? WHERE token_hash = ? AND user_id = ? AND revoked_at IS NULL")
+    // RETURNING, not meta.changes: D1 also counts the rows that the trigger changes.
+    const revoked = await this.#database
+      .prepare(
+        "UPDATE auth_sessions SET revoked_at = ? WHERE token_hash = ? AND user_id = ? AND revoked_at IS NULL RETURNING token_hash",
+      )
       .bind(now, authSessionHash, userId)
-      .run();
-    if ((result.meta.changes ?? 0) !== 1) {
+      .first<{ token_hash: string }>();
+    if (!revoked) {
       throw new RemoteControlPlaneError(401, "auth_session_revoked", "The account session has ended.");
     }
     await this.#flushAuthEvents();
@@ -797,7 +984,7 @@ export class RemoteControlPlane {
     );
   }
 
-  async issueSessionTicket(userId: string, sessionId: string, clientPublicKey: string) {
+  async issueSessionTicket(userId: string, sessionId: string, clientPublicKey: string, authSessionHash?: string) {
     const boundClientPublicKey = requiredText(clientPublicKey, 8_192, "client public key");
     const now = this.#now();
     const session = await this.#database
@@ -807,12 +994,12 @@ export class RemoteControlPlane {
          FROM remote_sessions s
          JOIN remote_memberships m ON m.membership_id = s.membership_id
          JOIN remote_hosts h ON h.host_id = s.host_id
-         WHERE s.session_id = ? AND s.user_id = ? AND (s.auth_session_hash IS NULL OR EXISTS(
+         WHERE s.session_id = ? AND s.user_id = ? AND (? IS NULL OR s.auth_session_hash = ?) AND (s.auth_session_hash IS NULL OR EXISTS(
            SELECT 1 FROM auth_sessions a WHERE a.token_hash = s.auth_session_hash
              AND a.user_id = s.user_id AND a.revoked_at IS NULL AND a.expires_at > ?
          )) LIMIT 1`,
       )
-      .bind(sessionId, userId, now)
+      .bind(sessionId, userId, authSessionHash ?? null, authSessionHash ?? null, now)
       .first<RemoteSessionRow>();
     if (!session || session.ended_at || session.expires_at <= now || session.status !== "active") {
       throw new RemoteControlPlaneError(403, "session_inactive", "The remote session is not active.");
@@ -848,13 +1035,27 @@ export class RemoteControlPlane {
   }
 
   async #requireRole(hostId: string, userId: string, roles: RemoteMemberRole[]): Promise<RemoteMembershipRow> {
-    const membership = await this.#database
-      .prepare(
-        `SELECT membership_id, host_id, user_id, role, status
-         FROM remote_memberships WHERE host_id = ? AND user_id = ? AND status = 'active' LIMIT 1`,
-      )
-      .bind(hostId, userId)
-      .first<RemoteMembershipRow>();
+    return this.#assertRole(
+      await this.#database
+        .prepare(
+          `SELECT membership_id, host_id, user_id, role, status
+           FROM remote_memberships WHERE host_id = ? AND user_id = ? AND status = 'active' LIMIT 1`,
+        )
+        .bind(hostId, userId)
+        .first<RemoteMembershipRow>(),
+      roles,
+    );
+  }
+
+  async #requireMemberSeat(hostId: string, userId: string): Promise<void> {
+    const seat = await this.#database
+      .prepare(`SELECT ${MEMBER_SEAT_AVAILABLE_SQL} AS available`)
+      .bind(hostId, userId, hostId, DEFAULT_TEAM_MEMBER_LIMIT)
+      .first<{ available: number }>();
+    if (!seat?.available) throw memberLimitReached();
+  }
+
+  #assertRole<Row extends RemoteMembershipRow>(membership: Row | null, roles: RemoteMemberRole[]): Row {
     if (!membership || !roles.includes(membership.role)) {
       throw new RemoteControlPlaneError(
         403,
@@ -875,32 +1076,48 @@ export class RemoteControlPlane {
       .first<RemoteHostRow>();
   }
 
-  #authEventStatement(event: RemoteAuthEvent, now: number): D1PreparedStatement {
-    return this.#database
-      .prepare(
-        "INSERT INTO remote_auth_events(event_id, payload, created_at, attempts, next_attempt_at) VALUES (?, ?, ?, 0, ?)",
-      )
-      .bind(crypto.randomUUID(), JSON.stringify(event), now, now);
+  #authEventStatement(event: RemoteAuthEvent, now: number, condition?: SqlCondition): D1PreparedStatement {
+    return authEventStatement(this.#database, event, now, condition);
   }
 
-  #authEpochEventStatement(hostId: string, now: number, ownerUserId?: string): D1PreparedStatement {
+  #authEpochEventStatement(
+    hostId: string,
+    now: number,
+    ownerUserId?: string,
+    condition?: SqlCondition,
+  ): D1PreparedStatement {
     return this.#database
       .prepare(
         `INSERT INTO remote_auth_events(event_id, payload, created_at, attempts, next_attempt_at)
          SELECT ?, json_object('type', 'remote-auth-changed', 'hostId', host_id, 'authEpoch', auth_epoch), ?, 0, ?
-         FROM remote_hosts WHERE host_id = ? AND (? IS NULL OR owner_user_id = ?)`,
+         FROM remote_hosts WHERE host_id = ? AND (? IS NULL OR owner_user_id = ?)${condition ? ` AND ${condition.sql}` : ""}`,
       )
-      .bind(crypto.randomUUID(), now, now, hostId, ownerUserId ?? null, ownerUserId ?? null);
+      .bind(
+        crypto.randomUUID(),
+        now,
+        now,
+        hostId,
+        ownerUserId ?? null,
+        ownerUserId ?? null,
+        ...(condition?.binds ?? []),
+      );
   }
 
+  /**
+   * The event is already in D1 next to the state it reports, and the cron redelivers it, so the
+   * answer must not wait for Signal. `schedule` is the Worker's `waitUntil`; without it the caller
+   * awaits the delivery, which is what the tests and any script outside a request need.
+   */
   async #flushAuthEvents(): Promise<void> {
-    await deliverRemoteAuthEvents({
+    const delivery = deliverRemoteAuthEvents({
       database: this.#database,
       webhookUrl: this.#webhookUrl,
       webhookSecret: this.#webhookSecret,
       fetch: this.#fetch,
       now: this.#now(),
     });
+    if (!this.#schedule) return delivery;
+    this.#schedule(delivery);
   }
 }
 
@@ -912,12 +1129,31 @@ export async function notifyAccountProfileChanged(
 ): Promise<void> {
   if (!bindings.REMOTE_AUTH_WEBHOOK_URL?.trim() || !bindings.REMOTE_AUTH_WEBHOOK_SECRET?.trim()) return;
   const now = Date.now();
-  await bindings.DB.prepare(
-    "INSERT INTO remote_auth_events(event_id, payload, created_at, attempts, next_attempt_at) VALUES (?, ?, ?, 0, ?)",
-  )
-    .bind(crypto.randomUUID(), JSON.stringify({ type: "account-profile-changed", userId }), now, now)
-    .run();
+  await authEventStatement(bindings.DB, { type: "account-profile-changed", userId }, now).run();
   waitUntil(deliverPendingRemoteAuthEvents(bindings, now, fetcher));
+}
+
+/** Queues one event for Signal. `remote/api` decodes each event type with its own schema. */
+function authEventStatement(
+  database: D1Database,
+  event: RemoteAuthEvent,
+  now: number,
+  condition?: SqlCondition,
+): D1PreparedStatement {
+  return database
+    .prepare(
+      `INSERT INTO remote_auth_events(event_id, payload, created_at, attempts, next_attempt_at)
+       SELECT ?, ?, ?, 0, ?${condition ? ` WHERE ${condition.sql}` : ""}`,
+    )
+    .bind(crypto.randomUUID(), JSON.stringify(event), now, now, ...(condition?.binds ?? []));
+}
+
+function memberLimitReached(): RemoteControlPlaneError {
+  return new RemoteControlPlaneError(
+    409,
+    "member_limit_reached",
+    `A host can have up to ${DEFAULT_TEAM_MEMBER_LIMIT} members.`,
+  );
 }
 
 export async function deliverPendingRemoteAuthEvents(

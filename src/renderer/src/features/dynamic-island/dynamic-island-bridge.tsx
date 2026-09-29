@@ -1,8 +1,8 @@
 import type { DynamicIslandAction } from "@openbot/contracts/ipc";
-import { createEffect, onSettled } from "solid-js";
+import { toast } from "@openbot/ui";
+import { useText } from "@openbot/ui/text";
+import { createEffect, onSettled, untrack } from "solid-js";
 import { withoutAgent } from "../../app-message-projection";
-import { toast } from "../../components/ui";
-import { errorMessage } from "../../error-message";
 import { useNavigation } from "../../navigation";
 import { usePlatform } from "../../platform";
 import { useTurns } from "../../turns";
@@ -14,33 +14,21 @@ import { useServerSelection } from "../servers/server-selection";
 import { useServerSwitch } from "../servers/server-switch";
 import { useServers } from "../servers/servers-context";
 import { useDynamicIsland } from "./dynamic-island-context";
+import { dynamicIslandPort } from "./dynamic-island-port";
 
 /**
- * The two directions the macOS Dynamic Island talks in, for the server the user
- * is actually looking at: the projection out to main, and the actions coming
- * back.
+ * Island bridge for the visible server: projects workspace state out to main and handles
+ * actions coming back. Split from `dynamic-island.tsx` (which owns the coordinator above the
+ * per-server domains) so the coordinator survives a server switch while the projection stays
+ * scoped to the active server. See docs/ARCHITECTURE.md.
  *
- * `dynamic-island.tsx` sits above every per-server domain and cannot read them -
- * it holds the coordinator and the background-server events. This is its
- * counterpart at the bottom of the tree, where the nine signals the projection
- * needs are readable. Splitting them is what keeps the coordinator alive across a
- * server switch while the projection stays scoped to the active one.
- *
- * The projection is withheld until the scope reports `loaded()`. Without that, a
- * mount would publish the new server's id next to a half-filled workspace for
- * exactly as long as its loads take. The flag is a boolean rather than a server
- * id because the scope it belongs to *is* one server: it starts false on every
- * mount and cannot describe the wrong one.
- *
- * Actions arrive for *any* server, including one that is not active, which is why
- * `handleDynamicIslandAction` may switch before it can act - and why it then
- * republishes the action through `server-switch.tsx` instead of finishing it: the
- * switch disposes this bridge, so the scope that lands has to run the rest. The
- * two that never need a switch - answering a prompt and responding to an
- * approval - resolve against the coordinator directly and republish, so a reply
- * from the island is reflected before the renderer has caught up.
+ * Projection waits for scope `loaded()` to avoid publishing a new server id next to a
+ * half-filled workspace. Cross-server actions republish through `server-switch.tsx` because
+ * the switch disposes this bridge; prompt answers and approval responses resolve directly
+ * against the coordinator so the island reflects before the renderer catches up.
  */
 export function DynamicIslandBridge() {
+  const { t, errorMessage } = useText();
   const platform = usePlatform();
   const { activeServerId } = useServers();
   const { dynamicIslandCoordinator, publishDynamicIslandPresentation } = useDynamicIsland();
@@ -89,7 +77,9 @@ export function DynamicIslandBridge() {
     },
     (input) => {
       if (!input) return;
-      dynamicIslandCoordinator.replaceServer(input);
+      // The coordinator reads the agent and message stores once; the compute above decides
+      // when it reads them again.
+      untrack(() => dynamicIslandCoordinator.replaceServer(input));
       publishDynamicIslandPresentation();
     },
   );
@@ -119,10 +109,10 @@ export function DynamicIslandBridge() {
 
   onSettled(() => {
     if (platform.landingPreview) return;
-    return window.openbot.dynamicIsland.onAction((action) => {
+    return dynamicIslandPort().dynamicIsland.onAction((action) => {
       void handleDynamicIslandAction(action).catch((error) => {
-        toast.error("Could not open this remote item", {
-          description: errorMessage(error, "Could not open this item. Try again."),
+        toast.error(t("island.error.openRemoteTitle"), {
+          description: errorMessage(error, t("island.error.openRemote")),
         });
       });
     });
@@ -183,9 +173,9 @@ export function DynamicIslandBridge() {
     if (action.type === "open-message") await openAgentMessage(action.agentId, action.messageId);
     if (action.type === "open-failure") {
       try {
-        await window.openbot.agent.acknowledgeFailedTurn({ agentId: action.agentId, turnId: action.turnId });
+        await dynamicIslandPort().agent.acknowledgeFailedTurn({ agentId: action.agentId, turnId: action.turnId });
       } catch (error) {
-        appendUiError(action.agentId, error, "Acknowledge failed", action.serverId);
+        appendUiError(action.agentId, error, t("app.errorStatus.acknowledge"), action.serverId);
         return;
       }
       setFailedTurns((current) =>

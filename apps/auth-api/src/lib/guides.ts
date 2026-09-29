@@ -7,7 +7,7 @@
 import { type ContentCollection, publishedFirst } from "./content-collection";
 import { NEWS_AUTHOR } from "./news";
 
-export const GUIDES_COLLECTION: ContentCollection = {
+export const GUIDES_COLLECTION: ContentCollection<"guides"> = {
   id: "guides",
   indexRoute: "/guides",
   articleRoute: "/guides/$slug",
@@ -19,6 +19,14 @@ export const GUIDES_COLLECTION: ContentCollection = {
   moreTitle: "More guides",
   imageEyebrow: "OPENBOT · GUIDES",
   articles: publishedFirst([
+    {
+      slug: "what-are-ai-agents",
+      title: "What Are AI Agents? How They Work and When to Use Them",
+      description:
+        "What are AI agents, how do they work, and when are they useful? A practical guide to their tools, use cases, and limits.",
+      publishedAt: "2026-09-24",
+      author: NEWS_AUTHOR,
+    },
     {
       slug: "openbot-101",
       title: "OpenBot 101",

@@ -1,5 +1,5 @@
 import { BotEngine } from "@norbert_bodziony/bloub";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, assert, describe, expect, it, vi } from "vitest";
 import {
   type BloubActivityFrame,
   bloubActivityGeometry,
@@ -104,7 +104,7 @@ it("morphs the displayed avatar into the selected face and retargets from an int
   const displayed = nativeFrame(
     new BotEngine(100, "idle", intermediate.radii, intermediate.expression).sample(6 / FPS),
   );
-  expect(displayed.body).toEqual(frames[6].body);
+  expect(displayed.body).toEqual(frames[6]?.body);
   const cancelled = vi.fn();
   const cancel = prepareBloubMorphFrames(intermediate, from, displayed, cancelled, idle.schedule);
   idle.next();
@@ -182,7 +182,7 @@ describe("loader frame preparation", () => {
 
       expect(idle).toHaveBeenCalled();
       expect(ready).toHaveBeenCalledOnce();
-      expect(ready.mock.calls[0][0].length).toBeGreaterThan(1);
+      expect(ready.mock.calls[0]?.[0].length).toBeGreaterThan(1);
     });
 
     it("stops the fallback timer of a loader that disappears", async () => {
@@ -215,7 +215,7 @@ describe("loader frame preparation", () => {
         /* Finish the idle morph. */
       }
       expect(ready).toHaveBeenCalledOnce();
-      expect(ready.mock.calls[0][0][0]).toEqual(cycle[60]);
+      expect(ready.mock.calls[0]?.[0][0]).toEqual(cycle[60]);
       ready.mockClear();
       const cancel = prepareReturnToIdleFrames(90, ready, idle.schedule);
       idle.next();
@@ -247,6 +247,24 @@ function preparedActivity(geometry: ReturnType<typeof bloubActivityGeometry>) {
   }
   return ready;
 }
+
+it("keeps each agent's own silhouette through the working cycle", () => {
+  // "shape-one" is a triangle and "shape-two" a cloud. The cycle used to open on `thinking`,
+  // which draws its own body, so both agents played the same column of dots while they worked.
+  const triangle = preparedActivity(bloubActivityGeometry("shape-one", "working"));
+  const cloud = preparedActivity(bloubActivityGeometry("shape-two", "working"));
+  expect(triangle).toHaveLength(cloud.length);
+  const shared = triangle.filter((frame, index) => frame.body.d === cloud[index]?.body.d);
+  expect(shared).toEqual([]);
+});
+
+it("wears the working face while it works and the resting face when it stops", () => {
+  const resting = bloubActivityGeometry("shape-one");
+  const working = bloubActivityGeometry("shape-one", "working");
+  expect(working.radii).toEqual(resting.radii);
+  expect(working.key).not.toBe(resting.key);
+  expect(working.expression).not.toEqual(resting.expression);
+});
 
 it("shares pending avatar preparation without blocking activity startup or any idle batch", () => {
   const geometry = bloubActivityGeometry("agent-test");
@@ -310,14 +328,16 @@ it("cancels abandoned avatar work while keeping preparation for remaining player
   }
   expect(header).not.toHaveBeenCalled();
   expect(activity).toHaveBeenCalledOnce();
-  expect(activity.mock.calls[0][0]).toHaveLength(FRAME_COUNT * 2);
+  expect(activity.mock.calls[0]?.[0]).toHaveLength(FRAME_COUNT * 2);
 });
 
 describe("activity sequence eviction", () => {
   it("keeps an existing player's frames valid when unused cached geometry is evicted", () => {
     const geometry = bloubActivityGeometry("eviction-test");
     const mounted = preparedActivity(geometry);
-    const firstPath = mounted[0].body.d;
+    const [first] = mounted;
+    assert(first);
+    const firstPath = first.body.d;
     const geometries = new Map([[geometry.key, geometry]]);
     for (let index = 0; geometries.size < 10; index += 1) {
       const next = bloubActivityGeometry(`geometry-${index}`);
@@ -327,7 +347,7 @@ describe("activity sequence eviction", () => {
     }
     const remounted = preparedActivity(geometry);
     expect(remounted).not.toBe(mounted);
-    expect(mounted[0].body.d).toBe(firstPath);
+    expect(mounted[0]?.body.d).toBe(firstPath);
     expect(remounted).toEqual(mounted);
   });
 });
@@ -340,18 +360,20 @@ it.each([30, 120, 190, FRAME_COUNT + 30, FRAME_COUNT + 120, FRAME_COUNT + 190])(
     const idle = idleQueue();
     const sample = vi.spyOn(BotEngine.prototype, "sample");
     const ready = vi.fn();
+    const displayed = cycle[sourceIndex];
+    assert(displayed);
     try {
-      prepareBloubSettlingFrames(geometry, sourceIndex, cycle[sourceIndex], ready, idle.schedule);
+      prepareBloubSettlingFrames(geometry, sourceIndex, displayed, ready, idle.schedule);
       expect(sample).not.toHaveBeenCalled();
       while (idle.next()) {
         expect(sample.mock.calls.length).toBeLessThanOrEqual(4);
         sample.mockClear();
       }
       expect(ready).toHaveBeenCalledOnce();
-      expect(ready.mock.calls[0][0]).toHaveLength(Math.ceil(SETTLE * FPS) + 1);
-      expect(ready.mock.calls[0][0][0]).toEqual(cycle[sourceIndex]);
+      expect(ready.mock.calls[0]?.[0]).toHaveLength(Math.ceil(SETTLE * FPS) + 1);
+      expect(ready.mock.calls[0]?.[0][0]).toEqual(displayed);
       ready.mockClear();
-      const cancel = prepareBloubSettlingFrames(geometry, sourceIndex, cycle[sourceIndex], ready, idle.schedule);
+      const cancel = prepareBloubSettlingFrames(geometry, sourceIndex, displayed, ready, idle.schedule);
       idle.next();
       sample.mockClear();
       cancel();

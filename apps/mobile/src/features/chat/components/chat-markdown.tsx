@@ -1,11 +1,21 @@
+import {
+  type FileReferenceTone,
+  fileReferenceBadge,
+  fileReferenceName,
+  fileReferenceTone,
+  isFileReference,
+} from "@openbot/brand/file-reference";
 import { chatTagReferences } from "@openbot/contracts/chat-tag-references";
+import type { MobileTranslate } from "@openbot/i18n/mobile";
 import * as Linking from "expo-linking";
 import { Typography } from "heroui-native";
 import { useThemeColor } from "heroui-native/hooks";
+import { FileText } from "lucide-react-native";
 import type { Token, Tokens } from "marked";
 import { Fragment, memo, type ReactNode, useMemo } from "react";
 import { Alert, type ColorValue, ScrollView, type TextStyle, useWindowDimensions, View } from "react-native";
 import { useReducedMotion } from "react-native-reanimated";
+import { useCSSVariable } from "uniwind";
 import { BloubAvatarThumbnail } from "@/features/agents/components/bloub-avatar";
 import { ChatLinkIcon } from "@/features/chat/components/chat-link-icon";
 import {
@@ -14,9 +24,13 @@ import {
   StreamRevealProvider,
 } from "@/features/chat/components/streaming-tail-text";
 import type { MobileAgent } from "@/features/workspace/model/workspace-types";
+import { haptics } from "@/shared/lib/haptics";
+import { currentText, useText } from "@/shared/lib/text";
 import { parseChatMarkdown } from "../model/chat-markdown-parser";
 import { plainMentionParts } from "../model/chat-mentions";
+import { createReplyReveal } from "../model/reply-reveal";
 import { ChatCodeBlock } from "./chat-code-block";
+import { type ReplyPlayback, useReplyPlayback } from "./use-reply-playback";
 
 interface MarkdownTokenByType {
   paragraph: Tokens.Paragraph;
@@ -36,6 +50,9 @@ interface MarkdownTokenByType {
 }
 
 // Marked's public Token union includes extension tokens; narrow its built-in tokens here.
+// Keeps the link icon on the same line as the first word of the link.
+const NO_BREAK_SPACE = "\u00a0";
+
 function tokenIs<K extends keyof MarkdownTokenByType>(token: Token, type: K): token is MarkdownTokenByType[K] {
   return token.type === type;
 }
@@ -48,6 +65,7 @@ interface TextPresentation {
   animateTail: boolean;
   agents: readonly MobileAgent[];
   mentionOffset: number;
+  t: MobileTranslate;
 }
 
 // The inline badge is shifted to align its label with native text. Reserve the
@@ -80,7 +98,56 @@ function sourceEntries<T>(values: T[], source: (value: T) => string) {
   });
 }
 
+/** The colour family of each file tone, as the desktop `data-file-tone` rules use them. */
+const FILE_TONE_COLORS: Record<FileReferenceTone, [string, string]> = {
+  source: ["--openbot-file-blue", "--openbot-file-blue-soft"],
+  script: ["--openbot-file-yellow", "--openbot-file-yellow-soft"],
+  markup: ["--openbot-file-orange", "--openbot-file-orange-soft"],
+  style: ["--openbot-file-teal", "--openbot-file-teal-soft"],
+  data: ["--openbot-file-green", "--openbot-file-green-soft"],
+  document: ["--openbot-file-red", "--openbot-file-red-soft"],
+  media: ["--openbot-file-pink", "--openbot-file-pink-soft"],
+  default: ["--openbot-file-default", "--openbot-file-default-soft"],
+};
+
+/**
+ * Inline code that names a file, drawn as the desktop file reference: a type badge and the name
+ * in the colour of its file family. Mobile cannot open workspace files, so it is not a control.
+ */
+function FileReference({ text, presentation }: { text: string; presentation: TextPresentation }) {
+  const name = fileReferenceName(text.trim());
+  const badge = fileReferenceBadge(name);
+  const [color, soft] = useCSSVariable(FILE_TONE_COLORS[fileReferenceTone(name)]);
+  const small = presentation.type === "body-sm";
+  return (
+    <View collapsable={false} className="max-w-full shrink flex-row items-center gap-1 self-start px-0.5">
+      <View
+        className="h-4 min-w-4 items-center justify-center rounded px-0.5"
+        style={{ backgroundColor: String(soft) }}
+      >
+        {badge ? (
+          <Typography style={{ color: String(color), fontSize: 8, lineHeight: 10, fontWeight: "800" }}>
+            {badge}
+          </Typography>
+        ) : (
+          <FileText size={11} color={String(color)} strokeWidth={2} />
+        )}
+      </View>
+      <Typography
+        selectable={presentation.selectable}
+        numberOfLines={1}
+        type={small ? "body-xs" : presentation.type}
+        className="shrink"
+        style={{ ...presentation.style, color: String(color), fontWeight: "600" }}
+      >
+        {text.trim()}
+      </Typography>
+    </View>
+  );
+}
+
 function CodeSpan({ text, presentation }: { text: string; presentation: TextPresentation }) {
+  if (isFileReference(text.trim())) return <FileReference text={text} presentation={presentation} />;
   return (
     <View
       collapsable={false}
@@ -138,6 +205,8 @@ function inline(tokens: Token[], parentPresentation: TextPresentation): ReactNod
       return <AgentMention key={offset} agent={agent} presentation={presentation} />;
     }
     if (token.type === "br") return "\n";
+    // The list row draws the task mark, so the checkbox token adds nothing.
+    if (token.type === "checkbox") return null;
     if (tokenIs(token, "text")) {
       if (token.tokens) return inline(token.tokens, presentation);
       return (
@@ -181,7 +250,7 @@ function inline(tokens: Token[], parentPresentation: TextPresentation): ReactNod
     if (tokenIs(token, "link") || tokenIs(token, "image")) {
       const url = webLink(token.href);
       const label = tokenIs(token, "image")
-        ? token.text || "Image"
+        ? token.text || presentation.t("mobile.chat.markdown.image")
         : inline(token.tokens, { ...presentation, agents: [] });
       if (!url) return <Fragment key={offset}>{label}</Fragment>;
       return (
@@ -191,16 +260,19 @@ function inline(tokens: Token[], parentPresentation: TextPresentation): ReactNod
           style={{ ...presentation.style, textDecorationLine: "underline" }}
           accessibilityRole="link"
           accessibilityHint={url}
-          onPress={() =>
-            void Linking.openURL(url).catch(() =>
-              Alert.alert("Couldn’t open link", "You can select and copy the link instead."),
-            )
-          }
+          onPress={() => {
+            void haptics.impact("soft");
+            void Linking.openURL(url).catch(() => {
+              void haptics.notification("error");
+              const { t } = currentText();
+              Alert.alert(t("mobile.chat.markdown.linkFailedTitle"), t("mobile.chat.markdown.linkFailedMessage"));
+            });
+          }}
         >
           {tokenIs(token, "link") ? (
             <>
               <ChatLinkIcon color={presentation.style.color} compact={presentation.type === "body-sm"} />
-              {"\u00a0"}
+              {NO_BREAK_SPACE}
             </>
           ) : null}
           {label}
@@ -213,15 +285,32 @@ function inline(tokens: Token[], parentPresentation: TextPresentation): ReactNod
 }
 
 function ListParagraph({ tokens, presentation }: { tokens: Token[]; presentation: TextPresentation }) {
-  const lines: Token[][][] = [[[]]];
+  let run: Token[] = [];
+  let line: Token[][] = [run];
+  const lines: Token[][][] = [line];
   for (const token of tokens) {
-    const line = lines[lines.length - 1];
+    if (token.type === "checkbox") continue;
     if (token.type === "br") {
-      lines.push([[]]);
+      run = [];
+      line = [run];
+      lines.push(line);
     } else if (tokenIs(token, "codespan")) {
-      line.push([token], []);
+      run = [];
+      line.push([token], run);
+    } else if (tokenIs(token, "text") && !token.tokens) {
+      // One run per word: the row wraps its items, so a long run would leave the line beside the
+      // chip and start below it, instead of continuing after it as text does.
+      for (const word of token.text.split(/(?<=\s)/u)) {
+        if (run.length) {
+          run = [];
+          line.push(run);
+        }
+        run.push({ type: "text", raw: word, text: word, escaped: false });
+      }
+      run = [];
+      line.push(run);
     } else {
-      line[line.length - 1].push(token);
+      run.push(token);
     }
   }
   const source = (run: Token[]) => run.map((token) => token.raw).join("");
@@ -231,8 +320,8 @@ function ListParagraph({ tokens, presentation }: { tokens: Token[]; presentation
         // Multiline chips must participate in flex layout, not sit inside a fixed-height native text line.
         <View key={lineOffset} className="min-w-0 flex-row flex-wrap items-center gap-y-1">
           {sourceEntries(line, source).map(({ value: run, offset }) => {
-            if (!run.length) return null;
-            const token = run[0];
+            const [token] = run;
+            if (!token) return null;
             if (tokenIs(token, "codespan")) {
               return <CodeSpan key={offset} text={token.text} presentation={presentation} />;
             }
@@ -273,7 +362,8 @@ function MarkdownBlocks({
           ...parentPresentation,
           animateTail: parentPresentation.animateTail,
         };
-        if (token.type === "space" || token.type === "def") return null;
+        // The list row draws the task mark, so the checkbox token adds nothing.
+        if (token.type === "space" || token.type === "def" || token.type === "checkbox") return null;
         if (tokenIs(token, "paragraph") || tokenIs(token, "text")) {
           if (inList && token.tokens?.some((child) => tokenIs(child, "codespan"))) {
             return <ListParagraph key={offset} tokens={token.tokens} presentation={presentation} />;
@@ -399,6 +489,7 @@ export const ChatMarkdown = memo(function ChatMarkdown({
   compact = false,
   streaming = false,
   animationEnabled = true,
+  playback,
   selectable = true,
   agents = [],
 }: {
@@ -407,17 +498,21 @@ export const ChatMarkdown = memo(function ChatMarkdown({
   compact?: boolean;
   streaming?: boolean;
   animationEnabled?: boolean;
+  playback?: ReplyPlayback;
   selectable?: boolean;
   agents?: readonly MobileAgent[];
 }) {
   const reducedMotion = useReducedMotion();
   const { fontScale } = useWindowDimensions();
   const tokens = useMemo(() => parseChatMarkdown(body), [body]);
+  const reveal = useMemo(() => createReplyReveal(tokens), [tokens]);
+  const visibleTokens = useReplyPlayback(reveal, playback);
   const codeColor = useThemeColor("foreground");
+  const { t } = useText();
   return (
     <StreamRevealProvider>
       <MarkdownBlocks
-        tokens={tokens}
+        tokens={visibleTokens}
         presentation={{
           selectable,
           type: compact ? "body-sm" : "body",
@@ -425,7 +520,8 @@ export const ChatMarkdown = memo(function ChatMarkdown({
           codeColor,
           agents,
           mentionOffset: 4 * fontScale,
-          animateTail: streaming && animationEnabled && !reducedMotion,
+          t,
+          animateTail: (streaming || Boolean(playback?.enabled)) && animationEnabled && !reducedMotion,
         }}
       />
     </StreamRevealProvider>

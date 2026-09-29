@@ -68,6 +68,8 @@ describe("TeamApiServer team", () => {
       });
       expect(previewResponse.status).toBe(200);
       expect(previewResponse.headers.get("Cache-Control")).toBe("no-store");
+      // The frozen Team API projection strips fields released builds never sent, so the
+      // wire preview keeps its released shape even though the store knows more.
       await expect(previewResponse.json()).resolves.toEqual({
         role: "member",
         expiresAt: invite.expiresAt,
@@ -230,13 +232,42 @@ describe("TeamApiServer team", () => {
     }
   });
 
+  it("lets a member leave with the same effect as an admin removal, and refuses the owner", async () => {
+    const { store, start } = await createTeamApiFixture("server", { configure: true });
+    const { base } = await start({ agents: createAgents() });
+    const ownerLogin = await jsonRequest<{ sessionToken: string }>(base, "/v1/auth/login", {
+      body: { username: "owner", password: "correct horse battery" },
+    });
+    const invite = await store.createInvite("member");
+    const joined = await jsonRequest<{ sessionToken: string }>(base, "/v1/join", {
+      body: { inviteToken: invite.token, username: "alice", password: "a secure team password" },
+    });
+    // A second device, so the leave has to end every session of the member, not only the caller's.
+    const otherDevice = await jsonRequest<{ sessionToken: string }>(base, "/v1/auth/login", {
+      body: { username: "alice", password: "a secure team password" },
+    });
+
+    await emptyRequest(base, "/v1/team/leave", { token: joined.sessionToken });
+
+    expect(store.listMembers().map((member) => member.username)).toEqual(["owner"]);
+    expect(store.authenticate(joined.sessionToken)).toBeNull();
+    expect(store.authenticate(otherDevice.sessionToken)).toBeNull();
+
+    const ownerLeave = await fetch(`${base}/v1/team/leave`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${ownerLogin.sessionToken}` },
+    });
+    expect(ownerLeave.status).toBe(400);
+    expect(store.authenticate(ownerLogin.sessionToken)).not.toBeNull();
+  });
+
   it("manages invites, members, sessions, and password changes on loopback", async () => {
     const { store, start } = await createTeamApiFixture("server", { configure: true });
     const agents = createAgents();
     const { base } = await start({
       agents,
       createInvite: async (input) => {
-        const created = await store.createInvite(input.role, input.email);
+        const created = await store.createInvite(input.role, input.email, { permanent: input.permanent });
         return {
           id: created.id,
           role: created.role,
@@ -244,6 +275,8 @@ describe("TeamApiServer team", () => {
           usedAt: null,
           inviteUrl: `https://openbot.run/join?token=${created.token}`,
           email: created.email,
+          permanent: created.permanent,
+          useCount: created.useCount,
         };
       },
     });

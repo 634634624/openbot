@@ -1,7 +1,10 @@
+import { readFile } from "node:fs/promises";
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
-import type { BrowserEnvironment } from "@openbot/contracts/ipc";
+import type { BrowserBounds, BrowserEnvironment } from "@openbot/contracts/ipc";
 import { isBoolean, isNumber, isString } from "@openbot/contracts/runtime-values";
 import { legacyAgentId } from "@openbot/contracts/validation";
+import type { BrowserToolArguments } from "./browser-tools";
+import { isMissingFileError } from "./file-errors";
 import { isRecord } from "./protocol";
 
 export interface StoredBrowserTab {
@@ -17,9 +20,9 @@ export interface StoredBrowserTab {
  * A viewport this large would allocate a backing store big enough to take the whole app down, and the
  * bound is on the *physical* pixels, so a modest CSS size with a 4x scale factor still trips it.
  */
-export const MAX_PHYSICAL_VIEWPORT_PIXELS = 8_388_608;
+const MAX_PHYSICAL_VIEWPORT_PIXELS = 8_388_608;
 
-export function isSafeViewportSize(width: number, height: number, deviceScaleFactor: number): boolean {
+function isSafeViewportSize(width: number, height: number, deviceScaleFactor: number): boolean {
   return width * height * deviceScaleFactor * deviceScaleFactor <= MAX_PHYSICAL_VIEWPORT_PIXELS;
 }
 
@@ -36,7 +39,7 @@ export function defaultBrowserEnvironment(): BrowserEnvironment {
  * trusted, because a hand-edited or truncated file would otherwise hand a viewport straight to
  * `Emulation.setDeviceMetricsOverride`.
  */
-export function browserEnvironment(value: unknown): BrowserEnvironment | null {
+function browserEnvironment(value: unknown): BrowserEnvironment | null {
   if (!isRecord(value) || !isRecord(value.viewport)) return null;
   const viewport = value.viewport;
   if (viewport.mode !== "fill" && viewport.mode !== "custom") return null;
@@ -82,10 +85,26 @@ export function browserEnvironment(value: unknown): BrowserEnvironment | null {
 const X_HOSTS = new Set(["x.com", "www.x.com"]);
 export const X_LANDING_URL = "https://x.com/";
 
-export function persistentBrowserUrl(value: string): string {
+export function persistentBrowserUrl(value: string, options: { popup?: boolean } = {}): string {
   const url = new URL(value);
   if (X_HOSTS.has(url.hostname) && url.pathname === "/i/jf/onboarding/web") {
     return X_LANDING_URL;
+  }
+  if (options.popup) {
+    // A restart cannot resume the popup's live authorization exchange. Keep ordinary
+    // query parameters, but do not save or replay callback credentials.
+    url.username = "";
+    url.password = "";
+    const fragment = new URLSearchParams(url.hash.slice(1));
+    let changedFragment = false;
+    for (const key of ["code", "state", "access_token", "id_token", "refresh_token", "oauth_token", "oauth_verifier"]) {
+      url.searchParams.delete(key);
+      if (fragment.has(key)) {
+        fragment.delete(key);
+        changedFragment = true;
+      }
+    }
+    if (changedFragment) url.hash = fragment.toString();
   }
   return url.toString();
 }
@@ -195,4 +214,120 @@ function tabOwner(tab: StoredBrowserTab, agents: readonly BrowserTabOwner[]): Br
 function legacyThreadId(agent: BrowserTabOwner): string | null {
   if (agent.threadId === null) return null;
   return agent.threadId.replace(agent.id, legacyAgentId(agent.id));
+}
+
+/**
+ * The file is always rewritten as v2. A v1 file is still read -- `storedBrowserTab` accepts both owner
+ * spellings, and a tab that arrives without an environment is given the default rather than dropped.
+ */
+export interface StoredBrowserStateV2 {
+  version: 2;
+  activeTabId: string | null;
+  tabs: Array<StoredBrowserTab & { environment: BrowserEnvironment }>;
+}
+
+export async function readBrowserState(path: string): Promise<StoredBrowserStateV2> {
+  try {
+    const parsed = JSON.parse(await readFile(path, "utf8"));
+    if (!isRecord(parsed) || (parsed.version !== 1 && parsed.version !== 2)) {
+      return { version: 2, activeTabId: null, tabs: [] };
+    }
+    const tabs = Array.isArray(parsed.tabs)
+      ? parsed.tabs
+          .map(storedBrowserTab)
+          .filter((tab) => tab !== null)
+          .map((tab) => ({
+            ...tab,
+            url: persistentBrowserUrl(tab.url),
+            // A v1 file never wrote an environment, so anything sitting under that key in one is not
+            // ours to trust -- the tab starts from the default instead.
+            environment: (parsed.version === 2 ? tab.environment : undefined) ?? defaultBrowserEnvironment(),
+          }))
+      : [];
+    return {
+      version: 2,
+      activeTabId: isString(parsed.activeTabId) ? parsed.activeTabId : null,
+      tabs: tabs.filter((tab, index) => tabs.findIndex((candidate) => candidate.id === tab.id) === index),
+    };
+  } catch (error) {
+    if (isMissingFileError(error) || error instanceof SyntaxError) {
+      return { version: 2, activeTabId: null, tabs: [] };
+    }
+    throw error;
+  }
+}
+
+export function resolveEnvironment(
+  value: BrowserToolArguments<"set_environment">,
+  current: BrowserEnvironment,
+  bounds: BrowserBounds,
+): BrowserEnvironment {
+  const preset = value.preset;
+  const presetSize = presetDimensions(preset);
+  const explicitScale = value.deviceScaleFactor !== undefined;
+  const scaleConvertsFill =
+    explicitScale && (preset === "fill" || (preset === undefined && current.viewport.mode === "fill"));
+  const requestedWidth =
+    value.width ??
+    presetSize?.width ??
+    (preset === "fill" || scaleConvertsFill ? bounds.width : current.viewport.width);
+  const requestedHeight =
+    value.height ??
+    presetSize?.height ??
+    (preset === "fill" || scaleConvertsFill ? bounds.height : current.viewport.height);
+  const width = Math.round(requestedWidth);
+  const height = Math.round(requestedHeight);
+  const mode =
+    preset === "fill" && !explicitScale
+      ? "fill"
+      : preset || value.width !== undefined || value.height !== undefined || explicitScale
+        ? "custom"
+        : current.viewport.mode;
+  const minimumWidth = mode === "fill" ? 1 : 320;
+  const minimumHeight = mode === "fill" ? 1 : 240;
+  if (
+    width < minimumWidth ||
+    width > INPUT_LIMITS.browserDimension ||
+    height < minimumHeight ||
+    height > INPUT_LIMITS.browserDimension
+  ) {
+    throw new Error("Viewport dimensions are outside the supported range.");
+  }
+  // Fill clears the device metrics override, so it cannot inherit a custom emulation scale.
+  const scale =
+    mode === "fill" ? 1 : (value.deviceScaleFactor ?? presetSize?.scale ?? current.viewport.deviceScaleFactor);
+  if (scale < 0.5 || scale > 4) throw new Error("deviceScaleFactor must be between 0.5 and 4.");
+  if (!isSafeViewportSize(width, height, scale)) {
+    throw new Error(`The physical viewport must not exceed ${MAX_PHYSICAL_VIEWPORT_PIXELS.toLocaleString()} pixels.`);
+  }
+  const resolvedPreset =
+    preset === "desktop" || preset === "tablet" || preset === "mobile"
+      ? preset
+      : preset === "custom" || preset === "fill"
+        ? null
+        : current.viewport.preset;
+  return {
+    viewport: {
+      mode,
+      width,
+      height,
+      deviceScaleFactor: scale,
+      preset: resolvedPreset,
+    },
+    colorScheme: value.colorScheme ?? current.colorScheme,
+    reducedMotion: value.reducedMotion ?? current.reducedMotion,
+  };
+}
+
+function presetDimensions(preset: "fill" | "desktop" | "tablet" | "mobile" | "custom" | undefined) {
+  switch (preset) {
+    case "desktop":
+      return { width: 1440, height: 900, scale: 1 };
+    case "tablet":
+      return { width: 820, height: 1180, scale: 2 };
+    case "mobile":
+      return { width: 390, height: 844, scale: 3 };
+    default:
+      return null;
+  }
 }

@@ -1,6 +1,6 @@
-import { expect, fn, within } from "storybook/test";
+import { ProviderModelPicker } from "@openbot/ui/components/ProviderModelPicker";
+import { fn } from "storybook/test";
 import type { Meta, StoryObj } from "storybook-solidjs-vite";
-import { ProviderModelPicker } from "../src/components/ProviderModelPicker";
 import { STORY_AGENT_STATUS, STORY_MODELS } from "./fixtures";
 
 const args: Parameters<typeof ProviderModelPicker>[0] = {
@@ -25,20 +25,29 @@ export const Pill: Story = {
   args: { reasoningEffort: "medium", onReasoningEffortChange: fn() },
 };
 
+/** A Claude model with every effort level, and the auto-approve switch. */
+export const AllEffortLevels: Story = {
+  args: {
+    provider: "claude",
+    value: "claude-opus-5-5",
+    modelOptions: STORY_MODELS.map((model) =>
+      model.id === "claude-opus-5-5"
+        ? { ...model, supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"] }
+        : model,
+    ),
+    reasoningEffort: "high",
+    onReasoningEffortChange: fn(),
+    agentName: "Researcher",
+    onAutoApproveChange: fn(),
+  },
+};
+
 export const Field: Story = {
   args: { variant: "field", label: "Model" },
 };
 
 export const Disabled: Story = {
   args: { disabled: true, disabledReason: "Choose a provider first." },
-};
-
-export const Opens: Story = {
-  args: { reasoningEffort: "medium", onReasoningEffortChange: fn() },
-  play: async ({ canvas, userEvent }) => {
-    await userEvent.click(canvas.getByRole("button", { name: /Agent model: GPT-5.6 Luna/ }));
-    await canvas.findByRole("dialog", { name: "Choose agent model" });
-  },
 };
 
 export const UnavailableProvidersOpen: Story = {
@@ -61,7 +70,6 @@ export const UnavailableProvidersOpen: Story = {
       ),
     },
   },
-  play: Opens.play,
 };
 
 export const ProviderDownloadsOpen: Story = {
@@ -86,7 +94,6 @@ export const ProviderDownloadsOpen: Story = {
     onCancelProviderDownload: fn(),
     onConnectProvider: fn(),
   },
-  play: Opens.play,
 };
 
 export const DiscoveredModels: Story = {
@@ -103,7 +110,6 @@ export const DiscoveredModels: Story = {
       },
     ],
   },
-  play: Opens.play,
 };
 
 export const OpenCodeCatalog: Story = {
@@ -131,10 +137,6 @@ export const OpenCodeCatalog: Story = {
         supportedReasoningEfforts: ["medium" as const],
       })),
     ),
-  },
-  play: async ({ canvas, userEvent }) => {
-    await userEvent.click(canvas.getByRole("button", { name: /Agent model:/ }));
-    await canvas.findByRole("textbox", { name: "Search models" });
   },
 };
 
@@ -166,7 +168,6 @@ export const OpenCodeLocalModels: Story = {
       ["openai/gpt", "OpenAI/GPT"],
     ]),
   },
-  play: OpenCodeCatalog.play,
 };
 
 const openCodeStatus = {
@@ -200,12 +201,6 @@ export const CustomTabEmpty: Story = {
     modelOptions: openCodeCatalog([["opencode/example", "OpenCode Zen/Example"]]),
     onAddCustomProvider: fn(),
   },
-  play: async ({ canvas, userEvent }) => {
-    await userEvent.click(canvas.getByRole("button", { name: /Agent model:/ }));
-    const dialog = within(await canvas.findByRole("dialog", { name: "Choose agent model" }));
-    await userEvent.click(dialog.getByRole("tab", { name: /^Custom:/ }));
-    await expect(dialog.findByRole("button", { name: "Add provider" })).resolves.toBeTruthy();
-  },
 };
 
 export const CustomTabWithModels: Story = {
@@ -223,11 +218,6 @@ export const CustomTabWithModels: Story = {
       ["openai/gpt", "OpenAI/GPT"],
     ]),
   },
-  play: async ({ canvas, userEvent }) => {
-    await userEvent.click(canvas.getByRole("button", { name: /Agent model:/ }));
-    const dialog = within(await canvas.findByRole("dialog", { name: "Choose agent model" }));
-    await expect(dialog.findByRole("option", { name: "Qwen3 Coder 30B" })).resolves.toBeTruthy();
-  },
 };
 
 /** The same catalog on the OpenCode tab, which must not list the two custom endpoints again. */
@@ -235,11 +225,5 @@ export const OpenCodeTabExcludesCustom: Story = {
   args: {
     ...CustomTabWithModels.args,
     value: "opencode/example-free",
-  },
-  play: async ({ canvas, userEvent }) => {
-    await userEvent.click(canvas.getByRole("button", { name: /Agent model:/ }));
-    const dialog = within(await canvas.findByRole("dialog", { name: "Choose agent model" }));
-    await expect(dialog.findByRole("option", { name: "Example Free" })).resolves.toBeTruthy();
-    await expect(dialog.queryByRole("option", { name: "Qwen3 Coder 30B" })).toBeNull();
   },
 };

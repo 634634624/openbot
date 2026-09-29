@@ -1,5 +1,15 @@
+import { realpath, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
+import type { AgentSummary } from "@openbot/contracts/ipc";
 import { legacyAgentId } from "@openbot/contracts/validation";
+import { sourceText } from "@openbot/i18n/source";
+import { isRecord } from "./protocol";
+
+export interface ResolvedSharedFile {
+  path: string;
+  name: string;
+  size: number;
+}
 
 export function sharedPathFromInput(sharedRoot: string, inputPath: string): string {
   const normalized = inputPath.replaceAll("\\", "/");
@@ -76,4 +86,40 @@ function decodePath(value: string): string {
   } catch {
     return value;
   }
+}
+
+export async function resolveSharedFile(sharedRootPath: string, inputPath: string): Promise<ResolvedSharedFile> {
+  const sharedRoot = await realpath(sharedRootPath);
+  const candidatePath = sharedPathFromInput(sharedRootPath, inputPath);
+  const resolvedPath = await realpath(candidatePath);
+  if (!isWithin(sharedRoot, resolvedPath)) {
+    throw new Error(sourceText("error.backend.sharedFileOutside"));
+  }
+  const metadata = await stat(resolvedPath);
+  if (!metadata.isFile()) throw new Error(sourceText("error.backend.sharedPathNotFile"));
+  return { path: resolvedPath, name: basename(resolvedPath), size: metadata.size };
+}
+
+export async function resolveWorkspaceFile(
+  agent: Pick<AgentSummary, "id" | "workspacePath">,
+  inputPath: string,
+): Promise<ResolvedSharedFile> {
+  const workspaceRoot = await realpath(agent.workspacePath);
+  const candidatePath = workspacePathFromInput(agent.workspacePath, agent.id, inputPath);
+  const resolvedPath = await realpath(candidatePath).catch(async (error: unknown) => {
+    // The file may be one the provider's own transcript still names under this agent's pre-rename
+    // workspace root. The containment check below is unchanged and runs on whatever comes back.
+    const rebased =
+      isRecord(error) && error.code === "ENOENT"
+        ? rebaseLegacyWorkspacePath(agent.workspacePath, agent.id, candidatePath)
+        : null;
+    if (rebased === null) throw error;
+    return await realpath(rebased);
+  });
+  if (!isWithin(workspaceRoot, resolvedPath)) {
+    throw new Error(sourceText("error.backend.workspaceFileOutside"));
+  }
+  const metadata = await stat(resolvedPath);
+  if (!metadata.isFile()) throw new Error(sourceText("error.backend.workspacePathNotFile"));
+  return { path: resolvedPath, name: basename(resolvedPath), size: metadata.size };
 }

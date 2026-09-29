@@ -1,15 +1,17 @@
+import { ConversationHeader as SharedConversationHeader } from "@openbot/ui/features/conversation/ConversationHeader";
 import { useConversationViewScope } from "./conversation-scope";
 
 const loadAgentSettingsPanel = () => import("./AgentSettingsPanel");
 
-import { Show } from "solid-js";
-import { ProviderModelPicker } from "../../components/ProviderModelPicker";
-import { Button } from "../../components/ui";
-import { AgentAvatar } from "../agents/AgentAvatar";
-import { ComputerIcon, RemoteDesktopIcon } from "./ConversationIcons";
+import { toast } from "@openbot/ui";
+import { useText } from "@openbot/ui/text";
+import { createMemo } from "solid-js";
+import { createPublishAgent } from "../agent-templates/PublishAgent";
+import { serverHasStorage } from "../files/storage-usage";
 
 /** @internal Stable HMR boundary for conversation header. */
 export function ConversationHeader() {
+  const { t, errorMessage } = useText();
   const {
     actingBrowserControl,
     agentActivity,
@@ -24,102 +26,98 @@ export function ConversationHeader() {
     settingsProvider,
     settingsReasoning,
     showBrowserPanel,
+    filesOpen,
+    toggleFilesPanel,
   } = useConversationViewScope();
+  const changeAutoApprove = createMemo(() => {
+    const save = props.onSetAgentAutoApprove;
+    const name = props.agent?.name ?? t("conversation.header.thisAgent");
+    if (!save) return undefined;
+    return (next: boolean) => {
+      void save(next).catch((error) => {
+        toast.error(
+          next
+            ? errorMessage(error, t("conversation.header.grantFailed", { name }))
+            : t("settings.autoApprove.revokeFailed", { name }),
+        );
+      });
+    };
+  });
+  const publishAgent = createPublishAgent();
   return (
-    <header class="window-drag conversation-header">
-      <div class="conversation-heading-group">
-        <Show when={props.agent}>
-          {(agent) => (
-            <Button
-              variant="ghost"
-              size="sm"
-              type="button"
-              class="conversation-title no-drag"
-              aria-label="View agent settings"
-              onPointerEnter={() => void loadAgentSettingsPanel()}
-              onFocus={() => void loadAgentSettingsPanel()}
-              onClick={() => setActiveRightPanel("settings")}
-            >
-              <AgentAvatar agent={agent()} />
-              <h1>{agent().name}</h1>
-            </Button>
-          )}
-        </Show>
-      </div>
-      <div class="conversation-header-actions no-drag">
-        <Show when={props.agent}>
-          <ProviderModelPicker
-            provider={settingsProvider()}
-            value={settingsModel()}
-            reasoningEffort={settingsReasoning()}
-            modelOptions={props.modelOptions}
-            agentStatus={props.agentStatus}
-            runtimeStatuses={props.providerRuntimeStatuses}
-            customProviders={props.customProviders}
-            onDownloadProvider={props.onDownloadProvider}
-            onCancelProviderDownload={props.onCancelProviderDownload}
-            onConnectProvider={props.onConnectProvider}
-            disabled={agentActivity() === "Working"}
-            disabledReason={
-              agentActivity() === "Working"
-                ? "Wait for the current work to finish before changing models."
-                : "Models are available after an agent CLI connects."
-            }
-            onChange={(model, provider) => void selectAndConfirmModel(model, provider)}
-            onReasoningEffortChange={(effort) => void selectAndConfirmReasoning(effort)}
-          />
-        </Show>
-        <Show when={props.remoteDesktopEnabled !== false && props.server?.kind === "remote" ? props.server : undefined}>
-          {(server) => {
-            const enabled = () => props.remoteDesktopSessionActive || server().state === "online";
-            const label = () => (props.remoteDesktopSessionActive ? "Resume remote control" : "Open remote control");
-            return (
-              <Button
-                variant="ghost"
-                type="button"
-                class="header-panel-toggle remote-desktop-button"
-                aria-label={label()}
-                aria-expanded={props.remoteDesktopVisible ? "true" : "false"}
-                disabled={!enabled()}
-                onClick={(event) => void props.onOpenRemoteDesktop(server().id, event.currentTarget)}
-              >
-                <RemoteDesktopIcon />
-                <Show when={props.remoteDesktopSessionActive}>
-                  <span class="remote-desktop-button-dot" aria-hidden="true" />
-                </Show>
-              </Button>
-            );
-          }}
-        </Show>
-        <Show when={props.browserEnabled !== false}>
-          <Button
-            variant="ghost"
-            type="button"
-            class={[
-              "header-panel-toggle computer-button",
-              { "computer-button-agent-active": Boolean(actingBrowserControl()) },
-            ]}
-            aria-label={
-              actingBrowserControl()
-                ? `${browserControlAgent()?.name ?? "Agent"} is controlling the browser`
-                : screenOpen()
-                  ? "Hide computer"
-                  : "Open computer"
-            }
-            aria-expanded={screenOpen() ? "true" : "false"}
-            disabled={props.browserVisibilitySuspended}
-            onClick={() => {
-              if (screenOpen()) hideBrowserPanel();
-              else showBrowserPanel();
-            }}
-          >
-            <ComputerIcon />
-            <Show when={actingBrowserControl()}>
-              <span class="computer-control-dot" aria-hidden="true" />
-            </Show>
-          </Button>
-        </Show>
-      </div>
-    </header>
+    <>
+      <SharedConversationHeader
+        agent={props.agent}
+        onSettingsIntent={() => void loadAgentSettingsPanel()}
+        onOpenSettings={() => setActiveRightPanel("settings")}
+        modelPicker={{
+          provider: settingsProvider(),
+          value: settingsModel(),
+          reasoningEffort: settingsReasoning(),
+          modelOptions: props.modelOptions,
+          agentStatus: props.agentStatus,
+          runtimeStatuses: props.providerRuntimeStatuses,
+          customProviders: props.customProviders,
+          customAgents: props.customAgents,
+          onDownloadProvider: props.onDownloadProvider,
+          onCancelProviderDownload: props.onCancelProviderDownload,
+          onConnectProvider: props.onConnectProvider,
+          modelChangesDisabled: agentActivity() === "Working",
+          disabledReason:
+            agentActivity() === "Working"
+              ? t("conversation.header.modelsBusy")
+              : t("conversation.header.modelsUnavailable"),
+          onChange: (model, provider) => void selectAndConfirmModel(model, provider),
+          onReasoningEffortChange: (effort) => void selectAndConfirmReasoning(effort),
+          autoApprove: props.agentAutoApproves,
+          agentName: props.agent?.name,
+          autoApproveLocked: props.agentAutoApproveLocked,
+          onAutoApproveChange: changeAutoApprove(),
+        }}
+        remoteControl={
+          props.remoteDesktopEnabled !== false && props.server?.kind === "remote"
+            ? {
+                enabled: Boolean(props.remoteDesktopSessionActive || props.server.state === "online"),
+                active: Boolean(props.remoteDesktopSessionActive),
+                visible: Boolean(props.remoteDesktopVisible),
+                onOpen: (trigger) => {
+                  if (props.server) void props.onOpenRemoteDesktop(props.server.id, trigger);
+                },
+              }
+            : undefined
+        }
+        files={
+          // The web client has no conversation Files panel, and a chat without a thread has no files to list.
+          !props.runtime && props.agent?.threadId && serverHasStorage(props.server)
+            ? { open: filesOpen(), onToggle: toggleFilesPanel }
+            : undefined
+        }
+        publish={
+          // Only an agent on this computer can be published: main reads its skills from the workspace.
+          !props.runtime && props.server?.kind === "local" && props.agent
+            ? {
+                onOpen: () => {
+                  if (props.agent) publishAgent.open(props.agent.id);
+                },
+              }
+            : undefined
+        }
+        browser={
+          props.browserEnabled !== false
+            ? {
+                acting: Boolean(actingBrowserControl()),
+                agentName: browserControlAgent()?.name,
+                open: screenOpen(),
+                disabled: props.browserVisibilitySuspended,
+                onToggle: () => {
+                  if (screenOpen()) hideBrowserPanel();
+                  else showBrowserPanel();
+                },
+              }
+            : undefined
+        }
+      />
+      {publishAgent.dialog()}
+    </>
   );
 }

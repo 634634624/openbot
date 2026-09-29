@@ -9,20 +9,24 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { isString } from "@openbot/contracts/runtime-values";
 import { TEAM_API_ROUTES } from "@openbot/contracts/team-api-routes";
+import { browserViewStreamSessionId } from "@openbot/contracts/team-protocol/browser-view-v1";
+import { sourceText } from "@openbot/i18n/source";
 import type * as Ws from "ws";
+import { LifecycleGate } from "./lifecycle-gate";
 import {
   decodeRemoteDesktopSignalBinary,
   decodeRemoteDesktopSignalControl,
   encodeRemoteDesktopSignalBinary,
   encodeRemoteDesktopSignalControl,
 } from "./remote-desktop-signal";
+import { rawDataBytes, rawDataSize, rawDataText } from "./ws-raw-data";
 
 const requireModule = createRequire(import.meta.url);
 const webSockets: typeof Ws = requireModule(join(dirname(requireModule.resolve("ws/package.json")), "index.js"));
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 const MAX_PENDING_SIGNAL_BYTES = 1024 * 1024;
 
-export interface RemoteViewerTransport {
+interface RemoteViewerTransport {
   sendDesktop(serverId: string, data: string | ArrayBuffer): Promise<void>;
   on(event: "desktopData", listener: (serverId: string, data: string | ArrayBuffer) => void): unknown;
   off(event: "desktopData", listener: (serverId: string, data: string | ArrayBuffer) => void): unknown;
@@ -50,7 +54,7 @@ export class RemoteViewerProxy {
   readonly #streams = new Map<string, ViewerStream>();
   #server: Server | null = null;
   #port: number | null = null;
-  #starting: Promise<number> | null = null;
+  readonly #lifecycle = new LifecycleGate<number>();
 
   constructor(options: RemoteViewerProxyOptions) {
     this.#options = options;
@@ -58,11 +62,16 @@ export class RemoteViewerProxy {
   }
 
   async viewerUrl(serverId: string, upstreamPath: string): Promise<string> {
-    const port = await this.#start();
+    const port = await this.#lifecycle.start(() => this.#start());
     return `http://127.0.0.1:${port}${this.#basePath(serverId)}${upstreamPath}`;
   }
 
-  async stop(): Promise<void> {
+  // After a start that is still running, so the listener it opens does not stay open after the stop.
+  stop(): Promise<void> {
+    return this.#lifecycle.stop(() => this.#stop());
+  }
+
+  async #stop(): Promise<void> {
     this.#options.transport.off("desktopData", this.#onDesktopData);
     const streams = [...this.#streams.values()];
     for (const stream of streams) stream.socket.close(1001, "Remote viewer stopped");
@@ -77,12 +86,15 @@ export class RemoteViewerProxy {
 
   async #start(): Promise<number> {
     if (this.#port) return this.#port;
-    if (this.#starting) return this.#starting;
-    this.#starting = new Promise<number>((resolve, reject) => {
+    return new Promise<number>((resolve, reject) => {
       const server = createServer((request, response) => void this.#handleHttp(request, response));
       server.on("upgrade", (request, socket, head) => {
         const route = this.#route(request.url ?? "/");
-        if (!route || !/^\/v1\/remote-screen\/sessions\/[A-Za-z0-9-]+\/stream$/u.test(route.upstreamPath)) {
+        const tunneled =
+          route &&
+          (/^\/v1\/remote-screen\/sessions\/[A-Za-z0-9-]+\/stream$/u.test(route.upstreamPath) ||
+            browserViewStreamSessionId(route.upstreamPath) !== null);
+        if (!route || !tunneled) {
           socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
           socket.destroy();
           return;
@@ -94,16 +106,12 @@ export class RemoteViewerProxy {
       server.once("error", reject);
       server.listen(0, "127.0.0.1", () => {
         const address = server.address();
-        if (!address || isString(address))
-          return reject(new Error("The local remote viewer proxy did not get a port."));
+        if (!address || isString(address)) return reject(new Error(sourceText("error.remote.viewerProxyNoPort")));
         this.#server = server;
         this.#port = address.port;
         resolve(address.port);
       });
-    }).finally(() => {
-      this.#starting = null;
     });
-    return this.#starting;
   }
 
   async #handleHttp(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -304,23 +312,6 @@ async function readBody(request: IncomingMessage): Promise<Buffer> {
     chunks.push(bytes);
   }
   return Buffer.concat(chunks);
-}
-
-function rawDataSize(data: Ws.RawData): number {
-  if (Array.isArray(data)) return data.reduce((sum, chunk) => sum + chunk.byteLength, 0);
-  return data.byteLength;
-}
-
-function rawDataBytes(data: Ws.RawData): Uint8Array {
-  if (Array.isArray(data)) return new Uint8Array(Buffer.concat(data));
-  if (data instanceof ArrayBuffer) return new Uint8Array(data.slice(0));
-  return new Uint8Array(Buffer.from(data.buffer, data.byteOffset, data.byteLength));
-}
-
-function rawDataText(data: Ws.RawData): string {
-  if (Array.isArray(data)) return Buffer.concat(data).toString("utf8");
-  if (data instanceof ArrayBuffer) return Buffer.from(data).toString("utf8");
-  return Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("utf8");
 }
 
 function sendText(response: ServerResponse, status: number, body: string): void {

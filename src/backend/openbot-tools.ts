@@ -1,7 +1,13 @@
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import { z } from "zod";
+import { interruptAgentToolSchema } from "./agent/agent-interrupt-tool";
 import { DATA_TOOL_DEFINITIONS } from "./agent/data-tools";
-import { createAgentToolSchema, updateProfileToolSchema } from "./agent/profile-tools";
+import {
+  createAgentToolSchema,
+  listModelsToolSchema,
+  readAgentToolSchema,
+  updateProfileToolSchema,
+} from "./agent/profile-tools";
 import {
   assignAgentSectionToolSchema,
   createSectionToolSchema,
@@ -91,19 +97,38 @@ export const OPENBOT_TOOL_DEFINITIONS: readonly OpenBotToolDefinition[] = [
   },
   {
     name: "list_agents",
-    description: "List local OpenBot agents with their name, title, description, and current status.",
+    description:
+      "List local OpenBot agents with their name, title, description, and progress: status (working, queued, or ready), queuedMessages, turnStartedAt while working, and lastActivityAt. OpenBot does not track which files an agent changed.",
     shape: {},
+  },
+  {
+    name: "list_models",
+    description:
+      "List the models each provider offers for a new agent: id, name, reasoning efforts, and the default model that create_agent uses when you give only a provider. Read-only.",
+    shape: listModelsToolSchema.shape,
+  },
+  {
+    name: "interrupt_agent",
+    description:
+      "Stop another agent's current turn when that turn works on your message, and cancel your requests still queued for it. The agent receives a notice from you with the reason. You cannot stop work that the user, a routine, a channel, or another agent started. To give new work, call send_message after this tool.",
+    shape: interruptAgentToolSchema.shape,
+  },
+  {
+    name: "read_agent",
+    description:
+      "Read the setup of one local OpenBot agent, or your own when you omit agentId: profile, provider, model, reasoning effort, access, Computer Use, notifications, auto-approve, installed skills, routines, and the MCP servers it gets. Read-only. Call it before you change another agent.",
+    shape: readAgentToolSchema.shape,
   },
   {
     name: "create_agent",
     description:
-      "Create a persistent local OpenBot agent when the user asks for a new teammate. Choose its profile from the user's request and supply its first task. Use update_profile for an existing agent.",
+      "Create a persistent local OpenBot agent when the user asks for a new teammate. Choose its profile from the user's request and supply its first task. Set provider, model, or reasoningEffort only when the user asks for them; call list_models first. Use update_profile for an existing agent. After it exists, add skills with install_local_skill and routines with create_routine as needed. A new agent gets your own access and Computer Use limits.",
     shape: createAgentToolSchema.shape,
   },
   {
     name: "update_profile",
     description:
-      "Update a local OpenBot agent’s name, title, instructions, or avatar from the user’s request. For an uploaded or local image, use avatarPath. Prepare a PNG, JPEG, or WebP copy up to 512 KB with your available tools if needed.",
+      "Update a local OpenBot agent’s name, title, instructions, avatar, provider, model, reasoning effort, access, Computer Use, or notifications from the user’s request. You can restrict access to workspace and turn Computer Use off; only the user can widen them again. For an uploaded or local image, use avatarPath. Prepare a PNG, JPEG, or WebP copy up to 512 KB with your available tools if needed. Call list_models before you change a model. A new model applies from the agent's next turn. A provider change fails while the agent has a turn or queued messages; try again when it is ready.",
     shape: updateProfileToolSchema.shape,
   },
   {

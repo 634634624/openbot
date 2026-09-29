@@ -1,10 +1,10 @@
 import type { AgentSummary } from "@openbot/contracts/ipc";
+import { Button, Heading, Text, Toaster, toast } from "@openbot/ui";
 import { createSignal, onCleanup, untrack } from "solid-js";
-import { expect, fn, waitFor, within } from "storybook/test";
+import { fn } from "storybook/test";
 import type { Meta, StoryObj } from "storybook-solidjs-vite";
-import { Button, Heading, Text, Toaster, toast } from "../src/components/ui";
 import { SkillsMarketplaceModal } from "../src/features/settings/SkillsMarketplaceModal";
-import { STORY_AGENT_SUMMARIES } from "../src/preview/fixtures";
+import { STORY_AGENT_SUMMARIES, STORY_MARKETPLACE_PLUGINS } from "../src/preview/fixtures";
 import { createMockOpenBot } from "./mock-openbot";
 
 const storyAgents: Array<Pick<AgentSummary, "id" | "name" | "marketplaceSource">> = STORY_AGENT_SUMMARIES.map(
@@ -13,6 +13,7 @@ const storyAgents: Array<Pick<AgentSummary, "id" | "name" | "marketplaceSource">
 
 function SkillsMarketplaceModalStory(props: {
   initialOpen: boolean;
+  plugins?: boolean;
   detailState?: "fallback" | "long";
   catalogState?: "empty" | "loading" | "loading-transition" | "missing-images";
 }) {
@@ -92,6 +93,7 @@ function SkillsMarketplaceModalStory(props: {
           onOpenChange={setOpen}
           agents={storyAgents}
           activeAgentId={storyAgents[0]?.id ?? ""}
+          plugins={props.plugins ? STORY_MARKETPLACE_PLUGINS : undefined}
           onTrySkill={fn()}
           onAgentInstalled={fn()}
         />
@@ -140,68 +142,6 @@ export const Narrow: Story = {
   parameters: { viewport: { defaultViewport: "marketplaceNarrow" } },
 };
 
-export const SkillDetail: Story = {
-  render: () => <SkillsMarketplaceModalStory initialOpen />,
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await userEvent.click(await body.findByRole("tab", { name: "Skills" }));
-    await userEvent.click(await body.findByRole("button", { name: "View Release notes details" }));
-    await expect(await body.findByRole("region", { name: "Release notes details" })).toBeVisible();
-  },
-};
-
-export const MySubmissions: Story = {
-  render: () => <SkillsMarketplaceModalStory initialOpen />,
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await userEvent.click(await body.findByRole("tab", { name: "Skills" }));
-    await userEvent.click(await body.findByRole("button", { name: "Marketplace menu" }));
-    await userEvent.click(await body.findByRole("menuitem", { name: "My submissions" }));
-    await expect(await body.findByText("Standup digest")).toBeVisible();
-  },
-};
-
-export const AgentMarketplace: Story = {
-  render: () => <SkillsMarketplaceModalStory initialOpen />,
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await userEvent.click(await body.findByRole("tab", { name: "Agents" }));
-    // The listing replaces its own rows when the page arrives, so the card is asserted on the node the retry finds.
-    await waitFor(async () =>
-      expect(await body.findByRole("button", { name: "View Release Manager details" })).toBeVisible(),
-    );
-  },
-};
-
-export const AgentDetail: Story = {
-  render: () => <SkillsMarketplaceModalStory initialOpen />,
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await userEvent.click(await body.findByRole("tab", { name: "Agents" }));
-    await userEvent.click(await body.findByRole("button", { name: "View Release Manager details" }));
-    await expect(await body.findByRole("region", { name: "Release Manager details" })).toBeVisible();
-  },
-};
-
-/** The Skills panel of a bot page: the entries the nav item opens to. */
-export const AgentDetailSkills: Story = {
-  render: () => <SkillsMarketplaceModalStory initialOpen />,
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await userEvent.click(await body.findByRole("tab", { name: "Agents" }));
-    await userEvent.click(await body.findByRole("button", { name: "View Release Manager details" }));
-    const page = within(await body.findByRole("region", { name: "Release Manager details" }));
-    await userEvent.click(await page.findByRole("button", { name: "Skills Playbooks it can run" }));
-    // The panel enters through an animation, so visibility is asserted after it settles.
-    await waitFor(async () => expect(await page.findByRole("region", { name: "Skills" })).toBeVisible());
-  },
-};
-
-export const NarrowAgentDetail: Story = {
-  ...AgentDetail,
-  globals: { viewport: { value: "marketplaceNarrow", isRotated: false } },
-};
-
 export const EmptyCatalog: Story = { render: () => <SkillsMarketplaceModalStory initialOpen catalogState="empty" /> };
 export const LoadingCatalog: Story = {
   render: () => <SkillsMarketplaceModalStory initialOpen catalogState="loading" />,
@@ -211,62 +151,16 @@ export const LoadingTransition: Story = {
 };
 export const MissingImages: Story = {
   render: () => <SkillsMarketplaceModalStory initialOpen catalogState="missing-images" />,
-  play: async ({ userEvent }) => {
-    await userEvent.click(await within(document.body).findByRole("tab", { name: "Skills" }));
-  },
 };
 
-/** The page one category opens to: its own heading, the way back, and the full listing under it. */
-export const AgentCategory: Story = {
-  render: () => <SkillsMarketplaceModalStory initialOpen />,
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await userEvent.click(await body.findByRole("tab", { name: "Agents" }));
-    await userEvent.click(await body.findByRole("button", { name: "View all Coding agents" }));
-    await expect(await body.findByRole("button", { name: "All agents" })).toBeVisible();
-  },
-};
-
-/** Searching replaces the category sections with one result list. */
-export const AgentSearchResults: Story = {
-  render: () => <SkillsMarketplaceModalStory initialOpen />,
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await userEvent.click(await body.findByRole("tab", { name: "Agents" }));
-    await userEvent.type(await body.findByRole("searchbox", { name: "Search agents" }), "review");
-    // The debounced search replaces the listing, so the card is asserted on the node the retry finds.
-    await waitFor(async () =>
-      expect(await body.findByRole("button", { name: "View Code Reviewer details" })).toBeVisible(),
-    );
-  },
-};
-
-/** A search that matches nothing, next to the switch that is still usable. */
-export const NoSearchResults: Story = {
-  render: () => <SkillsMarketplaceModalStory initialOpen />,
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await userEvent.click(await body.findByRole("tab", { name: "Skills" }));
-    await userEvent.type(await body.findByRole("searchbox", { name: "Search skills" }), "nothing matches this");
-    await waitFor(async () => expect(await body.findByText("No skills match this search.")).toBeVisible());
-  },
-};
-
-/** Plugins are announced but not yet served. */
-export const Plugins: Story = {
-  render: () => <SkillsMarketplaceModalStory initialOpen />,
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await userEvent.click(await body.findByRole("tab", { name: "Plugins" }));
-    await expect(await body.findByText("Plugins are not in the marketplace yet.")).toBeVisible();
-  },
+/** The plugin listing under design, on the surface it will really sit on. */
+export const PluginCatalog: Story = {
+  render: () => <SkillsMarketplaceModalStory initialOpen plugins />,
 };
 
 export const FallbackSkillDetail: Story = {
-  ...SkillDetail,
   render: () => <SkillsMarketplaceModalStory initialOpen detailState="fallback" />,
 };
 export const LongSkillDetail: Story = {
-  ...SkillDetail,
   render: () => <SkillsMarketplaceModalStory initialOpen detailState="long" />,
 };

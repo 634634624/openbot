@@ -9,8 +9,8 @@ below.
 
 ## IPC endpoints
 
-- Declare endpoints in `packages/contracts/src/ipc-channels.ts` and `ipc-endpoints.ts`. Implement them
-  in `src/main/ipc/`, one file per domain. Do not put handlers in `index.ts`.
+- Declare endpoints in `packages/contracts/src/ipc-endpoints.ts`. Implement them in
+  `src/main/ipc/`, one file per domain. Do not put handlers in `index.ts`.
 - Follow `ipc/team-handlers.ts`: a `*IpcDependencies` interface, destructured dependencies, a
   `*IpcHandlers` function that returns handlers keyed by endpoint name, and a
   `Pick<IpcGroupHandlers, …>` return type. Do not import from `index.ts`.
@@ -24,10 +24,10 @@ below.
   `*-inputs.ts` parsers. The sender check must run before decoding. Do not bind raw `unknown` as a
   no-payload handler.
 - Use `sendToRenderer` from `renderer-ipc.ts` to send messages. It drops messages for destroyed or
-  loading windows. Its channel argument must be a direct `IPC_CHANNELS.x` reference; do not use a
-  string literal or an intermediate variable. Handlers do not name channels; groups do.
-- Add a channel in one change across `ipc-channels.ts`, `ipc-endpoints.ts`, `src/main/ipc/`,
-  `src/preload/index.ts` and `src/renderer/src/preview/mock-openbot.ts`. See
+  loading windows. Its endpoint argument must be a direct `IPC_ENDPOINTS.group.name` reference;
+  do not use a string literal or an intermediate variable. Handlers do not name channels; groups do.
+- Add a channel in one change across `ipc-endpoints.ts`, `src/main/ipc/`, `src/preload/index.ts`
+  and `src/renderer/src/preview/mock-openbot.ts`. See
   [contract rules](../../packages/contracts/AGENTS.md) for coverage, including the untyped preload.
 
 ## Trust boundary
@@ -74,6 +74,14 @@ Tests that import Electron code must mock `electron`. Follow `trusted-ipc.test.t
 with a fabricated sender frame. Services that can be tested without Electron should not import it.
 `index.ts` has module-scope Electron calls; source coverage tests read it instead of importing it.
 
+## Interface text
+
+An error or status text that can reach a user is `sourceText(key, params)` from
+`@openbot/i18n/source`, not a literal. Its English must stay the same, byte for byte: remote
+clients and older versions read it. Dialogs, menus and window titles use `language.translate`.
+Errors that only a malformed payload or a programming error can cause stay English. See
+[docs/i18n.md](../../docs/i18n.md#text-from-another-process).
+
 ## Ownership and lifecycle
 
 Keep `index.ts` as the dispatcher and lifecycle module. Do not move these responsibilities into it:
@@ -107,11 +115,11 @@ error paths by importing each other.
 | Concern | Files |
 | --- | --- |
 | Stored server list and schema | `remote-server-store.ts`, `remote-server-stored-shape.ts` |
-| Team API requests | `remote-server-client.ts`, `remote-server-http.ts`, `remote-server-errors.ts` |
+| Team API requests | `remote-server-client.ts`, `remote-server-http.ts`, `remote-server-errors.ts`, `remote-attachment-cache.ts` |
 | User-visible connection failures | `remote-server-connection-status.ts`, `remote-server-connections.ts` |
 | Events and reconnects | `remote-server-event-stream.ts`, `remote-server-event-refresh.ts` |
 | Team directory, presence, host reconciliation | `remote-team-directory.ts`, `remote-server-presence.ts`, `remote-server-host-directory.ts` |
-| Host payload decoding | `remote-host-decoding.ts` and its four wire-area siblings |
+| Host payload decoding | `remote-host-decoding.ts` and its five wire-area siblings |
 
 ## Team API routes
 

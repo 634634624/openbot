@@ -1,7 +1,7 @@
 import type { AgentApproval } from "@openbot/contracts/ipc";
-import { fn, userEvent, within } from "storybook/test";
+import { ApprovalCard } from "@openbot/ui/features/conversation/ConversationPrompts";
+import { fn } from "storybook/test";
 import type { Meta, StoryObj } from "storybook-solidjs-vite";
-import { ApprovalCard } from "../src/features/conversation/ConversationPrompts";
 
 const approval: AgentApproval = {
   requestId: "approval-story",
@@ -84,10 +84,9 @@ export const Narrow: Story = {
     ),
   ],
 };
-export const Pending: Story = {
-  args: { onApprove: fn(async () => true) },
-  play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
-    await userEvent.click(canvas.getByRole("button", { name: "Allow" }));
-  },
+/** The three-button card: the agent runs on this computer, so the standing grant is the user's to give. */
+export const AlwaysAllow: Story = {
+  args: { agentName: "Chief", onAlwaysAllow: fn(async () => false) },
 };
+/** The same card without that option, which is what a remote agent and a permissions request both show. */
+export const WithoutAlwaysAllow: Story = { args: { agentName: "Chief" } };

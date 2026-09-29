@@ -10,6 +10,10 @@ const native = vi.hoisted(() => ({ push: vi.fn(), selection: vi.fn(async () => {
 vi.mock("expo-router", () => ({ router: { push: native.push } }));
 vi.mock("@/shared/lib/haptics", () => ({ haptics: { selection: native.selection } }));
 vi.mock("expo-glass-effect", () => ({ GlassView: ({ children }: PropsWithChildren) => <div>{children}</div> }));
+vi.mock("react-native-reanimated", () => ({
+  default: { View: ({ children }: PropsWithChildren) => <div>{children}</div> },
+  cubicBezier: () => "ease-out",
+}));
 vi.mock("lucide-react-native", () => ({ ChevronUp: () => null, Clock: () => null, TriangleAlert: () => null }));
 vi.mock("heroui-native/hooks", () => ({ useThemeColor: () => "gray" }));
 vi.mock("heroui-native", () => {
@@ -62,7 +66,10 @@ function stubQueue(
     serverId: "host",
     attachments: [],
     changeAttachments: async () => {},
+    attachmentSupport: () => ({ eml: true, media: true }),
     queued,
+    replies: [],
+    waiting: [],
     deliveries: queued,
     edit,
     editUnavailable: false,
@@ -168,4 +175,12 @@ it("counts a held edit whose delivery is missing from the queue", () => {
   };
   mount(stubQueue([], null, held));
   expect(screen.getByRole("button", { name: "1 queued message. Show queued messages" })).toBeTruthy();
+});
+
+it("keeps the entry while teammates work and no answer has arrived", () => {
+  // The waiting rows are in the sheet only. Without the entry, nothing would show who the agent waits for.
+  mount({ ...stubQueue([]), waiting: [{ id: "q:builder", agentId: "builder", state: "working", preview: null }] });
+  const button = screen.getByRole("button", { name: "Waiting for replies" });
+  act(() => fireEvent.click(button));
+  expect(native.push).toHaveBeenCalledWith({ pathname: "/queued-messages", params: { chat: "host:agent" } });
 });

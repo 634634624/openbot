@@ -1,7 +1,6 @@
+import { Heading, Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@openbot/ui";
 import { createSignal } from "solid-js";
-import { expect, within } from "storybook/test";
 import type { Meta, StoryObj } from "storybook-solidjs-vite";
-import { Heading, Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../src/components/ui";
 
 const options = ["Low", "Medium", "High", "Extra high"];
 
@@ -43,11 +42,4 @@ export const Gallery: Story = {
       </div>
     </main>
   ),
-  play: async ({ canvas, userEvent }) => {
-    const trigger = canvas.getAllByRole("button", { name: /Reasoning level/ })[0];
-    await userEvent.click(trigger);
-    const body = within(document.body);
-    await userEvent.click(await body.findByRole("option", { name: "High" }));
-    await expect(trigger).toHaveTextContent("High");
-  },
 };

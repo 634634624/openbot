@@ -14,14 +14,17 @@
 
 :root {
   --openbot-provider-current: currentcolor;
+  /* Main screen canvas and drawer, used by the native app. */
+  --openbot-bg-native-canvas: #141414;
+  --openbot-bg-native-sidebar: #141414;
   /* Grouped sheet surfaces, used by the native app. */
-  --openbot-bg-sheet: #121212;
+  --openbot-bg-sheet: #141414;
   --openbot-bg-grouped: #212121;
   --openbot-text-grouped-secondary: #96969b;
   --openbot-border-grouped: #333335;
   --openbot-radius-grouped: 16px;
 
-  /* Grok Bot-inspired neutral system. Keep UI colors here, not in components. */
+  /* Neutral color system. Keep UI colors here, not in components. */
   --openbot-bg-canvas: #1a1a1a;
   --openbot-bg-canvas-clear: rgba(26, 26, 26, 0);
   --openbot-bg-sidebar: #1a1a1a;
@@ -71,7 +74,7 @@
   --openbot-bg-notch: #000000;
   --openbot-mask-solid: #000000;
   --openbot-transparent: rgba(0, 0, 0, 0);
-  --openbot-drawer-scrim: #202020;
+  --openbot-drawer-scrim: #000000;
   --openbot-scroll-edge-overlay: rgba(0, 0, 0, 0.72);
   --openbot-queue-surface: var(--openbot-bg-surface);
   --openbot-queue-border: var(--openbot-border-strong);
@@ -120,6 +123,8 @@
   --openbot-provider-codex: var(--openbot-text-primary);
   --openbot-provider-claude: #d97757;
   --openbot-provider-grok: var(--openbot-text-primary);
+  /* The Gemini brand colour that Simple Icons gives. */
+  --openbot-provider-antigravity: #8e75b2;
   /* A chart series needs a hue of its own: the logo colours above give codex and grok the
      same white, which no reader can tell apart in two overlaid areas. Validated together
      with the dataviz skill's checker -
@@ -129,6 +134,14 @@
   --openbot-chart-series-claude: var(--openbot-provider-claude);
   --openbot-chart-series-grok: #6bc7d9;
   --openbot-chart-series-other: var(--openbot-text-muted);
+  /* The storage bar: four hues in this fixed order, then neutral app data. Validated with
+     node scripts/validate_palette.js "#3987e5,#d95926,#199e70,#9085e9" --mode dark --surface "#1a1a1a"
+     and again on #212121. */
+  --openbot-chart-storage-workspaces: #3987e5;
+  --openbot-chart-storage-files: #d95926;
+  --openbot-chart-storage-chats: #199e70;
+  --openbot-chart-storage-downloads: #9085e9;
+  --openbot-chart-storage-app: var(--openbot-text-dim);
   --openbot-logo-production: #d6adf2;
   --openbot-logo-eye: #040007;
   --openbot-logo-dev: var(--openbot-warning);
@@ -180,21 +193,23 @@
   --openbot-danger-soft-hover: rgba(253, 47, 59, 0.28);
   --openbot-danger-focus: rgba(253, 47, 59, 0.4);
   --openbot-danger-border: rgba(253, 47, 59, 0.5);
+  /* Literal values: the mobile themes repeat these in tokens-native.css, where var() resolves to
+   * nothing. They equal warning, question-option, success, danger and accent-text. */
   --openbot-file-blue: #74b9ff;
   --openbot-file-blue-soft: rgba(116, 185, 255, 0.14);
-  --openbot-file-yellow: var(--openbot-warning);
-  --openbot-file-yellow-soft: var(--openbot-warning-soft);
+  --openbot-file-yellow: #ff9412;
+  --openbot-file-yellow-soft: rgba(255, 148, 18, 0.12);
   --openbot-file-orange: #f0a06a;
   --openbot-file-orange-soft: rgba(240, 160, 106, 0.14);
-  --openbot-file-teal: var(--openbot-question-option);
-  --openbot-file-teal-soft: var(--openbot-question-option-soft);
-  --openbot-file-green: var(--openbot-success);
-  --openbot-file-green-soft: var(--openbot-success-soft);
-  --openbot-file-red: var(--openbot-danger);
-  --openbot-file-red-soft: var(--openbot-danger-soft);
+  --openbot-file-teal: #6bc7d9;
+  --openbot-file-teal-soft: rgba(107, 199, 217, 0.14);
+  --openbot-file-green: #31cf76;
+  --openbot-file-green-soft: rgba(49, 207, 118, 0.12);
+  --openbot-file-red: #fd2f3b;
+  --openbot-file-red-soft: rgba(253, 47, 59, 0.16);
   --openbot-file-pink: #d98ac9;
   --openbot-file-pink-soft: rgba(217, 138, 201, 0.14);
-  --openbot-file-default: var(--openbot-accent-text);
+  --openbot-file-default: #42a0ff;
   --openbot-file-default-soft: rgba(0, 124, 247, 0.14);
   --openbot-data-table-border: #303030;
   --openbot-data-table-header-text: #a1a1a1;
@@ -325,6 +340,11 @@
   --openbot-layer-dropdown: 40;
   --openbot-layer-popover: 60;
   --openbot-layer-dialog: 100;
+  /* A dialog that opens other surfaces over itself, such as the marketplace. Its own menus take
+     one above it, and a dialog it opens takes two, so the order is stated once here instead of
+     being re-derived by arithmetic at each surface - where a tie is decided by insertion order,
+     and the surface opened last wins only by accident. */
+  --openbot-layer-dialog-host: calc(var(--openbot-layer-dialog) + var(--openbot-layer-popover));
   --openbot-layer-toast: 120;
 }
 
@@ -351,5 +371,13 @@
 }
 
 [data-provider="opencode"] {
+  --openbot-provider-current: var(--openbot-text-primary);
+}
+
+[data-provider="antigravity"] {
+  --openbot-provider-current: var(--openbot-provider-antigravity);
+}
+
+[data-provider="acp"] {
   --openbot-provider-current: var(--openbot-text-primary);
 }

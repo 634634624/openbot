@@ -1,17 +1,18 @@
+import { useText } from "@openbot/ui/text";
 import { Loading, Show } from "solid-js";
 import { useAuth } from "./features/account/account-context";
-import { useAgents } from "./features/agents/agents-context";
-import { useCustomProviders } from "./features/custom-providers/custom-providers-context";
+import { useProviderDetection } from "./features/custom-providers/provider-detection-context";
 import { useSetup } from "./features/onboarding/onboarding-context";
+import { useSetupProviderProps } from "./features/onboarding/setup-provider-props";
 import { useServerSelection } from "./features/servers/server-selection";
 import { AccountLogin, InitialSetup, OnboardingFlow } from "./lazy-views";
 import { usePlatform } from "./platform";
-import { useProviders } from "./providers";
 import { WorkspaceShell } from "./WorkspaceShell";
 
 /** The one placeholder every gate below falls back to, at every depth. */
 function LoadingScreen() {
-  return <div class="initial-setup-screen" role="status" aria-label="Loading OpenBot" />;
+  const { t } = useText();
+  return <div class="initial-setup-screen" role="status" aria-label={t("app.loading")} />;
 }
 
 /**
@@ -34,21 +35,10 @@ export function AppAccessGate() {
   const platform = usePlatform();
   const auth = useAuth();
   const setup = useSetup();
-  const { agentStatus } = useAgents();
-  const {
-    providerRuntimeStatuses,
-    providerRuntimeDownloadsAvailable,
-    downloadProviderRuntime,
-    cancelProviderRuntimeDownload,
-    refreshingProviders,
-    connectProvider,
-    openProviderInstallGuide,
-    openProviderSignInGuide,
-    refreshAgentProviders,
-  } = useProviders();
-  // Onboarding is ungated: it only ever runs against this computer, so there is no remote server to
-  // hide the endpoints from. Settings gates on `activeServer()`; see `WorkspaceOverlays.tsx`.
-  const { customProviders, saveCustomProvider, deleteCustomProvider } = useCustomProviders();
+  // Setup is ungated: it only ever runs against this computer, so there is no remote server to hide
+  // the endpoints from. Settings gates on `activeServer()`; see `WorkspaceOverlays.tsx`.
+  const setupProviders = useSetupProviderProps();
+  const detection = useProviderDetection();
   const { joinRemoteDuringSetup } = useServerSelection();
 
   return (
@@ -77,37 +67,19 @@ export function AppAccessGate() {
                 fallback={
                   <Loading fallback={<LoadingScreen />}>
                     <OnboardingFlow
+                      {...setupProviders}
                       state={setup.setupState() ?? { completed: false, preferredProvider: null, preferredModel: null }}
-                      agentStatus={agentStatus()}
                       platform={platform.appInfo()?.platform ?? "darwin"}
-                      refreshingProviders={
-                        refreshingProviders() ||
-                        agentStatus().phase === "starting" ||
-                        agentStatus().phase === "restarting"
-                      }
-                      providerRuntimeStatuses={
-                        providerRuntimeDownloadsAvailable() ? providerRuntimeStatuses() : undefined
-                      }
-                      onDownloadProvider={providerRuntimeDownloadsAvailable() ? downloadProviderRuntime : undefined}
-                      onCancelProviderDownload={
-                        providerRuntimeDownloadsAvailable() ? cancelProviderRuntimeDownload : undefined
-                      }
-                      onConnectProvider={connectProvider}
-                      onInstallProvider={openProviderInstallGuide}
-                      onSignInProvider={providerRuntimeDownloadsAvailable() ? undefined : openProviderSignInGuide}
-                      onRefreshProviders={providerRuntimeDownloadsAvailable() ? undefined : refreshAgentProviders}
                       onSave={setup.saveSetup}
-                      customProviders={customProviders()}
-                      onAddCustomProvider={saveCustomProvider}
-                      onDeleteCustomProvider={deleteCustomProvider}
+                      onProviderStepShown={detection.scanOnce}
                     />
                   </Loading>
                 }
               >
                 <Loading fallback={<LoadingScreen />}>
                   <InitialSetup
+                    {...setupProviders}
                     state={setup.setupState() ?? { completed: false, preferredProvider: null, preferredModel: null }}
-                    agentStatus={agentStatus()}
                     platform={platform.appInfo()?.platform ?? "darwin"}
                     accountEmail={account().email}
                     inviteUrl={setup.pendingInviteUrl()}

@@ -8,13 +8,17 @@ import type {
   ProviderRuntimeSnapshot,
   UpdateStatus,
 } from "@openbot/contracts/ipc";
+import { Button, Heading, Text, Toaster, toast } from "@openbot/ui";
+import type { ProviderDetection } from "@openbot/ui/features/custom-providers/detected-providers";
+import type { ProviderDetectionSettingsValue } from "@openbot/ui/features/custom-providers/ProviderDetectionSettings";
+import { DEFAULT_GENERAL_SETTINGS } from "@openbot/ui/features/settings/app-settings";
 import { createSignal, onCleanup } from "solid-js";
-import { expect, fn, waitFor, within } from "storybook/test";
+import { fn } from "storybook/test";
 import type { Meta, StoryObj } from "storybook-solidjs-vite";
-import { Button, Heading, Text, Toaster, toast } from "../src/components/ui";
 import { createProviderRuntimeStore } from "../src/features/provider-updates/provider-runtime-store";
-import { DEFAULT_GENERAL_SETTINGS } from "../src/features/settings/app-settings";
-import { SettingsModal } from "../src/features/settings/SettingsModal";
+import { SettingsModal, type SettingsTab } from "../src/features/settings/SettingsModal";
+import { createFakeCodeLogin } from "./code-login-fixture";
+import { createStoryDetection, STORY_DETECTED_PROVIDERS } from "./detected-providers-fixture";
 import { createMockOpenBot } from "./mock-openbot";
 
 const storyAppInfo = { name: "OpenBot", version: "0.2.1", platform: "darwin", variant: "dev" } as const;
@@ -32,16 +36,6 @@ const storyUpdateStatus: UpdateStatus = {
   checkedAt: null,
   message: null,
   errorCode: null,
-};
-const availableUpdateStatus: UpdateStatus = {
-  ...storyUpdateStatus,
-  phase: "available",
-  availableVersion: "0.3.0",
-};
-const readyUpdateStatus: UpdateStatus = {
-  ...availableUpdateStatus,
-  phase: "ready",
-  progress: 100,
 };
 const providerAgentStatus: AgentStatus = {
   phase: "blocked",
@@ -62,6 +56,7 @@ const providerRuntimeStatuses: ProviderRuntimeSnapshot["providers"] = {
   claude: { phase: "downloading", progress: 48, message: null, version: null },
   grok: { phase: "downloading", progress: 72, message: null, version: null },
   opencode: { phase: "downloading", progress: 96, message: null, version: null },
+  antigravity: { phase: "downloading", progress: 12, message: null, version: null },
 };
 
 /** Four connected runtimes, one of which has a newer version waiting. */
@@ -82,6 +77,15 @@ const openCodeInstalledAgentStatus: AgentStatus = {
     ...(providerUpdateAgentStatus.providers ?? []),
     { id: "opencode", state: "sign-in-required", version: "1.18.27", message: null },
   ],
+};
+/** ChatGPT installed and signed out, so its row offers both ways in. The rest are connected. */
+const codeSignInAgentStatus: AgentStatus = {
+  ...providerUpdateAgentStatus,
+  providers: (providerUpdateAgentStatus.providers ?? []).map((provider) =>
+    provider.id === "codex"
+      ? { ...provider, state: "sign-in-required", version: "0.149.1", message: "Connect ChatGPT to continue." }
+      : provider,
+  ),
 };
 /** Two saved endpoints: one with a key of its own, one on this computer that asks for none. */
 const STORY_CUSTOM_PROVIDERS: readonly CustomProviderSummary[] = [
@@ -105,28 +109,39 @@ const providerUpdateRuntimeStatuses: ProviderRuntimeSnapshot["providers"] = {
   claude: { phase: "ready", progress: 100, message: null, version: "2.1.246", availableVersion: "2.1.250" },
   grok: { phase: "ready", progress: 100, message: null, version: "1.0.5" },
   opencode: { phase: "ready", progress: 100, message: null, version: "1.18.30" },
+  antigravity: { phase: "ready", progress: 100, message: null, version: "1.2.1" },
 };
 
 function SettingsModalStory(props: {
   initialOpen: boolean;
-  initialUpdateStatus?: UpdateStatus;
-  mockDownloadUpdate?: boolean;
   providerDownloads?: boolean;
   providerUpdate?: boolean;
   providerUpdateFailure?: boolean;
-  simulateMobileConnection?: boolean;
   openCodeInstalled?: boolean;
   customProviderList?: boolean;
-  customProviderSaveFails?: boolean;
+  codeSignIn?: boolean;
+  /** The first result of a fake scan. Scan again runs the whole scan. */
+  detection?: ProviderDetection;
+  /** Detected IDs that the user hid in an earlier run. */
+  hiddenDetected?: readonly string[];
+  /** Where the scan looks. Without it the tab has no detection settings. */
+  detectionSettings?: ProviderDetectionSettingsValue;
+  initialTab?: SettingsTab;
+  /** A restart that a server admin asked for. */
+  scheduledRestart?: UpdateStatus["scheduledRestart"];
 }) {
   const previousApi = window.openbot;
   const mock = createMockOpenBot({
     providerRuntimeSnapshot: props.providerUpdate
-      ? { revision: 0, providers: providerUpdateRuntimeStatuses }
+      ? {
+          revision: 0,
+          providers: providerUpdateRuntimeStatuses,
+          toolRuntimes: { bun: { phase: "ready", progress: 100, message: null, version: "1.4.2" } },
+        }
       : undefined,
     providerRuntimeFailure: props.providerUpdateFailure,
   });
-  const runtimes = createProviderRuntimeStore(props.providerUpdate ? mock.api.providerRuntimes : undefined);
+  const runtimes = createProviderRuntimeStore(() => (props.providerUpdate ? mock.api.providerRuntimes : undefined));
   window.openbot = mock.api;
   onCleanup(() => {
     mock.dispose();
@@ -135,7 +150,11 @@ function SettingsModalStory(props: {
   });
   const [open, setOpen] = createSignal(props.initialOpen);
   const [value, setValue] = createSignal({ ...DEFAULT_GENERAL_SETTINGS });
-  const [updateStatus, setUpdateStatus] = createSignal<UpdateStatus>(props.initialUpdateStatus ?? storyUpdateStatus);
+  const [updateStatus, setUpdateStatus] = createSignal<UpdateStatus>(
+    props.scheduledRestart
+      ? { ...storyUpdateStatus, phase: "ready", availableVersion: "0.3.0", scheduledRestart: props.scheduledRestart }
+      : storyUpdateStatus,
+  );
   const [account, setAccount] = createSignal<CentralAuthUser>({ ...storyAccount });
   const [mobileDevices, setMobileDevices] = createSignal<MobileConnectedDevice[]>([
     {
@@ -146,18 +165,28 @@ function SettingsModalStory(props: {
       lastActiveAt: Date.now() - 45_000,
     },
   ]);
-  let mobileConnectionTimer: number | undefined;
-
-  onCleanup(() => {
-    if (mobileConnectionTimer !== undefined) window.clearTimeout(mobileConnectionTimer);
-  });
-
+  const codeLogin = createFakeCodeLogin({ finishAfterMs: 0 });
   const [customProviders, setCustomProviders] = createSignal<CustomProviderSummary[]>(
     props.customProviderList ? [...STORY_CUSTOM_PROVIDERS] : [],
   );
+  const [detectionSettings, setDetectionSettings] = createSignal(props.detectionSettings);
+  const detection = props.detection
+    ? createStoryDetection(props.detection, {
+        hidden: props.hiddenDetected,
+        rescan: true,
+        // A saved server joins the saved endpoints, as the host's list would report it.
+        onSaved: (saved) => {
+          if (saved.kind !== "models") return;
+          const { id, name, baseUrl, apiKey, models } = saved.value;
+          setCustomProviders((current) => [
+            ...current.filter((provider) => provider.id !== id),
+            { id, name, baseUrl, models, hasApiKey: Boolean(apiKey) },
+          ]);
+        },
+      })
+    : undefined;
 
   async function addCustomProvider(): Promise<CustomProviderRestart> {
-    if (props.customProviderSaveFails) throw new Error("House Router refused the API key.");
     return "restarted";
   }
 
@@ -178,34 +207,10 @@ function SettingsModalStory(props: {
   }
 
   async function runUpdateAction(): Promise<void> {
-    if (!props.mockDownloadUpdate || updateStatus().phase !== "available") {
-      setUpdateStatus({ ...storyUpdateStatus, phase: "up-to-date", checkedAt: new Date().toISOString() });
-      return;
-    }
-
-    const downloadingStatus = { ...updateStatus(), phase: "downloading", progress: 0 } as const;
-    setUpdateStatus(downloadingStatus);
-    await new Promise((resolve) => setTimeout(resolve, 400));
-    setUpdateStatus({ ...downloadingStatus, progress: 48 });
-    await new Promise((resolve) => setTimeout(resolve, 400));
-    setUpdateStatus({ ...downloadingStatus, phase: "ready", progress: 100 });
+    setUpdateStatus({ ...storyUpdateStatus, phase: "up-to-date", checkedAt: new Date().toISOString() });
   }
 
   async function createMobileConnect(): Promise<{ qrData: string; expiresAt: number }> {
-    if (props.simulateMobileConnection) {
-      mobileConnectionTimer = window.setTimeout(() => {
-        setMobileDevices((current) => [
-          ...current,
-          {
-            sessionId: "22222222-2222-4222-8222-222222222222",
-            name: "OpenBot iPhone",
-            platform: "ios",
-            connectedAt: Date.now(),
-            lastActiveAt: Date.now(),
-          },
-        ]);
-      }, 500);
-    }
     return {
       qrData:
         "openbot://mobile-connect?api=https%3A%2F%2Fapi.openbot.run&ticket=storybook-mobile-ticket_1234567890abcdef",
@@ -224,12 +229,17 @@ function SettingsModalStory(props: {
           Open settings
         </Button>
         <SettingsModal
+          initialTab={props.initialTab}
           open={open()}
           onOpenChange={setOpen}
           value={value()}
           onValueChange={setValue}
           appInfo={storyAppInfo}
           updateStatus={updateStatus()}
+          onCancelScheduledRestart={async () => {
+            const { scheduledRestart: _cancelled, ...rest } = updateStatus();
+            setUpdateStatus(rest);
+          }}
           account={account()}
           onUpdateAccountName={updateAccountName}
           onUpdateAccountAvatar={updateAccountAvatar}
@@ -242,14 +252,17 @@ function SettingsModalStory(props: {
           }}
           onUpdateAction={runUpdateAction}
           agentStatus={
-            props.providerUpdate
-              ? providerUpdateAgentStatus
-              : props.providerDownloads
-                ? providerAgentStatus
-                : props.openCodeInstalled
-                  ? openCodeInstalledAgentStatus
-                  : undefined
+            props.codeSignIn
+              ? codeSignInAgentStatus
+              : props.providerUpdate
+                ? providerUpdateAgentStatus
+                : props.providerDownloads
+                  ? providerAgentStatus
+                  : props.openCodeInstalled
+                    ? openCodeInstalledAgentStatus
+                    : undefined
           }
+          codeLogin={props.codeSignIn ? codeLogin : undefined}
           providerRuntimeStatuses={
             props.providerUpdate
               ? runtimes.providerRuntimeStatuses()
@@ -265,10 +278,14 @@ function SettingsModalStory(props: {
           onCancelProviderDownload={
             props.providerUpdate ? runtimes.cancelProviderRuntimeDownload : props.providerDownloads ? fn() : undefined
           }
-          onConnectProvider={props.providerDownloads || props.providerUpdate ? fn() : undefined}
+          onConnectProvider={props.providerDownloads || props.providerUpdate || props.codeSignIn ? fn() : undefined}
           onAddCustomProvider={addCustomProvider}
           onDeleteCustomProvider={deleteCustomProvider}
           customProviders={customProviders()}
+          providerDetection={detection?.detection()}
+          detectedProviderApi={detection?.api}
+          detectionSettings={detectionSettings()}
+          onDetectionSettingsChange={setDetectionSettings}
         />
       </main>
       <Toaster />
@@ -327,57 +344,97 @@ export const Open: Story = {
 
 /** The row that adds a self-described endpoint. OpenCode is installed, so the row offers Add. */
 export const AddCustomProvider: Story = {
-  render: () => <SettingsModalStory initialOpen openCodeInstalled />,
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await userEvent.click(await body.findByRole("button", { name: "Add custom provider" }));
-    await expect(body.findByRole("heading", { name: "Custom provider" })).resolves.toBeTruthy();
-  },
+  render: () => <SettingsModalStory initialOpen openCodeInstalled initialTab="providers" />,
+};
+
+/** The AI providers tab looks for local model servers and ACP agents each time it opens. */
+export const DetectingProviders: Story = {
+  render: () => (
+    <SettingsModalStory
+      initialOpen
+      openCodeInstalled
+      initialTab="providers"
+      detection={{ scanning: true, found: STORY_DETECTED_PROVIDERS.slice(0, 1) }}
+    />
+  ),
+};
+
+/** The scan is done and Ollama is already added, so its row offers Edit. Scan again runs it once more. */
+export const DetectedProviders: Story = {
+  render: () => (
+    <SettingsModalStory
+      initialOpen
+      openCodeInstalled
+      initialTab="providers"
+      detection={{
+        scanning: false,
+        found: STORY_DETECTED_PROVIDERS.map((provider) =>
+          provider.id === "ollama" ? { ...provider, added: true } : provider,
+        ),
+      }}
+    />
+  ),
+};
+
+/** The user hid LM Studio in an earlier run. Show hidden puts it back in the list. */
+export const HiddenDetectedProviders: Story = {
+  render: () => (
+    <SettingsModalStory
+      initialOpen
+      openCodeInstalled
+      initialTab="providers"
+      detection={{ scanning: false, found: STORY_DETECTED_PROVIDERS }}
+      hiddenDetected={["models:http://127.0.0.1:1234/v1"]}
+    />
+  ),
 };
 
 /**
- * The saved endpoints, and the removal that discards a key. They are listed in a dialog the count on
- * the Custom provider row opens, so the AI providers section keeps its rows of fixed height.
+ * Where the scan looks: a server on another computer and a folder that is not on the PATH. With the
+ * switch off, the tab shows no detected list.
  */
-export const CustomProviderList: Story = {
-  render: () => <SettingsModalStory initialOpen openCodeInstalled customProviderList />,
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await userEvent.click(await body.findByRole("button", { name: "Manage 2 endpoints" }));
-    await expect(body.findByRole("button", { name: "Delete Studio Local" })).resolves.toBeTruthy();
-    // The removal asks first. Storybook has no dialog to answer, so the answer is given here.
-    const previousConfirm = window.confirm;
-    window.confirm = () => true;
-    try {
-      await userEvent.click(body.getByRole("button", { name: "Delete House Router" }));
-      await waitFor(() => expect(body.queryByRole("button", { name: "Delete House Router" })).toBeNull());
-      await expect(body.getByRole("button", { name: "Delete Studio Local" })).toBeVisible();
-      // The last endpoint leaves the dialog on its empty state rather than closing under the hand.
-      await userEvent.click(body.getByRole("button", { name: "Delete Studio Local" }));
-      await expect(body.findByText("No custom endpoints yet.")).resolves.toBeTruthy();
-    } finally {
-      window.confirm = previousConfirm;
-    }
-  },
+export const DetectionSettings: Story = {
+  render: () => (
+    <SettingsModalStory
+      initialOpen
+      openCodeInstalled
+      initialTab="providers"
+      detection={{ scanning: false, found: STORY_DETECTED_PROVIDERS }}
+      detectionSettings={{
+        enabled: true,
+        addresses: ["http://192.168.1.20:11434/v1"],
+        folders: ["~/tools/bin"],
+      }}
+    />
+  ),
 };
 
-/** The endpoint is refused, so the form stays with the values, including the key the user typed. */
-export const CustomProviderSaveFails: Story = {
-  render: () => <SettingsModalStory initialOpen openCodeInstalled customProviderSaveFails />,
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await userEvent.click(await body.findByRole("button", { name: "Add custom provider" }));
-    // A required field appends an aria-hidden asterisk to its label, so its name is not an exact match.
-    await userEvent.type(await body.findByLabelText(/^Provider ID/), "house-router");
-    await userEvent.type(body.getByLabelText(/^Display name/), "House Router");
-    await userEvent.type(body.getByLabelText(/^Base URL/), "https://models.example.com/v1");
-    await userEvent.type(body.getByLabelText("Model 1 ID"), "glm-5-air");
-    await userEvent.type(body.getByLabelText("Model 1 display name"), "GLM 5 Air");
-    await userEvent.click(body.getByRole("button", { name: "Submit" }));
+/** Nothing runs at the default addresses and no known agent is on the PATH. */
+export const NothingDetected: Story = {
+  render: () => (
+    <SettingsModalStory
+      initialOpen
+      openCodeInstalled
+      initialTab="providers"
+      detection={{ scanning: false, found: [] }}
+    />
+  ),
+};
 
-    await expect(body.findByText("House Router refused the API key.")).resolves.toBeTruthy();
-    await expect(body.getByLabelText(/^Provider ID/)).toHaveValue("house-router");
-  },
+/**
+ * Two saved endpoints. The count on the Custom provider row opens the dialog that lists them, so the
+ * AI providers section keeps its rows of fixed height.
+ */
+export const CustomProviderList: Story = {
+  render: () => <SettingsModalStory initialOpen openCodeInstalled customProviderList initialTab="providers" />,
+};
+
+/**
+ * The ChatGPT row signed out. The sign-in finished on another device sits in the row's actions
+ * menu, so the row still leads with one button.
+ */
+export const CodeSignIn: Story = {
+  render: () => <SettingsModalStory initialOpen codeSignIn initialTab="providers" />,
 };
 
 export const Narrow: Story = {
@@ -386,185 +443,29 @@ export const Narrow: Story = {
 };
 
 export const ProviderDownloads: Story = {
-  render: () => <SettingsModalStory initialOpen providerDownloads />,
+  render: () => <SettingsModalStory initialOpen providerDownloads initialTab="providers" />,
   parameters: { viewport: { defaultViewport: "settingsPhone" } },
 };
 
 /** The durable surface: the update the toast offers is still here after the toast is gone. */
 export const ProviderUpdateAvailable: Story = {
-  render: () => <SettingsModalStory initialOpen providerUpdate />,
-  play: async () => {
-    const body = within(document.body);
-    await expect(body.findByRole("button", { name: "Update Claude to 2.1.250" })).resolves.toBeEnabled();
-  },
-};
-
-export const ProviderUpdateFromSettings: Story = {
-  render: () => <SettingsModalStory initialOpen providerUpdate />,
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await userEvent.click(await body.findByRole("button", { name: "Update Claude to 2.1.250" }));
-    await expect(body.findByText("Updating Claude")).resolves.toBeInTheDocument();
-    await expect(body.findByText("Claude is up to date", undefined, { timeout: 8_000 })).resolves.toBeInTheDocument();
-  },
+  render: () => <SettingsModalStory initialOpen providerUpdate initialTab="providers" />,
 };
 
 export const ProviderUpdateRetry: Story = {
-  render: () => <SettingsModalStory initialOpen providerUpdate providerUpdateFailure />,
+  render: () => <SettingsModalStory initialOpen providerUpdate providerUpdateFailure initialTab="providers" />,
 };
 
-export const Profile: Story = {
-  render: () => <SettingsModalStory initialOpen />,
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await userEvent.click(await body.findByRole("tab", { name: "Profile" }));
-  },
-};
-
-export const ComputerUse: Story = {
-  render: () => <SettingsModalStory initialOpen />,
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await userEvent.click(await body.findByRole("tab", { name: "Computer Use" }));
-  },
-};
-
-export const Updates: Story = {
-  render: () => <SettingsModalStory initialOpen />,
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await userEvent.click(await body.findByRole("tab", { name: "Updates" }));
-  },
-};
-
-export const MobileConnect: Story = {
-  render: () => <SettingsModalStory initialOpen />,
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await userEvent.click(await body.findByRole("tab", { name: "Mobile Connect" }));
-    await userEvent.click(await body.findByRole("button", { name: "Generate QR code" }));
-    await expect(await body.findByRole("img", { name: "Mobile Connect sign-in QR code" })).toBeVisible();
-  },
-};
-
-export const MobileConnectSuccess: Story = {
-  render: () => <SettingsModalStory initialOpen simulateMobileConnection />,
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await userEvent.click(await body.findByRole("tab", { name: "Mobile Connect" }));
-    await userEvent.click(await body.findByRole("button", { name: "Generate QR code" }));
-    await expect(await body.findByText("Phone connected", undefined, { timeout: 3_000 })).toBeVisible();
-  },
-};
-
-export const UpdateAvailable: Story = {
-  render: () => <SettingsModalStory initialOpen initialUpdateStatus={availableUpdateStatus} />,
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await userEvent.click(await body.findByRole("tab", { name: "Updates" }));
-  },
-};
-
-export const DownloadUpdateFlow: Story = {
-  render: () => <SettingsModalStory initialOpen initialUpdateStatus={availableUpdateStatus} mockDownloadUpdate />,
-  play: async ({ step, userEvent }) => {
-    const body = within(document.body);
-
-    await step("Open the available OpenBot update", async () => {
-      await userEvent.click(await body.findByRole("tab", { name: "Updates" }));
-      await expect(body.getByText("OpenBot v0.3.0 is available to download.")).toBeVisible();
-    });
-
-    await step("Start the mocked download", async () => {
-      const downloadButton = body.getByRole("button", { name: "Download update" });
-      await expect(downloadButton).toBeEnabled();
-      await userEvent.click(downloadButton);
-      await expect(await body.findByText("Downloading OpenBot v0.3.0 · 0%")).toBeVisible();
-      await expect(body.getByRole("button", { name: "Downloading update…" })).toBeDisabled();
-    });
-
-    await step("Finish the mocked download", async () => {
-      await waitFor(() => expect(body.getByText("Downloading OpenBot v0.3.0 · 48%")).toBeVisible());
-      await waitFor(() => expect(body.getByText("OpenBot v0.3.0 is ready. Restart to apply.")).toBeVisible());
-      await expect(body.getByRole("button", { name: "Restart to update" })).toBeEnabled();
-    });
-  },
-};
-
-export const ReadyToInstall: Story = {
-  render: () => <SettingsModalStory initialOpen initialUpdateStatus={readyUpdateStatus} />,
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await userEvent.click(await body.findByRole("tab", { name: "Updates" }));
-  },
+export const ScheduledRemoteUpdate: Story = {
+  render: () => (
+    <SettingsModalStory
+      initialOpen
+      initialTab="updates"
+      scheduledRestart={{ requestedBy: "Ada Lovelace", mode: "when-idle", waitingFor: ["agent-turn"] }}
+    />
+  ),
 };
 
 export const Interactive: Story = {
   render: () => <SettingsModalStory initialOpen={false} />,
-  play: async ({ canvas, userEvent }) => {
-    const body = within(document.body);
-    const trigger = canvas.getByRole("button", { name: "Open settings" });
-
-    await userEvent.click(trigger);
-    let dialog = await body.findByRole("dialog", { name: "General" });
-    await waitFor(() => expect(dialog).toBeVisible());
-    await expect(body.getByTestId("settings-modal-scroll-frame")).toHaveAttribute("data-scroll-down");
-
-    const generalTab = body.getByRole("tab", { name: "General" });
-    generalTab.focus();
-    await userEvent.keyboard("{ArrowDown}");
-    const computerUseTab = body.getByRole("tab", { name: "Computer Use" });
-    await expect(computerUseTab).toHaveAttribute("aria-selected", "true");
-    await expect(body.getByRole("heading", { name: "Computer Use", level: 2 })).toBeVisible();
-
-    await userEvent.keyboard("{ArrowDown}");
-    const profileTab = body.getByRole("tab", { name: "Profile" });
-    await expect(profileTab).toHaveAttribute("aria-selected", "true");
-    await expect(body.getByRole("heading", { name: "Profile", level: 2 })).toBeVisible();
-    await expect(body.getByRole("textbox", { name: "Display name" })).toHaveValue("Norbert");
-
-    await userEvent.keyboard("{ArrowDown}");
-    const updatesTab = body.getByRole("tab", { name: "Updates" });
-    await expect(updatesTab).toHaveAttribute("aria-selected", "true");
-    await expect(body.getByRole("heading", { name: "Updates", level: 2 })).toBeVisible();
-
-    await userEvent.click(generalTab);
-    await expect(generalTab).toHaveAttribute("aria-selected", "true");
-
-    const linkTarget = body.getByRole("button", { name: /^Open external links in/ });
-    await userEvent.click(linkTarget);
-    await waitFor(() => expect(body.getByRole("listbox")).toBeVisible());
-    await userEvent.click(body.getByRole("option", { name: "OpenBot" }));
-    await expect(linkTarget).toHaveTextContent("OpenBot");
-
-    const launchSwitch = body.getByRole("switch", { name: "Launch OpenBot at login" });
-    await expect(launchSwitch).toBeChecked();
-    await userEvent.click(launchSwitch);
-    await expect(launchSwitch).not.toBeChecked();
-
-    await userEvent.click(updatesTab);
-    await userEvent.click(body.getByRole("button", { name: "Check for updates" }));
-    await expect(body.getByText("OpenBot is up to date on the Stable track.")).toBeVisible();
-
-    await userEvent.click(generalTab);
-
-    await userEvent.click(body.getByRole("button", { name: "Close settings" }));
-    await expect(dialog).toHaveAttribute("data-motion", "closing");
-    await waitFor(() => expect(body.queryByRole("dialog", { name: "General" })).not.toBeInTheDocument());
-    await waitFor(() => expect(trigger).toHaveFocus());
-
-    await userEvent.click(trigger);
-    dialog = await body.findByRole("dialog", { name: "General" });
-    await expect(body.getByRole("switch", { name: "Launch OpenBot at login" })).not.toBeChecked();
-    await userEvent.keyboard("{Escape}");
-    await expect(dialog).toHaveAttribute("data-motion", "closing");
-    await waitFor(() => expect(body.queryByRole("dialog", { name: "General" })).not.toBeInTheDocument());
-    await waitFor(() => expect(trigger).toHaveFocus());
-
-    await userEvent.click(trigger);
-    await body.findByRole("dialog", { name: "General" });
-    await userEvent.click(body.getByTestId("settings-modal-backdrop"));
-    await waitFor(() => expect(body.queryByRole("dialog", { name: "General" })).not.toBeInTheDocument());
-    await waitFor(() => expect(trigger).toHaveFocus());
-  },
 };

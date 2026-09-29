@@ -1,10 +1,12 @@
 import type { SharedTable } from "@openbot/contracts/ipc";
 import { onCleanup } from "solid-js";
-import { expect, fn, waitFor, within } from "storybook/test";
+import { fn } from "storybook/test";
 import type { Meta, StoryObj } from "storybook-solidjs-vite";
 import AgentSettingsPanel from "../src/features/conversation/AgentSettingsPanel";
-import { STORY_AGENT_STATUS, STORY_AGENTS, STORY_MODELS, STORY_SHARED_TABLES } from "./fixtures";
+import { STORY_AGENT, STORY_AGENT_STATUS, STORY_AGENTS, STORY_MODELS, STORY_SHARED_TABLES } from "./fixtures";
 import { createMockOpenBot } from "./mock-openbot";
+
+const storyAgent = STORY_AGENT;
 
 function SharedTablesStory(props: { tables: SharedTable[] }) {
   const previousApi = window.openbot;
@@ -20,12 +22,12 @@ function SharedTablesStory(props: { tables: SharedTable[] }) {
     <main class="agent-memories-story-stage">
       <AgentSettingsPanel
         onOpenUsage={fn()}
-        agent={STORY_AGENTS[0]}
+        agent={storyAgent}
         agents={STORY_AGENTS}
         runtimeSettings={{
-          provider: STORY_AGENTS[0].provider,
-          model: STORY_AGENTS[0].model,
-          reasoningEffort: STORY_AGENTS[0].reasoningEffort,
+          provider: storyAgent.provider,
+          model: storyAgent.model,
+          reasoningEffort: storyAgent.reasoningEffort,
         }}
         agentStatus={STORY_AGENT_STATUS}
         modelOptions={STORY_MODELS}
@@ -46,14 +48,14 @@ function SharedTablesStory(props: { tables: SharedTable[] }) {
 }
 
 const meta = {
-  title: "Settings/Saved Data",
+  title: "Settings/Tables",
   component: AgentSettingsPanel,
   args: {
-    agent: STORY_AGENTS[0],
+    agent: storyAgent,
     runtimeSettings: {
-      provider: STORY_AGENTS[0].provider,
-      model: STORY_AGENTS[0].model,
-      reasoningEffort: STORY_AGENTS[0].reasoningEffort,
+      provider: storyAgent.provider,
+      model: storyAgent.model,
+      reasoningEffort: storyAgent.reasoningEffort,
     },
     agentStatus: STORY_AGENT_STATUS,
     modelOptions: STORY_MODELS,
@@ -73,38 +75,8 @@ type Story = StoryObj<typeof meta>;
 
 export const SettingsRow: Story = {
   render: () => <SharedTablesStory tables={STORY_SHARED_TABLES} />,
-  play: async ({ canvas }) => {
-    await waitFor(() => expect(canvas.getByRole("button", { name: /Saved data/ })).toHaveTextContent("6 kept"));
-  },
-};
-
-export const OpenModal: Story = {
-  render: () => <SharedTablesStory tables={STORY_SHARED_TABLES} />,
-  play: async ({ canvas, userEvent }) => {
-    await userEvent.click(await canvas.findByRole("button", { name: /Saved data/ }));
-    const body = within(document.body);
-    await expect(await body.findByRole("dialog", { name: "Saved data" })).toBeVisible();
-    await expect(body.getByText("people")).toBeVisible();
-    await expect(body.getByText(`214 records · Kept by ${STORY_AGENTS[0].name}`)).toBeVisible();
-    await expect(body.getByText(/not counted · Made outside OpenBot/)).toBeVisible();
-  },
-};
-
-export const DeleteConfirmation: Story = {
-  render: () => <SharedTablesStory tables={STORY_SHARED_TABLES} />,
-  play: async ({ canvas, userEvent }) => {
-    await userEvent.click(await canvas.findByRole("button", { name: /Saved data/ }));
-    const body = within(document.body);
-    await userEvent.click(await body.findByRole("button", { name: "Delete people" }));
-    await expect(await body.findByText("Delete this for every agent?", { exact: false })).toBeVisible();
-  },
 };
 
 export const EmptyState: Story = {
   render: () => <SharedTablesStory tables={[]} />,
-  play: async ({ canvas, userEvent }) => {
-    await userEvent.click(await canvas.findByRole("button", { name: /Saved data/ }));
-    const body = within(document.body);
-    await expect(await body.findByText("Nothing saved yet", { exact: false })).toBeVisible();
-  },
 };

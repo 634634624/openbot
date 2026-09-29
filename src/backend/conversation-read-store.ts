@@ -1,12 +1,17 @@
 import { randomUUID } from "node:crypto";
-import type { AgentSummary, ConversationReadState, ConversationSnapshot } from "@openbot/contracts/ipc";
 import {
+  type AgentSummary,
+  CONTEXT_RESET_ITEM_TYPE,
+  CONVERSATION_PLAN_ITEM_TYPE,
+  type ConversationReadState,
+  type ConversationSnapshot,
   HOSTED_SITE_EVENT_ITEM_TYPE_PREFIX,
   ROUTINE_EVENT_ITEM_TYPE_PREFIX,
   ROUTINE_RUN_EVENT_ITEM_TYPE_PREFIX,
   SKILL_EVENT_ITEM_TYPE_PREFIX,
 } from "@openbot/contracts/ipc";
 import { isDynamicRecord, isNumber, isString } from "@openbot/contracts/runtime-values";
+import { sourceText } from "@openbot/i18n/source";
 import type { OpenBotDatabase } from "./openbot-database";
 
 export interface ConversationMarkerExclusions {
@@ -103,7 +108,7 @@ export class ConversationReadStore {
       ? snapshot.messages.findIndex((message) => message.id === throughMessageId)
       : -1;
     if (throughMessageId && requestedIndex < 0) {
-      throw new Error("The read boundary is no longer available.");
+      throw new Error(sourceText("error.backend.readBoundaryUnavailable"));
     }
     const stored = this.#storedCursor(snapshot.threadId, memberId);
     const storedIndex = stored ? snapshot.messages.findIndex((message) => message.id === stored) : -1;
@@ -182,20 +187,22 @@ export class ConversationReadStore {
           )
           .get(threadId, throughMessageId)
       : undefined;
-    if (
-      boundary !== undefined &&
-      (!isDynamicRecord(boundary) || !isString(boundary.created_at) || !isNumber(boundary.ordinal))
-    ) {
-      throw new Error("The conversation read boundary is malformed.");
+    let boundaryKey: [createdAt: string, ordinal: number] | null = null;
+    if (boundary !== undefined) {
+      if (!isDynamicRecord(boundary) || !isString(boundary.created_at) || !isNumber(boundary.ordinal))
+        throw new Error("The conversation read boundary is malformed.");
+      boundaryKey = [boundary.created_at, boundary.ordinal];
     }
-    const afterBoundary = boundary ? `AND (created_at, ordinal, message_id) > (?, ?, ?)` : "";
-    const parameters = boundary ? [threadId, boundary.created_at, boundary.ordinal, throughMessageId] : [threadId];
+    const afterBoundary = boundaryKey ? `AND (created_at, ordinal, message_id) > (?, ?, ?)` : "";
+    const parameters = boundaryKey ? [threadId, ...boundaryKey, throughMessageId] : [threadId];
     const unreadFilter = `author != 'user'
       AND COALESCE(item_type, '') != 'commentary'
+      AND COALESCE(item_type, '') != 'plan'
       AND COALESCE(item_type, '') != 'agent_attachment'
       AND COALESCE(item_type, '') NOT LIKE '${SKILL_EVENT_ITEM_TYPE_PREFIX}%' AND COALESCE(item_type, '') NOT LIKE '${ROUTINE_EVENT_ITEM_TYPE_PREFIX}%'
       AND COALESCE(item_type, '') NOT LIKE '${ROUTINE_RUN_EVENT_ITEM_TYPE_PREFIX}%'
-      AND COALESCE(item_type, '') NOT LIKE '${HOSTED_SITE_EVENT_ITEM_TYPE_PREFIX}%'`;
+      AND COALESCE(item_type, '') NOT LIKE '${HOSTED_SITE_EVENT_ITEM_TYPE_PREFIX}%'
+      AND COALESCE(item_type, '') != '${CONTEXT_RESET_ITEM_TYPE}'`;
     const countRow = this.database.connection
       .prepare(
         `SELECT COUNT(*) AS unread_count FROM projection_thread_messages
@@ -296,11 +303,13 @@ function stateFromSnapshot(snapshot: ConversationSnapshot, throughMessageId: str
       (message) =>
         message.author !== "user" &&
         message.itemType !== "commentary" &&
+        message.itemType !== CONVERSATION_PLAN_ITEM_TYPE &&
         message.itemType !== "agent_attachment" &&
         !message.itemType?.startsWith(SKILL_EVENT_ITEM_TYPE_PREFIX) &&
         !message.itemType?.startsWith(ROUTINE_EVENT_ITEM_TYPE_PREFIX) &&
         !message.itemType?.startsWith(ROUTINE_RUN_EVENT_ITEM_TYPE_PREFIX) &&
-        !message.itemType?.startsWith(HOSTED_SITE_EVENT_ITEM_TYPE_PREFIX),
+        !message.itemType?.startsWith(HOSTED_SITE_EVENT_ITEM_TYPE_PREFIX) &&
+        message.itemType !== CONTEXT_RESET_ITEM_TYPE,
     );
   return {
     unreadCount: unread.length,

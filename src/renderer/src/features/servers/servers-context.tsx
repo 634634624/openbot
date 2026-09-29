@@ -1,11 +1,15 @@
-import type { HostStatus, ServerSummary } from "@openbot/contracts/ipc";
+import type { HostStatus, ServerNotificationLevel, ServerSummary } from "@openbot/contracts/ipc";
 import type { TeamCurrentCapability } from "@openbot/contracts/team-protocol/current";
+import { HOST_UPDATE_CAPABILITY } from "@openbot/contracts/team-protocol/host-update-v1";
+import { toast } from "@openbot/ui";
+import { currentText } from "@openbot/ui/text";
 import { createMemo, createSignal, flush, onSettled } from "solid-js";
 import { FALLBACK_HOST_STATUS } from "../../app-defaults";
-import { toast } from "../../components/ui";
-import { errorMessage } from "../../error-message";
 import { createSimpleContext } from "../../simple-context";
-import { serverSupportsCapability } from "./server-capabilities";
+import { createHostRestartToasts } from "../updates/host-restart-toast";
+import { watchHostUpdate } from "./host-update-toast";
+import { remoteAdminServer, serverSupportsCapability } from "./server-capabilities";
+import { serversPort } from "./servers-port";
 
 /**
  * The workspaces the user can switch between - the local one this computer
@@ -81,20 +85,57 @@ const Servers = createSimpleContext({
       return serverSupportsCapability(activeServer(), capability);
     }
 
+    /** Opens Server Settings > Updates. The settings context below this one sets it. */
+    let openHostUpdate: ((serverId: string) => void) | undefined;
+    function setHostUpdateOpener(opener: ((serverId: string) => void) | undefined): void {
+      openHostUpdate = opener;
+    }
+
+    /** The connection of each admin server whose update status was read, so each connection reads it once. */
+    const updateChecks = new Map<string, number>();
+    /** `serverId:sequence` of each version mismatch notice that already offered the update. */
+    const mismatchOffers = new Set<string>();
+
     function applyServerSummaries(value: ServerSummary[]): void {
       const previous = new Map(servers().map((server) => [server.id, server]));
       for (const server of value) {
         const sequence = server.connectionSequence ?? 0;
         const previousSequence = previous.get(server.id)?.connectionSequence ?? 0;
         const compatibility = server.compatibility;
+        const administersUpdate = server.kind === "remote" && remoteAdminServer(server, HOST_UPDATE_CAPABILITY);
         if (
           server.kind === "remote" &&
           sequence > previousSequence &&
           compatibility?.hostAppVersion &&
           compatibility.hostAppVersion !== compatibility.localAppVersion
         ) {
-          toast.warning(`Different OpenBot versions on ${server.name}`, {
-            description: `The connection uses protocol ${compatibility.negotiatedProtocol}. Some newer features may be unavailable. Client ${compatibility.localAppVersion}; host ${compatibility.hostAppVersion}.`,
+          const { t } = currentText();
+          const opener = openHostUpdate;
+          const serverId = server.id;
+          toast.warning(t("server.compatibility.versionMismatchTitle", { name: server.name }), {
+            description: t("server.compatibility.versionMismatchDescription", {
+              protocol: String(compatibility.negotiatedProtocol),
+              clientVersion: compatibility.localAppVersion,
+              hostVersion: compatibility.hostAppVersion,
+            }),
+            action:
+              opener && administersUpdate
+                ? { label: t("server.update.hostAction"), onClick: () => opener(serverId) }
+                : undefined,
+          });
+          if (opener && administersUpdate) mismatchOffers.add(`${serverId}:${sequence}`);
+        }
+        // An admin learns about a new version, or sees the download that runs, when the host connects.
+        if (administersUpdate && server.state === "online" && updateChecks.get(server.id) !== sequence) {
+          updateChecks.set(server.id, sequence);
+          const opener = openHostUpdate;
+          const serverId = server.id;
+          watchHostUpdate({
+            serverId,
+            name: server.name,
+            calls: serversPort().hostAdmin,
+            ...(opener ? { openUpdates: () => opener(serverId) } : {}),
+            offer: !mismatchOffers.has(`${serverId}:${sequence}`),
           });
         }
       }
@@ -136,21 +177,23 @@ const Servers = createSimpleContext({
     });
 
     onSettled(() => {
-      const unsubscribeServers = window.openbot.servers.onEvent((value) => flush(() => applyServerSummaries(value)));
-      const unsubscribeHost = window.openbot.host.onEvent((status) => flush(() => setHostStatus(status)));
+      const unsubscribeServers = serversPort().servers.onEvent((value) => flush(() => applyServerSummaries(value)));
+      const unsubscribeHost = serversPort().host.onEvent((status) => flush(() => setHostStatus(status)));
       // One `then` rather than a `then`/`catch`/`finally` chain: every extra link
       // is another microtask between the summaries arriving and the per-server
       // bootstrap that waits on this promise, and that gap is long enough for the
       // view to paint a first pass from stale state.
-      void window.openbot.servers.list().then(
-        (value) => {
-          applyServerSummaries(value);
-          markServersLoaded();
-        },
-        () => markServersLoaded(),
-      );
-      void window.openbot.host
-        .getStatus()
+      void serversPort()
+        .servers.list()
+        .then(
+          (value) => {
+            applyServerSummaries(value);
+            markServersLoaded();
+          },
+          () => markServersLoaded(),
+        );
+      void serversPort()
+        .host.getStatus()
         .then(setHostStatus)
         .catch(() => undefined);
       return () => {
@@ -162,24 +205,39 @@ const Servers = createSimpleContext({
     async function retryServerConnection(serverId: string): Promise<void> {
       pendingCompatibilityRetryServerId = serverId;
       try {
-        await window.openbot.servers.retryConnection(serverId);
+        await serversPort().servers.retryConnection(serverId);
       } catch (error) {
         pendingCompatibilityRetryServerId = null;
-        toast.error("The connection failed", {
-          description: errorMessage(
-            error,
-            "Could not connect to this server. Check that the host is online and try again.",
-          ),
+        const text = currentText();
+        toast.error(text.t("server.connection.failedTitle"), {
+          description: text.errorMessage(error, text.t("server.connection.failedDescription")),
         });
       }
     }
 
-    async function setServerMuted(serverId: string, muted: boolean): Promise<void> {
+    // No duration mutes until the user unmutes.
+    async function setServerMuted(serverId: string, muted: boolean, durationMs?: number): Promise<void> {
       try {
-        applyServerSummaries(await window.openbot.servers.setMuted({ serverId, muted }));
+        applyServerSummaries(
+          await serversPort().servers.setMuted(
+            durationMs === undefined ? { serverId, muted } : { serverId, muted, durationMs },
+          ),
+        );
       } catch (error) {
-        toast.error("Could not change server notifications", {
-          description: errorMessage(error, "Could not save the setting. Try again."),
+        const text = currentText();
+        toast.error(text.t("server.notifications.changeFailedTitle"), {
+          description: text.errorMessage(error, text.t("server.notifications.changeFailedDescription")),
+        });
+      }
+    }
+
+    async function setServerNotificationLevel(serverId: string, level: ServerNotificationLevel): Promise<void> {
+      try {
+        applyServerSummaries(await serversPort().servers.setNotificationLevel({ serverId, level }));
+      } catch (error) {
+        const text = currentText();
+        toast.error(text.t("server.notifications.changeFailedTitle"), {
+          description: text.errorMessage(error, text.t("server.notifications.changeFailedDescription")),
         });
       }
     }
@@ -195,16 +253,33 @@ const Servers = createSimpleContext({
         }),
       ]);
       try {
-        setServers(await window.openbot.servers.reorder({ serverIds }));
+        setServers(await serversPort().servers.reorder({ serverIds }));
       } catch (error) {
         setServers(previous);
         throw error;
       }
     }
 
+    createHostRestartToasts(() =>
+      servers().flatMap((server) =>
+        server.kind === "remote"
+          ? [
+              {
+                id: server.id,
+                name: server.name,
+                online: server.state === "online",
+                restart: server.hostRestart?.state ?? null,
+                version: server.hostRestart?.version ?? null,
+              },
+            ]
+          : [],
+      ),
+    );
+
     return {
       servers,
       setServers,
+      setHostUpdateOpener,
       activeServer,
       activeServerId,
       activeServerSupportsCapability,
@@ -214,6 +289,7 @@ const Servers = createSimpleContext({
       setJoinServerOpen,
       reorderServers,
       setServerMuted,
+      setServerNotificationLevel,
       retryServerConnection,
       serverLoadRequest,
       initialServersReady,

@@ -1,5 +1,4 @@
 import { AppLogo, PlatformLogo, ProviderLogo } from "@openbot/brand";
-import { Link } from "@tanstack/solid-router";
 import { onSettled } from "solid-js";
 import { landingAnalytics } from "../../lib/analytics";
 import { EXTERNAL_LINK_REL, OPENBOT_LINKS } from "../../lib/landing-links";
@@ -10,6 +9,7 @@ import { LandingAppPreview } from "./LandingAppPreview";
 import { LandingFooter } from "./LandingFooter";
 import { LandingGlow } from "./LandingGlow";
 import { PricingSection } from "./PricingSection";
+import { SiteHeader } from "./SiteHeader";
 
 export function LandingPage() {
   let hero: HTMLDivElement | undefined;
@@ -27,35 +27,7 @@ export function LandingPage() {
 
   return (
     <div class="landing-page">
-      <header class="landing-header" data-enter="header">
-        <a class="landing-brand" href="/" aria-label="OpenBot home">
-          <AppLogo variant="production" class="landing-brand-logo" />
-          <span>OpenBot</span>
-        </a>
-
-        <nav class="landing-navigation" aria-label="Primary navigation">
-          <Link class="landing-header-link" to="/news">
-            News
-          </Link>
-          <Link class="landing-header-link" to="/guides">
-            Guides
-          </Link>
-          <Button
-            href={OPENBOT_LINKS.contact}
-            target="_blank"
-            rel={EXTERNAL_LINK_REL}
-            variant="secondary"
-            size="sm"
-            icon="contact"
-            class="landing-header-contact"
-          >
-            Contact
-          </Button>
-          <Button href={OPENBOT_LINKS.download} variant="primary" size="sm" icon="download">
-            Download
-          </Button>
-        </nav>
-      </header>
+      <SiteHeader page="landing" />
 
       <main>
         <section class="landing-hero" aria-labelledby="landing-title">
@@ -75,6 +47,13 @@ export function LandingPage() {
                 <PlatformLogo platform="windows" />
                 Windows
               </span>
+              <span class="landing-availability-separator" aria-hidden="true">
+                ·
+              </span>
+              <span class="landing-availability-platform">
+                <PlatformLogo platform="linux" />
+                Linux
+              </span>
             </p>
 
             <h1 id="landing-title" class="landing-title t-stagger-line t-stagger-line--2">
@@ -84,22 +63,31 @@ export function LandingPage() {
             </h1>
 
             <p class="landing-description t-stagger-line t-stagger-line--3">
-              Persistent AI teammates for real work. Run{" "}
+              Persistent AI teammates on your own computer. Run{" "}
+              <span class="landing-provider-item">
+                <span class="landing-provider">
+                  <ProviderLogo provider="codex" class="landing-provider-logo" />
+                  Codex
+                </span>
+                ,
+              </span>{" "}
+              <span class="landing-provider-item">
+                <span class="landing-provider">
+                  <ProviderLogo provider="claude" class="landing-provider-logo" />
+                  Claude
+                </span>
+                ,
+              </span>{" "}
               <span class="landing-provider">
-                <ProviderLogo provider="codex" class="landing-provider-logo" />
-                Codex
-              </span>
-              ,{" "}
-              <span class="landing-provider">
-                <ProviderLogo provider="claude" class="landing-provider-logo" />
-                Claude
+                <ProviderLogo provider="antigravity" class="landing-provider-logo" />
+                Gemini
               </span>{" "}
               and{" "}
               <span class="landing-provider">
                 <ProviderLogo provider="grok" class="landing-provider-logo" />
                 Grok
               </span>{" "}
-              side by side, each with its own workspace, queue, and context.
+              with the plans you already pay for, or your own model.
             </p>
 
             <div class="landing-actions t-stagger-line t-stagger-line--4">

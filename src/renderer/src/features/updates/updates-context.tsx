@@ -3,6 +3,8 @@ import { createSignal, flush, onSettled } from "solid-js";
 import { desktopAnalytics } from "../../analytics";
 import { FALLBACK_UPDATE_STATUS } from "../../app-defaults";
 import { createSimpleContext } from "../../simple-context";
+import { createScheduledUpdateToast } from "./scheduled-update-toast";
+import { updatesPort } from "./updates-port";
 
 /**
  * The updater, as the renderer sees it: one status main pushes, and one button
@@ -18,11 +20,11 @@ const Updates = createSimpleContext({
     const [status, setStatus] = createSignal<UpdateStatus>(FALLBACK_UPDATE_STATUS);
 
     onSettled(() => {
-      const unsubscribe = window.openbot.update.onEvent((next) => {
+      const unsubscribe = updatesPort().update.onEvent((next) => {
         flush(() => setStatus(next));
       });
-      void window.openbot.update
-        .getStatus()
+      void updatesPort()
+        .update.getStatus()
         .then(setStatus)
         .catch(() => undefined);
       return unsubscribe;
@@ -37,10 +39,13 @@ const Updates = createSimpleContext({
     async function runAction(): Promise<void> {
       const analytics = desktopAnalytics.scope();
       const current = status();
+      // Host-managed tenants never act: the host owns check, download and install timing.
+      // The button is disabled too; this is the second lock for callers that reach past it.
+      if (current.managedByHost === true) return;
       const phase = current.phase;
       if (phase === "ready") {
         try {
-          await window.openbot.update.install();
+          await updatesPort().update.install();
           analytics.track("update_action", { action: "install", result: "succeeded", phase: "installing" });
         } catch (error) {
           analytics.track("update_action", {
@@ -57,8 +62,7 @@ const Updates = createSimpleContext({
           ? ("download" as const)
           : ("check" as const);
       try {
-        const next =
-          action === "download" ? await window.openbot.update.download() : await window.openbot.update.check();
+        const next = action === "download" ? await updatesPort().update.download() : await updatesPort().update.check();
         setStatus(next);
         const succeeded =
           action === "download"
@@ -80,7 +84,14 @@ const Updates = createSimpleContext({
       }
     }
 
-    return { status, runAction };
+    /** Removes a restart that a server admin asked for. The update stays downloaded. */
+    async function cancelScheduledRestart(): Promise<void> {
+      setStatus(await updatesPort().update.cancelScheduledRestart());
+    }
+
+    createScheduledUpdateToast({ status, cancel: cancelScheduledRestart });
+
+    return { status, runAction, cancelScheduledRestart };
   },
 });
 

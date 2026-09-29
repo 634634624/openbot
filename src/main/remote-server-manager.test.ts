@@ -87,7 +87,13 @@ describe("remote server links", () => {
         signalUrl: "wss://signal.openbot.run/v1/signal",
       }),
       endSession: async () => undefined,
-      createInvite: async () => ({ inviteId: "invite-1", token: "t".repeat(43), expiresAt: Date.now() + 60_000 }),
+      createInvite: async () => ({
+        inviteId: "invite-1",
+        token: "t".repeat(43),
+        expiresAt: Date.now() + 60_000,
+        permanent: false,
+        useCount: 0,
+      }),
       listInvites: async () => [],
       previewInvite: async () => ({
         inviteId: "invite-1",
@@ -96,6 +102,7 @@ describe("remote server links", () => {
         role: "member" as const,
         expiresAt: Date.now() + 60_000,
         emailBound: false,
+        permanent: false,
         devicePublicKey: "trusted-host-public-key",
       }),
       acceptInvite,
@@ -167,7 +174,13 @@ describe("remote server links", () => {
         signalUrl: "wss://signal.openbot.run/v1/signal",
       }),
       endSession: async () => undefined,
-      createInvite: async () => ({ inviteId: "invite-1", token: "token", expiresAt: Date.now() + 60_000 }),
+      createInvite: async () => ({
+        inviteId: "invite-1",
+        token: "token",
+        expiresAt: Date.now() + 60_000,
+        permanent: false,
+        useCount: 0,
+      }),
       listInvites: async () => [],
       previewInvite: async () => ({
         inviteId: "invite-1",
@@ -176,6 +189,7 @@ describe("remote server links", () => {
         role: "member",
         expiresAt: Date.now() + 60_000,
         emailBound: false,
+        permanent: false,
         devicePublicKey: "trusted-host-public-key",
       }),
       acceptInvite: async () => ({ hostId, membershipId: "membership-1", role: "member" }),
@@ -283,7 +297,13 @@ describe("remote server links", () => {
       startSession: async (hostId) => ({ sessionId: "session-1", hostId, expiresAt: Date.now() + 60_000 }),
       issueTicket: async () => ({ ticket: "ticket", expiresAt: Date.now() + 60_000, signalUrl: "wss://signal" }),
       endSession: async () => undefined,
-      createInvite: async () => ({ inviteId: "invite-1", token: "t".repeat(43), expiresAt: Date.now() + 60_000 }),
+      createInvite: async () => ({
+        inviteId: "invite-1",
+        token: "t".repeat(43),
+        expiresAt: Date.now() + 60_000,
+        permanent: false,
+        useCount: 0,
+      }),
       listInvites: async () => [],
       previewInvite: async () => {
         throw new Error("Unexpected invite preview.");
@@ -377,9 +397,7 @@ describe("remote server links", () => {
       expect(manager.list().some((server) => server.id === gammaId)).toBe(false);
       expect(removeMember).not.toHaveBeenCalledWith(gammaId, `${gammaId}-member`);
       expect(JSON.parse(await readFile(statePath, "utf8"))).toMatchObject({ hiddenHostIds: [gammaId] });
-      const directoryChanged = vi.fn(() => {
-        void manager.syncRemoteHosts();
-      });
+      const directoryChanged = vi.fn(() => manager.syncRemoteHosts());
       manager.on("directoryInvalidated", directoryChanged);
       hosts = hosts.filter((host) => host.hostId !== betaId);
       transport.emit("error", betaId, "session_revoked", "The remote session was revoked.");
@@ -389,6 +407,8 @@ describe("remote server links", () => {
       });
       await vi.waitFor(() => expect(manager.list().some((server) => server.id === betaId)).toBe(false));
       expect(directoryChanged).toHaveBeenCalledOnce();
+      // The sync writes servers.json after the list changes. Let it finish before cleanup removes the directory.
+      await directoryChanged.mock.results[0]?.value;
       expect(manager.activeServerId).toBe("local");
     } finally {
       await manager.stop();
@@ -445,7 +465,13 @@ describe("remote server links", () => {
         signalUrl: "wss://signal.openbot.run/v1/signal",
       }),
       endSession: async () => undefined,
-      createInvite: async () => ({ inviteId: "invite-1", token: "token", expiresAt: Date.now() + 60_000 }),
+      createInvite: async () => ({
+        inviteId: "invite-1",
+        token: "token",
+        expiresAt: Date.now() + 60_000,
+        permanent: false,
+        useCount: 0,
+      }),
       listInvites: async () => [],
       previewInvite: async () => {
         throw new Error("Unexpected invite preview.");
@@ -648,7 +674,7 @@ describe("remote server order", () => {
       return new Response(bytes, {
         status: 200,
         headers: {
-          "Content-Disposition": `attachment; filename*=UTF-8''${url.pathname.includes("workspace") ? "page.tsx" : "report.csv"}`,
+          "Content-Disposition": `attachment; filename*=UTF-8''${url.pathname.includes("workspace") ? "page%E0%A4%A.tsx" : "report.csv"}`,
         },
       });
     });
@@ -672,6 +698,7 @@ describe("remote server order", () => {
         bytes,
         name: "report.csv",
       });
+      // A name that is not valid percent-encoding does not fail a download that has its bytes.
       await expect(manager.downloadWorkspaceFile("chief", "app/page.tsx", serverId)).resolves.toEqual({
         bytes,
         name: "page.tsx",
@@ -979,5 +1006,46 @@ describe("remote control capability discovery", () => {
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
+  });
+});
+
+describe("leaving a remote server", () => {
+  // An HTTP host with `member-leave-v1` removes the membership as an admin removal does; an older one
+  // can only end this computer's session. A host that fails either must not keep the server listed.
+  it("leaves an HTTP host that serves the route, logs out of an older one, also when the host fails", async () => {
+    const teamFetch = stubTeamFetch({
+      routes: {
+        "/v1/compatibility": ({ url }) =>
+          Response.json({
+            appVersion: "0.4.0",
+            protocol: { minimum: 1, maximum: 1 },
+            capabilities: url.hostname.startsWith("older") ? [] : ["member-leave-v1"],
+          }),
+        "/v1/agents": () => Response.json([]),
+        "/v1/team/leave": ({ url }) =>
+          url.hostname.startsWith("failing")
+            ? Response.json({ error: "Host unavailable." }, { status: 503 })
+            : new Response(null, { status: 204 }),
+        "/v1/auth/logout": () => new Response(null, { status: 204 }),
+      },
+    });
+    const servers = ["current", "older", "failing"];
+    const fixture = await createRemoteManager({
+      servers: servers.map((id) => storedHttpsServer(id)),
+      appVersion: "0.4.0",
+    });
+    // A request negotiates the protocol first, as the app does before the user can open settings.
+    for (const id of servers) await fixture.manager.request(id, "/v1/agents", (value) => value);
+
+    for (const id of servers) await fixture.manager.remove(id);
+
+    const sent = (path: string) =>
+      teamFetch.requests(path).map((call) => [call.url.hostname, call.init?.method, call.headers.get("Authorization")]);
+    expect(sent("/v1/team/leave")).toEqual([
+      ["current.trycloudflare.com", "POST", "Bearer token-current"],
+      ["failing.trycloudflare.com", "POST", "Bearer token-failing"],
+    ]);
+    expect(sent("/v1/auth/logout")).toEqual([["older.trycloudflare.com", "POST", "Bearer token-older"]]);
+    expect(fixture.manager.list().map((server) => server.id)).toEqual(["local"]);
   });
 });

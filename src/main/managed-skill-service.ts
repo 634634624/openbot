@@ -1,12 +1,17 @@
 import { lstat, mkdir, readdir, readFile, realpath, rename, unlink, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
+import { agentProviderDescriptor } from "@openbot/contracts/agent-providers";
 import type { AgentSummary, InstalledSkill } from "@openbot/contracts/ipc";
 import { isDynamicRecord } from "@openbot/contracts/runtime-values";
 import { createOpenBotLogger, toLogValue } from "@openbot/logging";
 import { parse as parseYaml } from "yaml";
+import { isMissingFileError } from "../backend/file-errors";
+import { isPathInside } from "../backend/path-containment";
 
 const MANAGED_SKILL_SLUG = "openbot-site-hosting";
-const OWNERSHIP_MARKER = ".openbot-managed.json";
+export const OWNERSHIP_MARKER = ".openbot-managed.json";
+/** The workspace skill folders OpenBot writes. Each provider reads at least one of them. */
+export const MANAGED_SKILL_FOLDERS = [".agents/skills", ".claude/skills"] as const;
 
 const logger = createOpenBotLogger("managed-skill-service");
 
@@ -40,8 +45,7 @@ export class ManagedSkillService {
     const results = await Promise.allSettled(
       agents.map((agent) => syncTargets(agent.workspacePath, content, this.slug)),
     );
-    for (let index = 0; index < results.length; index += 1) {
-      const result = results[index];
+    for (const [index, result] of results.entries()) {
       if (result.status === "fulfilled") {
         this.reportResult(result.value);
       } else {
@@ -76,14 +80,8 @@ export class ManagedSkillService {
 
 async function syncTargets(workspacePath: string, content: string, slug: string): Promise<SyncTargetsResult> {
   const workspaceRoot = await realpath(resolve(workspacePath));
-  const targets = [
-    join(workspacePath, ".agents", "skills", slug, "SKILL.md"),
-    join(workspacePath, ".claude", "skills", slug, "SKILL.md"),
-  ];
-  const resolvedTargets = [
-    join(workspaceRoot, ".agents", "skills", slug, "SKILL.md"),
-    join(workspaceRoot, ".claude", "skills", slug, "SKILL.md"),
-  ];
+  const targets = MANAGED_SKILL_FOLDERS.map((folder) => join(workspacePath, folder, slug, "SKILL.md"));
+  const resolvedTargets = MANAGED_SKILL_FOLDERS.map((folder) => join(workspaceRoot, folder, slug, "SKILL.md"));
   const results = await Promise.allSettled(
     resolvedTargets.map((target) => syncTarget(workspaceRoot, target, content, slug)),
   );
@@ -172,17 +170,16 @@ async function verifySafeDirectory(workspaceRoot: string, directory: string): Pr
     await requireRealDirectory(current);
   }
   const resolvedDirectory = await realpath(directory);
-  if (!isInside(workspaceRoot, resolvedDirectory)) {
+  if (!isPathInside(workspaceRoot, resolvedDirectory)) {
     throw new Error(`Managed skill target escapes its workspace: ${directory}`);
   }
 }
 
 function containedRelativePath(workspaceRoot: string, candidate: string): string {
-  const path = relative(workspaceRoot, candidate);
-  if (path === ".." || path.startsWith(`..${sep}`) || isAbsolute(path)) {
+  if (!isPathInside(workspaceRoot, candidate)) {
     throw new Error(`Managed skill target escapes its workspace: ${candidate}`);
   }
-  return path;
+  return relative(workspaceRoot, candidate);
 }
 
 async function requireRealDirectory(path: string): Promise<void> {
@@ -199,11 +196,6 @@ async function rejectSymlink(path: string): Promise<void> {
     if (isMissingFileError(error)) return;
     throw error;
   }
-}
-
-function isInside(root: string, candidate: string): boolean {
-  const path = relative(root, candidate);
-  return path === "" || (!path.startsWith(`..${sep}`) && path !== ".." && !isAbsolute(path));
 }
 
 async function fileExists(path: string): Promise<boolean> {
@@ -225,10 +217,6 @@ async function optionalText(path: string): Promise<string | null> {
   }
 }
 
-function isMissingFileError(error: unknown): boolean {
-  return error instanceof Error && "code" in error && error.code === "ENOENT";
-}
-
 function isFileExistsError(error: unknown): boolean {
   return error instanceof Error && "code" in error && error.code === "EEXIST";
 }
@@ -236,7 +224,8 @@ function isFileExistsError(error: unknown): boolean {
 /** Read only OpenBot-owned skills from the active provider's skill folder. */
 export async function listManagedSkillsForChat(agent: AgentSummary): Promise<InstalledSkill[]> {
   const root = await realpath(agent.workspacePath);
-  const directory = join(root, agent.provider === "claude" ? ".claude" : ".agents", "skills");
+  const reads = agentProviderDescriptor(agent.provider).skillFolders;
+  const directory = join(root, MANAGED_SKILL_FOLDERS.find((folder) => reads.includes(folder)) ?? reads[0]);
   const skills: InstalledSkill[] = [];
   try {
     await verifySafeDirectory(root, directory);

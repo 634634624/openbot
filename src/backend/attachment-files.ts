@@ -2,10 +2,10 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   copyFile,
   type FileHandle,
+  lstat,
   mkdir,
   open,
   readdir,
-  readFile,
   realpath,
   rename,
   rm,
@@ -22,6 +22,8 @@ import type {
   AttachmentSummary,
   QueueDelivery,
 } from "@openbot/contracts/ipc";
+import { sourceText } from "@openbot/i18n/source";
+import { sha256File } from "./file-hash";
 
 const MAX_ATTACHMENTS = INPUT_LIMITS.attachments;
 const MAX_FILE_BYTES = ATTACHMENT_LIMITS.fileBytes;
@@ -31,6 +33,11 @@ const TRANSFER_MANIFEST_FILE = ".openbot-transfer.json";
 export interface StoredAttachment extends AttachmentSummary {
   path: string;
   sha256: string;
+  /**
+   * ISO time the user deleted the file from Storage. The record stays, so the message that sent it
+   * keeps its card and says the file is not found. Absent on every record from before the field.
+   */
+  deletedAt?: string;
 }
 
 export interface StoredGeneratedAttachment extends StoredAttachment {
@@ -126,6 +133,20 @@ export class AttachmentFiles {
     return generatedRootForPath(this.#transfersRoot, path);
   }
 
+  /**
+   * The real path of a managed transfer file, or null when the file is gone or resolves outside
+   * the Transfers folder. A delete from Storage removes only a path this returns.
+   */
+  async managedTransferFile(path: string): Promise<string | null> {
+    try {
+      const [root, candidate] = await Promise.all([realpath(this.#transfersRoot), realpath(path)]);
+      if (!isWithin(root, candidate)) return null;
+      return (await lstat(candidate)).isFile() ? candidate : null;
+    } catch {
+      return null;
+    }
+  }
+
   async remove(path: string): Promise<void> {
     await rm(path, { recursive: true, force: true });
   }
@@ -181,10 +202,10 @@ export class AttachmentFiles {
         total += copied.size;
         if (total > MAX_TOTAL_BYTES) {
           await rm(targetDirectory, { recursive: true, force: true });
-          throw new Error("Attachments exceed the 250 MB total limit.");
+          throw new Error(sourceText("error.attachment.totalTooLarge"));
         }
         prepared.push({
-          ...attachmentRecord(id, name, copied.size, targetPath, await sha256(targetPath)),
+          ...attachmentRecord(id, name, copied.size, targetPath, await sha256File(targetPath)),
           createdAt: new Date().toISOString(),
         });
       }
@@ -194,7 +215,7 @@ export class AttachmentFiles {
           throw new Error(`${item.name} exceeds the 100 MB limit.`);
         }
         total += bytes.byteLength;
-        if (total > MAX_TOTAL_BYTES) throw new Error("Attachments exceed the 250 MB total limit.");
+        if (total > MAX_TOTAL_BYTES) throw new Error(sourceText("error.attachment.totalTooLarge"));
         const id = randomUUID();
         const targetDirectory = join(this.#draftsRoot, id);
         const name = sanitizeName(item.name || "pasted-image.png");
@@ -246,8 +267,8 @@ export class AttachmentFiles {
         const copied = await stat(targetPath);
         if (copied.size > MAX_FILE_BYTES) throw new Error(`${name} exceeds the 100 MB limit.`);
         total += copied.size;
-        if (total > MAX_TOTAL_BYTES) throw new Error("Attachments exceed the 250 MB total limit.");
-        attachments.push(attachmentRecord(id, name, copied.size, join(finalRoot, name), await sha256(targetPath)));
+        if (total > MAX_TOTAL_BYTES) throw new Error(sourceText("error.attachment.totalTooLarge"));
+        attachments.push(attachmentRecord(id, name, copied.size, join(finalRoot, name), await sha256File(targetPath)));
       }
       await writeTransferManifest(temporaryRoot, {
         version: 2,
@@ -273,19 +294,19 @@ export class AttachmentFiles {
     ownerThreadId?: string | null;
   }): Promise<StoredGeneratedAttachment[]> {
     if (input.sources.length === 0 || input.sources.length > MAX_ATTACHMENTS) {
-      throw new Error(`Attach between 1 and ${MAX_ATTACHMENTS} files.`);
+      throw new Error(sourceText("error.backend.attachBetween", { limit: MAX_ATTACHMENTS }));
     }
     const sources = await Promise.all(
       input.sources.map(async (source) => {
         const metadata = await source.handle.stat();
-        if (!metadata.isFile()) throw new Error(`Attachment is not a file: ${source.path}`);
+        if (!metadata.isFile()) throw new Error(sourceText("error.backend.attachmentNotFile", { path: source.path }));
         if (metadata.size > MAX_FILE_BYTES) throw new Error(`${basename(source.path)} exceeds the 100 MB limit.`);
         assertSupportedAttachmentName(source.path);
         return { ...source, size: metadata.size };
       }),
     );
     const total = sources.reduce((sum, source) => sum + source.size, 0);
-    if (total > MAX_TOTAL_BYTES) throw new Error("Attachments exceed the 250 MB total limit.");
+    if (total > MAX_TOTAL_BYTES) throw new Error(sourceText("error.attachment.totalTooLarge"));
 
     const usedNames = new Set<string>();
     const entries = sources.map((source) => {
@@ -304,9 +325,9 @@ export class AttachmentFiles {
         const copied = await stat(entry.targetPath);
         if (copied.size > MAX_FILE_BYTES) throw new Error(`${entry.name} exceeds the 100 MB limit.`);
         copiedTotal += copied.size;
-        if (copiedTotal > MAX_TOTAL_BYTES) throw new Error("Attachments exceed the 250 MB total limit.");
+        if (copiedTotal > MAX_TOTAL_BYTES) throw new Error(sourceText("error.attachment.totalTooLarge"));
         const attachment: StoredGeneratedAttachment = {
-          ...attachmentRecord(entry.id, entry.name, copied.size, entry.targetPath, await sha256(entry.targetPath)),
+          ...attachmentRecord(entry.id, entry.name, copied.size, entry.targetPath, await sha256File(entry.targetPath)),
           ...(input.ownerAgentId ? { ownerAgentId: input.ownerAgentId } : {}),
           ...(input.ownerThreadId !== undefined ? { ownerThreadId: input.ownerThreadId } : {}),
         };
@@ -336,7 +357,7 @@ export class AttachmentFiles {
     const source = input.sourcePath === undefined ? null : await inspectSource(input.sourcePath);
     const bytes = input.bytes === undefined ? null : normalizeBytes(input.bytes);
     const size = source?.size ?? bytes?.byteLength ?? 0;
-    if (size > MAX_FILE_BYTES) throw new Error("Generated image exceeds the 100 MB limit.");
+    if (size > MAX_FILE_BYTES) throw new Error(sourceText("error.backend.generatedImageTooLarge"));
 
     const name = sanitizeName(input.name ?? (source ? basename(source.path) : "generated-image.png"));
     const generatedRoot = join(this.#transfersRoot, "generated", id);
@@ -347,9 +368,9 @@ export class AttachmentFiles {
       else if (bytes) await writeFile(targetPath, bytes, { mode: 0o600 });
       else throw new Error("Generated image bytes are missing.");
       const stored = await stat(targetPath);
-      if (stored.size > MAX_FILE_BYTES) throw new Error("Generated image exceeds the 100 MB limit.");
+      if (stored.size > MAX_FILE_BYTES) throw new Error(sourceText("error.backend.generatedImageTooLarge"));
       const generatedAttachment: StoredGeneratedAttachment = {
-        ...attachmentRecord(id, name, stored.size, targetPath, await sha256(targetPath), input.mimeType),
+        ...attachmentRecord(id, name, stored.size, targetPath, await sha256File(targetPath), input.mimeType),
         ...(input.ownerAgentId ? { ownerAgentId: input.ownerAgentId } : {}),
         ...(input.ownerThreadId !== undefined ? { ownerThreadId: input.ownerThreadId } : {}),
       };
@@ -387,7 +408,7 @@ async function resolveManagedAttachment(
     if (!isWithin(canonicalRoot, canonicalPath)) return null;
     const metadata = await stat(canonicalPath);
     if (!metadata.isFile() || metadata.size !== attachment.size) return null;
-    if ((await sha256(canonicalPath)) !== attachment.sha256) return null;
+    if ((await sha256File(canonicalPath)) !== attachment.sha256) return null;
     return { path: canonicalPath, mimeType: attachment.mimeType, name: attachment.name };
   } catch {
     return null;
@@ -448,15 +469,10 @@ function manifestAttachment(attachment: StoredAttachment): TransferManifest["att
 async function inspectSource(sourcePath: string): Promise<{ path: string; size: number }> {
   const path = await realpath(sourcePath);
   const metadata = await stat(path);
-  if (!metadata.isFile()) throw new Error(`Only regular files can be attached: ${basename(path)}`);
+  if (!metadata.isFile())
+    throw new Error(sourceText("error.backend.attachmentNotRegularFile", { name: basename(path) }));
   if (metadata.size > MAX_FILE_BYTES) throw new Error(`${basename(path)} exceeds the 100 MB limit.`);
   return { path, size: metadata.size };
-}
-
-async function sha256(path: string): Promise<string> {
-  return createHash("sha256")
-    .update(await readFile(path))
-    .digest("hex");
 }
 
 function sanitizeName(path: string): string {
@@ -574,12 +590,12 @@ async function copyOpenedFile(
       if (bytesRead === 0) return;
       const nextPosition = position + bytesRead;
       if (nextPosition > MAX_FILE_BYTES) throw new Error(`${name} exceeds the 100 MB limit.`);
-      if (nextPosition > remainingTotalBytes) throw new Error("Attachments exceed the 250 MB total limit.");
+      if (nextPosition > remainingTotalBytes) throw new Error(sourceText("error.attachment.totalTooLarge"));
 
       let written = 0;
       while (written < bytesRead) {
         const result = await target.write(buffer, written, bytesRead - written, position + written);
-        if (result.bytesWritten === 0) throw new Error(`OpenBot could not copy ${name}.`);
+        if (result.bytesWritten === 0) throw new Error(sourceText("error.backend.attachmentCopyFailed", { name }));
         written += result.bytesWritten;
       }
       position = nextPosition;

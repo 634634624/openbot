@@ -9,6 +9,10 @@ export interface BrowserTab {
   environment?: BrowserEnvironment;
   recording?: boolean;
   diagnosticErrorCount?: number;
+  /** Live local popup relationship; not restored after an app restart. */
+  openerTabId?: string;
+  /** Local popup failure, without authentication URLs or request data. */
+  popupFailure?: { id: string; message: string };
 }
 
 export type BrowserImageMode = "auto" | "always" | "never";
@@ -90,6 +94,8 @@ export interface BrowserSnapshot {
   viewport: BrowserViewport;
   text: string;
   elements: BrowserElement[];
+  /** Page text or elements were left out to keep the snapshot within its size limit. */
+  truncated: boolean;
   focus: BrowserFocus | null;
   diagnostics: BrowserDiagnosticEntry[];
   actions: BrowserActionHistoryEntry[];
@@ -205,3 +211,35 @@ export interface BrowserVisibilityInput {
   bounds?: BrowserBounds;
   target?: BrowserViewTarget;
 }
+
+/**
+ * A pointer or key event the user made over a live view of a remote tab, or the frame the view
+ * has drawn. The acknowledgement is how a view that nobody clicks still tells the host which
+ * frames it has left behind.
+ *
+ * Coordinates are a fraction of the frame the user was looking at, not pixels. The renderer draws a
+ * frame at whatever size its panel is and the host's viewport is a third size again, so pixels would
+ * mean one side has to know the other's scale. This mirrors the Team protocol's own input shape
+ * rather than importing it: the wire may version, and the renderer's API must not move when it does.
+ */
+export type BrowserLiveViewInput =
+  | {
+      type: "pointer";
+      action: "move" | "down" | "up" | "wheel";
+      x: number;
+      y: number;
+      /** The frame the fraction belongs to, so the host expands it against that frame and no other. */
+      sequence?: number;
+      button: "left" | "middle" | "right";
+      clickCount?: number;
+      deltaX?: number;
+      deltaY?: number;
+      modifiers?: number;
+    }
+  | { type: "key"; action: "down" | "up" | "char"; key: string; code: string; text?: string; modifiers?: number }
+  | { type: "ack"; sequence: number };
+
+/** What a live view sends the renderer. The image is the host's own JPEG, not a data URL. */
+export type BrowserLiveViewEvent =
+  | { type: "frame"; tabId: string; sequence: number; width: number; height: number; image: Uint8Array }
+  | { type: "stopped"; tabId: string; reason: string };

@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor, within } from "@solidjs/testing-library";
-import { beforeAll, beforeEach, expect, it, vi } from "vitest";
+import { assert, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { App } from "./App";
 import { emitAgentEvent, installOpenbotStub, testServer } from "./app-test-harness";
 import { CHANNEL_SELECTION_STORAGE_KEY } from "./features/channels/channel-selection";
@@ -176,9 +176,50 @@ it.each([0, 1])("opens the agent chat from author control %i", async (control) =
   }));
   const chat = await openSavedChannel();
   const controls = await within(chat).findAllByRole("button", { name: "Open Chief's chat" });
-  await fireEvent.click(controls[control]);
+  const authorControl = controls[control];
+  assert(authorControl);
+  await fireEvent.click(authorControl);
   const conversation = await screen.findByRole("main", { name: "Conversation" });
   expect(within(conversation).getByRole("heading", { name: "Chief", level: 1 })).toBeVisible();
+});
+
+it("reports a message copy that the clipboard refuses", async () => {
+  const writeText = vi.fn().mockRejectedValue(new DOMException("Document is not focused.", "NotAllowedError"));
+  Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+  Object.defineProperty(document, "execCommand", { configurable: true, value: vi.fn(() => false) });
+  const read = window.openbot.agent.readChannel;
+  vi.spyOn(window.openbot.agent, "readChannel").mockImplementation(async (input) => ({
+    ...(await read(input)),
+    messages: [
+      {
+        id: "reply",
+        channelId: input.channelId,
+        sequence: 1,
+        author: { kind: "agent", id: "chief", name: "Chief" },
+        taskId: null,
+        superseded: false,
+        message: {
+          id: "reply",
+          author: "assistant",
+          text: "The report is ready.",
+          createdAt: new Date().toISOString(),
+          status: "completed",
+        },
+      },
+    ],
+  }));
+  try {
+    const chat = await openSavedChannel();
+    await fireEvent.pointerDown(await within(chat).findByRole("button", { name: "More message actions" }), {
+      button: 0,
+    });
+    await fireEvent.pointerUp(screen.getByRole("menuitem", { name: "Copy" }), { button: 0 });
+
+    expect(await within(chat).findByRole("alert")).toHaveTextContent("Could not copy the message.");
+    expect(writeText).toHaveBeenCalledWith("The report is ready.");
+  } finally {
+    Reflect.deleteProperty(document, "execCommand");
+  }
 });
 
 it.each(["owner", "admin", "member"] as const)("limits remote channel deletion for %s", async (role) => {
@@ -217,6 +258,35 @@ it("opens the channel creation dialog from both sidebar context menus", async ()
   await fireEvent.contextMenu(screen.getByLabelText("Sidebar free area"));
   await fireEvent.pointerUp(await screen.findByRole("menuitem", { name: "New channel" }), { button: 0 });
   await screen.findByRole("dialog", { name: "New channel" });
+});
+
+it("closes sidebar context menus on a left press on their trigger, outside press, and Escape", async () => {
+  const chat = await openSavedChannel();
+  const freeArea = screen.getByLabelText("Sidebar free area");
+  const sidebarMenuClosed = () =>
+    waitFor(() => expect(screen.queryByRole("menu", { name: "Sidebar actions" })).not.toBeInTheDocument());
+
+  await fireEvent.contextMenu(freeArea);
+  await screen.findByRole("menu", { name: "Sidebar actions" });
+  await fireEvent.pointerDown(freeArea, { button: 0 });
+  await sidebarMenuClosed();
+
+  await fireEvent.contextMenu(freeArea);
+  const menu = await screen.findByRole("menu", { name: "Sidebar actions" });
+  await fireEvent.keyDown(menu, { key: "Escape" });
+  await sidebarMenuClosed();
+
+  await fireEvent.contextMenu(channelRow("Project room"));
+  await screen.findByRole("menuitem", { name: "Edit channel" });
+  await fireEvent.pointerDown(channelRow("Project room"), { button: 0 });
+  await waitFor(() => expect(screen.queryByRole("menuitem", { name: "Edit channel" })).not.toBeInTheDocument());
+
+  await fireEvent.contextMenu(freeArea);
+  await screen.findByRole("menu", { name: "Sidebar actions" });
+  await waitFor(async () => {
+    await fireEvent.pointerDown(chat, { button: 0 });
+    expect(screen.queryByRole("menu", { name: "Sidebar actions" })).not.toBeInTheDocument();
+  });
 });
 
 it("keeps the section editor open past menu focus restoration", async () => {
@@ -478,7 +548,7 @@ it("keeps a queued settings save on the channel it was made in", async () => {
   for (const [channelId, name] of [
     ["channel-test", "Project room"],
     ["channel-other", "Release room"],
-  ]) {
+  ] satisfies [string, string][]) {
     await window.openbot.agent.channelCommand({
       type: "save",
       operationId: `create-${channelId}`,
@@ -525,15 +595,11 @@ it("keeps a queued settings save on the channel it was made in", async () => {
   expect(saves.map((input) => input.type === "save" && input.update === true)).toEqual([true, true]);
 });
 
-/**
- * A channel with one task that the service stopped and wrote a reason on. The stub does not run
- * the automatic assignment limit, so the stopped task arrives through the read.
- */
+/** Stopped task via read; the stub skips the automatic assignment limit. */
 const STOPPED_TASK_REASON = "The automatic assignment limit was reached. Continue or reassign this task.";
 it("shows a channel read that lands while more changes are still arriving", async () => {
   const chat = await openSavedChannel();
-  // Every streamed chunk of a member publishes a change, and each read of a channel is two calls.
-  // Hold every read open, so the events overtake them the way streaming does.
+  // Hold every read open so events overtake them the way streaming does (see channels-context).
   const gates: Array<() => void> = [];
   const originalRead = window.openbot.agent.readChannel;
   vi.spyOn(window.openbot.agent, "readChannel").mockImplementation(async (input) => {
@@ -553,9 +619,7 @@ it("shows a channel read that lands while more changes are still arriving", asyn
   await waitFor(() => expect(gates).toHaveLength(1));
   for (const revision of [2, 3, 4]) emitAgentEvent?.({ type: "channels-changed", channelId: "channel-test", revision });
 
-  // The read that is already running answers for the changes behind it, so the reader sees the
-  // message. Starting a read for each event and keeping only the newest showed nothing until the
-  // writing stopped.
+  // The running read answers for the changes behind it (see channels-context).
   gates[0]?.();
   await within(chat).findByRole("article", { name: "Message from You" });
   expect(within(chat).getByRole("article", { name: "Message from You" })).toHaveTextContent("Prepare the report");
@@ -758,8 +822,7 @@ it("addresses a channel member only while the request names one", async () => {
     expect(command).toHaveBeenCalledWith(expect.objectContaining({ type: "send", recipientAgentId: "chief" })),
   );
 
-  // The composer keeps no recipient of its own, so the next request returns to the coordinator. A
-  // recipient that outlives the message that named it silently addresses every later request.
+  // The composer keeps no recipient of its own; a stale one would address every later request.
   await waitFor(() => expect(composer).toHaveTextContent(""));
   composer.textContent = "Add the rollback step";
   await fireEvent.input(composer);
@@ -771,10 +834,7 @@ it("addresses a channel member only while the request names one", async () => {
   );
 });
 
-/**
- * The routing window as the renderer sees it: a root task that no member owns yet. The lead runs
- * that turn, and `state` chooses whether routing is still open or ended without an owner.
- */
+/** Routing window: a root task no member owns yet. */
 async function openChannelWhileRouting(state: "queued" | "paused") {
   await window.openbot.agent.channelCommand({
     type: "save",

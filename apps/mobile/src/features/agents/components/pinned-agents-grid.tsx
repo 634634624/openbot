@@ -11,11 +11,14 @@ import Animated, {
   LinearTransition,
   ReduceMotion,
 } from "react-native-reanimated";
+import { useAgentChatPreview } from "@/features/agents/components/agent-chat-preview";
 import { useAgentContextMenu } from "@/features/agents/components/agent-context-menu";
 import { AgentPinAvatar } from "@/features/agents/components/agent-pin-avatar";
 import { BloubAvatar } from "@/features/agents/components/bloub-avatar";
 import { ChatLinkPressable } from "@/features/agents/components/chat-link-pressable";
-import { type MobileAgent, useMobileWorkspace } from "@/features/workspace/context/mobile-workspace-context";
+import { useAgentUnread } from "@/features/workspace/components/use-live-workspace";
+import type { MobileAgent } from "@/features/workspace/context/mobile-workspace-context";
+import { useText } from "@/shared/lib/text";
 
 const EASE_OUT = Easing.bezier(0.23, 1, 0.32, 1);
 const EASE_IN_OUT = Easing.bezier(0.77, 0, 0.175, 1);
@@ -53,19 +56,26 @@ export function PinnedAgentsGrid({ agents, children }: PropsWithChildren<{ agent
 }
 
 function PinnedAgentItem({ agent }: { agent: MobileAgent }) {
+  const { t } = useText();
   const [background, accent] = useThemeColor(["background", "accent"]);
-  const { unreadAgentIds } = useMobileWorkspace();
   const agentContextMenu = useAgentContextMenu(agent);
-  const isUnread = unreadAgentIds.includes(agent.id);
+  const agentChatPreview = useAgentChatPreview(agent);
+  const isUnread = useAgentUnread(agent.id);
 
   return (
     <PinnedChatItem>
       <Link href={{ pathname: "/chat/[agentId]", params: { agentId: agent.id } }} asChild>
         <Link.Trigger>
           <ChatLinkPressable
-            accessibilityLabel={`Open pinned chat with ${agent.name}${agent.title.trim() ? `, ${agent.title.trim()}` : ""}`}
+            chatId={agent.id}
+            accessibilityLabel={
+              agent.title.trim()
+                ? t("mobile.agent.list.openPinnedWithTitle", { name: agent.name, title: agent.title.trim() })
+                : t("mobile.agent.list.openPinned", { name: agent.name })
+            }
             accessibilityRole="button"
             className="w-full items-center gap-2 px-1"
+            onPressIn={agentChatPreview.onPressIn}
             style={({ pressed }) => ({ opacity: pressed ? 0.58 : 1 })}
           >
             <Link.AppleZoom>
@@ -101,8 +111,10 @@ function PinnedAgentItem({ agent }: { agent: MobileAgent }) {
                 </Typography.Paragraph>
               ) : null}
             </View>
+            {agentChatPreview.measurer}
           </ChatLinkPressable>
         </Link.Trigger>
+        {agentChatPreview.preview}
         {agentContextMenu}
       </Link>
     </PinnedChatItem>

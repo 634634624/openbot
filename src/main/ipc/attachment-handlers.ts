@@ -14,15 +14,17 @@ import {
 import { ATTACHMENT_LIMITS, INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import {
   type DownloadAttachmentsInput,
-  type FilePreview,
   type ImportAttachmentsInput,
   LOCAL_SERVER_ID,
+  type OpenAttachmentInput,
 } from "@openbot/contracts/ipc";
 import { TEAM_API_ROUTES } from "@openbot/contracts/team-api-routes";
 import {
   TEAM_EML_ATTACHMENTS_CAPABILITY,
   TEAM_MEDIA_ATTACHMENTS_CAPABILITY,
 } from "@openbot/contracts/team-protocol/current";
+import type { AppTranslate } from "@openbot/i18n";
+import { sourceText } from "@openbot/i18n/source";
 import { app, type BrowserWindow, dialog, type OpenDialogOptions, shell } from "electron";
 import { type Zippable, zip } from "fflate";
 import type { AgentService } from "../../backend/agent-service";
@@ -31,7 +33,8 @@ import { filePreviewFromBytes, localFilePreview, mimeTypeForName } from "../file
 import { decodeVoid } from "../remote-host-decoding";
 import type { RemoteServerManager } from "../remote-server-manager";
 import {
-  parseAgentRequest,
+  agentRequest,
+  parseAttachmentId,
   parseChooseAttachments,
   parseDownloadAttachments,
   parseImportAttachments,
@@ -41,7 +44,7 @@ import {
 } from "./agent-inputs";
 import { type IpcGroupHandlers, payloadHandler } from "./define-ipc-group";
 import { routeToServer } from "./route-to-server";
-import { requireString } from "./validation";
+import { scopedHandler } from "./scoped-handler";
 
 export interface AttachmentIpcDependencies {
   service: Pick<
@@ -63,6 +66,7 @@ export interface AttachmentIpcDependencies {
     | "uploadAttachment"
   >;
   getMainWindow: () => BrowserWindow | null;
+  translate: AppTranslate;
 }
 
 export function attachmentIpcHandlers({
@@ -70,13 +74,22 @@ export function attachmentIpcHandlers({
   mailbox,
   remoteServers,
   getMainWindow,
-}: AttachmentIpcDependencies): Pick<IpcGroupHandlers, "agentAttachments"> {
+  translate,
+}: AttachmentIpcDependencies): Pick<IpcGroupHandlers, "agentAttachments" | "attachmentImports"> {
   return {
+    attachmentImports: {
+      importAttachments: scopedHandler(parseImportAttachments, {
+        local: (parsed) => service.prepareImportedAttachments(parsed.paths, parsed.data),
+        remote: (parsed, serverId) => uploadRemoteImports(remoteServers, serverId, parsed),
+      }),
+    },
     agentAttachments: {
-      chooseAttachments: payloadHandler(parseAgentRequest, async (parsed) => {
+      chooseAttachments: payloadHandler(agentRequest(parseChooseAttachments), async (parsed) => {
         const mainWindow = getMainWindow();
-        const { serverId, payload } = parsed;
-        const { filter } = parseChooseAttachments(payload);
+        const {
+          serverId,
+          payload: { filter },
+        } = parsed;
         const supportsEml =
           serverId === LOCAL_SERVER_ID || remoteServers.supportsCapability(serverId, TEAM_EML_ATTACHMENTS_CAPABILITY);
         const supportsMedia =
@@ -85,10 +98,10 @@ export function attachmentIpcHandlers({
           properties: ["openFile", "multiSelections"],
           filters:
             filter === "images"
-              ? [{ name: "Images", extensions: [...IMAGE_ATTACHMENT_EXTENSIONS] }]
+              ? [{ name: translate("dialog.filter.images"), extensions: [...IMAGE_ATTACHMENT_EXTENSIONS] }]
               : [
                   {
-                    name: "Supported files",
+                    name: translate("dialog.filter.supportedFiles"),
                     extensions: supportedAttachmentExtensions({ eml: supportsEml, media: supportsMedia }),
                   },
                 ],
@@ -102,134 +115,128 @@ export function attachmentIpcHandlers({
           remote: (target) => uploadRemotePaths(remoteServers, target, result.filePaths),
         });
       }),
-      importAttachments: payloadHandler(parseAgentRequest, (scoped) => {
-        const parsed = parseImportAttachments(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => service.prepareImportedAttachments(parsed.paths, parsed.data),
-          remote: (serverId) => uploadRemoteImports(remoteServers, serverId, parsed),
-        });
+      discardDraftAttachment: scopedHandler(parseAttachmentId, {
+        local: (attachmentId) => service.discardDraftAttachment(attachmentId),
+        remote: (attachmentId, serverId) =>
+          remoteServers.request(serverId, TEAM_API_ROUTES.attachment(attachmentId), decodeVoid, { method: "DELETE" }),
       }),
-      discardDraftAttachment: payloadHandler(parseAgentRequest, (scoped) => {
-        const attachmentId = requireString(scoped.payload, "attachmentId");
-        return routeToServer(scoped.serverId, {
-          local: () => service.discardDraftAttachment(attachmentId),
-          remote: (serverId) =>
-            remoteServers.request(serverId, TEAM_API_ROUTES.attachment(attachmentId), decodeVoid, { method: "DELETE" }),
-        });
-      }),
-      downloadAttachments: payloadHandler(parseAgentRequest, async (scoped) => {
-        const parsed = parseDownloadAttachments(scoped.payload);
+      downloadAttachments: payloadHandler(agentRequest(parseDownloadAttachments), async (scoped) => {
+        const parsed = scoped.payload;
         await saveAttachmentArchive(
           parsed,
-          () => chooseSavePath(getMainWindow(), "attachments.zip"),
+          () => chooseSavePath(getMainWindow(), translate, "attachments.zip"),
           (item) =>
             routeToServer(scoped.serverId, {
               local: async () => {
                 const attachment = await mailbox.resolveAttachment(item.id);
-                if (!attachment) throw new Error("Attachment was not found.");
+                if (!attachment) throw new Error(sourceText("error.attachment.notFound"));
                 if ((await stat(attachment.path)).size > ATTACHMENT_LIMITS.fileBytes)
-                  throw new Error("A file exceeds the 100 MB limit.");
+                  throw new Error(sourceText("error.attachment.fileTooLarge"));
                 return readFile(attachment.path);
               },
               remote: async (serverId) => (await remoteServers.downloadAttachment(item.id, serverId)).bytes,
             }),
         );
       }),
-      openAttachment: payloadHandler(parseAgentRequest, (scoped) => {
-        const parsed = parseOpenAttachment(scoped.payload);
-        return routeToServer<void>(scoped.serverId, {
-          local: async () => {
-            const attachment = await mailbox.resolveAttachment(parsed.attachmentId);
-            if (!attachment) throw new Error("Attachment was not found.");
-            if (parsed.action === "download") {
-              const safeId = basename(parsed.attachmentId).replace(/[^a-z0-9_-]/gi, "-") || "attachment";
-              const suggestedName = basename(attachment.name) || `attachment-${safeId}`;
-              const filePath = await chooseSavePath(getMainWindow(), suggestedName);
-              if (!filePath) return;
-              await copyFile(attachment.path, filePath);
-              return;
-            }
-            if (parsed.action === "reveal") {
-              shell.showItemInFolder(attachment.path);
-              return;
-            }
-            await openPath(attachment.path);
-          },
-          remote: async (serverId) => {
-            const downloaded = await remoteServers.downloadAttachment(parsed.attachmentId, serverId);
-            const suggestedName = basename(downloaded.name) || `attachment-${parsed.attachmentId}`;
-            if (parsed.action === "download") {
-              const filePath = await chooseSavePath(getMainWindow(), suggestedName);
-              if (!filePath) return;
-              await writeFile(filePath, downloaded.bytes, { mode: 0o600 });
-              return;
-            }
-            const cacheRoot = join(app.getPath("userData"), "remote-attachments");
-            await mkdir(cacheRoot, { recursive: true });
-            const target = join(cacheRoot, `${parsed.attachmentId}-${suggestedName}`);
-            await writeFile(target, downloaded.bytes, { mode: 0o600 });
-            if (parsed.action === "reveal") shell.showItemInFolder(target);
-            else await openPath(target);
-          },
-        });
+      openAttachment: payloadHandler(agentRequest(parseOpenAttachment), (scoped) =>
+        openAttachmentForServer({ mailbox, remoteServers, getMainWindow, translate }, scoped.serverId, scoped.payload),
+      ),
+      openSharedFile: scopedHandler(parseOpenSharedFile, {
+        local: async (parsed) => {
+          const sharedFile = await service.resolveSharedFile(parsed.path);
+          await openPath(sharedFile.path);
+        },
+        remote: async (parsed, serverId) => {
+          const downloaded = await remoteServers.downloadSharedFile(parsed.path, serverId);
+          const target = await cacheRemoteFile("remote-shared-files", `${serverId}:${parsed.path}`, downloaded);
+          await openPath(target);
+        },
       }),
-      openSharedFile: payloadHandler(parseAgentRequest, (scoped) => {
-        const parsed = parseOpenSharedFile(scoped.payload);
-        return routeToServer<void>(scoped.serverId, {
-          local: async () => {
-            const sharedFile = await service.resolveSharedFile(parsed.path);
-            await openPath(sharedFile.path);
-          },
-          remote: async (serverId) => {
-            const downloaded = await remoteServers.downloadSharedFile(parsed.path, serverId);
-            const target = await cacheRemoteFile("remote-shared-files", `${serverId}:${parsed.path}`, downloaded);
-            await openPath(target);
-          },
-        });
+      openWorkspaceFile: scopedHandler(parseOpenWorkspaceFile, {
+        local: async (parsed) => {
+          const workspaceFile = await service.resolveWorkspaceFile(parsed.agentId, parsed.path);
+          await openPath(workspaceFile.path);
+        },
+        remote: async (parsed, serverId) => {
+          const downloaded = await remoteServers.downloadWorkspaceFile(parsed.agentId, parsed.path, serverId);
+          const key = `${serverId}:${parsed.agentId}:${parsed.path}`;
+          const target = await cacheRemoteFile("remote-workspace-files", key, downloaded);
+          await openPath(target);
+        },
       }),
-      openWorkspaceFile: payloadHandler(parseAgentRequest, (scoped) => {
-        const parsed = parseOpenWorkspaceFile(scoped.payload);
-        return routeToServer<void>(scoped.serverId, {
-          local: async () => {
-            const workspaceFile = await service.resolveWorkspaceFile(parsed.agentId, parsed.path);
-            await openPath(workspaceFile.path);
-          },
-          remote: async (serverId) => {
-            const downloaded = await remoteServers.downloadWorkspaceFile(parsed.agentId, parsed.path, serverId);
-            const key = `${serverId}:${parsed.agentId}:${parsed.path}`;
-            const target = await cacheRemoteFile("remote-workspace-files", key, downloaded);
-            await openPath(target);
-          },
-        });
+      previewSharedFile: scopedHandler(parseOpenSharedFile, {
+        local: async (parsed) => {
+          const sharedFile = await service.resolveSharedFile(parsed.path);
+          return localFilePreview(sharedFile.path, sharedFile.name, sharedFile.size);
+        },
+        remote: async (parsed, serverId) => {
+          const downloaded = await remoteServers.downloadSharedFile(parsed.path, serverId);
+          return filePreviewFromBytes(downloaded.name, downloaded.bytes);
+        },
       }),
-      previewSharedFile: payloadHandler(parseAgentRequest, (scoped): Promise<FilePreview> => {
-        const parsed = parseOpenSharedFile(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: async () => {
-            const sharedFile = await service.resolveSharedFile(parsed.path);
-            return localFilePreview(sharedFile.path, sharedFile.name, sharedFile.size);
-          },
-          remote: async (serverId) => {
-            const downloaded = await remoteServers.downloadSharedFile(parsed.path, serverId);
-            return filePreviewFromBytes(downloaded.name, downloaded.bytes);
-          },
-        });
-      }),
-      previewWorkspaceFile: payloadHandler(parseAgentRequest, (scoped): Promise<FilePreview> => {
-        const parsed = parseOpenWorkspaceFile(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: async () => {
-            const workspaceFile = await service.resolveWorkspaceFile(parsed.agentId, parsed.path);
-            return localFilePreview(workspaceFile.path, workspaceFile.name, workspaceFile.size);
-          },
-          remote: async (serverId) => {
-            const downloaded = await remoteServers.downloadWorkspaceFile(parsed.agentId, parsed.path, serverId);
-            return filePreviewFromBytes(downloaded.name, downloaded.bytes);
-          },
-        });
+      previewWorkspaceFile: scopedHandler(parseOpenWorkspaceFile, {
+        local: async (parsed) => {
+          const workspaceFile = await service.resolveWorkspaceFile(parsed.agentId, parsed.path);
+          return localFilePreview(workspaceFile.path, workspaceFile.name, workspaceFile.size);
+        },
+        remote: async (parsed, serverId) => {
+          const downloaded = await remoteServers.downloadWorkspaceFile(parsed.agentId, parsed.path, serverId);
+          return filePreviewFromBytes(downloaded.name, downloaded.bytes);
+        },
       }),
     },
   };
+}
+
+export type OpenAttachmentDependencies = Pick<AttachmentIpcDependencies, "getMainWindow" | "translate"> & {
+  mailbox: Pick<MailboxStore, "resolveAttachment">;
+  remoteServers: Pick<RemoteServerManager, "downloadAttachment">;
+};
+
+/**
+ * Opens, reveals or saves one sent or generated file of the local host or a joined server. The
+ * chat and the storage surfaces both reach a file by its attachment id, so they share this.
+ */
+export function openAttachmentForServer(
+  { mailbox, remoteServers, getMainWindow, translate }: OpenAttachmentDependencies,
+  serverId: string,
+  input: OpenAttachmentInput,
+): Promise<void> {
+  return routeToServer<void>(serverId, {
+    local: async () => {
+      const attachment = await mailbox.resolveAttachment(input.attachmentId);
+      if (!attachment) throw new Error(sourceText("error.attachment.unavailable"));
+      if (input.action === "download") {
+        const safeId = basename(input.attachmentId).replace(/[^a-z0-9_-]/gi, "-") || "attachment";
+        const suggestedName = basename(attachment.name) || `attachment-${safeId}`;
+        const filePath = await chooseSavePath(getMainWindow(), translate, suggestedName);
+        if (!filePath) return;
+        await copyFile(attachment.path, filePath);
+        return;
+      }
+      if (input.action === "reveal") {
+        shell.showItemInFolder(attachment.path);
+        return;
+      }
+      await openPath(attachment.path);
+    },
+    remote: async (target) => {
+      const downloaded = await remoteServers.downloadAttachment(input.attachmentId, target);
+      const suggestedName = basename(downloaded.name) || `attachment-${input.attachmentId}`;
+      if (input.action === "download") {
+        const filePath = await chooseSavePath(getMainWindow(), translate, suggestedName);
+        if (!filePath) return;
+        await writeFile(filePath, downloaded.bytes, { mode: 0o600 });
+        return;
+      }
+      const cached = await cacheRemoteFile("remote-attachments", `${target}:${input.attachmentId}`, {
+        name: suggestedName,
+        bytes: downloaded.bytes,
+      });
+      if (input.action === "reveal") shell.showItemInFolder(cached);
+      else await openPath(cached);
+    },
+  });
 }
 
 // A remote file has to land on disk before the OS can open it. Owner-only, under a per-server and
@@ -255,11 +262,15 @@ async function openPath(path: string): Promise<void> {
 }
 
 // Returns the chosen path, or undefined when the user cancelled.
-async function chooseSavePath(mainWindow: BrowserWindow | null, suggestedName: string): Promise<string | undefined> {
+async function chooseSavePath(
+  mainWindow: BrowserWindow | null,
+  translate: AppTranslate,
+  suggestedName: string,
+): Promise<string | undefined> {
   const extension = extname(suggestedName).slice(1).toLowerCase();
   const options: Electron.SaveDialogOptions = {
     defaultPath: join(app.getPath("downloads"), suggestedName),
-    filters: [{ name: "Attachment", extensions: extension ? [extension] : ["*"] }],
+    filters: [{ name: translate("dialog.filter.attachment"), extensions: extension ? [extension] : ["*"] }],
     showsTagField: false,
   };
   const result =
@@ -275,7 +286,7 @@ async function uploadRemotePaths(
   paths: string[],
 ) {
   if (paths.length > INPUT_LIMITS.attachments) {
-    throw new Error(`Choose at most ${INPUT_LIMITS.attachments} files.`);
+    throw new Error(sourceText("error.attachment.tooMany", { limit: INPUT_LIMITS.attachments }));
   }
   assertRemoteAttachmentSupport(
     remoteServers,
@@ -291,10 +302,10 @@ async function uploadRemotePaths(
   );
   const total = files.reduce((sum, file) => sum + file.bytes.byteLength, 0);
   if (files.some((file) => file.bytes.byteLength > ATTACHMENT_LIMITS.fileBytes)) {
-    throw new Error("A file exceeds the 100 MB limit.");
+    throw new Error(sourceText("error.attachment.fileTooLarge"));
   }
   if (total > ATTACHMENT_LIMITS.totalBytes) {
-    throw new Error("Attachments exceed the 250 MB total limit.");
+    throw new Error(sourceText("error.attachment.totalTooLarge"));
   }
   return Promise.all(
     files.map((file) => remoteServers.uploadAttachment(file.name, mimeTypeForName(file.name), file.bytes, serverId)),
@@ -307,7 +318,7 @@ async function uploadRemoteImports(
   input: ImportAttachmentsInput,
 ) {
   if (input.paths.length + input.data.length > INPUT_LIMITS.attachments) {
-    throw new Error(`Choose at most ${INPUT_LIMITS.attachments} files.`);
+    throw new Error(sourceText("error.attachment.tooMany", { limit: INPUT_LIMITS.attachments }));
   }
   assertRemoteAttachmentSupport(remoteServers, serverId, [
     ...input.paths.map((path) => basename(path)),
@@ -330,10 +341,10 @@ async function uploadRemoteImports(
   ];
   for (const file of files) assertSupportedAttachmentName(file.name);
   if (files.some((file) => file.bytes.byteLength > ATTACHMENT_LIMITS.fileBytes)) {
-    throw new Error("A file exceeds the 100 MB limit.");
+    throw new Error(sourceText("error.attachment.fileTooLarge"));
   }
   if (files.reduce((sum, file) => sum + file.bytes.byteLength, 0) > ATTACHMENT_LIMITS.totalBytes) {
-    throw new Error("Attachments exceed the 250 MB total limit.");
+    throw new Error(sourceText("error.attachment.totalTooLarge"));
   }
   return Promise.all(
     files.map((file) => remoteServers.uploadAttachment(file.name, file.mimeType, file.bytes, serverId)),
@@ -351,11 +362,11 @@ function assertRemoteAttachmentSupport(
     ) &&
     !remoteServers.supportsCapability(serverId, TEAM_MEDIA_ATTACHMENTS_CAPABILITY)
   ) {
-    throw new Error("This server does not support MP3 or MOV attachments. Update OpenBot on the host and retry.");
+    throw new Error(sourceText("error.attachment.mediaUnsupported"));
   }
   if (!names.some((name) => attachmentFileExtension(name) === "eml")) return;
   if (remoteServers.supportsCapability(serverId, TEAM_EML_ATTACHMENTS_CAPABILITY)) return;
-  throw new Error("This server does not support EML attachments. Update OpenBot on the host and retry.");
+  throw new Error(sourceText("error.attachment.emlUnsupported"));
 }
 
 // Names are archive labels only; file access always uses a managed attachment ID.
@@ -372,8 +383,8 @@ export async function saveAttachmentArchive(
   for (const item of input.attachments) {
     const bytes = await readAttachment(item);
     totalBytes += bytes.byteLength;
-    if (bytes.byteLength > ATTACHMENT_LIMITS.fileBytes) throw new Error("A file exceeds the 100 MB limit.");
-    if (totalBytes > ATTACHMENT_LIMITS.totalBytes) throw new Error("Attachments exceed the 250 MB total limit.");
+    if (bytes.byteLength > ATTACHMENT_LIMITS.fileBytes) throw new Error(sourceText("error.attachment.fileTooLarge"));
+    if (totalBytes > ATTACHMENT_LIMITS.totalBytes) throw new Error(sourceText("error.attachment.totalTooLarge"));
     const safeName =
       item.name
         .replaceAll("\\", "/")

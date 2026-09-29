@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { realpath, stat } from "node:fs/promises";
-import { basename } from "node:path";
+import { sortConversationMessages } from "@openbot/contracts/conversation-order";
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import type {
   AccountUsage,
@@ -16,9 +15,11 @@ import type {
   AgentSummary,
   AttachmentDataInput,
   AvatarImageInput,
+  CapabilityState,
   ChannelMemory,
   ChannelRoutine,
   ChannelRoutineRun,
+  ConversationMessage,
   ConversationPage,
   ConversationPageAnchor,
   ConversationReadState,
@@ -44,11 +45,13 @@ import type {
   ListRoutineRunsInput,
   McpServerConfig,
   McpTestResult,
+  ProviderCodeLoginStart,
   QueuedMessageReceipt,
   QueueSnapshot,
   RemoveMcpServerInput,
   ReorderQueueInput,
   RespondToApprovalInput,
+  RespondToBrowserSecretInput,
   RespondToBrowserTakeoverInput,
   RespondToPromptInput,
   Routine,
@@ -73,71 +76,65 @@ import type {
   UpdateQueuedMessageInput,
   UpdateRoutineInput,
 } from "@openbot/contracts/ipc";
-import {
-  AGENT_RUNTIME_TEXT_LIMIT,
-  defaultProviderModel,
-  isMessageReaction,
-  mcpConfigErrors,
-  normalizeMcpConfig,
-  skillConversationEventItemType,
-} from "@openbot/contracts/ipc";
-import { isString } from "@openbot/contracts/runtime-values";
-import { QueueEditRejectedError, type QueueEditRequest } from "@openbot/contracts/team-protocol/queue-edit-v1";
-import { createOpenBotLogger, redactText } from "@openbot/logging";
+import { CONTEXT_RESET_ITEM_TYPE, isContextResetMarker, workspaceAccessEnforced } from "@openbot/contracts/ipc";
+import { ContextResetBusyError } from "@openbot/contracts/team-protocol/context-reset-v1";
+import type { QueueEditRequest } from "@openbot/contracts/team-protocol/queue-edit-v1";
+import { sourceText } from "@openbot/i18n/source";
+import { createOpenBotLogger } from "@openbot/logging";
 import { AgentMemories } from "./agent/agent-memories";
+import { AgentRemoval } from "./agent/agent-removal";
+import type { ApprovalAutomationPolicy } from "./agent/approval-automation";
 import { AttachmentGateway } from "./agent/attachment-gateway";
 import { AttentionRegistry } from "./agent/attention-registry";
-import { loadAvatarFile } from "./agent/avatar-file";
 import { BootRecovery } from "./agent/boot-recovery";
 import { BrowserUploads } from "./agent/browser-uploads";
 import { ContextCompaction } from "./agent/context-compaction";
+import { ConversationReader } from "./agent/conversation-reader";
 import { ConversationRuntime } from "./agent/conversation-runtime";
-import { handleDataTool } from "./agent/data-tools";
-import {
-  agentNamesById,
-  deliveryInput,
-  displayMessageReferences,
-  responseAttachmentMessageId,
-} from "./agent/delivery-content";
+import { CustomEndpoints } from "./agent/custom-endpoints";
+import { agentNamesById, displayMessageReferences } from "./agent/delivery-content";
 import { DeltaBuffer } from "./agent/delta-buffer";
-import { DEVELOPMENT_DEFAULT_PROVIDER, developmentStartingModel } from "./agent/development-defaults";
-import { DrainScheduler, REMOVED_ENDPOINT_MESSAGE } from "./agent/drain-scheduler";
+import { DrainScheduler } from "./agent/drain-scheduler";
 import { DuplicationGate } from "./agent/duplication-gate";
 import { type AgentHostedSites, HostedSiteCoordinator } from "./agent/hosted-site-coordinator";
-import { isHostedSiteMutationTool } from "./agent/hosted-site-events";
 import { ImageGenRuntime } from "./agent/image-gen-runtime";
 import { MailboxSync } from "./agent/mailbox-sync";
+import { McpGateway, type TestMcpServerOptions } from "./agent/mcp-gateway";
+import {
+  creationModel,
+  type ModelChoice,
+  type ProviderPreference,
+  startingChoice,
+  startingModel,
+} from "./agent/model-choice";
+import { OpenBotToolRouter } from "./agent/openbot-tool-router";
+import { ProfileClients } from "./agent/profile-clients";
 import { generateProfile, generateTextWithoutTools } from "./agent/profile-generation";
 import { ProfileSave } from "./agent/profile-save";
-import { createAgentToolSchema, updateProfileToolSchema } from "./agent/profile-tools";
 import { type AgentClientFactory, ProviderRuntime } from "./agent/provider-runtime";
+import { QueueControls } from "./agent/queue-controls";
 import { type RoutineMutationOptions, RoutineScheduler } from "./agent/routine-scheduler";
-import { type OpenBotToolResponse, openBotToolResult } from "./agent/routine-tools";
-import { fitRuntimeSnapshot } from "./agent/runtime-snapshot";
-import { type AgentSidebar, handleSidebarTool } from "./agent/sidebar-tools";
-import { LOCAL_SKILL_TOOL_DEFINITIONS, type LocalSkillTools, runLocalSkillTool } from "./agent/skill-tools";
-import { isDynamicToolCall, isRequestTimeout, providerForAgent, providerLabel } from "./agent/thread-items";
+import { buildRuntimeSnapshot } from "./agent/runtime-snapshot";
+import type { AgentSidebar } from "./agent/sidebar-tools";
+import type { LocalSkillTools } from "./agent/skill-tools";
+import { isRequestTimeout, providerForAgent, providerLabel } from "./agent/thread-items";
 import { ThreadLifecycle } from "./agent/thread-lifecycle";
 import { type AgentBrowserHost, TurnLifecycle } from "./agent/turn-lifecycle";
-import type { AgentClient, AgentProvider } from "./agent-client";
+import type { AgentProvider } from "./agent-client";
 import type { AgentTables } from "./agent-data/agent-tables";
-import { type AgentStore, DEFAULT_AGENT_PROVIDER } from "./agent-store";
-import { OPENBOT_BROWSER_NAMESPACE } from "./browser-tools";
+import type { AgentStore } from "./agent-store";
 import { ChannelRoutineScheduler } from "./channel-routine-scheduler";
 import { ChannelService } from "./channel-service";
 import type { BundledProviderExecutables } from "./cli";
-import { type ConversationMarkerExclusions, ConversationReadStore } from "./conversation-read-store";
-import { mergeConversationSnapshots } from "./conversation-snapshots";
+import type { ConversationMarkerExclusions } from "./conversation-read-store";
 import type { MailboxStore } from "./mailbox-store";
-import { McpHandoffLog } from "./mcp-handoff-log";
-import { testMcpServer } from "./mcp-probe";
-import { mcpSecretValues, redactMcpValues } from "./mcp-redaction";
 import { McpServerStore } from "./mcp-server-store";
-import { type AppServerRequest, type DynamicToolCallParams, decodeRecordResponse, isRecord } from "./protocol";
+import { decodeRecordResponse } from "./protocol";
 import { NO_PROVIDER_CREDENTIALS, type ProviderClientContext } from "./provider-drivers";
+import { recordAgentRestartActivity } from "./restart-activity";
 import { RoutineTimer } from "./routine-timer";
 import type { SidebarLayoutStore } from "./sidebar-layout-store";
-import { isWithin, rebaseLegacyWorkspacePath, sharedPathFromInput, workspacePathFromInput } from "./workspace-paths";
+import { type ResolvedSharedFile, resolveSharedFile, resolveWorkspaceFile } from "./workspace-paths";
 
 const logger = createOpenBotLogger("agent-service");
 
@@ -148,20 +145,12 @@ const logger = createOpenBotLogger("agent-service");
  */
 const DEFAULT_BUNDLED_EXECUTABLES: BundledProviderExecutables = { claude: null, grok: null };
 
-// Both types were declared in this module before the split and are part of the frozen public
-// surface, so they keep being reachable from here rather than only from the controller that owns
-// them now. `Pick<AgentService, ...>` in team-api-server.ts does not cover exported types.
-export type { AgentClientFactory } from "./agent/provider-runtime";
+export type { TestMcpServerOptions } from "./agent/mcp-gateway";
 export type { RoutineMutationOptions } from "./agent/routine-scheduler";
+export type { ResolvedSharedFile } from "./workspace-paths";
 
 interface AgentServiceEvents {
   event: [event: AgentEvent];
-}
-
-export interface ResolvedSharedFile {
-  path: string;
-  name: string;
-  size: number;
 }
 
 export interface AgentServiceOptions {
@@ -185,6 +174,12 @@ export interface AgentServiceOptions {
   credentials?: ProviderClientContext;
   localSkillTools?: () => LocalSkillTools;
   /**
+   * Whose approvals are answered without asking. The main process owns the preference, because it
+   * is a property of this computer and never crosses the Team API. Omitted, every approval asks.
+   */
+  approvalAutomation?: ApprovalAutomationPolicy;
+  deleteWithRevokedApproval?: (agentId: string, remove: () => Promise<void>) => Promise<void>;
+  /**
    * The shared database agents keep their tables in. Injected because the host child's packaged
    * path is the main process's knowledge, not this class's.
    */
@@ -194,58 +189,32 @@ export interface AgentServiceOptions {
    * The main process passes the app variant; only a dev build turns it on.
    */
   developmentDefaults?: boolean;
+  /**
+   * The Computer Use driver's MCP entry while its daemon runs, or `null`.
+   *
+   * A function rather than a value because the daemon starts and stops under the user, and the
+   * answer is read at each spawn. It is the main process's knowledge: the driver is a child of the
+   * main process, not of this class.
+   */
+  computerUseMcpServer?: () => McpServerConfig | null;
 }
 
 export class AgentService extends EventEmitter<AgentServiceEvents> {
   readonly channels: ChannelService;
   readonly #profileSave: ProfileSave;
-  /**
-   * Every disposable client that is generating, with the record that ends its generation. A client
-   * alone is not enough to stop the work: it may not hold a process yet.
-   */
-  readonly #profileClients = new Map<AgentClient, { cancelled: boolean }>();
-  readonly #deletingAgents = new Set<string>();
-  /**
-   * Endpoints the running CLI may still list although the saved file no longer defines them, because
-   * a restart it refused or failed leaves its catalogue as it was. The value is `#endpointRevision`
-   * as it stood when the exclusion was taken, so a process that spawned before that number read the
-   * old files and its catalogue says nothing about this endpoint.
-   */
-  readonly #releasedCustomProviders = new Map<string, number>();
-  /**
-   * Counts the endpoint changes, which puts an exclusion and a spawn in order. A CLI reads the files
-   * once, at spawn, so a removal made while a process starts is not in the process that arrives.
-   */
-  #endpointRevision = 0;
-  /**
-   * The newest revision whose file write finished, which is the newest a spawning process can read.
-   * A removal is excluded before its write, so a process that starts during the write reads the old
-   * file and must not be taken as proof that the endpoint is gone.
-   */
-  #committedEndpointRevision = 0;
-  /**
-   * One endpoint change or one agent update at a time. A removal excludes the endpoint, moves the
-   * agents off it and then writes the file; an agent update that ran between those steps could put
-   * an agent back onto the endpoint after the sweep and before the write, and the removal would not
-   * notice. Both paths run here, so neither can start inside the other.
-   */
-  #endpointChain: Promise<unknown> = Promise.resolve();
+  readonly #profileClients = new ProfileClients();
   readonly #store: AgentStore;
   readonly #mailbox: MailboxStore;
   readonly #browser: AgentBrowserHost;
-  readonly #conversationReads: ConversationReadStore;
+  readonly #reader: ConversationReader;
   readonly #memories: AgentMemories;
   readonly #tables: AgentTables | null;
   readonly #routines: RoutineScheduler;
   readonly #routineTimer: RoutineTimer;
   readonly #channelRoutines: ChannelRoutineScheduler;
-  readonly #mcpServers: McpServerStore;
-  /**
-   * What has already been handed to a provider process, kept for redaction. Declared here because
-   * both hand-off paths - the client credentials and `enabledMcpServers` - start in this class.
-   */
-  readonly #mcpHandoff = new McpHandoffLog();
+  readonly #mcp: McpGateway;
   readonly #providers: ProviderRuntime;
+  readonly #endpoints: CustomEndpoints;
   readonly #prepareAgentWorkspace: (agent: AgentSummary) => Promise<void>;
   readonly #hostedSites: HostedSiteCoordinator;
   readonly #conversation: ConversationRuntime;
@@ -253,6 +222,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
   readonly #images: ImageGenRuntime;
   readonly #threads: ThreadLifecycle;
   readonly #drain: DrainScheduler;
+  readonly #queue: QueueControls;
   readonly #attachments: AttachmentGateway;
   readonly #browserUploads: BrowserUploads;
   readonly #mailboxSync: MailboxSync;
@@ -261,6 +231,8 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
   readonly #turn: TurnLifecycle;
   readonly #compaction: ContextCompaction;
   readonly #duplication: DuplicationGate;
+  readonly #removal: AgentRemoval;
+  readonly #tools: OpenBotToolRouter;
   readonly #sidebarLayout: AgentSidebar | null;
   readonly #localSkillTools?: () => LocalSkillTools;
   readonly #developmentDefaults: boolean;
@@ -284,13 +256,24 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       credentials = NO_PROVIDER_CREDENTIALS,
       localSkillTools,
       developmentDefaults = false,
+      computerUseMcpServer = () => null,
     } = options;
     this.#developmentDefaults = developmentDefaults;
     this.#localSkillTools = localSkillTools;
     this.#store = store;
     // First of the sub-objects, because `#emitError` reads it to redact and every one of them is
     // given that callback.
-    this.#mcpServers = new McpServerStore(store.database);
+    this.#mcp = new McpGateway({
+      servers: new McpServerStore(store.database),
+      credentials,
+      computerUseMcpServer,
+      logger,
+      hooks: {
+        emitError: (code, error) => this.#emitError(code, error),
+        // Read late: the threads are built further down this constructor.
+        refreshAllAgentRuntimes: () => this.#threads.refreshAllAgentRuntimes(),
+      },
+    });
     this.#sidebarLayout = sidebarLayout;
     this.#profileSave = new ProfileSave(store, {
       create: (input, configure) =>
@@ -301,13 +284,12 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
         this.#drain.scheduleDrain(agent.id);
       },
       delete: async (agent) => {
-        await this.#deleteAgentData(agent);
+        await this.#removal.deleteData(agent);
         this.#emit({ type: "agents-changed", agents: this.listAgents() });
       },
     });
     this.#mailbox = mailbox;
     this.#browser = browser;
-    this.#conversationReads = new ConversationReadStore(store.database);
     this.#prepareAgentWorkspace = prepareAgentWorkspace;
     this.#conversation = new ConversationRuntime(
       store,
@@ -342,7 +324,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
         awaitDrain: (agentId) => this.#drain.taskFor(agentId),
         syncMailboxMessages: (snapshot) => this.#mailboxSync.syncMailboxMessages(snapshot),
         listAgents: () => this.listAgents(),
-        excludedAgents: () => new Set([...this.#duplication.pendingAgents(), ...this.#deletingAgents]),
+        excludedAgents: () => new Set([...this.#duplication.pendingAgents(), ...this.#removal.deleting()]),
         isRunning: () => this.#initialized && !this.#stopping,
       },
     });
@@ -358,7 +340,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       hooks: {
         bindClient: (client) => {
           client.on("notification", (notification) => this.#turn.handleNotification(notification, client));
-          client.on("request", (request) => void this.#handleServerRequest(client, request));
+          client.on("request", (request) => void this.#tools.handle(client, request));
         },
         onProvidersReady: async () => {
           await this.#boot.reconcileUnresolvedDeliveries();
@@ -370,29 +352,51 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
           for (const agent of this.#store.list()) this.#drain.scheduleDrain(agent.id);
         },
         onProviderLost: (client) => {
+          this.#boot.orphanDeliveriesOf(client.provider, (agentId) => this.#providers.runsOnOwnProcess(agentId));
           this.#compaction.dispose();
           this.#attention.clearPrompts(client);
-          this.#attention.clearBrowserTakeovers();
-          this.#attention.clearApprovals();
+          this.#attention.clearBrowserTakeovers(client);
+          this.#attention.clearApprovals(client);
           this.#browser.clearControls();
         },
+        onClientStopped: (client) => {
+          this.#attention.clearPrompts(client);
+          this.#attention.clearBrowserTakeovers(client);
+          this.#attention.clearApprovals(client);
+          this.#turn.interruptTurnsOf(client);
+        },
+        onAgentClientLost: (agentId, client) => {
+          this.#attention.clearPrompts(client);
+          this.#attention.clearBrowserTakeovers(client);
+          this.#attention.clearApprovals(client);
+          this.#boot.orphanDeliveriesOfAgent(agentId);
+          // A teammate that asked this agent may hold the other answers until this work ends.
+          const requesters = this.#mailbox
+            .unresolvedDeliveries()
+            .flatMap(({ delivery }) =>
+              delivery.recipientAgentId === agentId && delivery.sender.kind === "agent"
+                ? [delivery.sender.agentId]
+                : [],
+            );
+          void this.#boot
+            .reconcileUnresolvedDeliveries()
+            .catch((error) => this.#emitError("delivery_reconcile_failed", error, agentId))
+            .finally(() => {
+              this.#drain.scheduleDrain(agentId);
+              for (const requester of new Set(requesters)) this.#drain.scheduleDrain(requester);
+            });
+        },
+        sharedRoot: () => this.#store.sharedRoot,
         isStopping: () => this.#stopping,
         isProviderBusy: (provider) =>
           this.#drain.hasStartingDeliveries(provider) ||
-          this.#store.list().some(
-            (agent) =>
-              providerForAgent(agent) === provider &&
-              // A channel turn runs on a thread of its own, so the agent's own conversation holds no
-              // turn id while the CLI works. `workingSnapshot` reads the execution threads as well.
-              //
-              // A compaction is a provider turn as well, and it holds no active turn id: its
-              // `turn/started` belongs to the compaction, not to the agent, so `claimTurn` takes
-              // it away. Only its own guard reports the turn the CLI is running.
-              (this.#conversation.workingSnapshot(agent.id) != null || !this.#compaction.mayDrain(agent.id)),
-          ),
-        captureConfigRevision: () => this.#committedEndpointRevision,
+          this.#store.list().some((agent) => providerForAgent(agent) === provider && this.#runsTurn(agent.id)),
+        isAgentBusy: (agentId) => this.#runsTurn(agentId),
+        isProviderAssigned: (provider) => this.#store.list().some((agent) => providerForAgent(agent) === provider),
+        captureConfigRevision: () => this.#endpoints.committedRevision(),
         onProviderActivated: (provider, configRevision) => {
-          if (provider === "opencode") this.#clearReleasedCustomProviders(configRevision);
+          if (provider === "opencode") this.#endpoints.clearReleased(configRevision);
+          void this.#endpoints.runExclusive(() => this.#endpoints.moveAgentsOffUnlistedModels(provider));
         },
         onProviderResumed: (provider) => {
           for (const agent of this.#store.list()) {
@@ -411,14 +415,32 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       // endpoint can refuse the prompt itself, after the waits every caller above it makes.
       credentials: {
         ...credentials,
-        servesModel: (modelId) => this.#servesModel(modelId),
+        servesModel: (modelId) => this.#endpoints.serves(modelId),
         // Every MCP set that leaves for a provider is remembered, so its secrets stay redactable
         // after the user edits them. This is the second of the two ways one leaves; the other is
         // `enabledMcpServers`, which the Codex thread configuration reads.
-        mcpServers: () => this.#mcpHandoff.record(credentials.mcpServers()),
+        mcpServers: () => this.#mcp.record(credentials.mcpServers()),
+        reportMcpDrops: (provider, drops) => this.#mcp.reportDrops(provider, drops),
+        mcpAuthorization: (config) => this.#mcp.authorization(config),
       },
-      mcpHandoff: this.#mcpHandoff,
-      redactMcp: (text) => this.#redactMcp(text),
+      mcpHandoff: this.#mcp.handoffLog(),
+      redactMcp: (text) => this.#mcp.redact(text),
+    });
+    this.#endpoints = new CustomEndpoints({
+      store,
+      mailbox: this.#mailbox,
+      conversation: this.#conversation,
+      providers: this.#providers,
+      hooks: {
+        applyAgentUpdate: (input) => this.#applyAgentUpdate(input),
+        // The model list reaches the renderer by pull, refreshed on a status event, and an exclusion
+        // changes what that pull answers while no provider state moves.
+        modelsChanged: () => this.#emit({ type: "status", status: this.getStatus() }),
+        stopProfileClients: () => this.#profileClients.stopOpenCode(),
+        emitError: (code, error, agentId) => this.#emitError(code, error, agentId),
+        providerAvailable: (provider) => this.#providerAvailable(provider),
+        preference: () => this.#preference(),
+      },
     });
     this.#compaction = new ContextCompaction({
       store,
@@ -431,6 +453,11 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       browser: this.#browser,
       hostedSites: this.#hostedSites,
       routines: this.#routines,
+      approvalAutomation: options.approvalAutomation,
+      workspaceSandboxed: (agentId) => {
+        const agent = store.list().find((candidate) => candidate.id === agentId);
+        return agent !== undefined && workspaceAccessEnforced(agent);
+      },
       emit: (event) => this.#emit(event),
       emitError: (code, error, agentId) => this.#emitError(code, error, agentId),
       emitRuntimeSnapshot: () => this.#emitRuntimeSnapshot(),
@@ -444,7 +471,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       hooks: {
         emit: (event) => this.#emit(event),
         listAgents: () => this.listAgents(),
-        deleteAgentData: (agent) => this.#deleteAgentData(agent),
+        deleteAgentData: (agent) => this.#removal.deleteData(agent),
         hasAttentionFor: (agentId) => this.#attention.hasAttentionFor(agentId),
         scheduleDrain: (agentId) => this.#drain.scheduleDrain(agentId),
       },
@@ -481,6 +508,15 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
         queueHold: (agentId) => this.channels.queueHold(agentId),
       },
     });
+    this.#reader = new ConversationReader({
+      store,
+      conversation: this.#conversation,
+      mailboxSync: this.#mailboxSync,
+      hooks: {
+        emit: (event) => this.#emit(event),
+        listAgents: () => this.listAgents(),
+      },
+    });
     this.#attachments = new AttachmentGateway({
       conversation: this.#conversation,
       mailbox,
@@ -502,13 +538,15 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       conversation: this.#conversation,
       memories: this.#memories,
       compaction: this.#compaction,
-      // Read at each spawn, not now: the store is built further down this constructor.
-      mcpServers: () => this.enabledMcpServers(),
+      mcpServers: () => this.#mcp.enabled(),
+      mcpToolRuntimes: () => this.#mcp.toolRuntimes(),
+      mcpAuthorization: (config) => this.#mcp.authorization(config),
       hooks: {
         logRecovery: (agentId, provider, outcome) =>
           logger.warn("Recovered an unavailable provider session.", { agentId, provider, outcome }),
         logReleaseFailure: (provider, error) =>
           logger.warn("Could not close a replaced provider session.", { provider, error }),
+        reportMcpDrops: (provider, drops) => this.#mcp.reportDrops(provider, drops),
       },
     });
     this.#boot = new BootRecovery({
@@ -531,21 +569,19 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       agents: () => this.listAgents(),
       generate: async (lead, prompt) => {
         await this.#providers.ensureProvider(lead.provider);
-        const model = this.#availableModels().find((item) => item.provider === lead.provider && item.id === lead.model);
-        if (!model) throw new Error("The channel lead model is unavailable.");
+        const model = this.#endpoints
+          .available()
+          .find((item) => item.provider === lead.provider && item.id === lead.model);
+        if (!model) throw new Error(sourceText("error.backend.channelLeadModelUnavailable"));
         const client = this.#providers.createProfileClient(lead.provider);
-        const generation = { cancelled: false };
-        this.#profileClients.set(client, generation);
-        try {
-          return await generateTextWithoutTools(
+        return this.#profileClients.run(client, (cancelled) =>
+          generateTextWithoutTools(
             client,
             { ...model, defaultReasoningEffort: lead.reasoningEffort },
             prompt,
-            () => generation.cancelled,
-          );
-        } finally {
-          this.#profileClients.delete(client);
-        }
+            cancelled,
+          ),
+        );
       },
       schedule: (agentId) => this.#drain.scheduleDrain(agentId),
       awaitDrain: (agentId) => this.#drain.taskFor(agentId),
@@ -637,13 +673,26 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       threads: this.#threads,
       hooks: {
         emitError: (code, error, agentId) => this.#emitError(code, error, agentId),
-        redactMcp: (text) => this.#redactMcp(text),
+        redactMcp: (text) => this.#mcp.redact(text),
         isStopping: () => this.#stopping,
-        servesModel: (model) => this.#servesModel(model),
+        servesModel: (model) => this.#endpoints.serves(model),
       },
     });
     this.#browser.onControlChanged((state) => {
       this.#emit({ type: "browser-control-changed", state });
+    });
+    this.#queue = new QueueControls({
+      store,
+      mailbox,
+      mailboxSync: this.#mailboxSync,
+      conversation: this.#conversation,
+      providers: this.#providers,
+      endpoints: this.#endpoints,
+      drain: this.#drain,
+      routines: this.#routines,
+      hooks: {
+        channelAssignment: (deliveryId) => this.channels.store.assignmentForDelivery(deliveryId),
+      },
     });
     this.#turn = new TurnLifecycle({
       store,
@@ -663,6 +712,62 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
         emitRuntimeSnapshot: () => this.#emitRuntimeSnapshot(),
         scheduleDrain: (agentId) => this.#drain.scheduleDrain(agentId),
         listAgents: () => this.listAgents(),
+        redactMcp: (text) => this.#mcp.redact(text),
+      },
+    });
+    this.#removal = new AgentRemoval({
+      store,
+      mailbox,
+      conversation: this.#conversation,
+      browser,
+      channels: this.channels,
+      routines: this.#routines,
+      duplication: this.#duplication,
+      drain: this.#drain,
+      threads: this.#threads,
+      turn: this.#turn,
+      hostedSites: this.#hostedSites,
+      compaction: this.#compaction,
+      deleteWithRevokedApproval: options.deleteWithRevokedApproval ?? ((_agentId, remove) => remove()),
+      logger,
+      hooks: {
+        emit: (event) => this.#emit(event),
+        listAgents: () => this.listAgents(),
+      },
+    });
+    this.#tools = new OpenBotToolRouter({
+      store,
+      mailbox,
+      mailboxSync: this.#mailboxSync,
+      conversation: this.#conversation,
+      attention: this.#attention,
+      browser,
+      browserUploads: this.#browserUploads,
+      attachments: this.#attachments,
+      channels: this.channels,
+      hostedSites: this.#hostedSites,
+      routines: this.#routines,
+      memories: this.#memories,
+      drain: this.#drain,
+      tables: this.#tables,
+      sidebarLayout: this.#sidebarLayout,
+      localSkillTools: this.#localSkillTools,
+      approvalAutomation: options.approvalAutomation,
+      hooks: {
+        listAgents: () => this.listAgents(),
+        listModels: () => this.listModels(),
+        preferredProvider: () => this.preferredProvider(),
+        createAgent: (input, configure) => this.createAgent(input, configure),
+        updateAgent: (input, initiatingAgentId) => this.updateAgent(input, initiatingAgentId),
+        setAvatar: (agentId, image) => this.setAvatar(agentId, image),
+        enabledMcpServers: () => this.enabledMcpServers(),
+        emitError: (code, error, agentId) => this.#emitError(code, error, agentId),
+        runsTurn: (agentId) => this.#runsTurn(agentId),
+        interrupt: (agentId, turnId, mayStop) => this.#interruptTurn(agentId, turnId, undefined, mayStop),
+        turnActivity: (agentId, turnId) => ({
+          startedAt: turnId ? this.#turn.turnStartedAt(turnId) : null,
+          lastEventAt: this.#turn.lastEventAt(agentId),
+        }),
       },
     });
   }
@@ -672,20 +777,21 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
   }
 
   getAnalytics(input: AgentAnalyticsInput) {
-    if (!this.listAgents().some((agent) => agent.id === input.agentId)) throw new Error("Agent not found.");
+    if (!this.listAgents().some((agent) => agent.id === input.agentId))
+      throw new Error(sourceText("error.team.agentNotFound"));
     return this.#store.database.usage.read(input);
   }
 
   getHostAnalytics(input: HostAnalyticsInput) {
     if (input.agentId && !this.listAgents().some((agent) => agent.id === input.agentId))
-      throw new Error("Agent not found.");
+      throw new Error(sourceText("error.team.agentNotFound"));
     return this.#store.database.usage.readHost(input);
   }
 
   async getUsage(agentId?: string): Promise<AccountUsage> {
     if (!agentId) return this.#providers.usage();
     const agent = this.listAgents().find((candidate) => candidate.id === agentId);
-    if (!agent) throw new Error("Agent not found.");
+    if (!agent) throw new Error(sourceText("error.team.agentNotFound"));
     return this.#providers.usage({ provider: agent.provider, model: agent.model });
   }
 
@@ -705,59 +811,48 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
   }
 
   getRuntimeSnapshot(): AgentRuntimeSnapshot {
-    const agents = this.listAgents();
-    const runtimeAgents: AgentRuntimeSnapshot["agents"] = agents.map((agent) => ({
-      id: agent.id,
-      name: agent.name,
-      notifications: agent.notifications,
-      preview: agent.preview.slice(0, AGENT_RUNTIME_TEXT_LIMIT),
-      updatedAt: agent.updatedAt,
-      avatarSeed: agent.avatarSeed,
-      avatarHue: agent.avatarHue,
-      avatarUrl: agent.avatarUrl,
-    }));
-    const activeTurns: AgentRuntimeSnapshot["activeTurns"] = [];
-    const latestMessages: AgentRuntimeSnapshot["latestMessages"] = [];
-    for (const agent of agents) {
-      const live = this.#conversation.snapshot(agent.id);
-      const liveLatest = [...(live?.messages ?? [])]
-        .reverse()
-        .find(
-          (message) =>
-            (message.author === "assistant" || message.author === "agent") &&
-            message.itemType !== "commentary" &&
-            message.itemType !== "question_prompt" &&
-            message.itemType !== "agent_attachment",
-        );
-      const persisted =
-        !live || !liveLatest
-          ? this.#store.database.readConversationRuntime(agent.id, agent.threadId)
-          : { activeTurnId: null, latestMessage: null };
-      const activeTurnId = live ? live.activeTurnId : persisted.activeTurnId;
-      if (activeTurnId && agent.threadId) {
-        activeTurns.push({ agentId: agent.id, threadId: agent.threadId, turnId: activeTurnId });
-      }
-      const latest = liveLatest ?? persisted.latestMessage;
-      if (latest) {
-        latestMessages.push({
-          agentId: agent.id,
-          id: latest.id,
-          text: latest.text.slice(0, AGENT_RUNTIME_TEXT_LIMIT),
-          createdAt: latest.createdAt,
-        });
+    return buildRuntimeSnapshot({
+      agents: this.listAgents(),
+      conversation: this.#conversation,
+      database: this.#store.database,
+      mailbox: this.#mailbox,
+      turn: this.#turn,
+      attention: this.#attention,
+    });
+  }
+
+  /**
+   * Why this instance must not restart right now, or empty when nothing holds it. Read-only:
+   * every source below is also what the drain loop and the shutdown path consult, so the answer
+   * agrees with what stopping would interrupt. Scheduled future routine runs do not count; they
+   * resume from durable rows after a restart.
+   */
+  hasActiveWork(): string[] {
+    const reasons: string[] = [];
+    for (const [, snapshot] of this.#conversation.activeSnapshots()) {
+      if (snapshot.activeTurnId && !this.#conversation.isExecutionThread(snapshot.threadId)) {
+        reasons.push("agent-turn");
+        break;
       }
     }
-    return fitRuntimeSnapshot({
-      agents: runtimeAgents,
-      activeTurns,
-      work: this.#mailbox.listRuntimeWork(
-        agents.map((agent) => agent.id),
-        this.#turn.failedTurns(),
-      ),
-      latestMessages,
-      ...this.#attention.runtimeAttention(),
-      failedTurns: [...this.#turn.failedTurns()].map(([agentId, turnId]) => ({ agentId, turnId })),
-    });
+    if (this.listAgents().some((agent) => this.#mailbox.hasUnfinishedDelivery(agent.id))) {
+      reasons.push("queued-delivery");
+    }
+    // A scheduled drain with nothing behind it is a no-op microtask, not work: only an
+    // in-flight drain carrying an unfinished delivery or a live turn holds the restart.
+    for (const agent of this.listAgents()) {
+      if (
+        this.#drain.taskFor(agent.id) &&
+        (this.#mailbox.hasUnfinishedDelivery(agent.id) || this.#conversation.workingSnapshot(agent.id)?.activeTurnId)
+      ) {
+        reasons.push("drain-task");
+        break;
+      }
+    }
+    if (this.#routines.hasActiveRuns() || this.#channelRoutines.hasActiveRuns()) reasons.push("routine-run");
+    if (this.channels.hasActiveWork()) reasons.push("channel-work");
+    if (this.#providers.activeProcessCount() > 0) reasons.push("provider-process");
+    return reasons;
   }
 
   listMemories(agentId: string): AgentMemory[] {
@@ -785,7 +880,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
   }
 
   async deleteTable(input: DeleteSharedTableInput): Promise<void> {
-    if (!this.#tables) throw new Error("Shared data is unavailable.");
+    if (!this.#tables) throw new Error(sourceText("error.backend.sharedDataUnavailable"));
     await this.#tables.removeAsUser(input.name);
   }
 
@@ -864,119 +959,93 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
    * when the user asks for a test, and when an agent starts - and the second is the provider's own.
    */
   listMcpServers(): McpServerConfig[] {
-    return this.#mcpServers.list();
+    return this.#mcp.list();
   }
 
   saveMcpServer(input: SaveMcpServerInput): McpServerConfig[] {
-    this.#mcpServers.save(input.config);
-    return this.#mcpServersChanged();
+    return this.#mcp.save(input);
   }
 
   removeMcpServer(input: RemoveMcpServerInput): McpServerConfig[] {
-    this.#mcpServers.remove(input.mcpServerId);
-    return this.#mcpServersChanged();
+    return this.#mcp.remove(input);
   }
 
   setMcpServerEnabled(input: SetMcpServerEnabledInput): McpServerConfig[] {
-    this.#mcpServers.setEnabled(input.mcpServerId, input.enabled);
-    return this.#mcpServersChanged();
+    return this.#mcp.setEnabled(input);
   }
 
   /**
-   * The new list, and every agent marked to start a fresh provider session for its next turn.
+   * Marks every agent's provider session for refresh, spent before its next turn.
    *
-   * Without the mark, a provider session that is already loaded keeps the tools it was given: a
-   * removed server stays callable and an added one is invisible until the app restarts. The public
-   * thread and its history are untouched - only the private provider session is replaced.
+   * The mark is what a managed tool runtime becoming ready spends: a session that dropped its
+   * `npx` servers before Bun finished downloading is replaced once they can start. Mid-turn
+   * sessions keep the mark until the turn ends, and the public threads and their histories stay.
    */
-  #mcpServersChanged(): McpServerConfig[] {
+  refreshAllAgentRuntimes(): void {
     this.#threads.refreshAllAgentRuntimes();
-    return this.listMcpServers();
+  }
+
+  testMcpServer(input: TestMcpServerInput, options: TestMcpServerOptions = {}): Promise<McpTestResult> {
+    return this.#mcp.test(input, options);
+  }
+
+  enabledMcpServers(): McpServerConfig[] {
+    return this.#mcp.enabled();
   }
 
   /**
-   * Connects to the configuration the user is looking at, once, and reports what it found.
+   * The Computer Use capability, as the main process alone can know it.
    *
-   * The configuration comes from the form, not from the table, so a draft can be tested before it
-   * is saved. It is validated here first: a name this machine reserves, or a missing command, is a
-   * sentence rather than a connection attempt.
+   * Here rather than on the runtime directly, so the main process does not reach past this class
+   * into the providers it owns.
    */
-  async testMcpServer(input: TestMcpServerInput): Promise<McpTestResult> {
-    const config = normalizeMcpConfig(input.config);
-    const errors = mcpConfigErrors(config);
-    const firstError = errors.name ?? errors.command ?? errors.url;
-    if (firstError) throw new Error(firstError);
-    return testMcpServer(config);
+  setComputerUseCapability(state: CapabilityState): void {
+    this.#providers.setComputerUseCapability(state);
   }
 
-  /** What the providers are given at spawn. They connect for themselves; a test is not used. */
-  enabledMcpServers(): McpServerConfig[] {
-    return this.#mcpHandoff.record(this.#mcpServers.listEnabled());
+  /**
+   * The driver appeared or went away, so every loaded provider session now lists the wrong tools.
+   *
+   * Same treatment as a saved or removed server: the agents are marked for a fresh provider session
+   * and the public thread is untouched.
+   */
+  notifyComputerUseChanged(): void {
+    this.#mcp.changed();
+  }
+
+  /**
+   * A setting that lives outside the agent store changed, such as an agent's auto-approve grant.
+   * Clients of this host read those settings again when the agent list changes.
+   */
+  notifyAgentsChanged(): void {
+    this.#emit({ type: "agents-changed", agents: this.listAgents() });
+  }
+
+  /** The installed skills of one agent changed, so every open skills list reads them again. */
+  notifySkillsChanged(agentId: string): void {
+    this.#emit({ type: "skills-changed", agentId });
   }
 
   listModels(): AgentModelOption[] {
-    return this.#availableModels();
-  }
-
-  /**
-   * The catalogue every caller may choose from: what the connected providers report, less the models
-   * of an endpoint whose removal is written.
-   *
-   * The two lists differ only while OpenCode keeps running with an old configuration, which is what
-   * a removal during a turn leaves behind. The CLI still lists the endpoint, so the raw catalogue
-   * would let the renderer show it, `updateAgent` accept it, and a new agent start on it, all after
-   * the file that defines it is gone. `alsoExcluded` names an endpoint whose removal is in progress
-   * and therefore not recorded yet.
-   */
-  #availableModels(): AgentModelOption[] {
-    if (this.#releasedCustomProviders.size === 0) return this.#providers.listModels();
-    return this.#providers.listModels().filter((option) => this.#servesModel(option.id));
-  }
-
-  /**
-   * Whether the model id is one a save still defines. A model of no custom endpoint, and a model of
-   * an endpoint nothing removed, are served; a model an endpoint no longer lists is not.
-   */
-  #servesModel(modelId: string): boolean {
-    const separator = modelId.indexOf("/");
-    if (separator <= 0) return true;
-    return !this.#releasedCustomProviders.has(modelId.slice(0, separator));
-  }
-
-  /** Ends every disposable generation that may reach an endpoint the user has taken out. */
-  #stopProfileClients(): void {
-    for (const [client, generation] of this.#profileClients) {
-      if (client.provider !== "opencode") continue;
-      // The generation is cancelled as well as the client stopped. A generation still preparing its
-      // workspace holds no process, so the stop reaches nothing, and its own `start()` would then
-      // spawn the process with the endpoints as they were before this change.
-      generation.cancelled = true;
-      void client.stop().catch(() => undefined);
-    }
+    return this.#endpoints.available();
   }
 
   async generateProfile(input: GenerateAgentProfileInput, sections: SidebarSection[]): Promise<AgentProfileDraft> {
     const agent = input.agentId ? this.listAgents().find((candidate) => candidate.id === input.agentId) : null;
-    if (input.agentId && !agent) throw new Error("This agent no longer exists.");
-    if (this.#stopping) throw new Error("OpenBot is shutting down.");
-    if (this.#profileClients.size >= 3) throw new Error("Profile generation is busy. Try again shortly.");
+    if (input.agentId && !agent) throw new Error(sourceText("error.agent.gone"));
+    if (this.#stopping) throw new Error(sourceText("error.backend.shuttingDown"));
+    if (this.#profileClients.busy()) throw new Error(sourceText("error.agent.profileGenerationBusy"));
     const provider = agent?.provider ?? this.#providers.preferredProvider();
     await this.ensureProvider(provider);
-    const models = this.#availableModels();
+    const models = this.#endpoints.available();
     const model = agent
       ? models.find((candidate) => candidate.id === agent.model && candidate.provider === provider)
-      : this.#startingModel(provider, models);
-    if (!model) throw new Error("The selected provider has no available model.");
-    if (this.#stopping) throw new Error("OpenBot is shutting down.");
-    if (this.#profileClients.size >= 3) throw new Error("Profile generation is busy. Try again shortly.");
+      : startingModel(provider, models, this.#preference());
+    if (!model) throw new Error(sourceText("error.provider.noModel"));
+    if (this.#stopping) throw new Error(sourceText("error.backend.shuttingDown"));
+    if (this.#profileClients.busy()) throw new Error(sourceText("error.agent.profileGenerationBusy"));
     const client = this.#providers.createProfileClient(provider);
-    const generation = { cancelled: false };
-    this.#profileClients.set(client, generation);
-    try {
-      return await generateProfile(client, model, input, sections, () => generation.cancelled);
-    } finally {
-      this.#profileClients.delete(client);
-    }
+    return this.#profileClients.run(client, (cancelled) => generateProfile(client, model, input, sections, cancelled));
   }
 
   saveProfile(
@@ -990,76 +1059,9 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     return this.#providers.preferredProvider();
   }
 
-  /**
-   * The model a new agent, or a profile draft with no agent, starts on for `provider`.
-   *
-   * Setup records a model beside the preferred provider, so that model comes first -- but only while
-   * the CLI still lists it, because the list is the provider's answer and a saved id can name an
-   * endpoint or a model that is gone. After it come the provider's own default and then whatever it
-   * does list; `null` means it listed nothing at all.
-   */
-  #startingModel(provider: AgentProvider, models: AgentModelOption[]): AgentModelOption | null {
-    const listed = (id: AgentModelId) => models.find((model) => model.provider === provider && model.id === id);
-    const preferred = this.#providers.preferredModel();
-    const chosen = preferred !== null && provider === this.#providers.preferredProvider() ? listed(preferred) : null;
-    return (
-      chosen ?? listed(defaultProviderModel(provider)) ?? models.find((model) => model.provider === provider) ?? null
-    );
-  }
-
-  /**
-   * The provider and model a creation request names, resolved against what the CLIs list right now,
-   * or `null` when the request names neither. A named model must be listed for the named provider;
-   * a lone provider takes its default when listed, else whatever it lists first.
-   */
-  #creationModel(input: CreateAgentInput): { provider: AgentProvider; model: AgentModelOption } | null {
-    const { provider, model: requestedId } = input;
-    if (provider === undefined && requestedId === undefined) return null;
-    const models = this.#availableModels();
-    if (requestedId !== undefined) {
-      const model = models.find(
-        (candidate) => candidate.id === requestedId && (provider === undefined || candidate.provider === provider),
-      );
-      if (!model) throw new Error("The selected agent model is unavailable.");
-      if (provider !== undefined && model.provider !== provider) {
-        throw new Error("The selected model does not belong to that provider.");
-      }
-      return { provider: model.provider, model };
-    }
-    if (provider === undefined) return null;
-    const model =
-      models.find((candidate) => candidate.provider === provider && candidate.id === defaultProviderModel(provider)) ??
-      models.find((candidate) => candidate.provider === provider) ??
-      null;
-    if (!model) throw new Error(`${providerLabel(provider)} has no available model.`);
-    return { provider, model };
-  }
-
-  /**
-   * The provider and model a new agent starts on, or `null` when the preferred provider lists
-   * nothing at all.
-   *
-   * `#startingModel` answers for one provider; this one chooses the provider too, which is what a
-   * development default needs: the model it names belongs to OpenCode, and a preferred provider of
-   * Codex would never list it.
-   *
-   * That default stands in for the built-in one and nothing else. A preferred provider that is not
-   * the built-in one, or a model recorded beside it, is the developer's own choice and is left as
-   * it is.
-   */
-  #startingChoice(models: AgentModelOption[]): { provider: AgentProvider; model: AgentModelOption } | null {
-    const preferredProvider = this.#providers.preferredProvider();
-    const development =
-      preferredProvider === DEFAULT_AGENT_PROVIDER && this.#providers.preferredModel() === null
-        ? developmentStartingModel({
-            enabled: this.#developmentDefaults,
-            models,
-            providerAvailable: (provider) => this.#providerAvailable(provider),
-          })
-        : null;
-    if (development) return { provider: DEVELOPMENT_DEFAULT_PROVIDER, model: development };
-    const model = this.#startingModel(preferredProvider, models);
-    return model ? { provider: preferredProvider, model } : null;
+  /** The provider and model setup or Settings recorded. */
+  #preference(): ProviderPreference {
+    return { provider: this.#providers.preferredProvider(), model: this.#providers.preferredModel() };
   }
 
   async createAgent(
@@ -1068,14 +1070,15 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     profileOperationId?: string,
   ): Promise<AgentSummary> {
     const initialMessage = input.initialMessage.trim();
-    if (!initialMessage) throw new Error("Initial message is required.");
-    if (input.initialMessage.length > INPUT_LIMITS.messageText) throw new Error("Initial message is too long.");
+    if (!initialMessage) throw new Error(sourceText("error.agent.initialMessageRequired"));
+    if (input.initialMessage.length > INPUT_LIMITS.messageText)
+      throw new Error(sourceText("error.agent.initialMessageTooLong"));
     let agent = await this.#store.createAgent(input, profileOperationId);
     try {
       await this.#prepareAgentWorkspace(agent);
       // A named pair lands before the initial message is queued: a provider change afterwards is
       // rejected while the delivery or turn is active, so a follow-up update could never apply it.
-      const requested = this.#creationModel(input);
+      const requested = creationModel(input, this.#endpoints.available());
       if (requested) {
         agent = await this.#store.updateAgent({
           agentId: agent.id,
@@ -1087,23 +1090,15 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
               : requested.model.defaultReasoningEffort,
         });
       } else {
-        const starting = this.#startingChoice(this.#availableModels());
-        // The provider a start lands on, even when it lists no model: the throw below names the
-        // provider the developer expected, and a preferred provider that equals the record's own is
-        // still the no-op it always was.
-        const startingProvider = starting?.provider ?? this.#providers.preferredProvider();
-        // A new record starts on the built-in default provider, so this is the one place a preferred
-        // provider lands on a new agent -- and with it the model setup chose, which is how a custom
-        // endpoint becomes the default: it is a model of the CLI that runs it, never a provider.
-        if (startingProvider !== agent.provider) {
-          if (!starting) throw new Error(`${providerLabel(startingProvider)} has no available model.`);
-          agent = await this.#store.updateAgent({
-            agentId: agent.id,
-            provider: starting.provider,
-            model: starting.model.id,
-            reasoningEffort: starting.model.defaultReasoningEffort,
-          });
+        const starting = this.#startingChoice();
+        // No provider lists a model, the preferred one included, so the agent could never answer.
+        // The error names the provider the user chose, because that is the one they expected.
+        if (!starting) {
+          throw new Error(
+            sourceText("error.agent.noStartingModel", { provider: providerLabel(this.#preference().provider) }),
+          );
         }
+        agent = await this.#landOnStartingChoice(agent, starting);
       }
       if (configure) agent = await configure(agent);
       await this.sendMessage({ agentId: agent.id, text: initialMessage, attachmentDraftIds: [] });
@@ -1111,19 +1106,41 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     } catch (error) {
       let rollbackError: unknown;
       try {
-        await this.#deleteAgentData(agent);
+        await this.#removal.deleteData(agent);
       } catch (caught) {
         rollbackError = caught;
       }
       this.#emit({ type: "agents-changed", agents: this.listAgents() });
       if (rollbackError) {
-        throw new AggregateError(
-          [error, rollbackError],
-          "Agent setup failed and the incomplete agent could not be removed.",
-        );
+        throw new AggregateError([error, rollbackError], sourceText("error.agent.setupCleanupFailed"));
       }
       throw error;
     }
+  }
+
+  /** Where a new agent that names no model starts: the saved choice, else its provider default (Luna 6 for ChatGPT). */
+  #startingChoice(): ModelChoice | null {
+    return startingChoice(this.#endpoints.available(), this.#preference(), {
+      developmentDefaults: this.#developmentDefaults,
+      providerAvailable: (provider) => this.#providerAvailable(provider),
+    });
+  }
+
+  /**
+   * Moves a new record onto `starting`. A new record starts on the built-in default provider, so this
+   * is the one place a preferred provider lands on a new agent -- and with it the model setup chose,
+   * which is how a custom endpoint becomes the default: it is a model of the CLI that runs it, never a
+   * provider. A record already on the chosen model keeps its effort, which is the low one a new agent
+   * leads with rather than the one the CLI reports.
+   */
+  async #landOnStartingChoice(agent: AgentSummary, starting: ModelChoice): Promise<AgentSummary> {
+    if (starting.provider === agent.provider && starting.model.id === agent.model) return agent;
+    return this.#store.updateAgent({
+      agentId: agent.id,
+      provider: starting.provider,
+      model: starting.model.id,
+      reasoningEffort: starting.model.defaultReasoningEffort,
+    });
   }
 
   async createAgentProfile(
@@ -1132,11 +1149,15 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     let agent = await this.#store.createAgent(input);
     try {
       await this.#prepareAgentWorkspace(agent);
+      // A template, a marketplace agent and an imported one name no model. They start where a new
+      // agent does; with nothing listed yet they keep the record's own, because no message waits.
+      const starting = this.#startingChoice();
+      if (starting) agent = await this.#landOnStartingChoice(agent, starting);
       if (input.title) agent = await this.#store.updateAgent({ agentId: agent.id, title: input.title });
       this.#emit({ type: "agents-changed", agents: this.listAgents() });
       return agent;
     } catch (error) {
-      await this.#deleteAgentData(agent);
+      await this.#removal.deleteData(agent);
       throw error;
     }
   }
@@ -1159,29 +1180,23 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     return agent;
   }
 
-  updateAgent(input: UpdateAgentInput): Promise<AgentSummary> {
-    return this.#runEndpointExclusive(() => this.#applyAgentUpdate(input));
+  /** `initiatingAgentId` is set when an agent, not the user, asks for the change. */
+  updateAgent(input: UpdateAgentInput, initiatingAgentId?: string): Promise<AgentSummary> {
+    return this.#endpoints.runExclusive(() => this.#applyAgentUpdate(input, initiatingAgentId));
   }
 
-  /** A failed change does not stop the next one, so the chain swallows what it re-throws here. */
-  #runEndpointExclusive<T>(run: () => Promise<T>): Promise<T> {
-    const operation = this.#endpointChain.then(run);
-    this.#endpointChain = operation.catch(() => undefined);
-    return operation;
-  }
-
-  async #applyAgentUpdate(input: UpdateAgentInput): Promise<AgentSummary> {
+  async #applyAgentUpdate(input: UpdateAgentInput, initiatingAgentId?: string): Promise<AgentSummary> {
     this.#conversation.requireKnownAgent(input.agentId);
     const previous = this.#store.list().find((agent) => agent.id === input.agentId);
     const requestedModel = input.model
-      ? this.#availableModels().find(
-          (model) => model.id === input.model && (!input.provider || model.provider === input.provider),
-        )
+      ? this.#endpoints
+          .available()
+          .find((model) => model.id === input.model && (!input.provider || model.provider === input.provider))
       : undefined;
-    if (input.model && !requestedModel) throw new Error("The selected agent model is unavailable.");
+    if (input.model && !requestedModel) throw new Error(sourceText("error.agent.modelUnavailable"));
     const requestedProvider = input.provider ?? requestedModel?.provider ?? previous?.provider;
     if (input.provider && requestedModel && requestedModel.provider !== input.provider) {
-      throw new Error("The selected model does not belong to that provider.");
+      throw new Error(sourceText("error.agent.modelProviderMismatch"));
     }
     if (requestedProvider && previous && requestedProvider !== providerForAgent(previous)) {
       if (!input.model || !input.provider) {
@@ -1194,7 +1209,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
           ? this.#store.database.readConversation(input.agentId, previous.threadId).activeTurnId
           : null);
       if (hasPendingWork || activeTurn) {
-        throw new Error("Wait for the active turn and queue to finish before changing provider.");
+        throw new Error(sourceText("error.agent.waitBeforeProviderChange"));
       }
       await this.ensureProvider(requestedProvider);
     }
@@ -1203,11 +1218,13 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       input.title !== undefined ||
       input.description !== undefined ||
       input.model !== undefined ||
-      input.reasoningEffort !== undefined;
-    const agent = await this.#store.updateAgent({
-      ...input,
-      ...(requestedModel && !input.provider ? { provider: requestedModel.provider } : {}),
-    });
+      input.reasoningEffort !== undefined ||
+      input.access !== undefined ||
+      input.computerUse !== undefined;
+    const agent = await this.#store.updateAgent(
+      { ...input, ...(requestedModel && !input.provider ? { provider: requestedModel.provider } : {}) },
+      initiatingAgentId,
+    );
     const activeSession = this.#store.activeProviderSession(agent.id);
     if (previous?.threadId && requestedProvider && requestedProvider !== providerForAgent(previous)) {
       this.#store.database.deactivateProviderSessions(previous.threadId);
@@ -1219,7 +1236,9 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
         agent.reasoningEffort,
       );
     }
-    // Re-resume before the next turn so App Server receives the updated standing instructions. The
+    // Re-resume before the next turn so the provider receives the updated standing instructions.
+    // Codex keeps the ones a loaded session started with, so `ThreadLifecycle.ensureThread` replaces
+    // that session instead - see `toolFingerprint`. The
     // agent chat is not the only session that holds them: a channel turn runs on a session of its
     // own, and it is written from the same profile.
     if (profileChanged) this.#conversation.unloadAgentThreads(agent.id);
@@ -1237,108 +1256,76 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     this.#threads.refreshAgentRuntime(agentId);
   }
 
+  /**
+   * Starts a new chat with the agent and keeps the agent. A marker goes into the agent's own thread,
+   * and its provider sessions end, so the next turn starts a new session that does not see the
+   * messages before the marker. The messages stay visible, and the profile, memories, workspace, and
+   * browser do not change.
+   */
+  clearAgentContext(agentId: string): void {
+    const agent = this.#conversation.requireKnownAgent(agentId);
+    const activeTurn =
+      this.#conversation.workingSnapshot(agentId)?.activeTurnId ??
+      (agent.threadId ? this.#store.database.readConversation(agentId, agent.threadId).activeTurnId : null);
+    if (activeTurn || this.#mailbox.hasUnfinishedDelivery(agentId) || this.#threads.providerContextBusy(agent)) {
+      throw new ContextResetBusyError(sourceText("error.agent.waitBeforeClearContext"));
+    }
+    const database = this.#store.database;
+    const threadId = this.#conversation.withConversationTransaction(agentId, ({ threadId, snapshot }) => {
+      const last = snapshot.messages.at(-1);
+      if (!last || isContextResetMarker(last)) return { result: threadId, snapshot };
+      const message: ConversationMessage = {
+        id: `context-reset-${randomUUID()}`,
+        author: "system",
+        source: "system",
+        text: sourceText("status.agent.contextCleared"),
+        createdAt: new Date().toISOString(),
+        status: "completed",
+        itemType: CONTEXT_RESET_ITEM_TYPE,
+      };
+      snapshot.messages.push(message);
+      sortConversationMessages(snapshot.messages);
+      snapshot.revision = database.appendConversationMessage({
+        agentId,
+        threadId,
+        activeTurnId: snapshot.activeTurnId,
+        message,
+        eventType: "thread.context-cleared",
+      });
+      return { result: threadId, snapshot };
+    });
+    this.#threads.endThreadContext(threadId);
+  }
+
   resolveAvatar(agentId: string): { path: string; mimeType: AvatarImageInput["mimeType"]; version: string } | null {
     return this.#store.resolveAvatar(agentId);
   }
 
-  async resolveSharedFile(inputPath: string): Promise<ResolvedSharedFile> {
-    const sharedRoot = await realpath(this.#store.sharedRoot);
-    const candidatePath = sharedPathFromInput(this.#store.sharedRoot, inputPath);
-    const resolvedPath = await realpath(candidatePath);
-    if (!isWithin(sharedRoot, resolvedPath)) {
-      throw new Error("Shared file must be inside the shared directory.");
-    }
-    const metadata = await stat(resolvedPath);
-    if (!metadata.isFile()) throw new Error("Shared path is not a file.");
-    return { path: resolvedPath, name: basename(resolvedPath), size: metadata.size };
+  resolveSharedFile(inputPath: string): Promise<ResolvedSharedFile> {
+    return resolveSharedFile(this.#store.sharedRoot, inputPath);
   }
 
   async resolveWorkspaceFile(agentId: string, inputPath: string): Promise<ResolvedSharedFile> {
     const agent = this.#store.list().find((candidate) => candidate.id === agentId);
-    if (!agent) throw new Error(`Unknown agent: ${agentId}`);
-    const workspaceRoot = await realpath(agent.workspacePath);
-    const candidatePath = workspacePathFromInput(agent.workspacePath, agent.id, inputPath);
-    const resolvedPath = await realpath(candidatePath).catch(async (error: unknown) => {
-      // The file may be one the provider's own transcript still names under this agent's pre-rename
-      // workspace root. The containment check below is unchanged and runs on whatever comes back.
-      const rebased =
-        isRecord(error) && error.code === "ENOENT"
-          ? rebaseLegacyWorkspacePath(agent.workspacePath, agent.id, candidatePath)
-          : null;
-      if (rebased === null) throw error;
-      return await realpath(rebased);
-    });
-    if (!isWithin(workspaceRoot, resolvedPath)) {
-      throw new Error("Workspace file must be inside the agent workspace.");
-    }
-    const metadata = await stat(resolvedPath);
-    if (!metadata.isFile()) throw new Error("Workspace path is not a file.");
-    return { path: resolvedPath, name: basename(resolvedPath), size: metadata.size };
+    if (!agent) throw new Error(sourceText("error.agent.unknown", { id: agentId }));
+    return resolveWorkspaceFile(agent, inputPath);
   }
 
-  async deleteAgent(agentId: string): Promise<void> {
-    if (this.#deletingAgents.has(agentId)) throw new Error("Agent deletion is already in progress.");
-    const agent = this.#store.list().find((candidate) => candidate.id === agentId);
-    const hasPendingWork = this.#mailbox.hasUnfinishedDelivery(agentId);
-    if (hasPendingWork || this.#conversation.workingSnapshot(agentId)?.activeTurnId) {
-      throw new Error("Stop the agent and cancel its queued messages before deleting it.");
-    }
-
-    const { wasPending, release } = this.#duplication.releaseForDelete(agentId);
-    this.#deletingAgents.add(agentId);
-    const releaseDeliveries = this.#mailbox.blockAgentDeliveries(agentId);
-    try {
-      this.#routines.arm();
-      await this.#deleteAgentData(agent ?? { id: agentId, threadId: null });
-      this.#duplication.forget(agentId);
-      if (!wasPending) this.#emit({ type: "agents-changed", agents: this.listAgents() });
-    } finally {
-      release();
-      releaseDeliveries();
-      this.#deletingAgents.delete(agentId);
-      this.#routines.arm();
-      if (this.#store.list().some((candidate) => candidate.id === agentId)) this.#drain.scheduleDrain(agentId);
-    }
+  deleteAgent(agentId: string): Promise<void> {
+    return this.#removal.delete(agentId);
   }
 
   deleteChannel(channelId: string): Promise<void> {
     return this.channels.deleteChannel(channelId);
   }
 
-  async #deleteAgentData(agent: Pick<AgentSummary, "id" | "threadId">): Promise<void> {
-    const providerSessions = agent.threadId ? this.#store.database.listProviderSessions(agent.threadId) : [];
-    let stage = "provider-files";
-    try {
-      // Keep session records available if private file removal needs a retry.
-      for (const session of providerSessions) await this.#threads.deleteProviderSessionFiles(session.externalSessionId);
-      stage = "mailbox";
-      await this.#mailbox.deleteAgentData(agent.id, this.channels.store.allContextThreads());
-      stage = "agent-files-and-record";
-      await this.#store.deleteAgent(agent.id);
-    } catch {
-      // File-system errors can contain private paths. Log only the failed stage.
-      logger.warn("Agent deletion failed.", { stage });
-      throw new Error("The agent data could not be removed completely. Retry deleting the agent.");
-    }
-    this.#conversation.forgetAgent(agent.id);
-    this.#turn.forgetAgent(agent.id);
-    this.#drain.forgetAgent(agent.id);
-    this.#hostedSites.forgetAgent(agent.id);
-    if (agent.threadId) {
-      for (const session of providerSessions) {
-        this.#conversation.unbindThread(session.externalSessionId);
-        this.#conversation.unloadThread(session.externalSessionId);
-        this.#compaction.forgetThread(session.externalSessionId);
-      }
-    }
-    this.#compaction.forgetAgent(agent.id);
-  }
-
   async initialize(): Promise<void> {
     this.#stopping = false;
     await this.#store.initialize();
     await this.#mailbox.initialize();
+    this.#mcp.migrateCatalogBridgesToHttp();
     this.channels.restoreDeliveryLinks();
+    this.channels.removeDeletedMembers(new Set(this.#store.list().map((agent) => agent.id)));
     await this.#threads.reconcileProviderSessionFiles();
     this.#boot.recoverPersistedTurns();
     this.#hostedSites.restore();
@@ -1373,6 +1360,14 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     return this.#providers.connectProvider(provider, openExternal);
   }
 
+  startProviderCodeLogin(provider: AgentProvider): Promise<ProviderCodeLoginStart> {
+    return this.#providers.startProviderCodeLogin(provider);
+  }
+
+  cancelProviderCodeLogin(provider: AgentProvider): Promise<AgentStatus> {
+    return this.#providers.cancelProviderCodeLogin(provider);
+  }
+
   changeProviderCredential(provider: AgentProvider, change: () => Promise<void>): Promise<AgentStatus> {
     return this.#providers.changeProviderCredential(provider, change);
   }
@@ -1386,156 +1381,51 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     return this.#providers.reloadOpenCodeConfig();
   }
 
-  /**
-   * Saves one endpoint: the exclusion of the id being saved and `persist`, which is the caller's file
-   * write, as one change nothing else can interleave with.
-   *
-   * The id is excluded although it is being added. The process answering now was spawned before this
-   * write, and an id this app has never saved can still exist in OpenCode's own configuration and in
-   * its live catalogue. Without the exclusion the picker reads those models as the saved endpoint's,
-   * while every prompt still goes to the old process, at the URL and with the credentials it started
-   * with. The exclusion is given back only when a process that read this write reports its own
-   * catalogue, so a restart that is skipped for a busy CLI, or one that fails, leaves it in place.
-   *
-   * No agent is moved off the id, unlike a removal: the endpoint is arriving, not going away, and a
-   * fresh process usually serves it within seconds. Until then its models are refused at delivery,
-   * which is the safe answer while two different servers could answer to one id.
-   */
+  /** Replaces the custom agents' router so a saved or removed agent reaches it. Reports why, if it did not. */
+  reloadCustomAgents(): Promise<CustomProviderRestart> {
+    return this.#providers.reloadCustomAgents();
+  }
+
+  /** See `CustomEndpoints.saveCustomAgent`. */
+  saveCustomAgent<T>(persist: () => Promise<T>): Promise<T> {
+    return this.#endpoints.saveCustomAgent(persist);
+  }
+
+  /** See `CustomEndpoints.removeCustomAgent`: the agents on it move to another provider first. */
+  removeCustomAgent<T>(customAgentId: string, persist: () => Promise<T>): Promise<T> {
+    return this.#endpoints.removeCustomAgent(customAgentId, persist);
+  }
+
+  /** See `CustomEndpoints.save`: the exclusion of the id being saved and the caller's file write. */
   saveCustomProvider<T>(providerId: string, persist: () => Promise<T>): Promise<T> {
-    return this.#runEndpointExclusive(async () => {
-      const previous = this.#releasedCustomProviders.get(providerId);
-      this.#endpointRevision += 1;
-      const revision = this.#endpointRevision;
-      this.#releasedCustomProviders.set(providerId, revision);
-      this.#emitModelsChanged();
-      // The same reason as a removal: a profile or channel client is a process of its own, holding
-      // the endpoints it was spawned with, and no restart of the main client reaches it.
-      this.#stopProfileClients();
-      try {
-        const persisted = await persist();
-        // Only now can a spawning process read the saved endpoint.
-        this.#committedEndpointRevision = revision;
-        return persisted;
-      } catch (error) {
-        // Nothing was written, so the id is served exactly as it was before this call.
-        if (previous !== undefined) this.#releasedCustomProviders.set(providerId, previous);
-        else this.#releasedCustomProviders.delete(providerId);
-        this.#emitModelsChanged();
-        throw error;
-      }
-    });
+    return this.#endpoints.save(providerId, persist);
   }
 
-  /**
-   * Removes one endpoint: the exclusion, the agents that were on it, and `persist`, which is the
-   * caller's file write, as one change nothing else can interleave with.
-   *
-   * The exclusion is taken *first*, so no agent can be moved onto the endpoint while its removal
-   * runs, and given back when the write throws: an endpoint that is still on disk is still saved and
-   * still served, and its models stay a valid fallback for the next removal.
-   */
+  /** See `CustomEndpoints.update`: the agents on removed models, the exclusion, and the file write. */
+  updateCustomProvider<T>(
+    providerId: string,
+    removedModelIds: readonly string[],
+    persist: () => Promise<T>,
+  ): Promise<T> {
+    return this.#endpoints.update(providerId, removedModelIds, persist);
+  }
+
+  /** See `CustomEndpoints.remove`: the exclusion, the agents that were on it, and the file write. */
   removeCustomProvider<T>(providerId: string, persist: () => Promise<T>): Promise<T> {
-    return this.#runEndpointExclusive(async () => {
-      const previous = this.#releasedCustomProviders.get(providerId);
-      this.#endpointRevision += 1;
-      const revision = this.#endpointRevision;
-      this.#releasedCustomProviders.set(providerId, revision);
-      this.#emitModelsChanged();
-      // A profile or channel client is a process of its own, spawned with the endpoints as they
-      // were, and no restart of the main client reaches it. It is one short request, so it is
-      // stopped rather than watched: its caller reports a failure the user can repeat.
-      this.#stopProfileClients();
-      try {
-        await this.#releaseCustomProviderModels();
-        const persisted = await persist();
-        // Only now is the removal on disk, so only now can a process read it. Removals run one at a
-        // time on the chain, so this number never goes back.
-        this.#committedEndpointRevision = revision;
-        return persisted;
-      } catch (error) {
-        if (previous !== undefined) this.#releasedCustomProviders.set(providerId, previous);
-        else this.#releasedCustomProviders.delete(providerId);
-        this.#emitModelsChanged();
-        throw error;
-      }
-    });
+    return this.#endpoints.remove(providerId, persist);
   }
 
   /**
-   * A fresh OpenCode process is the one the app uses now, and it read the endpoint files as they are,
-   * so what it lists is the truth and nothing has to be masked any more.
+   * True while the CLI runs a turn for this agent. A channel turn runs on a thread of its own, so the
+   * agent's own conversation holds no turn id while the CLI works. `workingSnapshot` reads the
+   * execution threads as well.
    *
-   * Only a client that reached `onProviderActivated` gets here. A restart that fails leaves the old
-   * process answering, on the endpoints it started with, and every id removed since then stays out:
-   * an id saved a second time may name another server, and the old process would take the message to
-   * the one the user has just replaced.
+   * A compaction is a provider turn as well, and it holds no active turn id: its `turn/started`
+   * belongs to the compaction, not to the agent, so `claimTurn` takes it away. Only its own guard
+   * reports the turn the CLI is running.
    */
-  #clearReleasedCustomProviders(configRevision: number): void {
-    let changed = false;
-    for (const [providerId, revision] of this.#releasedCustomProviders) {
-      // A removal made while this process started is not in the files it read, so its catalogue is
-      // the one from before the removal and the endpoint stays out.
-      if (revision > configRevision) continue;
-      this.#releasedCustomProviders.delete(providerId);
-      changed = true;
-    }
-    if (changed) this.#emitModelsChanged();
-  }
-
-  /**
-   * Tells the renderer to read the catalogue again. The model list reaches it by pull, refreshed on a
-   * status event, and an exclusion changes what that pull answers while no provider state moves.
-   */
-  #emitModelsChanged(): void {
-    this.#emit({ type: "status", status: this.getStatus() });
-  }
-
-  /**
-   * Moves every agent off a removed endpoint's models, onto a model that is still served.
-   *
-   * Runs *before* the file write and the restart, so no agent is left naming a model the fresh
-   * catalogue does not list, and inside `removeCustomProvider`, which has already excluded the
-   * endpoint and holds the chain that keeps an agent update out.
-   *
-   * Throws while an affected agent is busy, which stops the removal: the move is a provider switch,
-   * and that is refused during a turn or a queued delivery. The check runs over all of them first,
-   * so a refusal moves no agent at all.
-   */
-  async #releaseCustomProviderModels(): Promise<void> {
-    // Every endpoint already removed, not only this one. A removal during a turn leaves the running
-    // CLI's catalogue as it was, so the models of an endpoint already taken out are still listed,
-    // and choosing one here would move agents onto an endpoint that is gone.
-    const affected = this.#store
-      .list()
-      .filter((agent) => providerForAgent(agent) === "opencode" && !this.#servesModel(agent.model));
-    if (affected.length === 0) return;
-    // OpenCode declares no default model of its own -- its catalogue is whatever the CLI lists -- so
-    // the fallback is chosen from the live list with the endpoint being removed taken out of it.
-    // The built-in default provider comes second, because an agent left on a model the CLI no longer
-    // serves cannot answer, and a provider switch keeps its workspace, thread and identity.
-    const remaining = this.#availableModels();
-    // The built-in default is offered only while it is usable: `#applyAgentUpdate` connects the
-    // provider it moves an agent to, and a Codex that is not installed or not signed in throws
-    // there. That would trap a user who runs custom endpoints only, because the last endpoint could
-    // never be removed while an agent still names one of its models.
-    const fallback =
-      this.#startingModel("opencode", remaining) ??
-      (this.#providerAvailable(DEFAULT_AGENT_PROVIDER) ? this.#startingModel(DEFAULT_AGENT_PROVIDER, remaining) : null);
-    // Nothing is listed, so there is no model to move to. The removal still goes ahead: refusing it
-    // would trap the user on an endpoint that may be the reason no model is listed.
-    if (!fallback) return;
-    if (fallback.provider !== "opencode" && affected.some((agent) => this.#hasWorkInFlight(agent))) {
-      throw new Error("Wait for the active turn and queue to finish before you remove this endpoint.");
-    }
-    for (const agent of affected) {
-      // Not the public `updateAgent`: this already runs inside the chain that one takes.
-      await this.#applyAgentUpdate({
-        agentId: agent.id,
-        provider: fallback.provider,
-        model: fallback.id,
-        reasoningEffort: fallback.defaultReasoningEffort,
-      });
-    }
+  #runsTurn(agentId: string): boolean {
+    return this.#conversation.workingSnapshot(agentId) != null || !this.#compaction.mayDrain(agentId);
   }
 
   /** Whether this provider reports a CLI that is installed, current, and signed in. */
@@ -1544,19 +1434,6 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       this.getStatus().providers?.some((candidate) => candidate.id === provider && candidate.state === "available") ??
       false
     );
-  }
-
-  /**
-   * Whether a turn is running for this agent or a delivery is still queued for it. Read from the
-   * live snapshot first, then from the stored conversation, because an agent whose thread is not
-   * loaded keeps its active turn in the database.
-   */
-  #hasWorkInFlight(agent: AgentSummary): boolean {
-    if (this.#mailbox.hasUnfinishedDelivery(agent.id)) return true;
-    const active =
-      this.#conversation.workingSnapshot(agent.id)?.activeTurnId ??
-      (agent.threadId ? this.#store.database.readConversation(agent.id, agent.threadId).activeTurnId : null);
-    return Boolean(active);
   }
 
   async stop(): Promise<void> {
@@ -1573,8 +1450,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     this.#attention.clearPrompts();
     this.#attention.clearBrowserTakeovers();
     this.#attention.clearApprovals();
-    const clients = [...this.#providers.dispose(), ...this.#profileClients.keys()];
-    this.#profileClients.clear();
+    const clients = [...this.#providers.dispose(), ...this.#profileClients.release()];
     for (const [agentId, snapshot] of this.#conversation.activeSnapshots()) {
       if (!snapshot.activeTurnId) continue;
       const agent = this.#store.list().find((item) => item.id === agentId);
@@ -1598,77 +1474,50 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     this.#providers.markStopped();
   }
 
-  async readConversation(agentId: string): Promise<ConversationSnapshot> {
-    const agent = await this.#store.getOrCreate(agentId);
-    const persisted = this.#store.database.readConversation(agentId, agent.threadId);
-    const live = this.#conversation.snapshot(agentId);
-    const snapshot = live?.activeTurnId ? mergeConversationSnapshots(persisted, live) : persisted;
-    this.#mailboxSync.syncMailboxMessages(snapshot);
-    this.#conversation.setSnapshot(agentId, snapshot);
-    return structuredClone(snapshot);
+  readConversation(agentId: string): Promise<ConversationSnapshot> {
+    return this.#reader.read(agentId);
   }
 
-  async readConversationFor(agentId: string, memberId: string): Promise<ConversationWithReadState> {
-    const snapshot = await this.readConversation(agentId);
-    return {
-      ...snapshot,
-      readState: this.#conversationReads.readState(memberId, snapshot),
-    };
+  readConversationFor(agentId: string, memberId: string): Promise<ConversationWithReadState> {
+    return this.#reader.readFor(agentId, memberId);
   }
 
-  async readConversationPageFor(
+  readConversationPageFor(
     agentId: string,
     memberId: string,
-    anchor: ConversationPageAnchor = { type: "latest" },
-    limit = 50,
-    options: ConversationMarkerExclusions = {},
+    anchor?: ConversationPageAnchor,
+    limit?: number,
+    options?: ConversationMarkerExclusions,
   ): Promise<ConversationPage> {
-    const agent = await this.#store.getOrCreate(agentId);
-    this.#mailboxSync.reconcilePersistedMailboxMessages(agent);
-    const page = this.#store.database.readConversationPage(agentId, agent.threadId, anchor, limit, options);
-    return {
-      ...page,
-      readState: this.#conversationReads.readStateForThread(memberId, agent.threadId, options),
-    };
+    return this.#reader.readPageFor(agentId, memberId, anchor, limit, options);
   }
 
-  searchConversationMessages(query: string, agentId?: string, cursor?: string, limit = 100): ConversationSearchPage {
-    return this.#store.database.searchConversationMessages(query, agentId, cursor, limit);
+  searchConversationMessages(query: string, agentId?: string, cursor?: string, limit?: number): ConversationSearchPage {
+    return this.#reader.search(query, agentId, cursor, limit);
   }
 
   listConversationReads(
     memberId: string,
-    options: ConversationMarkerExclusions = {},
+    options?: ConversationMarkerExclusions,
   ): Record<string, ConversationReadState> {
-    return this.#conversationReads.listStates(memberId, this.listAgents(), options);
+    return this.#reader.listReads(memberId, options);
   }
 
   adoptConversationReads(sourceMemberId: string, targetMemberId: string): void {
-    this.#conversationReads.adoptMemberState(sourceMemberId, targetMemberId);
+    this.#reader.adoptReads(sourceMemberId, targetMemberId);
   }
 
-  async markConversationRead(
+  markConversationRead(
     agentId: string,
     memberId: string,
     throughMessageId: string | null,
-    options: ConversationMarkerExclusions = {},
+    options?: ConversationMarkerExclusions,
   ): Promise<ConversationReadState> {
-    const snapshot = await this.readConversation(agentId);
-    const previous = this.#conversationReads.readState(memberId, snapshot).throughMessageId;
-    const state = this.#conversationReads.markRead(memberId, snapshot, throughMessageId, options);
-    if (this.#conversationReads.readState(memberId, snapshot).throughMessageId !== previous) {
-      // Read cursors are shared by a member's devices, not by every team member.
-      // Invalidate without broadcasting a reader's cursor; each client reloads its own state.
-      this.#emit({ type: "conversation-invalidated", agentId, revision: snapshot.revision });
-    }
-    return state;
+    return this.#reader.markRead(agentId, memberId, throughMessageId, options);
   }
 
-  async markConversationUnread(agentId: string, memberId: string): Promise<ConversationReadState> {
-    const snapshot = await this.readConversation(agentId);
-    const state = this.#conversationReads.markUnread(memberId, snapshot);
-    this.#emit({ type: "conversation-invalidated", agentId, revision: snapshot.revision });
-    return state;
+  markConversationUnread(agentId: string, memberId: string): Promise<ConversationReadState> {
+    return this.#reader.markUnread(agentId, memberId);
   }
 
   prepareAttachments(paths: string[]): Promise<DraftAttachment[]> {
@@ -1691,154 +1540,30 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     this.#turn.acknowledgeFailedTurn(agentId, turnId);
   }
 
-  async cancelQueuedMessage(agentId: string, deliveryId: string): Promise<void> {
-    if (this.channels.store.assignmentForDelivery(deliveryId))
-      throw new Error("Use the channel task controls for this assignment.");
-    await this.#mailbox.cancel(agentId, deliveryId);
-    this.#mailboxSync.emitQueue(agentId);
-    this.#drain.scheduleDrain(agentId);
+  cancelQueuedMessage(agentId: string, deliveryId: string): Promise<void> {
+    return this.#queue.cancel(agentId, deliveryId);
   }
 
-  async editQueuedMessage(agentId: string, input: QueueEditRequest): Promise<QueueSnapshot> {
-    const finished = this.#mailbox.finishedQueueEditAction(agentId, input.deliveryId, input.editId);
-    if (finished) {
-      if (input.action === "begin" || input.action === "retain-attachments")
-        throw new QueueEditRejectedError("This edit has already finished.");
-      // The uploads belong to an edit that is over, so they never stay behind.
-      if (input.action === "save")
-        await Promise.all(input.attachmentDraftIds.map((id) => this.#mailbox.discardDraft(id)));
-      // Only a retry of the action that finished can report success. A Save that follows a
-      // finished Cancel never reached the message, so the client must keep its text.
-      if (input.action !== finished)
-        throw new QueueEditRejectedError(
-          finished === "cancel"
-            ? "This edit was cancelled, so the message keeps its original text."
-            : "This edit was already saved.",
-        );
-      if (
-        input.action === "save" &&
-        !this.#mailbox.matchesFinishedQueueSave(
-          agentId,
-          input.deliveryId,
-          input.editId,
-          input.text,
-          input.keepAttachmentIds,
-          input.attachmentDraftIds,
-        )
-      )
-        throw new QueueEditRejectedError(
-          "This edit was already saved with different contents. Your changes were not saved.",
-        );
-      this.#drain.scheduleDrain(agentId);
-      this.#mailboxSync.emitQueue(agentId);
-      return this.listQueue(agentId);
-    }
-    if (this.channels.store.assignmentForDelivery(input.deliveryId))
-      throw new Error("Use the channel task controls for this assignment.");
-    if (input.action === "begin") this.#mailbox.beginQueueEdit(agentId, input.deliveryId, input.editId);
-    else {
-      if (input.action === "retain-attachments")
-        this.#mailbox.retainQueueEditAttachments(agentId, input.deliveryId, input.editId, input.attachmentDraftIds);
-      if (input.action === "save") {
-        await this.#mailbox.updateQueuedMessage(
-          agentId,
-          input.deliveryId,
-          input.text,
-          input.keepAttachmentIds,
-          input.attachmentDraftIds,
-          input.editId,
-        );
-        const snapshot = this.#conversation.snapshot(agentId);
-        if (snapshot) {
-          this.#mailboxSync.syncMailboxMessages(snapshot);
-          this.#conversation.emitConversation(snapshot, "queue.message-updated");
-        }
-      }
-      if (input.action === "cancel") this.#mailbox.finishQueueEdit(agentId, input.deliveryId, input.editId);
-      this.#drain.scheduleDrain(agentId);
-    }
-    this.#mailboxSync.emitQueue(agentId);
-    return this.#mailbox.listQueue(agentId);
+  editQueuedMessage(agentId: string, input: QueueEditRequest): Promise<QueueSnapshot> {
+    return this.#queue.edit(agentId, input);
   }
 
-  async updateQueuedMessage(input: UpdateQueuedMessageInput): Promise<void> {
-    if (this.channels.store.assignmentForDelivery(input.deliveryId))
-      throw new Error("Use the channel task controls for this assignment.");
-    await this.#mailbox.updateQueuedMessage(
-      input.agentId,
-      input.deliveryId,
-      input.text,
-      input.keepAttachmentIds,
-      input.attachmentDraftIds,
-    );
-    const snapshot = this.#conversation.snapshot(input.agentId);
-    if (snapshot) this.#mailboxSync.syncMailboxMessages(snapshot);
-    this.#mailboxSync.emitQueue(input.agentId);
-    if (snapshot) this.#conversation.emitConversation(snapshot, "queue.message-updated");
-    this.#drain.scheduleDrain(input.agentId);
+  updateQueuedMessage(input: UpdateQueuedMessageInput): Promise<void> {
+    return this.#queue.update(input);
   }
 
-  async reorderQueue(input: ReorderQueueInput): Promise<void> {
-    if (input.deliveryIds.some((id) => this.channels.store.assignmentForDelivery(id)))
-      throw new Error("Use the channel task controls for channel work.");
-    // The queue the user reads holds no channel work, so the order it sends names the normal
-    // messages alone, and the mailbox reads the whole queued order. Channel work stays at the head:
-    // it reserved the agent before these messages arrived.
-    const channelDeliveryIds = this.#mailbox.queuedChannelDeliveryIds(input.agentId);
-    await this.#mailbox.reorderQueue(input.agentId, [...channelDeliveryIds, ...input.deliveryIds]);
-    this.#mailboxSync.emitQueue(input.agentId);
+  reorderQueue(input: ReorderQueueInput): Promise<void> {
+    return this.#queue.reorder(input);
   }
 
-  async steerQueuedMessage(input: SteerQueuedMessageInput): Promise<void> {
-    const agent = await this.#store.getOrCreate(input.agentId);
-    const client = this.#providers.requireReadyClient(providerForAgent(agent));
-    const session = this.#store.activeProviderSession(agent.id);
-    const snapshot = this.#conversation.ensureSnapshot(agent.id, agent.threadId);
-    if (!session || !snapshot.activeTurnId || snapshot.activeTurnId !== input.expectedTurnId) {
-      throw new Error("The active turn changed before this message could be steered.");
-    }
-    if (this.channels.store.assignmentForDelivery(input.deliveryId))
-      throw new Error("Use the channel task controls for this assignment.");
-    const context = this.#mailbox.getDelivery(input.deliveryId);
-    if (!context || context.delivery.recipientAgentId !== agent.id || context.delivery.status !== "queued") {
-      throw new Error("Only queued messages can be steered.");
-    }
-
-    const turnId = snapshot.activeTurnId;
-    // Steering carries a new message into the turn that is running, on the session the CLI opened,
-    // so it reaches the endpoint that turn started on. The agent record may already name another
-    // model, because a removal moves it, while the CLI keeps that session until it restarts, and
-    // the restart waits for the turn. So the turn's own model is what the exclusion is read for.
-    if (!this.#servesModel(this.#drain.modelForTurn(agent.id, turnId) ?? agent.model)) {
-      throw new Error(REMOVED_ENDPOINT_MESSAGE);
-    }
-    await this.#mailbox.markSteering(input.deliveryId, turnId);
-    this.#mailboxSync.emitQueue(agent.id);
-    try {
-      await client.request(
-        "turn/steer",
-        {
-          threadId: session.externalSessionId,
-          expectedTurnId: turnId,
-          clientUserMessageId: input.deliveryId,
-          input: deliveryInput(context, agentNamesById(this.#store.list())),
-        },
-        decodeRecordResponse,
-      );
-      await this.#mailbox.markRunning(input.deliveryId, turnId);
-      this.#mailboxSync.syncMailboxMessages(snapshot);
-      this.#mailboxSync.emitQueue(agent.id);
-      this.#conversation.emitConversation(snapshot, "queue.message-steered", { deliveryId: input.deliveryId });
-    } catch (error) {
-      await this.#mailbox.restoreQueued(input.deliveryId);
-      this.#mailboxSync.emitQueue(agent.id);
-      throw error;
-    }
+  steerQueuedMessage(input: SteerQueuedMessageInput): Promise<void> {
+    return this.#queue.steer(input);
   }
 
   async sendMessage(input: SendMessageInput): Promise<QueuedMessageReceipt> {
     const validateRecipient = this.#mailbox.prepareDelivery([input.agentId]);
-    if (this.#duplication.isPending(input.agentId)) throw new Error(`Unknown agent: ${input.agentId}`);
+    if (this.#duplication.isPending(input.agentId))
+      throw new Error(sourceText("error.agent.unknown", { id: input.agentId }));
     const agent = await this.#store.getOrCreate(input.agentId);
     await this.ensureProvider(providerForAgent(agent));
     validateRecipient();
@@ -1849,8 +1574,9 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       draftIds: input.attachmentDraftIds ?? [],
       replyToMessageId: input.replyToMessageId ?? null,
     });
-    const delivery = this.#mailbox.getDelivery(receipt.deliveries[0].id);
-    if (!delivery) throw new Error("Unable to create queued message.");
+    const [queued] = receipt.deliveries;
+    const delivery = queued ? this.#mailbox.getDelivery(queued.id) : null;
+    if (!delivery) throw new Error(sourceText("error.agent.queuedMessageCreateFailed"));
     const snapshot = this.#conversation.ensureSnapshot(agent.id, agent.threadId);
     this.#mailboxSync.syncMailboxMessages(snapshot);
     await this.#store.updatePreview(
@@ -1876,7 +1602,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     }
     const current = this.#conversation.ensureSnapshot(agent.id, agent.threadId);
     if (!current.messages.some((message) => message.id === input.messageId)) {
-      throw new Error("The message is no longer available.");
+      throw new Error(sourceText("error.agent.messageUnavailable"));
     }
     await this.#mailbox.setReaction(agent.id, input.messageId, { kind: "user" }, input.emoji);
     this.#mailboxSync.syncMailboxMessages(current);
@@ -1884,18 +1610,36 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
   }
 
   async interrupt(agentId: string, turnId: string, executionThreadId?: string): Promise<void> {
+    await this.#interruptTurn(agentId, turnId, executionThreadId);
+  }
+
+  /**
+   * `mayStop` is for `interrupt_agent`, whose checks run before the await below. In that time the
+   * turn can end, and the next one, which another sender can own, starts: ACP and Claude stop
+   * whatever turn runs, not `turnId`. Or the user can steer a message into the turn. So the turn
+   * must still run, and `mayStop` is asked again, just before the stop is sent. `false` means no
+   * stop was sent.
+   */
+  async #interruptTurn(
+    agentId: string,
+    turnId: string,
+    executionThreadId?: string,
+    mayStop?: () => boolean,
+  ): Promise<boolean> {
     const agent = await this.#store.getOrCreate(agentId);
-    const client = this.#providers.requireReadyClient(providerForAgent(agent));
+    const client = this.#providers.requireReadyClientForAgent(agent);
     const snapshot = [...this.#conversation.activeSnapshots()].find(
       ([id, snapshot]) => id === agentId && snapshot.activeTurnId === turnId,
     )?.[1];
+    if (mayStop && (!snapshot || !mayStop())) return false;
     const targetThreadId = executionThreadId ?? snapshot?.threadId;
     const session = targetThreadId
       ? this.#store.database.activeProviderSession(targetThreadId, agent.provider)
       : this.#store.activeProviderSession(agentId);
-    if (!session) return;
+    if (!session) return false;
     this.#images.interrupt(agentId, session.externalSessionId, turnId);
     await client.request("turn/interrupt", { threadId: session.externalSessionId, turnId }, decodeRecordResponse);
+    return true;
   }
 
   async interruptAll(): Promise<void> {
@@ -1932,352 +1676,12 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     await this.#attention.respondToApproval(input);
   }
 
+  async respondToBrowserSecret(input: RespondToBrowserSecretInput): Promise<void> {
+    await this.#attention.respondToBrowserSecret(input);
+  }
+
   async respondToBrowserTakeover(input: RespondToBrowserTakeoverInput): Promise<void> {
     await this.#attention.respondToBrowserTakeover(input);
-  }
-
-  async #handleServerRequest(client: AgentClient, request: AppServerRequest): Promise<void> {
-    try {
-      switch (request.method) {
-        case "item/commandExecution/requestApproval":
-          this.#attention.surfaceApproval(client, request, "command");
-          return;
-        case "item/fileChange/requestApproval":
-          this.#attention.surfaceApproval(client, request, "file-change");
-          return;
-        case "item/permissions/requestApproval":
-          this.#attention.surfaceApproval(client, request, "permissions");
-          return;
-        case "applyPatchApproval":
-        case "execCommandApproval":
-          this.#attention.surfaceLegacyApproval(client, request);
-          return;
-        case "item/tool/call": {
-          if (!isDynamicToolCall(request.params)) throw new Error("Invalid dynamic tool request.");
-          if (request.params.namespace === OPENBOT_BROWSER_NAMESPACE) {
-            const agentId = this.#conversation.agentForThread(request.params.threadId);
-            if (!agentId) throw new Error("The browsing OpenBot agent is unknown.");
-            if (request.params.tool === "request_takeover") {
-              client.respond(request.id, await this.#attention.surfaceBrowserTakeover(request));
-              return;
-            }
-            if (this.#attention.hasBrowserTakeoverForAgent(agentId)) {
-              client.respond(request.id, {
-                success: false,
-                contentItems: [{ type: "inputText", text: "Browser tools are unavailable during user takeover." }],
-              });
-              return;
-            }
-            const params = {
-              ...request.params,
-              threadId: this.#conversation.publicThreadId(agentId, request.params.threadId),
-              ownerAgentId: agentId,
-            };
-            client.respond(
-              request.id,
-              request.params.tool === "upload_files"
-                ? await this.#browserUploads.uploadFiles(agentId, params)
-                : await this.#browser.handleDynamicTool(params),
-            );
-            return;
-          }
-          if (request.params.namespace === "openbot") {
-            if (request.params.tool === "ask_user") {
-              this.#attention.surfaceDynamicPrompt(client, request);
-              return;
-            }
-            if (isHostedSiteMutationTool(request.params.tool)) {
-              await this.#attention.surfaceHostedSiteApproval(client, request, request.params, request.params.tool);
-              return;
-            }
-            client.respond(request.id, await this.#handleOpenBotTool(request.params));
-            return;
-          }
-          throw new Error(`Unsupported dynamic tool namespace: ${request.params.namespace}`);
-        }
-        case "item/tool/requestUserInput":
-          this.#attention.surfacePrompt(client, request);
-          return;
-        case "mcpServer/elicitation/request":
-          this.#attention.surfaceMcpElicitation(client, request);
-          return;
-        case "currentTime/read":
-          client.respond(request.id, { currentTimeAt: Math.floor(Date.now() / 1_000) });
-          return;
-        default:
-          client.respondError(request.id, {
-            code: -32601,
-            message: `OpenBot does not implement server request ${request.method}.`,
-          });
-      }
-    } catch (error) {
-      if (client.running) {
-        try {
-          client.respondError(request.id, { code: -32603, message: String(error) });
-        } catch {
-          // The process can exit between the running check and the write.
-        }
-      }
-      this.#emitError("server_request_failed", error);
-    }
-  }
-
-  async #handleOpenBotTool(params: DynamicToolCallParams): Promise<OpenBotToolResponse> {
-    const senderAgentId = this.#conversation.agentForThread(params.threadId);
-    if (!senderAgentId) throw new Error("The sending OpenBot agent is unknown.");
-
-    if (LOCAL_SKILL_TOOL_DEFINITIONS.some((tool) => tool.name === params.tool)) {
-      try {
-        if (!this.#localSkillTools) throw new Error("Local skill tools are unavailable.");
-        const result = openBotToolResult(
-          await runLocalSkillTool(this.#localSkillTools(), senderAgentId, params.tool, params.arguments, (event) => {
-            const executionThreadId = this.#conversation.publicThreadId(senderAgentId, params.threadId);
-            const snapshot = structuredClone(this.#conversation.ensureSnapshot(senderAgentId, executionThreadId));
-            snapshot.messages.push({
-              id: randomUUID(),
-              turnId: params.turnId,
-              author: "system",
-              source: "system",
-              status: "completed",
-              createdAt: new Date().toISOString(),
-              itemType: skillConversationEventItemType(event),
-              text: redactText(event.skillName),
-            });
-            const persisted = this.#store.database.persistConversation(snapshot, `skill.${event.action}`, event);
-            this.#conversation.setSnapshot(senderAgentId, persisted);
-            this.#conversation.publishConversation(persisted);
-          }),
-        );
-        return {
-          ...result,
-          contentItems: result.contentItems.map((item) => ({ ...item, text: redactText(item.text) })),
-        };
-      } catch (error) {
-        return {
-          success: false,
-          contentItems: [
-            { type: "inputText", text: redactText(error instanceof Error ? error.message : String(error)) },
-          ],
-        };
-      }
-    }
-
-    const executionThreadId = this.#conversation.publicThreadId(senderAgentId, params.threadId);
-    const channelId = this.channels.store.channelForThread(executionThreadId);
-    if (channelId && (params.tool.startsWith("channel_") || params.tool === "send_message")) {
-      if (params.tool === "send_message") throw new Error("Use channel_assign or channel_transfer for channel work.");
-      return openBotToolResult(
-        await this.channels.tool(channelId, senderAgentId, params.turnId, params.callId, params.tool, params.arguments),
-      );
-    }
-    if (params.tool.startsWith("channel_")) {
-      return {
-        success: false,
-        contentItems: [
-          {
-            type: "inputText",
-            text: "This chat has no active channel assignment. Channel tools work only inside a channel task. Use openbot.send_message for direct teammate work, or sidebar section tools (list_sections, create_section, assign_agent_section) to group agents.",
-          },
-        ],
-      };
-    }
-
-    if (params.tool === "list_sites") {
-      return openBotToolResult({ sites: await this.#hostedSites.listSites(), limit: 10 });
-    }
-
-    if (isHostedSiteMutationTool(params.tool)) throw new Error("Hosted site changes require user approval.");
-
-    if (params.tool === "attach_files_to_response") {
-      const args = params.arguments;
-      if (!isRecord(args) || !Array.isArray(args.paths)) throw new Error("paths must be an array of local files.");
-      if (
-        args.paths.length === 0 ||
-        args.paths.length > INPUT_LIMITS.attachments ||
-        !args.paths.every((path) => isString(path) && path.trim().length > 0 && path.length <= INPUT_LIMITS.path)
-      ) {
-        throw new Error(`paths must contain between 1 and ${INPUT_LIMITS.attachments} valid local file paths.`);
-      }
-
-      const messageId = responseAttachmentMessageId(params.threadId, params.turnId, params.callId);
-      return this.#attachments.attachFiles(senderAgentId, params, args.paths, messageId);
-    }
-
-    if (params.tool === "list_agents") {
-      const agents = this.listAgents().map((agent) => {
-        const queue = this.#mailbox.listQueue(agent.id);
-        return {
-          id: agent.id,
-          name: agent.name,
-          title: agent.title,
-          description: agent.description,
-          status: this.#conversation.workingSnapshot(agent.id)?.activeTurnId
-            ? "working"
-            : queue.deliveries.some((delivery) => delivery.status === "queued")
-              ? "queued"
-              : "ready",
-        };
-      });
-      return {
-        success: true,
-        contentItems: [{ type: "inputText", text: JSON.stringify({ agents }) }],
-      };
-    }
-
-    if (params.tool === "create_agent") {
-      const args = createAgentToolSchema.parse(params.arguments);
-      const hue = args.avatarHue ?? null;
-      const sectionId = this.#sidebarLayout?.getSnapshot().agentAssignments[senderAgentId] ?? null;
-      const create = (assign?: (agentId: string) => Promise<SidebarLayoutSnapshot>) =>
-        this.createAgent(
-          {
-            name: args.name,
-            description: args.description,
-            initialMessage: args.initialMessage,
-            avatarSeed: args.avatarSeed ?? randomUUID(),
-            avatarHue: hue,
-          },
-          async (agent) => {
-            if (assign) await assign(agent.id);
-            return args.title === undefined ? agent : this.#store.updateAgent({ agentId: agent.id, title: args.title });
-          },
-        );
-      const created =
-        this.#sidebarLayout && sectionId !== null
-          ? await this.#sidebarLayout.withProfileAssignment(sectionId, create)
-          : await create();
-      return { success: true, contentItems: [{ type: "inputText", text: JSON.stringify(created) }] };
-    }
-
-    if (params.tool === "update_profile") {
-      const args = updateProfileToolSchema.parse(params.arguments);
-      const { agentId, avatarHue, avatarPath, ...fields } = args;
-      if (avatarPath !== undefined && (args.avatarSeed !== undefined || avatarHue !== undefined)) {
-        throw new Error("Use avatarPath or generated avatar settings, not both.");
-      }
-      if (
-        Object.values(fields).every((value) => value === undefined) &&
-        avatarHue === undefined &&
-        avatarPath === undefined
-      ) {
-        throw new Error("At least one profile field is required.");
-      }
-      const sender = this.listAgents().find((agent) => agent.id === senderAgentId);
-      if (!sender) throw new Error("The calling agent no longer exists.");
-      const image = avatarPath === undefined ? undefined : await loadAvatarFile(avatarPath, sender.workspacePath);
-      const input: UpdateAgentInput = { agentId, ...fields, ...(avatarHue === undefined ? {} : { avatarHue }) };
-      let updated = await this.updateAgent(input);
-      if (image !== undefined) {
-        updated = await this.setAvatar(agentId, image);
-      } else if (args.avatarSeed !== undefined || args.avatarHue !== undefined) {
-        updated = await this.setAvatar(agentId, null);
-      }
-      return {
-        success: true,
-        contentItems: [
-          {
-            type: "inputText",
-            text: JSON.stringify({
-              id: updated.id,
-              name: updated.name,
-              title: updated.title,
-              description: updated.description,
-              avatarSeed: updated.avatarSeed,
-              avatarHue: updated.avatarHue,
-              avatarUrl: updated.avatarUrl,
-            }),
-          },
-        ],
-      };
-    }
-
-    const sidebarResult = await handleSidebarTool(
-      params.tool,
-      params.arguments,
-      this.#sidebarLayout,
-      new Set(this.listAgents().map((agent) => agent.id)),
-    );
-    if (sidebarResult) return sidebarResult;
-
-    const routineResult = await this.#routines.handleTool(params, senderAgentId);
-    if (routineResult) return routineResult;
-
-    const memoryResult = this.#memories.handleTool(params, senderAgentId);
-    if (memoryResult) return memoryResult;
-
-    const tableResult = await handleDataTool(params.tool, params.arguments, senderAgentId, this.#tables);
-    if (tableResult) return tableResult;
-
-    if (params.tool === "react_to_user_message") {
-      const args = params.arguments;
-      if (!isRecord(args) || !isMessageReaction(args.emoji)) {
-        throw new Error("emoji must be exactly one complete Unicode emoji.");
-      }
-      const delivery = this.#mailbox
-        .findDeliveriesByTurn(senderAgentId, params.turnId)
-        .find((candidate) => candidate.delivery.sender.kind === "user");
-      if (!delivery) throw new Error("Only the current user message can receive an agent reaction.");
-      await this.#mailbox.setReaction(
-        senderAgentId,
-        delivery.delivery.id,
-        { kind: "agent", agentId: senderAgentId },
-        args.emoji,
-      );
-      const snapshot = this.#conversation.ensureSnapshot(senderAgentId, params.threadId);
-      this.#mailboxSync.syncMailboxMessages(snapshot);
-      this.#conversation.emitConversation(snapshot);
-      return openBotToolResult({ status: "reacted", messageId: delivery.delivery.id, emoji: args.emoji });
-    }
-
-    if (params.tool !== "send_message" || !isRecord(params.arguments)) {
-      throw new Error(`Unsupported OpenBot tool: ${params.tool}`);
-    }
-    const recipientValues = params.arguments.recipientAgentIds;
-    if (!Array.isArray(recipientValues) || !recipientValues.every((item) => isString(item))) {
-      throw new Error("recipientAgentIds must be an array of agent ids.");
-    }
-    if (recipientValues.length !== new Set(recipientValues).size) {
-      throw new Error("Duplicate recipients are not allowed.");
-    }
-    if (recipientValues.includes(senderAgentId)) throw new Error("An agent cannot message itself.");
-    const knownIds = new Set(this.listAgents().map((agent) => agent.id));
-    for (const recipient of recipientValues) {
-      if (!knownIds.has(recipient)) throw new Error(`Unknown OpenBot agent: ${recipient}`);
-    }
-    const paths = params.arguments.paths ?? [];
-    if (!Array.isArray(paths) || !paths.every((item) => isString(item))) {
-      throw new Error("paths must be an array of local file paths.");
-    }
-    const replyToMessageId = params.arguments.replyToMessageId;
-    if (replyToMessageId !== undefined && replyToMessageId !== null && !isString(replyToMessageId)) {
-      throw new Error("replyToMessageId must be a message id.");
-    }
-    if (!isString(params.arguments.text)) throw new Error("text is required.");
-    const expectsReply = params.arguments.expectsReply;
-    if (expectsReply !== undefined && typeof expectsReply !== "boolean") {
-      throw new Error("expectsReply must be a boolean.");
-    }
-
-    const receipt = await this.#mailbox.enqueue({
-      sender: { kind: "agent", agentId: senderAgentId },
-      recipientAgentIds: recipientValues,
-      text: params.arguments.text,
-      sourcePaths: paths,
-      replyToMessageId: replyToMessageId ?? null,
-      expectsReply,
-      idempotencyKey: `${params.threadId}:${params.turnId}:${params.callId}`,
-    });
-    for (const recipient of recipientValues) {
-      this.#mailboxSync.emitQueue(recipient);
-      this.#drain.scheduleDrain(recipient);
-    }
-    const snapshot = this.#conversation.ensureSnapshot(senderAgentId, params.threadId);
-    this.#mailboxSync.syncMailboxMessages(snapshot);
-    this.#conversation.emitConversation(snapshot);
-    return {
-      success: true,
-      contentItems: [{ type: "inputText", text: JSON.stringify(receipt) }],
-    };
   }
 
   #emitError(code: string, error: unknown, agentId?: string): void {
@@ -2288,21 +1692,8 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       // Redacted, because every error from a provider CLI arrives here on its way to the renderer
       // and the log, and a CLI quotes what it was given: a failure against a custom endpoint can
       // carry that endpoint's API key or a header value.
-      message: this.#redactMcp(error instanceof Error ? error.message : String(error)),
+      message: this.#mcp.redact(error instanceof Error ? error.message : String(error)),
     });
-  }
-
-  /**
-   * One piece of provider text with the MCP credentials taken out of it.
-   *
-   * The stored configurations and the hand-off log together, so a credential a running process
-   * still holds stays covered after the user edits or removes the server that named it. Every
-   * reader of provider text that leaves this class - a renderer error event, and the failure reason
-   * the queue writes to the database - goes through here. `redactMcpValues` ends with `redactText`,
-   * which covers the patterns shared across the app.
-   */
-  #redactMcp(text: string): string {
-    return redactMcpValues(text, [...mcpSecretValues(this.#mcpServers.list()), ...this.#mcpHandoff.values()]);
   }
 
   #emitRuntimeSnapshot(): void {
@@ -2310,6 +1701,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
   }
 
   #emit(event: AgentEvent): void {
+    recordAgentRestartActivity(event);
     if (this.channels?.event(event)) return;
     this.emit("event", event);
   }

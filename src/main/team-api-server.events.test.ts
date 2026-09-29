@@ -39,14 +39,16 @@ import {
 afterEach(stopTeamApiFixtures);
 
 describe("TeamApiServer events", () => {
-  it("filters OpenCode snapshots and events for old peers without changing the host", async () => {
+  it("filters OpenCode for old peers and Gemini for every peer without changing the host", async () => {
     const source = opencodeFixture[0];
     if (!isAgentSummary(source)) throw new Error("Invalid OpenCode fixture.");
+    // Gemini stays on the host: no protocol, v4 included, gets its agent.
+    const gemini: AgentSummary = { ...source, id: "agent-gemini", provider: "antigravity", model: "gemini-3-pro" };
     const events = new EventEmitter();
-    const snapshot = { ...createAgents().getRuntimeSnapshot(), agents: [source] };
+    const snapshot = { ...createAgents().getRuntimeSnapshot(), agents: [source, gemini] };
     const { store, start } = await createTeamApiFixture("provider-events", { configure: true });
     const { port } = await start({
-      agents: createAgents({ listAgents: () => [source], getRuntimeSnapshot: () => snapshot }, events),
+      agents: createAgents({ listAgents: () => [source, gemini], getRuntimeSnapshot: () => snapshot }, events),
     });
     const login = await store.login("owner", "correct horse battery");
     for (const supportsOpencode of [false, true]) {
@@ -72,13 +74,57 @@ describe("TeamApiServer events", () => {
       const changed = new Promise<unknown>((resolve) =>
         socket.addEventListener("message", (event) => resolve(JSON.parse(String(event.data))), { once: true }),
       );
-      events.emit("event", { type: "agents-changed", agents: [source] });
+      events.emit("event", { type: "agents-changed", agents: [source, gemini] });
       await expect(changed).resolves.toMatchObject({ type: "bots-changed", bots: supportsOpencode ? [source] : [] });
       const closed = new Promise<void>((resolve) => socket.addEventListener("close", () => resolve(), { once: true }));
       socket.close();
       await closed;
     }
-    expect(snapshot.agents).toEqual([source]);
+    expect(snapshot.agents).toEqual([source, gemini]);
+  });
+
+  it("sends a skills change only to clients that negotiated skills-events-v1", async () => {
+    const events = new EventEmitter();
+    const { store, start } = await createTeamApiFixture("skills-events", { configure: true });
+    const { port } = await start({ agents: createAgents({}, events) });
+    const login = await store.login("owner", "correct horse battery");
+    const received = new Map<boolean, unknown[]>();
+    const sockets: WebSocket[] = [];
+    for (const supportsSkillsEvents of [true, false]) {
+      const socket = new WebSocket(`ws://127.0.0.1:${port}/v1/events`, [
+        "openbot-team-v1",
+        `openbot-token.${login.sessionToken}`,
+      ]);
+      const presence = nextJsonEvent(socket);
+      await new Promise<void>((resolve) => socket.addEventListener("open", () => resolve(), { once: true }));
+      await presence;
+      socket.send(
+        JSON.stringify({
+          type: "agent-event-scope",
+          includeConversations: true,
+          capabilities: supportsSkillsEvents ? ["skills-events-v1"] : [],
+        }),
+      );
+      const messages: unknown[] = [];
+      received.set(supportsSkillsEvents, messages);
+      // Presence follows the members that join, so the second socket reaches the first.
+      socket.addEventListener("message", (event) => {
+        const text = String(event.data);
+        if (!text.includes('"team-presence"')) messages.push(JSON.parse(text));
+      });
+      sockets.push(socket);
+    }
+    // The scope message has no reply, so a known event on both sockets proves both scopes applied.
+    events.emit("event", { type: "routines-changed", agentId: "agent-1" });
+    await vi.waitFor(() => expect([...received.values()].every((messages) => messages.length === 1)).toBe(true));
+    events.emit("event", { type: "skills-changed", agentId: "agent-1" });
+    events.emit("event", { type: "routines-changed", agentId: "agent-1" });
+    await vi.waitFor(() => expect(received.get(false)).toHaveLength(2));
+    await vi.waitFor(() => expect(received.get(true)).toHaveLength(3));
+    expect(received.get(true)?.[1]).toEqual({ type: "skills-changed", agentId: "agent-1" });
+    // A released client never sees the event: its protocol has no word for it.
+    expect(received.get(false)?.some((message) => JSON.stringify(message).includes("skills-changed"))).toBe(false);
+    for (const socket of sockets) socket.close();
   });
 
   it("shares sidebar layout mutations with owner, admin, and member clients", async () => {

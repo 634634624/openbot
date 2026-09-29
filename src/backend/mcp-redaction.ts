@@ -1,5 +1,5 @@
 import type { McpServerConfig } from "@openbot/contracts/ipc";
-import { redactText } from "@openbot/logging";
+import { isSecretName, redactText, registerSecretValue } from "@openbot/logging";
 import { mcpEnvironment } from "./mcp-provider-shapes";
 
 const MASK = "•••";
@@ -34,6 +34,23 @@ export function redactMcpValues(text: string, values: Iterable<string>): string 
 }
 
 /**
+ * Adds this configuration's labelled secrets to the process-wide mask, so a log line that has no
+ * configuration at hand still hides them.
+ *
+ * Only values under a secret name go there: `Content-Type: application/json` or `NODE_ENV=production`
+ * would erase ordinary text from every log. The unlabelled rest stays masked by
+ * `redactMcpSecrets` on the paths that know the configuration.
+ */
+export function registerMcpSecretValues(config: McpServerConfig): void {
+  for (const [name, value] of Object.entries(mcpEnvironment(config))) {
+    if (isSecretName(name)) registerSecretValue(value);
+  }
+  for (const pair of config.headers) {
+    if (isSecretName(pair.key)) registerSecretValue(pair.value);
+  }
+}
+
+/**
  * Every secret value these configurations carry, without duplicates.
  *
  * The environment is read from `mcpEnvironment`, not from `config.env`, because that is what the
@@ -45,7 +62,26 @@ export function mcpSecretValues(configs: readonly McpServerConfig[]): string[] {
   for (const config of configs) {
     for (const value of Object.values(mcpEnvironment(config))) values.add(value);
     for (const pair of config.headers) values.add(pair.value);
+    for (const value of urlQueryValues(config.url)) values.add(value);
   }
   // A short value is left alone - masking a two-character value would hide ordinary words.
   return [...values].filter((value) => value.length >= 4);
+}
+
+/**
+ * A link from a service such as Composio names the user or the session in its query, and anyone
+ * with the link can use it. The whole query is masked as a transport quotes it. Each value alone is
+ * not: a value such as `default` would then be masked in every error. The path is left alone so the
+ * error still says which server failed.
+ */
+function urlQueryValues(url: string): string[] {
+  if (!url) return [];
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return [];
+  }
+  if (!parsed.search) return [];
+  return [parsed.search.slice(1)];
 }

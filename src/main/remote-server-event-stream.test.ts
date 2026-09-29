@@ -12,6 +12,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createRemoteManager,
   deferredRoute,
+  fakeWebRtcTransport,
   stopRemoteFixtures,
   storedHttpsServer,
   stubEventSockets,
@@ -179,6 +180,58 @@ describe("remote event connections", () => {
     await vi.advanceTimersByTimeAsync(60_000);
 
     expect(sockets).toHaveLength(1);
+  });
+
+  it("retries a WebRTC host that Signal reports offline each 5 minutes with focus, and each 15 without it", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const hostId = "00000000-0000-4000-8000-0000000000fa";
+    const transport = fakeWebRtcTransport([
+      {
+        hostId,
+        name: "Host",
+        logoKey: null,
+        devicePublicKey: null,
+        authEpoch: 1,
+        membershipId: "member-1",
+        role: "member",
+      },
+    ]);
+    const connect = vi.spyOn(transport, "connect").mockImplementation(async (failedHostId) => {
+      transport.emit("error", failedHostId, "host_unavailable", "The host is offline.");
+      throw new Error("The host is offline.");
+    });
+    const fixture = await createRemoteManager({
+      servers: [storedHttpsServer(hostId, { transport: "webrtc-v2", apiUrl: `webrtc://${hostId}` })],
+      managerOptions: { webrtcTransport: transport },
+    });
+
+    fixture.manager.startEventConnections();
+    await vi.waitFor(() => expect(connect).toHaveBeenCalledOnce());
+    // Each retry costs a Worker request and a Signal ticket, and a host that went away for good stays
+    // listed, so an open window does not retry each minute.
+    await vi.advanceTimersByTimeAsync(4 * 60_000);
+    expect(connect).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(connect).toHaveBeenCalledTimes(2);
+
+    // Without focus, the retry waits longer. The retry set with focus still runs first.
+    fixture.manager.setAppFocused(false);
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    const unfocusedCalls = connect.mock.calls.length;
+    expect(unfocusedCalls).toBe(3);
+    await vi.advanceTimersByTimeAsync(14 * 60_000);
+    expect(connect).toHaveBeenCalledTimes(unfocusedCalls);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(connect).toHaveBeenCalledTimes(unfocusedCalls + 1);
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    fixture.manager.setAppFocused(true);
+    expect(connect).toHaveBeenCalledTimes(unfocusedCalls + 2);
+    // A focus right after Signal answered does not send another request.
+    fixture.manager.setAppFocused(false);
+    fixture.manager.setAppFocused(true);
+    expect(connect).toHaveBeenCalledTimes(unfocusedCalls + 2);
   });
 
   it("buffers events while fallback state is loaded", async () => {

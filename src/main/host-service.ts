@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createInviteUrl } from "@openbot/contracts/invite-links";
 import type {
   AvatarImageInput,
@@ -26,6 +26,7 @@ import type {
   MarkDirectReadInput,
   RemoteDesktopDisplay,
   RemoteDesktopIceServer,
+  RemoteDesktopSetupAction,
   SendDirectMessageInput,
   SetTeamTypingInput,
   TeamInviteSummary,
@@ -36,10 +37,13 @@ import type {
   UpdateTeamMemberInput,
 } from "@openbot/contracts/ipc";
 import { SIGNED_OUT_CHANNEL_MEMBER_ID } from "@openbot/contracts/ipc";
+import type { HostRestartState } from "@openbot/contracts/team-protocol/host-update-v1";
+import { sourceText } from "@openbot/i18n/source";
 import { createOpenBotLogger, toLogValue } from "@openbot/logging";
 import type { AgentService } from "../backend/agent-service";
 import type { ChannelService } from "../backend/channel-service";
 import type { TeamChatStore } from "../backend/team-chat-store";
+import { BrowserViewGateway } from "./browser-view-gateway";
 import type { VerifiedRemoteSessionTicket } from "./central-auth-manager";
 import type { RemoteDesktopRuntimePaths } from "./remote-desktop-runtime-artifact";
 import { appendRemoteDiagnosticLog } from "./remote-diagnostics";
@@ -71,6 +75,9 @@ type ForwardedApiOptions = ConstructorParameters<typeof TeamApiServer>[0];
 interface HostServiceOptions {
   channels?: ChannelService;
   mcpServers?: ForwardedApiOptions["mcpServers"];
+  mcpToolRuntimePreparation?: ForwardedApiOptions["mcpToolRuntimePreparation"];
+  storage?: ForwardedApiOptions["storage"];
+  admin?: ForwardedApiOptions["admin"];
   appVersion: string;
   store: TeamStore;
   agents: ForwardedApiOptions["agents"] & Pick<AgentService, "adoptConversationReads">;
@@ -79,7 +86,11 @@ interface HostServiceOptions {
   mailbox: ForwardedApiOptions["mailbox"];
   browser: ForwardedApiOptions["browser"];
   chat?: TeamChatStore;
-  allowLocalDevelopmentInvites?: boolean;
+  /**
+   * A local development host keeps its members and invitations in its own team file and never reads
+   * or writes them in the account directory.
+   */
+  localDevelopmentHost?: boolean;
   logDirectory?: string;
   removeLegacyRemoteDesktopCredential?: () => Promise<void>;
   getSignedInUser: () => CentralAuthUser;
@@ -90,6 +101,7 @@ interface HostServiceOptions {
     inviteUrl: string;
     role: "admin" | "member";
   }) => Promise<void>;
+  openRemoteDesktopSetup?: (action: RemoteDesktopSetupAction, appPath: string) => Promise<void>;
   remoteDesktopRuntimePaths?: RemoteDesktopRuntimePaths | null;
   remoteDesktopStateDirectory?: string;
   /** Only a test supplies this. The gateway builds the real Sunshine and Moonlight runtime itself. */
@@ -112,8 +124,8 @@ interface HostServiceOptions {
   remoteControlPlaneUrl?: string;
   createRemoteInvite?: (
     hostId: string,
-    input: { role: "admin" | "member"; email?: string },
-  ) => Promise<{ inviteId: string; token: string; expiresAt: number }>;
+    input: { role: "admin" | "member"; email?: string; permanent?: boolean },
+  ) => Promise<{ inviteId: string; token: string; expiresAt: number; permanent: boolean; useCount: number }>;
   listRemoteInvites?: (hostId: string) => Promise<
     Array<{
       inviteId: string;
@@ -122,6 +134,8 @@ interface HostServiceOptions {
       expiresAt: number;
       usedAt: number | null;
       revokedAt: number | null;
+      permanent: boolean;
+      useCount: number;
     }>
   >;
   revokeRemoteInvite?: (inviteId: string) => Promise<void>;
@@ -141,10 +155,11 @@ interface HostServiceOptions {
 }
 
 export class HostService extends EventEmitter<HostEvents> {
-  readonly #options: Required<Pick<HostServiceOptions, "allowLocalDevelopmentInvites">> &
-    Omit<HostServiceOptions, "allowLocalDevelopmentInvites">;
+  readonly #options: Required<Pick<HostServiceOptions, "localDevelopmentHost">> &
+    Omit<HostServiceOptions, "localDevelopmentHost">;
   readonly #api: TeamApiServer;
   readonly #remoteScreen: RemoteScreenGateway;
+  readonly #browserView: BrowserViewGateway;
   readonly #webrtcGateway: TeamWebRtcHostGateway | null;
   #status: HostStatus;
   #runtimeGeneration = 0;
@@ -158,7 +173,7 @@ export class HostService extends EventEmitter<HostEvents> {
     super();
     this.#options = {
       ...options,
-      allowLocalDevelopmentInvites: options.allowLocalDevelopmentInvites ?? false,
+      localDevelopmentHost: options.localDevelopmentHost ?? false,
     };
     this.#status = initialHostStatus(options.store.getIdentity(), options.unattended ?? false);
     const logDirectory = options.logDirectory;
@@ -174,7 +189,7 @@ export class HostService extends EventEmitter<HostEvents> {
       getIceServers:
         options.getRemoteDesktopIceServers ??
         (async () => {
-          throw new Error("Remote Signal has not supplied ICE servers.");
+          throw new Error(sourceText("error.host.iceServersMissing"));
         }),
       ...(options.createRemoteDesktopRuntime ? { createRuntime: options.createRemoteDesktopRuntime } : {}),
       ...(logDirectory
@@ -203,16 +218,26 @@ export class HostService extends EventEmitter<HostEvents> {
         }
       },
     });
+    this.#browserView = new BrowserViewGateway({
+      browser: options.browser,
+      authenticate: (token) => options.store.authenticate(token),
+    });
     this.#api = new TeamApiServer({
       appVersion: options.appVersion,
       store: options.store,
       agents: options.agents,
       channels: options.channels,
       mcpServers: options.mcpServers,
+      mcpToolRuntimePreparation: options.mcpToolRuntimePreparation,
+      storage: options.storage,
+      // The identity route changes this host's name and logo through `updateIdentity`, so a change
+      // from a joined admin runs every step a local one does.
+      admin: { ...options.admin, identity: { updateIdentity: (input) => this.updateIdentity(input) } },
       skills: options.skills,
       sidebarLayout: options.sidebarLayout,
       mailbox: options.mailbox,
       browser: options.browser,
+      browserView: this.#browserView,
       remoteScreen: this.#remoteScreen,
       redeemCentralTicket: options.redeemCentralTicket,
       chat: options.chat,
@@ -229,7 +254,7 @@ export class HostService extends EventEmitter<HostEvents> {
           appVersion: options.appVersion,
           transferDirectory: join(options.logDirectory ?? ".openbot-remote", "transfers"),
           renewSignal: async (hostId) => {
-            if (!options.issueRemoteHostTicket) throw new Error("The WebRTC host service is not configured.");
+            if (!options.issueRemoteHostTicket) throw new Error(sourceText("error.host.webRtcNotConfigured"));
             return options.issueRemoteHostTicket(hostId);
           },
           onSignalRecoveryFailure: (error) => {
@@ -239,7 +264,10 @@ export class HostService extends EventEmitter<HostEvents> {
               message: error.message,
             });
           },
-          closeSession: (sessionId) => this.#remoteScreen.revokeTeamSession(sessionId),
+          closeSession: async (sessionId) => {
+            await this.#remoteScreen.revokeTeamSession(sessionId);
+            await this.#browserView.revokeTeamSession(sessionId);
+          },
           verifyClientTicket: options.verifyRemoteSessionTicket,
         })
       : null;
@@ -263,9 +291,49 @@ export class HostService extends EventEmitter<HostEvents> {
    * The host owner is the only one who can give that grant, and until they can check it here the
    * warning they are shown outlives the repair that answered it.
    */
+  checkRemoteDesktopSetup() {
+    return this.#remoteScreen.checkSetup();
+  }
+
+  createLocalRemoteDesktopTestSession() {
+    return this.#remoteScreen.createLocalTestSession();
+  }
+
+  testLocalRemoteDesktop(sessionId: string, action: "start" | "status" | "stop") {
+    return this.#remoteScreen.testLocalSession(sessionId, action);
+  }
+
+  closeLocalRemoteDesktopTestSession(sessionId: string) {
+    return this.#remoteScreen.closeLocalTestSession(sessionId);
+  }
+
+  async openRemoteDesktopSetup(action: RemoteDesktopSetupAction): Promise<void> {
+    if (process.platform !== "darwin") throw new Error(sourceText("status.remote.setupMacOnly"));
+    const executable = this.#options.remoteDesktopRuntimePaths?.sunshine;
+    if (!executable) throw new Error(sourceText("error.host.runtimeNotInstalled"));
+    const appPath = dirname(dirname(dirname(executable)));
+    if (!this.#options.openRemoteDesktopSetup) throw new Error(sourceText("error.host.setupUnavailable"));
+    await this.#options.openRemoteDesktopSetup(action, appPath);
+  }
+
   async recheckScreenRecording(): Promise<HostStatus> {
     await this.#remoteScreen.recheckScreenRecording();
     return this.getStatus();
+  }
+
+  /**
+   * Why the Team host half of this instance must not restart right now. A session still
+   * connecting never blocks: only a connected stream, a live browser view, or a moving file
+   * transfer holds the restart. Agent work is reported by AgentService, not here.
+   */
+  describeRestartBlockers(): string[] {
+    const reasons: string[] = [];
+    if (this.#remoteScreen.list().some((session) => session.phase === "connected")) {
+      reasons.push("remote-desktop");
+    }
+    if (this.#browserView.activeViewCount() > 0) reasons.push("browser-view");
+    if (this.#webrtcGateway?.hasActiveTransfers()) reasons.push("file-transfer");
+    return reasons;
   }
 
   /**
@@ -381,7 +449,7 @@ export class HostService extends EventEmitter<HostEvents> {
       this.#options.store.unbindActiveHost();
       this.#status = initialHostStatus(null, this.#options.unattended ?? false);
       this.emit("changed", this.getStatus());
-      throw new Error("The signed-in account changed while this server was being created.");
+      throw new Error(sourceText("error.team.accountChangedDuringCreate"));
     }
     // The store checked the account before it resolved; the switch can still land between
     // there and here, and publishing then would show A's server to B.
@@ -412,7 +480,7 @@ export class HostService extends EventEmitter<HostEvents> {
       if (!this.#isActiveHost(identity.serverId)) return this.getStatus();
       this.#setStatus({
         apiUrl: null,
-        message: "Registered this OpenBot for WebRTC access.",
+        message: sourceText("status.host.registered"),
       });
     } catch (error) {
       // A failure that arrives after another account signed in belongs to the host that is
@@ -420,7 +488,7 @@ export class HostService extends EventEmitter<HostEvents> {
       if (this.#isActiveHost(identity.serverId)) {
         this.#setStatus({
           phase: "error",
-          message: error instanceof Error ? error.message : "Could not reserve the public address.",
+          message: error instanceof Error ? error.message : sourceText("error.host.reserveAddressFailed"),
         });
       }
     }
@@ -436,7 +504,7 @@ export class HostService extends EventEmitter<HostEvents> {
     this.#setStatus({
       serverName: identity.serverName,
       logoUrl: identity.logoVersion ? serverLogoUrl(identity.logoVersion) : null,
-      message: "Server identity updated.",
+      message: sourceText("status.host.identityUpdated"),
     });
     this.#api.refreshIdentity();
     const ownerMembershipId = this.#requiredOwnerMemberId();
@@ -468,7 +536,7 @@ export class HostService extends EventEmitter<HostEvents> {
 
   #assertStillActiveHost(serverId: string): void {
     if (!this.#isActiveHost(serverId)) {
-      throw new Error("The signed-in account changed while this server was being updated.");
+      throw new Error(sourceText("error.host.accountChangedDuringUpdate"));
     }
   }
 
@@ -486,7 +554,7 @@ export class HostService extends EventEmitter<HostEvents> {
   }
 
   async #startRuntimeOperation(): Promise<HostStatus> {
-    if (!this.#options.store.configured) throw new Error("Name this OpenBot before publishing it.");
+    if (!this.#options.store.configured) throw new Error(sourceText("error.host.nameBeforePublish"));
     if ((this.#status.phase === "online" && this.#webRtcOnline) || this.#status.phase === "starting") {
       return this.getStatus();
     }
@@ -495,15 +563,15 @@ export class HostService extends EventEmitter<HostEvents> {
     const signedInUser = this.#options.getSignedInUser();
     this.#options.store.assertOwnerAccount(signedInUser);
     if (await this.#options.store.syncAccount(signedInUser)) this.#api.refreshPresence();
-    this.#setStatus({ phase: "starting", message: "Starting the WebRTC host…" });
+    this.#setStatus({ phase: "starting", message: sourceText("status.host.starting") });
 
     try {
       const apiPort = await this.#api.start();
       if (await this.#cancelSupersededStart(generation)) return this.getStatus();
       const identity = this.#options.store.getIdentity();
-      if (!identity) throw new Error("Name this OpenBot before publishing it.");
+      if (!identity) throw new Error(sourceText("error.host.nameBeforePublish"));
       if (!this.#webrtcGateway || !this.#options.registerRemoteHost || !this.#options.issueRemoteHostTicket) {
-        throw new Error("The WebRTC host service is not configured.");
+        throw new Error(sourceText("error.host.webRtcNotConfigured"));
       }
       await this.#options.registerRemoteHost({
         hostId: identity.serverId,
@@ -512,7 +580,7 @@ export class HostService extends EventEmitter<HostEvents> {
         devicePublicKey: identity.publicKey,
       });
       if (await this.#cancelSupersededStart(generation)) return this.getStatus();
-      if (this.#options.listRemoteMembers) {
+      if (this.#usesAccountDirectory() && this.#options.listRemoteMembers) {
         await this.#options.store.syncRemoteDirectory(
           identity.serverId,
           await this.#options.listRemoteMembers(identity.serverId),
@@ -532,7 +600,7 @@ export class HostService extends EventEmitter<HostEvents> {
       this.#setStatus({
         apiUrl: bootstrap.signalUrl,
         apiOnline: true,
-        message: "This OpenBot is ready for WebRTC connections.",
+        message: sourceText("status.host.ready"),
       });
       if (await this.#cancelSupersededStart(generation)) return this.getStatus();
       await this.#options.store.setEnabledOnLaunch(identity.serverId, true);
@@ -548,7 +616,7 @@ export class HostService extends EventEmitter<HostEvents> {
         phase: "error",
         apiOnline: false,
         apiUrl: null,
-        message: error instanceof Error ? error.message : "This OpenBot could not be published.",
+        message: error instanceof Error ? error.message : sourceText("error.host.publishFailed"),
       });
     }
     return this.getStatus();
@@ -591,13 +659,11 @@ export class HostService extends EventEmitter<HostEvents> {
     try {
       authenticated = await this.#options.store.login(username, password);
     } catch {
-      // Publishing this host reconciles its members against the control plane, and the technical
-      // client is never in that list -- it is password-only, owned by no account -- so the
-      // reconciliation disables it. `login` skips a disabled member and `acceptInvite` refuses a
-      // username that already exists, so once the developer had published the host, every later
-      // `bun run dev:test-client` died at startup with "This username is already in use." and only
-      // editing the profile by hand brought it back. Replacing the member is what makes publishing
-      // a state the dev stack can leave: it is a fixture, and nothing outside this file reads it.
+      // Before a development host kept its members in its own team file, publishing reconciled them
+      // against the control plane, and that disabled the technical client -- it is password-only,
+      // owned by no account. `login` skips a disabled member and `acceptInvite` refuses a username
+      // that already exists, so a profile published then fails here. Replacing the member lets such
+      // a profile recover: it is a fixture, and nothing outside this file reads it.
       const existing = this.#options.store.listMembers().find((member) => member.username === username);
       if (existing && existing.role !== "owner") await this.#options.store.removeMember(existing.id);
       const invite = await this.#options.store.createInvite("member");
@@ -620,7 +686,7 @@ export class HostService extends EventEmitter<HostEvents> {
     const serverId = this.#options.store.getIdentity()?.serverId;
     this.#runtimeGeneration += 1;
     if (persistPreference) this.#options.store.assertOwnerAccount(this.#options.getSignedInUser());
-    this.#setStatus({ phase: "stopping", message: "Making this OpenBot private…" });
+    this.#setStatus({ phase: "stopping", message: sourceText("status.host.stopping") });
     await this.#stopRuntime();
     await this.#startOperation;
     await this.#stopRuntime();
@@ -634,14 +700,14 @@ export class HostService extends EventEmitter<HostEvents> {
       enabledOnLaunch: persistPreference ? false : this.#status.enabledOnLaunch,
       apiUrl: null,
       apiOnline: false,
-      message: "This OpenBot is private.",
+      message: sourceText("status.host.private"),
     });
     return this.getStatus();
   }
 
   listMembers(): TeamMemberSummary[] | Promise<TeamMemberSummary[]> {
     const hostId = this.#options.store.getIdentity()?.serverId;
-    if (hostId && this.#options.listRemoteMembers) {
+    if (hostId && this.#usesAccountDirectory() && this.#options.listRemoteMembers) {
       return this.#options.listRemoteMembers(hostId).then(async (members) => {
         // An account switch while the directory loaded makes this list the previous
         // account's. Answer with the now-active host's own members rather than failing a
@@ -668,6 +734,10 @@ export class HostService extends EventEmitter<HostEvents> {
 
   getPresence(): TeamPresenceSnapshot {
     return this.#api.getPresence();
+  }
+
+  announceRestart(state: HostRestartState, version: string | null): void {
+    this.#api.announceHostRestart(state, version);
   }
 
   setTyping(input: SetTeamTypingInput): void {
@@ -739,7 +809,7 @@ export class HostService extends EventEmitter<HostEvents> {
 
   listInvites(): TeamInviteSummary[] | Promise<TeamInviteSummary[]> {
     const hostId = this.#options.store.getIdentity()?.serverId;
-    if (hostId && this.#options.listRemoteInvites) {
+    if (hostId && this.#remoteInviteApiUrl() && this.#options.listRemoteInvites) {
       return this.#options.listRemoteInvites(hostId).then((invites) => {
         // As in `listMembers`: a switch while the directory loaded makes these the previous
         // account's invitations, their email addresses included. Answer with the now-active
@@ -753,6 +823,8 @@ export class HostService extends EventEmitter<HostEvents> {
             email: invite.email,
             expiresAt: new Date(invite.expiresAt).toISOString(),
             usedAt: invite.usedAt === null ? null : new Date(invite.usedAt).toISOString(),
+            permanent: invite.permanent,
+            useCount: invite.useCount,
           }));
       });
     }
@@ -767,6 +839,7 @@ export class HostService extends EventEmitter<HostEvents> {
     const hostId = this.#options.store.getIdentity()?.serverId;
     if (
       hostId &&
+      this.#usesAccountDirectory() &&
       this.#options.updateRemoteMember &&
       this.#options.removeRemoteMember &&
       this.#options.listRemoteMembers
@@ -774,7 +847,7 @@ export class HostService extends EventEmitter<HostEvents> {
       const current = (await this.#options.listRemoteMembers(hostId)).find(
         (member) => member.membershipId === input.memberId,
       );
-      if (!current || current.role === "owner") throw new Error("The remote member does not exist.");
+      if (!current || current.role === "owner") throw new Error(sourceText("error.host.memberNotFound"));
       // The directory read is a round trip, and the account can change during it. Mutating
       // the previous account's host with the new account's authorization is what this guard
       // stops; the same check runs again before the result is written back.
@@ -790,7 +863,7 @@ export class HostService extends EventEmitter<HostEvents> {
       this.#assertStillActiveHost(hostId);
       const members = await this.#options.listRemoteMembers(hostId);
       const updated = members.find((member) => member.membershipId === input.memberId);
-      if (!updated) throw new Error("The remote member does not exist.");
+      if (!updated) throw new Error(sourceText("error.host.memberNotFound"));
       await this.#options.store.syncRemoteDirectory(hostId, members);
       // Recording the directory is a write too, so the switch can land inside it and the
       // member below would be the previous account's.
@@ -817,7 +890,7 @@ export class HostService extends EventEmitter<HostEvents> {
 
   async removeMember(memberId: string): Promise<void> {
     const hostId = this.#options.store.getIdentity()?.serverId;
-    if (hostId && this.#options.removeRemoteMember) {
+    if (hostId && this.#usesAccountDirectory() && this.#options.removeRemoteMember) {
       await this.#options.removeRemoteMember(hostId, memberId);
       if (this.#options.listRemoteMembers) {
         await this.#options.store.syncRemoteDirectory(hostId, await this.#options.listRemoteMembers(hostId));
@@ -833,6 +906,7 @@ export class HostService extends EventEmitter<HostEvents> {
     await this.#revokeWebRtcSession(sessionId);
     await this.#options.store.revokeSession(sessionId);
     await this.#remoteScreen.revokeTeamSession(sessionId);
+    await this.#browserView.revokeTeamSession(sessionId);
     this.#api.refreshPresence();
   }
 
@@ -840,26 +914,37 @@ export class HostService extends EventEmitter<HostEvents> {
     await Promise.all([this.#options.endRemoteSession?.(sessionId), this.#webrtcGateway?.revokeSession(sessionId)]);
   }
 
+  /**
+   * Whether members and invitations live in the account directory. A local development host keeps
+   * them in its own team file, so every read and write of them goes where the others went.
+   */
+  #usesAccountDirectory(): boolean {
+    return !this.#options.localDevelopmentHost;
+  }
+
+  /** The account directory that holds invitations, or `null` for this machine's own team file. */
+  #remoteInviteApiUrl(): string | null {
+    return this.#usesAccountDirectory() ? this.#options.remoteControlPlaneUrl || null : null;
+  }
+
   revokeInvite(inviteId: string): Promise<void> {
-    if (this.#options.revokeRemoteInvite) return this.#options.revokeRemoteInvite(inviteId);
+    if (this.#remoteInviteApiUrl() && this.#options.revokeRemoteInvite)
+      return this.#options.revokeRemoteInvite(inviteId);
     return this.#options.store.revokeInvite(inviteId);
   }
 
   async createInvite(input: CreateTeamInviteInput): Promise<InviteSummary> {
     const identity = this.#options.store.getIdentity();
-    if (!identity) throw new Error("Name this OpenBot before publishing it.");
-    if (
-      !this.#options.allowLocalDevelopmentInvites &&
-      this.#options.createRemoteInvite &&
-      this.#options.remoteControlPlaneUrl
-    ) {
+    if (!identity) throw new Error(sourceText("error.host.nameBeforePublish"));
+    const remoteInviteApiUrl = this.#remoteInviteApiUrl();
+    if (remoteInviteApiUrl && this.#options.createRemoteInvite) {
       const invite = await this.#options.createRemoteInvite(identity.serverId, input);
       // The invitation belongs to the account that asked for it, so it stays on that host
       // and shows up in its invite list. What must not happen is emailing it under the new
       // account's authorization, or handing it back to the renderer the new account sees.
       this.#assertStillActiveHost(identity.serverId);
       const inviteUrl = createInviteUrl({
-        apiUrl: this.#options.remoteControlPlaneUrl,
+        apiUrl: remoteInviteApiUrl,
         serverId: identity.serverId,
         fingerprint: identity.fingerprint,
         token: invite.token,
@@ -871,6 +956,8 @@ export class HostService extends EventEmitter<HostEvents> {
         usedAt: null,
         inviteUrl,
         email: input.email ?? null,
+        permanent: invite.permanent,
+        useCount: invite.useCount,
       };
       if (input.email) {
         try {
@@ -898,8 +985,8 @@ export class HostService extends EventEmitter<HostEvents> {
     // address -- which `createInviteUrl` rejects, so a developer who had published this host could
     // not create an invite at all.
     const localApiUrl = this.#localApiUrl();
-    if (!localApiUrl) throw new Error("Make this OpenBot public before creating an invite.");
-    const invite = await this.#options.store.createInvite(input.role, input.email);
+    if (!localApiUrl) throw new Error(sourceText("error.host.publishBeforeInvite"));
+    const invite = await this.#options.store.createInvite(input.role, input.email, { permanent: input.permanent });
     const inviteUrl = createInviteUrl(
       {
         apiUrl: localApiUrl,
@@ -907,7 +994,7 @@ export class HostService extends EventEmitter<HostEvents> {
         fingerprint: identity.fingerprint,
         token: invite.token,
       },
-      { allowLocalDevelopmentApiUrl: this.#options.allowLocalDevelopmentInvites },
+      { allowLocalDevelopmentApiUrl: this.#options.localDevelopmentHost },
     );
     const result: InviteSummary = {
       id: invite.id,
@@ -916,6 +1003,8 @@ export class HostService extends EventEmitter<HostEvents> {
       usedAt: null,
       inviteUrl,
       email: invite.email,
+      permanent: invite.permanent,
+      useCount: invite.useCount,
     };
     if (invite.email) {
       try {
@@ -975,7 +1064,7 @@ export class HostService extends EventEmitter<HostEvents> {
 
   #currentMemberId(): string {
     const memberId = this.#findCurrentMemberId();
-    if (!memberId) throw new Error("Your team access is unavailable.");
+    if (!memberId) throw new Error(sourceText("error.host.teamAccessUnavailable"));
     return memberId;
   }
 
@@ -1020,7 +1109,7 @@ export class HostService extends EventEmitter<HostEvents> {
 
   #requiredOwnerMemberId(): string {
     const memberId = this.#options.store.getOwnerMemberId();
-    if (!memberId) throw new Error("The host owner identity is unavailable.");
+    if (!memberId) throw new Error(sourceText("error.host.ownerIdentityUnavailable"));
     return memberId;
   }
 }
@@ -1044,7 +1133,7 @@ function initialHostStatus(identity: TeamIdentity | null, unattended: boolean): 
   };
 }
 
-export function serverLogoUrl(version: string): string {
+function serverLogoUrl(version: string): string {
   return `openbot-server-logo://local/logo?v=${encodeURIComponent(version)}`;
 }
 

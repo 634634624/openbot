@@ -1,5 +1,6 @@
-import { channelEvent } from "@openbot/contracts/team-protocol/channels-v1";
-import { decodeTeamProtocolV4BaseCurrentEvent } from "@openbot/contracts/team-protocol/v4-base-adapter";
+import type { HostRestartEvent } from "@openbot/contracts/team-protocol/host-update-v1";
+import { optionalTeamEvent } from "@openbot/contracts/team-protocol/optional-events";
+import { decodeTeamProtocolV5BaseCurrentEvent } from "@openbot/contracts/team-protocol/v5-base-adapter";
 // The live event channel for HTTPS servers, and the reconnect policy both transports share.
 //
 // This is the only part of the remote-server family that owns a clock. Everything it does -- the
@@ -38,6 +39,7 @@ import {
   encodeTeamProtocolV1CurrentClientEvent,
   type TeamProtocolV1CurrentClientEvent,
 } from "@openbot/contracts/team-protocol/v1-adapter";
+import { sourceText } from "@openbot/i18n/source";
 import { RemoteProtocolError, RemoteRequestError } from "./remote-server-errors";
 import { requestJson } from "./remote-server-http";
 import type { RemoteServerDirectory, StoredRemoteServerView } from "./remote-server-store";
@@ -45,6 +47,12 @@ import type { RemoteServerDirectory, StoredRemoteServerView } from "./remote-ser
 const REMOTE_EVENT_RECONNECT_BASE_MS = 1_000;
 const REMOTE_EVENT_RECONNECT_MAX_MS = 60_000;
 const REMOTE_EVENT_RECONNECT_JITTER = 0.2;
+// Signal said the host is not connected. The account directory keeps hosts that went away for good,
+// so a one-minute retry ran all day against them, and each retry spent a Signal ticket. An offline
+// host retries each five minutes while an app window has focus, and each fifteen minutes without
+// focus. Focus and a manual retry still retry at once.
+const REMOTE_HOST_OFFLINE_RETRY_MS = 5 * 60_000;
+const REMOTE_HOST_OFFLINE_UNFOCUSED_RETRY_MS = 15 * 60_000;
 const REMOTE_EVENT_HEALTHY_MS = 30_000;
 const REMOTE_EVENT_PAYLOAD_LIMIT = 1024 * 1024;
 const REMOTE_EVENT_INITIAL_BUFFER_LIMIT = 1_000;
@@ -95,6 +103,7 @@ export interface RemoteEventStreamOptions {
   onPresence: (serverId: string, snapshot: TeamPresenceSnapshot) => void;
   onDirectMessage: (serverId: string, event: DirectMessageRealtimeEvent) => void;
   onDirectTyping: (serverId: string, event: DirectTypingRealtimeEvent) => void;
+  onHostRestart: (serverId: string, event: HostRestartEvent) => void;
   onOffline: (serverId: string) => void;
   onChanged: () => void;
 }
@@ -110,6 +119,7 @@ export class RemoteEventStream {
   readonly #onPresence: RemoteEventStreamOptions["onPresence"];
   readonly #onDirectMessage: RemoteEventStreamOptions["onDirectMessage"];
   readonly #onDirectTyping: RemoteEventStreamOptions["onDirectTyping"];
+  readonly #onHostRestart: RemoteEventStreamOptions["onHostRestart"];
   readonly #onOffline: RemoteEventStreamOptions["onOffline"];
   readonly #onChanged: RemoteEventStreamOptions["onChanged"];
   readonly #controllers = new Map<string, AbortController>();
@@ -118,6 +128,9 @@ export class RemoteEventStream {
   readonly #reconnectAttempts = new Map<string, number>();
   readonly #transportAttempts = new Set<string>();
   readonly #authenticationPaused = new Set<string>();
+  /** When Signal last reported each host offline. */
+  readonly #offlineHosts = new Map<string, number>();
+  #appFocused = true;
   #enabled = false;
 
   constructor(options: RemoteEventStreamOptions) {
@@ -131,6 +144,7 @@ export class RemoteEventStream {
     this.#onPresence = options.onPresence;
     this.#onDirectMessage = options.onDirectMessage;
     this.#onDirectTyping = options.onDirectTyping;
+    this.#onHostRestart = options.onHostRestart;
     this.#onOffline = options.onOffline;
     this.#onChanged = options.onChanged;
   }
@@ -151,6 +165,7 @@ export class RemoteEventStream {
     for (const timer of this.#reconnectTimers.values()) clearTimeout(timer);
     this.#reconnectTimers.clear();
     this.#reconnectAttempts.clear();
+    this.#offlineHosts.clear();
     this.#transportAttempts.clear();
     this.#authenticationPaused.clear();
   }
@@ -192,6 +207,53 @@ export class RemoteEventStream {
     if (reconnectTimer) clearTimeout(reconnectTimer);
     this.#reconnectTimers.delete(serverId);
     this.#reconnectAttempts.delete(serverId);
+    this.#offlineHosts.delete(serverId);
+  }
+
+  /** The next retry for this host waits the offline delay, also over a shorter one already set. */
+  markHostOffline(serverId: string): void {
+    this.#offlineHosts.set(serverId, Date.now());
+    const reconnectTimer = this.#reconnectTimers.get(serverId);
+    if (!reconnectTimer) return;
+    clearTimeout(reconnectTimer);
+    this.#reconnectTimers.delete(serverId);
+    this.scheduleReconnect(serverId);
+  }
+
+  /** Focus makes an offline host retry at once. */
+  setAppFocused(focused: boolean): void {
+    this.#appFocused = focused;
+    if (focused) this.retryOfflineHosts();
+  }
+
+  /**
+   * The computer woke from sleep. A socket from before the sleep can be dead with no close event,
+   * and the backoff was earned on a network that is gone, so each HTTPS host opens a new socket and
+   * each waiting WebRTC host connects at once. A WebRTC host that still shows as connected keeps its
+   * channel: the transport finds a dead one itself. A host whose credentials were rejected stays
+   * paused.
+   */
+  wake(): void {
+    if (!this.#enabled) return;
+    for (const server of this.#servers.servers) {
+      if (this.#authenticationPaused.has(server.id)) continue;
+      this.clearReconnectBackoff(server.id);
+      if (server.transport === "webrtc-v2") this.ensure(server.id);
+      else this.restart(server.id);
+    }
+  }
+
+  /** Retries each offline host once, unless Signal reported it offline within the last minute. */
+  retryOfflineHosts(): void {
+    const now = Date.now();
+    for (const [serverId, markedAt] of this.#offlineHosts) {
+      if (now - markedAt < REMOTE_EVENT_RECONNECT_MAX_MS) continue;
+      this.#offlineHosts.delete(serverId);
+      const reconnectTimer = this.#reconnectTimers.get(serverId);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      this.#reconnectTimers.delete(serverId);
+      this.ensure(serverId);
+    }
   }
 
   // Whether this server's retries are suspended. The manager asks before it records a WebRTC
@@ -226,6 +288,7 @@ export class RemoteEventStream {
     if (reconnectTimer) clearTimeout(reconnectTimer);
     this.#reconnectTimers.delete(serverId);
     this.#reconnectAttempts.delete(serverId);
+    this.#offlineHosts.delete(serverId);
     this.#authenticationPaused.delete(serverId);
     this.#sockets.delete(serverId);
   }
@@ -275,17 +338,22 @@ export class RemoteEventStream {
     if (this.#authenticationPaused.has(serverId)) return;
     const attempt = (this.#reconnectAttempts.get(serverId) ?? 0) + 1;
     this.#reconnectAttempts.set(serverId, attempt);
-    const exponentialDelay = Math.min(
-      REMOTE_EVENT_RECONNECT_MAX_MS,
-      REMOTE_EVENT_RECONNECT_BASE_MS * 2 ** (attempt - 1),
-    );
+    const hostOffline = this.#offlineHosts.has(serverId);
+    const offlineDelay = this.#appFocused ? REMOTE_HOST_OFFLINE_RETRY_MS : REMOTE_HOST_OFFLINE_UNFOCUSED_RETRY_MS;
+    const maximumDelay = hostOffline ? offlineDelay : REMOTE_EVENT_RECONNECT_MAX_MS;
+    const exponentialDelay = hostOffline
+      ? offlineDelay
+      : Math.min(REMOTE_EVENT_RECONNECT_MAX_MS, REMOTE_EVENT_RECONNECT_BASE_MS * 2 ** (attempt - 1));
     const jitter = exponentialDelay * REMOTE_EVENT_RECONNECT_JITTER * (Math.random() * 2 - 1);
     const delay = Math.min(
-      REMOTE_EVENT_RECONNECT_MAX_MS,
+      maximumDelay,
       Math.max(REMOTE_EVENT_RECONNECT_BASE_MS, Math.round(exponentialDelay + jitter)),
     );
     const timer = setTimeout(() => {
       this.#reconnectTimers.delete(serverId);
+      // Only the attempt that follows was delayed. When it fails for another reason, for example
+      // while the host starts again, the normal retry applies.
+      this.#offlineHosts.delete(serverId);
       this.ensure(serverId);
     }, delay);
     this.#reconnectTimers.set(serverId, timer);
@@ -351,7 +419,7 @@ export class RemoteEventStream {
             protocolFailed = true;
             this.#connections.reportError(
               serverId,
-              new RemoteProtocolError("protocol_error", "The host sent a binary event."),
+              new RemoteProtocolError("protocol_error", sourceText("error.remote.binaryEvent")),
             );
             socket.close(1003, "Text event payloads are required");
             return;
@@ -360,23 +428,23 @@ export class RemoteEventStream {
             protocolFailed = true;
             this.#connections.reportError(
               serverId,
-              new RemoteProtocolError("protocol_error", "The host event was too large."),
+              new RemoteProtocolError("protocol_error", sourceText("error.remote.eventTooLarge")),
             );
             socket.close(1009, "Event payload is too large");
             return;
           }
           try {
             const value = JSON.parse(message.data);
-            const optional = channelEvent(value);
+            const optional = optionalTeamEvent(value);
             const decoded = optional
               ? { kind: "known" as const, event: optional }
-              : decodeTeamProtocolV4BaseCurrentEvent(value);
+              : decodeTeamProtocolV5BaseCurrentEvent(value);
             if (decoded.kind === "unknown") return;
             if (decoded.kind === "invalid") {
               protocolFailed = true;
               this.#connections.reportError(
                 serverId,
-                new RemoteProtocolError("protocol_error", "The host returned an invalid known event."),
+                new RemoteProtocolError("protocol_error", sourceText("error.remote.invalidKnownEvent")),
               );
               socket.close(1003, "Invalid known event payload");
               return;
@@ -390,6 +458,8 @@ export class RemoteEventStream {
               this.#onDirectMessage(serverId, event);
             } else if (event.type === "team-direct-typing") {
               this.#onDirectTyping(serverId, event);
+            } else if (event.type === "host-restart") {
+              this.#onHostRestart(serverId, event);
             } else {
               if (!agentEventsReady) {
                 if (bufferedAgentEvents.length >= REMOTE_EVENT_INITIAL_BUFFER_LIMIT) {
@@ -405,7 +475,7 @@ export class RemoteEventStream {
             protocolFailed = true;
             this.#connections.reportError(
               serverId,
-              new RemoteProtocolError("protocol_error", "The host returned invalid JSON."),
+              new RemoteProtocolError("protocol_error", sourceText("error.remote.invalidJson")),
             );
             socket.close(1003, "Invalid event payload");
           }
@@ -414,7 +484,7 @@ export class RemoteEventStream {
           "error",
           () => {
             socket.close(1011, "Remote events are unavailable");
-            reject(new Error("Remote events are unavailable."));
+            reject(new Error(sourceText("error.remote.eventsUnavailable")));
           },
           { once: true },
         );
@@ -442,7 +512,10 @@ export class RemoteEventStream {
         } else {
           authenticationFailed = !opened && (await this.#hasRejectedEventCredentials(server));
           if (authenticationFailed) {
-            this.#connections.reportError(serverId, new RemoteRequestError(401, "Sign in again."));
+            this.#connections.reportError(
+              serverId,
+              new RemoteRequestError(401, sourceText("error.remote.signInAgain")),
+            );
           } else {
             this.#connections.reportUnreachable(serverId);
             this.#onOffline(serverId);

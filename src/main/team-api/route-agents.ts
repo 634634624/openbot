@@ -1,10 +1,12 @@
 import {
+  BROWSER_SECRET_RESPONSE_PATH,
   parseAgentAnalyticsInput,
+  parseBrowserSecretResponse,
   parseGenerateAgentProfile,
   parseHostAnalyticsInput,
   parseSaveAgentProfile,
 } from "@openbot/contracts/ipc";
-import { hiddenProviderAgentIds } from "./provider-visibility";
+import { hiddenProviderAgentIds, isPeerHiddenProvider } from "./provider-visibility";
 // Agents: the collection, the sidebar that arranges them, and everything under one agent's id.
 //
 // The order in this file is the one thing about it that is not free. The static collection paths -
@@ -18,10 +20,12 @@ import { hiddenProviderAgentIds } from "./provider-visibility";
 // 400 on a malformed identifier into a 404 for some methods and not others.
 
 import { readFile } from "node:fs/promises";
+import type { AgentProviderId } from "@openbot/contracts/agent-providers";
 import { isAvatarMimeType } from "@openbot/contracts/avatar-images";
 import { AVATAR_IMAGE_LIMITS, INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import type { DuplicateAgentResult } from "@openbot/contracts/ipc";
 import { TEAM_API_ROUTES } from "@openbot/contracts/team-api-routes";
+import { sourceText } from "@openbot/i18n/source";
 import { parseSidebarLayoutAction } from "../ipc/agent-inputs";
 import type { TeamApiAgents, TeamApiOptions, TeamApiSidebarLayout } from "./dependencies";
 import { HttpError } from "./http-error";
@@ -59,19 +63,30 @@ export async function routeAgents(
   { agents, skills, sidebarLayout, duplicateAgent }: AgentRouteDependencies,
 ): Promise<RouteOutcome> {
   const { method, url, request, response, member, capabilities, json, empty } = context;
-  const hidden = context.protocol < 4 ? hiddenProviderAgentIds(agents.listAgents()) : new Set<string>();
+  const hidden = hiddenProviderAgentIds(agents.listAgents(), context.protocol);
   function requireCompatibleDefault(): void {
     if (context.protocol < 4 && agents.preferredProvider() === "opencode") {
-      throw new HttpError(400, "The host's default provider requires Team API v4.");
+      throw new HttpError(400, sourceText("error.team.defaultProviderRequiresV4"));
+    }
+  }
+  /**
+   * A peer cannot start an agent on a provider that its protocol does not show: the agent would be
+   * hidden from the peer that made it. With no named provider, the host default applies.
+   */
+  function requireVisibleProvider(named: AgentProviderId | undefined): void {
+    if (named !== undefined) {
+      if (isPeerHiddenProvider(named, context.protocol)) throw new HttpError(400, "provider is invalid.");
+    } else if (isPeerHiddenProvider(agents.preferredProvider(), context.protocol)) {
+      throw new HttpError(400, sourceText("error.team.providersUnsupported"));
     }
   }
   function requireVisible(id: string | undefined | null): void {
-    if (id && hidden.has(id)) throw new HttpError(404, "Agent not found.");
+    if (id && hidden.has(id)) throw new HttpError(404, sourceText("error.team.agentNotFound"));
   }
 
   if (method === "GET" && url.pathname === TEAM_API_ROUTES.analytics) {
     if (!capabilities.has("host-analytics"))
-      throw new HttpError(400, "Host analytics is not supported by this client.");
+      throw new HttpError(400, sourceText("error.team.hostAnalyticsUnsupported"));
     const input = parseHostAnalyticsInput({
       ...(url.searchParams.has("agentId") ? { agentId: url.searchParams.get("agentId") } : {}),
       startDate: url.searchParams.get("startDate"),
@@ -79,7 +94,7 @@ export async function routeAgents(
       timeZone: url.searchParams.get("timeZone"),
     });
     if (input.agentId && !agents.listAgents().some((agent) => agent.id === input.agentId))
-      throw new HttpError(404, "Agent not found.");
+      throw new HttpError(404, sourceText("error.team.agentNotFound"));
     return json(200, agents.getHostAnalytics(input));
   }
   if (
@@ -87,10 +102,13 @@ export async function routeAgents(
     (url.pathname === TEAM_API_ROUTES.agents.generateProfile || url.pathname === TEAM_API_ROUTES.agents.saveProfile)
   ) {
     if (!capabilities.has("agent-profile-generation"))
-      throw new HttpError(400, "Profile generation is not supported by this client.");
+      throw new HttpError(400, sourceText("error.team.profileGenerationUnsupported"));
     const body = await readJson(request);
     if (typeof body.agentId === "string") requireVisible(body.agentId);
-    else requireCompatibleDefault();
+    else {
+      requireCompatibleDefault();
+      requireVisibleProvider(undefined);
+    }
     if (url.pathname === TEAM_API_ROUTES.agents.generateProfile) {
       return json(
         200,
@@ -102,7 +120,7 @@ export async function routeAgents(
   if (method === "GET" && url.pathname === TEAM_API_ROUTES.messages.search) {
     const query = url.searchParams.get("q") ?? "";
     if (!query.trim() || query.length > INPUT_LIMITS.messageText) {
-      throw new HttpError(400, "A valid search query is required.");
+      throw new HttpError(400, sourceText("error.team.searchQueryRequired"));
     }
     return json(
       200,
@@ -143,8 +161,9 @@ export async function routeAgents(
   }
   if (method === "POST" && url.pathname === TEAM_API_ROUTES.agents.all) {
     requireCompatibleDefault();
-    const body = await readJson(request);
-    return json(201, await agents.createAgent(agentCreate(body)));
+    const input = agentCreate(await readJson(request));
+    requireVisibleProvider(input.provider);
+    return json(201, await agents.createAgent(input));
   }
 
   const agentMatch = url.pathname.match(/^\/v1\/agents\/([^/]+)(?:\/(.*))?$/);
@@ -153,8 +172,9 @@ export async function routeAgents(
     const action = agentMatch[2] ?? "";
     if (method === "GET" && action === "analytics") {
       if (!capabilities.has("agent-analytics"))
-        throw new HttpError(400, "Agent analytics is not supported by this client.");
-      if (!agents.listAgents().some((agent) => agent.id === agentId)) throw new HttpError(404, "Agent not found.");
+        throw new HttpError(400, sourceText("error.team.agentAnalyticsUnsupported"));
+      if (!agents.listAgents().some((agent) => agent.id === agentId))
+        throw new HttpError(404, sourceText("error.team.agentNotFound"));
       const input = parseAgentAnalyticsInput({
         agentId,
         startDate: url.searchParams.get("startDate"),
@@ -170,15 +190,16 @@ export async function routeAgents(
       return json(200, (await skills?.listInstalledForChatTags(agentId)) ?? []);
     }
     if (method === "PATCH" && !action) {
-      const body = await readJson(request);
-      return json(200, await agents.updateAgent(agentUpdate(body, agentId)));
+      const input = agentUpdate(await readJson(request), agentId);
+      if (input.provider !== undefined) requireVisibleProvider(input.provider);
+      return json(200, await agents.updateAgent(input));
     }
     if (method === "POST" && action === "duplicate") {
       const body = await readJson(request);
       return json(201, await duplicateAgent(agentId, stringField(body, "operationId")));
     }
     if (method === "DELETE" && !action) {
-      if (member.role === "member") throw new HttpError(403, "Members cannot delete agents.");
+      if (member.role === "member") throw new HttpError(403, sourceText("error.team.membersCannotDeleteAgents"));
       await agents.deleteAgent(agentId);
       await sidebarLayout.removeAgent(agentId);
       return empty(204);
@@ -187,7 +208,7 @@ export async function routeAgents(
       if (method === "PUT") {
         const mimeType = request.headers["content-type"]?.split(";", 1)[0]?.trim() ?? "";
         if (!isAvatarMimeType(mimeType)) {
-          throw new HttpError(415, "Choose a PNG, JPEG, or WebP image.");
+          throw new HttpError(415, sourceText("error.team.avatarType"));
         }
         const bytes = await readBinary(request, AVATAR_IMAGE_LIMITS.storedBytes);
         return json(200, await agents.setAvatar(agentId, { mimeType, bytes }));
@@ -198,7 +219,7 @@ export async function routeAgents(
       if (method === "GET") {
         const avatar = agents.resolveAvatar(agentId);
         if (!avatar || avatar.version !== url.searchParams.get("v")) {
-          throw new HttpError(404, "Agent avatar not found.");
+          throw new HttpError(404, sourceText("error.team.avatarNotFound"));
         }
         const bytes = await readFile(avatar.path);
         response.writeHead(200, {
@@ -233,6 +254,12 @@ export async function routeAgents(
       requestId: promptRequestId(body.requestId),
       decision: approvalDecision(body.decision),
     });
+    return empty(204);
+  }
+  if (method === "POST" && url.pathname === BROWSER_SECRET_RESPONSE_PATH) {
+    if (!capabilities.has("browser-secret-handoff"))
+      throw new HttpError(400, sourceText("error.team.secureAuthUnsupported"));
+    await agents.respondToBrowserSecret(parseBrowserSecretResponse(await readJson(request)));
     return empty(204);
   }
   if (method === "POST" && url.pathname === TEAM_API_ROUTES.respond.browserTakeover) {

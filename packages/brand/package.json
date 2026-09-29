@@ -6,13 +6,17 @@
   "exports": {
     ".": "./src/index.ts",
     "./bloub-avatar": "./src/bloub-avatar.ts",
+    "./bloub-avatar-motion": "./src/bloub-avatar-motion.ts",
     "./logo.css": "./src/logo.css",
     "./tokens.css": "./src/tokens.css",
     "./tokens-native.css": "./src/tokens-native.css",
-    "./article-gradient": "./src/article-gradient.ts"
+    "./article-gradient": "./src/article-gradient.ts",
+    "./file-reference": "./src/file-reference.ts",
+    "./app-logo-shape": "./src/app-logo-shape.ts",
+    "./provider-logo-shape": "./src/provider-logo-shape.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "typecheck": "bun ../../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json",
     "test": "vitest run --config vitest.config.ts"
   },
   "dependencies": {

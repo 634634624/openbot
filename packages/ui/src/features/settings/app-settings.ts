@@ -1,0 +1,48 @@
+export type ExternalLinkTarget = "Default browser" | "OpenBot";
+
+export interface GeneralSettingsValue {
+  launchAtLogin: boolean;
+  keepRunningInBackground: boolean;
+  restoreLastWorkspace: boolean;
+  externalLinkTarget: ExternalLinkTarget;
+  desktopNotifications: boolean;
+  macBookNotch: boolean;
+  macBookNotchHaptics: boolean;
+  macBookNotchIdle: boolean;
+  macBookNotchAdditionalDisplays: boolean;
+  /** The compact Dynamic Island size, as percents of the default. */
+  macBookNotchWidthPercent: number;
+  macBookNotchHeightPercent: number;
+  taskCompletionSound: boolean;
+  /**
+   * Turbo mode. Agents run commands and change files without asking. Permission grants and site
+   * publishing still ask, so this is not the same as "no boundary at all".
+   */
+  turboMode: boolean;
+  autoDownloadUpdates: boolean;
+  /** Owners and admins of a joined server can start an update of this computer. */
+  allowRemoteUpdates: boolean;
+  /** Restart into a downloaded update when no work runs. */
+  autoInstallUpdates: boolean;
+  productAnalytics: boolean;
+}
+
+export const DEFAULT_GENERAL_SETTINGS: GeneralSettingsValue = {
+  launchAtLogin: true,
+  keepRunningInBackground: false,
+  restoreLastWorkspace: true,
+  externalLinkTarget: "Default browser",
+  desktopNotifications: true,
+  macBookNotch: true,
+  macBookNotchHaptics: true,
+  macBookNotchIdle: true,
+  macBookNotchAdditionalDisplays: true,
+  macBookNotchWidthPercent: 100,
+  macBookNotchHeightPercent: 100,
+  taskCompletionSound: false,
+  turboMode: false,
+  autoDownloadUpdates: true,
+  allowRemoteUpdates: true,
+  autoInstallUpdates: false,
+  productAnalytics: true,
+};

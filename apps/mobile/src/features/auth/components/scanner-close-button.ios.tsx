@@ -10,22 +10,28 @@ import {
 } from "@expo/ui/swift-ui/modifiers";
 import { isLiquidGlassAvailable } from "expo-glass-effect";
 
+import { haptics } from "@/shared/lib/haptics";
+import { useText } from "@/shared/lib/text";
 import type { ScannerCloseButtonProps } from "./scanner-close-button";
 
 export function ScannerCloseButton({ disabled, onPress }: ScannerCloseButtonProps) {
+  const { t } = useText();
   return (
     <Host ignoreSafeArea="all" style={{ width: 44, height: 44 }}>
       <Button
-        label="Close scanner"
+        label={t("mobile.auth.closeScanner")}
         systemImage="xmark"
-        onPress={onPress}
+        onPress={() => {
+          void haptics.impact("soft");
+          onPress();
+        }}
         modifiers={[
           buttonStyle(isLiquidGlassAvailable() ? "glass" : "bordered"),
           buttonBorderShape("circle"),
           controlSize("large"),
           labelStyle("iconOnly"),
           disabledModifier(disabled),
-          accessibilityLabel("Close scanner"),
+          accessibilityLabel(t("mobile.auth.closeScanner")),
         ]}
       />
     </Host>

@@ -1,10 +1,12 @@
 // @vitest-environment node
 
+import { request } from "node:http";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { isDynamicRecord } from "@openbot/contracts/runtime-values";
-import { afterEach, describe, expect, it } from "vitest";
-import { type DynamicToolNamespace, LocalMcpBridge } from "./local-mcp-bridge";
+import { afterEach, assert, describe, expect, it, vi } from "vitest";
+import { type DynamicToolNamespace, LOCAL_MCP_PROGRESS_INTERVAL_MS, LocalMcpBridge } from "./local-mcp-bridge";
+import type { DynamicToolResult } from "./protocol";
 
 const TOOLS: DynamicToolNamespace[] = [
   {
@@ -95,8 +97,11 @@ describe("LocalMcpBridge", () => {
       }),
     );
 
-    const firstClient = await connect(first.servers[0]);
-    const secondClient = await connect(second.servers[0]);
+    const [firstServer] = first.servers;
+    const [secondServer] = second.servers;
+    assert(firstServer && secondServer);
+    const firstClient = await connect(firstServer);
+    const secondClient = await connect(secondServer);
     expect((await firstClient.listTools()).tools.map((tool) => tool.name)).toEqual(["echo"]);
     expect(await firstClient.callTool({ name: "echo", arguments: {} })).toMatchObject({
       content: [{ type: "text", text: "hello" }],
@@ -113,7 +118,7 @@ describe("LocalMcpBridge", () => {
     clients.push(unauthorized);
     await expect(
       unauthorized.connect(
-        new StreamableHTTPClientTransport(new URL(first.servers[0].url), {
+        new StreamableHTTPClientTransport(new URL(firstServer.url), {
           requestInit: { headers: { Authorization: "Bearer wrong-token" } },
         }),
       ),
@@ -125,13 +130,99 @@ describe("LocalMcpBridge", () => {
     clients.push(closed);
     await expect(
       closed.connect(
-        new StreamableHTTPClientTransport(new URL(first.servers[0].url), {
+        new StreamableHTTPClientTransport(new URL(firstServer.url), {
           requestInit: {
-            headers: Object.fromEntries(first.servers[0].headers.map((header) => [header.name, header.value])),
+            headers: Object.fromEntries(firstServer.headers.map((header) => [header.name, header.value])),
           },
         }),
       ),
     ).rejects.toThrow();
+  });
+
+  it("keeps a waiting call alive with progress notifications", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      const bridge = new LocalMcpBridge();
+      bridges.push(bridge);
+      let answer: (result: DynamicToolResult) => void = () => undefined;
+      let start: () => void = () => undefined;
+      const started = new Promise<void>((resolve) => {
+        start = resolve;
+      });
+      const session = await bridge.createSession(
+        "thread-1",
+        TOOLS,
+        () => "turn-1",
+        () => {
+          start();
+          return new Promise<DynamicToolResult>((resolve) => {
+            answer = resolve;
+          });
+        },
+      );
+      const [server] = session.servers;
+      assert(server);
+      const client = await connect(server);
+      const progress: number[] = [];
+      const call = client.callTool({ name: "echo", arguments: {} }, undefined, {
+        resetTimeoutOnProgress: true,
+        onprogress: (update) => progress.push(update.progress),
+      });
+      await started;
+
+      vi.advanceTimersByTime(LOCAL_MCP_PROGRESS_INTERVAL_MS);
+      await vi.waitFor(() => expect(progress).toEqual([1]));
+      vi.advanceTimersByTime(LOCAL_MCP_PROGRESS_INTERVAL_MS);
+      await vi.waitFor(() => expect(progress).toEqual([1, 2]));
+
+      answer({ success: true, contentItems: [{ type: "inputText", text: "answered" }] });
+      expect(await call).toMatchObject({ content: [{ type: "text", text: "answered" }] });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("tells the owner when the client cancels a call or closes its stream", async () => {
+    const bridge = new LocalMcpBridge();
+    bridges.push(bridge);
+    const signals: AbortSignal[] = [];
+    const session = await bridge.createSession(
+      "thread-1",
+      TOOLS,
+      () => "turn-1",
+      (_call, signal) => {
+        signals.push(signal);
+        return new Promise<DynamicToolResult>(() => undefined);
+      },
+    );
+    const [server] = session.servers;
+    assert(server);
+
+    // An MCP client whose timeout ends sends `notifications/cancelled` on a new POST.
+    const client = await connect(server);
+    const cancel = new AbortController();
+    const cancelled = client.callTool({ name: "echo", arguments: {} }, undefined, { signal: cancel.signal });
+    await vi.waitFor(() => expect(signals).toHaveLength(1));
+    cancel.abort();
+    await expect(cancelled).rejects.toThrow();
+    await vi.waitFor(() => expect(signals.map((signal) => signal.aborted)).toEqual([true]));
+
+    // A client that goes away closes the response stream. `node:http`, because fetch keeps a spare
+    // connection open that delays the server's close.
+    const call = request(server.url, {
+      method: "POST",
+      agent: false,
+      headers: {
+        ...Object.fromEntries(server.headers.map((header) => [header.name, header.value])),
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json",
+      },
+    });
+    call.on("error", () => undefined);
+    call.end(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "echo", arguments: {} } }));
+    await vi.waitFor(() => expect(signals).toHaveLength(2));
+    call.destroy();
+    await vi.waitFor(() => expect(signals.map((signal) => signal.aborted)).toEqual([true, true]));
   });
 });
 

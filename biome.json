@@ -144,7 +144,12 @@
       }
     },
     {
-      "includes": ["src/renderer/src/**/*.ts", "src/renderer/src/**/*.tsx"],
+      "includes": [
+        "src/renderer/src/**/*.ts",
+        "src/renderer/src/**/*.tsx",
+        "packages/ui/src/**/*.ts",
+        "packages/ui/src/**/*.tsx"
+      ],
       "linter": {
         "rules": {
           "style": {
@@ -184,6 +189,71 @@
       }
     },
     {
+      "includes": ["packages/contracts/src/**/*.ts"],
+      "linter": {
+        "rules": {
+          "style": {
+            "noRestrictedImports": {
+              "level": "error",
+              "options": {
+                "patterns": [
+                  {
+                    "group": [
+                      "electron",
+                      "electron/**",
+                      "solid-js",
+                      "solid-js/**",
+                      "@solidjs/**",
+                      "cloudflare:*",
+                      "@cloudflare/**",
+                      "@anthropic-ai/**",
+                      "@openai/**",
+                      "openai",
+                      "**/src/main/**",
+                      "**/src/backend/**",
+                      "**/src/preload/**",
+                      "**/src/renderer/**",
+                      "**/apps/**"
+                    ],
+                    "message": "Contracts are shared by every surface. Keep them free of Electron, SolidJS, provider, Cloudflare and application code."
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "includes": ["apps/auth-api/src/server/**/*.ts", "apps/auth-api/src/worker-entry.ts"],
+      "linter": {
+        "rules": {
+          "style": {
+            "noRestrictedImports": {
+              "level": "error",
+              "options": {
+                "patterns": [
+                  {
+                    "group": [
+                      "electron",
+                      "electron/**",
+                      "@openbot/renderer-preview",
+                      "@openbot/renderer-web",
+                      "**/src/main/**",
+                      "**/src/backend/**",
+                      "**/src/preload/**",
+                      "**/src/renderer/**"
+                    ],
+                    "message": "The account server does not import desktop implementation files. Share the type through packages/contracts."
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
       "includes": ["**/*.test.ts", "**/*.test.tsx"],
       "plugins": [
         "./tools/biome/anti-slop/rules/no-class-assertions.grit",
@@ -199,6 +269,49 @@
         "./tools/biome/anti-slop/rules/no-class-selector-queries.grit",
         "./tools/biome/anti-slop/rules/no-sleep-in-tests.grit"
       ]
+    },
+    {
+      "includes": ["**/*.stories.ts", "**/*.stories.tsx"],
+      "plugins": ["./tools/ui-foundation/no-story-play.grit"]
+    },
+    {
+      "includes": [
+        "src/renderer/src/**/*.ts",
+        "src/renderer/src/**/*.tsx",
+        "packages/ui/src/**/*.ts",
+        "packages/ui/src/**/*.tsx",
+        "apps/mobile/src/**/*.ts",
+        "apps/mobile/src/**/*.tsx",
+        "!**/*.test.ts",
+        "!**/*.test.tsx",
+        "!**/*.stories.tsx",
+        "!src/renderer/src/preview/**",
+        "!src/renderer/src/app-test-harness.ts",
+        "!src/renderer/src/setupTests.ts",
+        "!apps/mobile/src/test-setup.ts"
+      ],
+      "plugins": ["./tools/ui-foundation/no-hardcoded-ui-text.grit"]
+    },
+    {
+      "includes": ["packages/ui/src/**/*.ts", "packages/ui/src/**/*.tsx"],
+      "plugins": ["./tools/ui-foundation/no-desktop-preload.grit"],
+      "linter": {
+        "rules": {
+          "style": {
+            "noRestrictedImports": {
+              "level": "error",
+              "options": {
+                "patterns": [
+                  {
+                    "group": ["**/renderer/**", "**/main/**", "**/backend/**", "**/preload/**"],
+                    "message": "Shared UI receives data and actions through props; do not import application or platform implementations."
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
     }
   ],
   "javascript": {

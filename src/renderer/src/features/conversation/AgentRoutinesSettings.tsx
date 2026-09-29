@@ -1,14 +1,25 @@
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import type { RoutineFields, RoutineRunFields, RoutineSchedule } from "@openbot/contracts/ipc";
-import { createEffect, createSignal, For, onCleanup, Show } from "solid-js";
+import { Button, CirclePause, Clock3, ConfirmDialog, Input, Plus, Switch, Textarea } from "@openbot/ui";
+import { createScrollFades } from "@openbot/ui/components/createScrollFades";
+import { SettingsBackIcon, SettingsForwardIcon } from "@openbot/ui/components/SettingsPanel";
+import { RoutineRunHistory } from "@openbot/ui/features/conversation/RoutineRunHistory";
+import { RoutineSchedulePicker } from "@openbot/ui/features/conversation/RoutineSchedulePicker";
+import {
+  ROUTINE_EVERY_DAY,
+  type RoutineScheduleDraft,
+  routineDraftSummary,
+} from "@openbot/ui/features/conversation/routine-schedule-draft";
+import {
+  ROUTINE_SAVED_DRAFT_KINDS,
+  routineDraftProblem,
+  routineScheduleFromDraft,
+  routineScheduleToDraft,
+} from "@openbot/ui/features/conversation/routine-schedule-saved";
+import { type RoutineText, routineScheduleSummary } from "@openbot/ui/features/conversation/routine-schedule-ui";
+import { useText } from "@openbot/ui/text";
+import { createEffect, createSignal, For, onCleanup, Show, untrack } from "solid-js";
 import { type DesktopAnalyticsScope, desktopAnalytics } from "../../analytics";
-import { createScrollFades } from "../../components/createScrollFades";
-import { SettingsBackIcon, SettingsForwardIcon } from "../../components/SettingsPanel";
-import { Button, CirclePause, Clock3, Dialog, Input, Plus, Switch, Textarea } from "../../components/ui";
-import { errorMessage } from "../../error-message";
-import { RoutineRunHistory } from "./RoutineRunHistory";
-import { RoutineScheduleEditor } from "./RoutineScheduleEditor";
-import { defaultRoutineSchedule, routineScheduleSummary } from "./routine-schedule-ui";
 import type { RoutinesPort } from "./routines-port";
 
 export interface RoutineSelectionRequest {
@@ -28,8 +39,12 @@ interface RoutineDraft {
   name: string;
   instruction: string;
   active: boolean;
+  /** Saved as it is until the user changes a chip, so a rename keeps a schedule the chips cannot show. */
   schedule: RoutineSchedule;
+  scheduleDraft: RoutineScheduleDraft;
 }
+
+const NEW_ROUTINE_SCHEDULE: RoutineScheduleDraft = { kind: "daily", days: ROUTINE_EVERY_DAY, time: "09:00" };
 
 interface AgentRoutinesSettingsProps {
   /** Names the owner and owns every call. A channel passes `channelRoutinesPort` here. */
@@ -43,6 +58,8 @@ interface AgentRoutinesSettingsProps {
 }
 
 export function AgentRoutinesSettings(props: AgentRoutinesSettingsProps) {
+  const text = useText();
+  const { t, errorMessage } = text;
   const [routines, setRoutines] = createSignal<RoutineFields[]>([]);
   const [draft, setDraft] = createSignal<RoutineDraft | null>(null);
   const [runs, setRuns] = createSignal<RoutineRunFields[]>([]);
@@ -53,26 +70,35 @@ export function AgentRoutinesSettings(props: AgentRoutinesSettingsProps) {
   const [testing, setTesting] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const [confirmDelete, setConfirmDelete] = createSignal(false);
-  const [scheduleExpanded, setScheduleExpanded] = createSignal(false);
   const [pendingExit, setPendingExit] = createSignal<PendingRoutineExit | null>(null);
   const scrollFades = createScrollFades();
   let draftRevision = 0;
+  // The saved routine the open draft started from. A field that still matches it is unedited.
+  let draftBase: RoutineFields | null = null;
 
   onCleanup(scrollFades.stop);
 
+  // Only the newest list applies: an older response can arrive after a save and undo it.
+  let listRequest = 0;
+
   async function loadRoutines(): Promise<void> {
+    const request = ++listRequest;
     try {
       const next = await props.port.list();
+      if (request !== listRequest) return;
       setRoutines(next);
       setRoutinesLoaded(true);
       props.onCountChange(next.length);
-      const selected = draft();
-      if (selected?.id && !next.some((routine) => routine.id === selected.id)) closeEditor();
+      const selectedId = draft()?.id;
+      const selected = selectedId ? next.find((routine) => routine.id === selectedId) : undefined;
+      if (selectedId && !selected) closeEditor();
+      if (selected) refreshDraft(selected);
     } catch (caught) {
+      if (request !== listRequest) return;
       setRoutinesLoaded(false);
-      setError(errorMessage(caught, "Could not load routines."));
+      setError(errorMessage(caught, t("routine.settings.loadFailed")));
     } finally {
-      setLoading(false);
+      if (request === listRequest) setLoading(false);
     }
   }
 
@@ -80,7 +106,7 @@ export function AgentRoutinesSettings(props: AgentRoutinesSettingsProps) {
     try {
       setRuns(await props.port.listRuns(routineId, 10));
     } catch (caught) {
-      setError(errorMessage(caught, "Could not load run history."));
+      setError(errorMessage(caught, t("routine.settings.loadRunsFailed")));
     }
   }
 
@@ -100,7 +126,7 @@ export function AgentRoutinesSettings(props: AgentRoutinesSettingsProps) {
       closeEditor();
       setLoading(true);
       setRoutinesLoaded(false);
-      void loadRoutines();
+      void untrack(loadRoutines);
     },
   );
 
@@ -122,15 +148,41 @@ export function AgentRoutinesSettings(props: AgentRoutinesSettingsProps) {
   );
 
   createEffect(
-    () => [draft(), routines().length, runs().length, loading(), scheduleExpanded(), confirmDelete(), error()] as const,
+    () => [draft(), routines().length, runs().length, loading(), confirmDelete(), error()] as const,
     () => {
       scrollFades.remeasure();
     },
   );
 
+  /**
+   * Takes a change saved elsewhere, such as from a chat card, into each field the person did not
+   * edit here. Without it, the next Save would write the old values back.
+   */
+  function refreshDraft(routine: RoutineFields): void {
+    const base = draftBase;
+    draftBase = routine;
+    if (base?.id !== routine.id) return;
+    setDraft((current) => {
+      if (current?.id !== routine.id) return current;
+      const scheduleEdited = JSON.stringify(current.schedule) !== JSON.stringify(base.trigger.schedule);
+      return {
+        ...current,
+        name: current.name === base.name ? routine.name : current.name,
+        instruction: current.instruction === base.instruction ? routine.instruction : current.instruction,
+        active: current.active === base.active ? routine.active : current.active,
+        ...(scheduleEdited
+          ? {}
+          : {
+              schedule: structuredClone(routine.trigger.schedule),
+              scheduleDraft: routineScheduleToDraft(routine.trigger.schedule),
+            }),
+      };
+    });
+  }
+
   function openRoutine(routine: RoutineFields): void {
+    draftBase = routine;
     setConfirmDelete(false);
-    setScheduleExpanded(false);
     setError(null);
     draftRevision = 0;
     setDirty(false);
@@ -140,13 +192,14 @@ export function AgentRoutinesSettings(props: AgentRoutinesSettingsProps) {
       instruction: routine.instruction,
       active: routine.active,
       schedule: structuredClone(routine.trigger.schedule),
+      scheduleDraft: routineScheduleToDraft(routine.trigger.schedule),
     });
     void loadRuns(routine.id);
   }
 
   function createDraft(): void {
+    draftBase = null;
     setConfirmDelete(false);
-    setScheduleExpanded(false);
     setRuns([]);
     setError(null);
     draftRevision = 0;
@@ -156,18 +209,19 @@ export function AgentRoutinesSettings(props: AgentRoutinesSettingsProps) {
       name: "",
       instruction: "",
       active: true,
-      schedule: defaultRoutineSchedule("daily"),
+      schedule: routineScheduleFromDraft(NEW_ROUTINE_SCHEDULE),
+      scheduleDraft: NEW_ROUTINE_SCHEDULE,
     });
   }
 
   function closeEditor(): void {
+    draftBase = null;
     setDraft(null);
     setRuns([]);
     setError(null);
     draftRevision = 0;
     setDirty(false);
     setConfirmDelete(false);
-    setScheduleExpanded(false);
     setPendingExit(null);
   }
 
@@ -222,7 +276,7 @@ export function AgentRoutinesSettings(props: AgentRoutinesSettingsProps) {
       openRoutine(target.routine);
       return;
     }
-    setError(`Routine "${target.routineName}" no longer exists.`);
+    setError(t("routine.settings.missing", { name: target.routineName }));
   }
 
   function discardChanges(): void {
@@ -260,12 +314,13 @@ export function AgentRoutinesSettings(props: AgentRoutinesSettingsProps) {
         return next;
       });
       setDraft((latest) => (latest && latest.id === current.id ? { ...latest, id: saved.id } : latest));
+      if (draft()?.id === current.id) draftBase = saved;
       if (draftRevision === savingRevision) setDirty(false);
       if (!current.id) void loadRuns(saved.id);
       trackRoutineAction(analytics, action, current.schedule, startedAt, "succeeded");
     } catch (caught) {
       trackRoutineAction(analytics, action, current.schedule, startedAt, "failed");
-      setError(errorMessage(caught, "Could not save this routine."));
+      setError(errorMessage(caught, t("routine.settings.saveFailed")));
     } finally {
       setSaving(false);
     }
@@ -290,7 +345,7 @@ export function AgentRoutinesSettings(props: AgentRoutinesSettingsProps) {
       trackRoutineAction(analytics, "delete", current.schedule, startedAt, "succeeded");
     } catch (caught) {
       trackRoutineAction(analytics, "delete", current.schedule, startedAt, "failed");
-      setError(errorMessage(caught, "Could not delete this routine."));
+      setError(errorMessage(caught, t("routine.settings.deleteFailed")));
     }
   }
 
@@ -307,7 +362,7 @@ export function AgentRoutinesSettings(props: AgentRoutinesSettingsProps) {
       await loadRuns(current.id);
     } catch (caught) {
       trackRoutineAction(analytics, "test", current.schedule, startedAt, "failed");
-      setError(errorMessage(caught, "Could not start the test run."));
+      setError(errorMessage(caught, t("routine.settings.testFailed")));
     } finally {
       setTesting(false);
     }
@@ -320,14 +375,14 @@ export function AgentRoutinesSettings(props: AgentRoutinesSettingsProps) {
           variant="ghost"
           type="button"
           class="settings-panel-nav-button"
-          aria-label={draft() ? "Back to Routines" : "Back to settings"}
+          aria-label={draft() ? t("routine.settings.backToRoutines") : t("routine.settings.backToSettings")}
           disabled={Boolean(draft() && saving())}
           onClick={() => (draft() ? requestExit("list") : props.onBack?.())}
         >
           <SettingsBackIcon />
         </Button>
         <div class="agent-routines-heading">
-          <h2>{draft() ? "Routine" : "Routines"}</h2>
+          <h2>{draft() ? t("routine.settings.routine") : t("routine.settings.routines")}</h2>
         </div>
         <Show
           when={!draft()}
@@ -336,7 +391,7 @@ export function AgentRoutinesSettings(props: AgentRoutinesSettingsProps) {
               variant="ghost"
               type="button"
               class="settings-panel-nav-button"
-              aria-label="Close details"
+              aria-label={t("routine.settings.closeDetails")}
               disabled={saving()}
               onClick={() => requestExit("close")}
             >
@@ -348,7 +403,7 @@ export function AgentRoutinesSettings(props: AgentRoutinesSettingsProps) {
             variant="ghost"
             type="button"
             class="settings-panel-nav-button"
-            aria-label="Create Routine"
+            aria-label={t("routine.settings.create")}
             onClick={createDraft}
           >
             <Plus aria-hidden="true" />
@@ -360,8 +415,11 @@ export function AgentRoutinesSettings(props: AgentRoutinesSettingsProps) {
           when={draft()}
           fallback={
             <div class="agent-routines-list-view">
-              <Show when={!loading()} fallback={<p class="agent-routines-empty">Loading routines…</p>}>
-                <Show when={routines().length > 0} fallback={<p class="agent-routines-empty">No routines yet.</p>}>
+              <Show when={!loading()} fallback={<p class="agent-routines-empty">{t("routine.settings.loading")}</p>}>
+                <Show
+                  when={routines().length > 0}
+                  fallback={<p class="agent-routines-empty">{t("routine.settings.empty")}</p>}
+                >
                   <div class="agent-routines-list">
                     <For each={routines()}>
                       {(routine) => (
@@ -383,7 +441,9 @@ export function AgentRoutinesSettings(props: AgentRoutinesSettingsProps) {
                           <span>
                             <strong>{routine.name}</strong>
                             <small>
-                              {routine.active ? routineScheduleSummary(routine.trigger.schedule) : "Paused"}
+                              {routine.active
+                                ? routineListSummary(routine.trigger.schedule, text)
+                                : t("routine.settings.paused")}
                             </small>
                           </span>
                         </Button>
@@ -401,11 +461,13 @@ export function AgentRoutinesSettings(props: AgentRoutinesSettingsProps) {
                 <div class="agent-routine-active-toggle">
                   <Switch
                     id="routine-active"
-                    aria-label="Routine active"
+                    aria-label={t("routine.settings.activeToggle")}
                     checked={current().active}
                     onChange={(active) => changeDraft((value) => ({ ...value, active }))}
                   />
-                  <label for="routine-active">{current().active ? "Active" : "Paused"}</label>
+                  <label for="routine-active">
+                    {current().active ? t("routine.settings.active") : t("routine.settings.paused")}
+                  </label>
                 </div>
                 <div class="agent-routine-action-buttons">
                   <Show
@@ -413,16 +475,16 @@ export function AgentRoutinesSettings(props: AgentRoutinesSettingsProps) {
                     fallback={
                       <>
                         <Button variant="destructive" type="button" size="sm" onClick={() => void deleteRoutine()}>
-                          Delete now
+                          {t("routine.settings.deleteNow")}
                         </Button>
                         <Button variant="secondary" type="button" size="sm" onClick={() => setConfirmDelete(false)}>
-                          Cancel
+                          {t("common.cancel")}
                         </Button>
                       </>
                     }
                   >
                     <Button variant="destructive" type="button" size="sm" onClick={() => setConfirmDelete(true)}>
-                      Delete
+                      {t("common.delete")}
                     </Button>
                     <Show
                       when={dirty()}
@@ -433,10 +495,10 @@ export function AgentRoutinesSettings(props: AgentRoutinesSettingsProps) {
                           class="agent-routine-test"
                           disabled={!current().id || testing() || !validDraft(current())}
                           loading={testing()}
-                          loadingLabel="Starting…"
+                          loadingLabel={t("routine.settings.starting")}
                           onClick={() => void testRun()}
                         >
-                          Test run
+                          {t("routine.settings.testRun")}
                         </Button>
                       }
                     >
@@ -445,10 +507,10 @@ export function AgentRoutinesSettings(props: AgentRoutinesSettingsProps) {
                         size="sm"
                         disabled={saving() || !validDraft(current())}
                         loading={saving()}
-                        loadingLabel="Saving…"
+                        loadingLabel={t("common.saving")}
                         onClick={() => void saveDraft()}
                       >
-                        Save
+                        {t("common.save")}
                       </Button>
                     </Show>
                   </Show>
@@ -456,30 +518,41 @@ export function AgentRoutinesSettings(props: AgentRoutinesSettingsProps) {
               </div>
 
               <label class="settings-field">
-                <span>Name</span>
+                <span>{t("routine.settings.name")}</span>
                 <Input
                   value={current().name}
-                  placeholder="Morning brief"
+                  placeholder={t("routine.settings.namePlaceholder")}
                   maxlength={INPUT_LIMITS.routineName}
                   onValueChange={(name) => changeDraft((value) => ({ ...value, name }))}
                 />
               </label>
+              <section class="agent-routine-when" aria-labelledby="agent-routine-when-heading">
+                <h3 id="agent-routine-when-heading">{t("routine.settings.whenToRun")}</h3>
+                <RoutineSchedulePicker
+                  schedule={current().scheduleDraft}
+                  kinds={ROUTINE_SAVED_DRAFT_KINDS}
+                  onChange={(scheduleDraft) =>
+                    changeDraft((value) => ({
+                      ...value,
+                      schedule: routineScheduleFromDraft(scheduleDraft),
+                      scheduleDraft,
+                    }))
+                  }
+                />
+              </section>
               <label class="settings-field agent-routine-instruction-field">
-                <span>Instruction</span>
+                <span>{t("routine.settings.instruction")}</span>
                 <Textarea
                   value={current().instruction}
-                  placeholder={`Describe what this ${props.port.ownerNoun} should do.`}
+                  placeholder={
+                    props.port.ownerNoun === "channel"
+                      ? t("routine.settings.instructionPlaceholderChannel")
+                      : t("routine.settings.instructionPlaceholderAgent")
+                  }
                   maxlength={INPUT_LIMITS.routineInstruction}
                   onValueChange={(instruction) => changeDraft((value) => ({ ...value, instruction }))}
                 />
               </label>
-
-              <RoutineScheduleEditor
-                schedule={current().schedule}
-                expanded={scheduleExpanded()}
-                onExpandedChange={setScheduleExpanded}
-                onChange={(schedule) => changeDraft((value) => ({ ...value, schedule }))}
-              />
 
               <RoutineRunHistory runs={runs()} onOpenRun={props.onOpenRun ? requestOpenRun : undefined} />
             </div>
@@ -493,36 +566,32 @@ export function AgentRoutinesSettings(props: AgentRoutinesSettingsProps) {
           )}
         </Show>
       </div>
-      <Dialog.Root
+      <ConfirmDialog
         open={pendingExit() !== null}
-        onOpenChange={(open) => {
-          if (!open) setPendingExit(null);
-        }}
-      >
-        <Dialog.Portal>
-          <Dialog.Overlay class="agent-memory-confirm-overlay" />
-          <Dialog.Content class="agent-memory-confirm-dialog">
-            <div class="agent-memory-confirm-content">
-              <Dialog.Title>Discard changes?</Dialog.Title>
-              <Dialog.Description>Your unsaved changes to this routine will be lost.</Dialog.Description>
-              <div class="agent-memory-confirm-actions">
-                <Button variant="ghost" type="button" onClick={() => setPendingExit(null)}>
-                  Keep editing
-                </Button>
-                <Button variant="destructive" type="button" onClick={discardChanges}>
-                  Discard changes
-                </Button>
-              </div>
-            </div>
-          </Dialog.Content>
-        </Dialog.Portal>
-      </Dialog.Root>
+        onCancel={() => setPendingExit(null)}
+        onConfirm={discardChanges}
+        title={t("routine.settings.discardTitle")}
+        description={t("routine.settings.discardDescription")}
+        confirmLabel={t("routine.settings.discardConfirm")}
+        cancelLabel={t("routine.settings.keepEditing")}
+        initialFocus="cancel"
+      />
     </div>
   );
 }
 
+/**
+ * The list row reads the schedule as the chips do. A schedule the chips show only as cron, such
+ * as an interval, keeps its own summary: "Every 15 minutes", not the cron text.
+ */
+function routineListSummary(schedule: RoutineSchedule, text: RoutineText): string {
+  const draft = routineScheduleToDraft(schedule);
+  if (draft.kind === "custom") return routineScheduleSummary(schedule, false, text);
+  return routineDraftSummary(draft, text);
+}
+
 function validDraft(draft: RoutineDraft): boolean {
-  return Boolean(draft.name.trim() && draft.instruction.trim());
+  return Boolean(draft.name.trim() && draft.instruction.trim()) && routineDraftProblem(draft.scheduleDraft) === null;
 }
 
 function isBlankNewDraft(draft: RoutineDraft): boolean {

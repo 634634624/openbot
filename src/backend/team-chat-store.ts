@@ -9,6 +9,14 @@ import type {
   DirectThreadSummary,
 } from "@openbot/contracts/ipc";
 import { type DynamicRecord, isDynamicRecord, isNumber, isString } from "@openbot/contracts/runtime-values";
+import { sourceText } from "@openbot/i18n/source";
+import {
+  databaseRow,
+  databaseRows,
+  optionalNumberColumn,
+  requiredNumberColumn,
+  requiredStringColumn,
+} from "./database/database-rows";
 import type { OpenBotDatabase } from "./openbot-database";
 
 export class TeamChatStore {
@@ -42,14 +50,14 @@ export class TeamChatStore {
         .all(memberId, memberId, memberId, memberId),
     );
     return rows.map((row) => ({
-      threadId: requiredString(row, "thread_id"),
+      threadId: requiredStringColumn(row, "thread_id"),
       otherMemberId:
-        requiredString(row, "member_a_id") === memberId
-          ? requiredString(row, "member_b_id")
-          : requiredString(row, "member_a_id"),
-      lastMessage: JSON.parse(requiredString(row, "message_json")),
-      unreadCount: requiredNumber(row, "unread_count"),
-      updatedAt: requiredString(row, "updated_at"),
+        requiredStringColumn(row, "member_a_id") === memberId
+          ? requiredStringColumn(row, "member_b_id")
+          : requiredStringColumn(row, "member_a_id"),
+      lastMessage: JSON.parse(requiredStringColumn(row, "message_json")),
+      unreadCount: requiredNumberColumn(row, "unread_count"),
+      updatedAt: requiredStringColumn(row, "updated_at"),
     }));
   }
 
@@ -72,12 +80,12 @@ export class TeamChatStore {
         )
         .all(threadId),
     );
-    const messages = rows.map((row) => decodeDirectMessage(JSON.parse(requiredString(row, "message_json"))));
+    const messages = rows.map((row) => decodeDirectMessage(JSON.parse(requiredStringColumn(row, "message_json"))));
     return {
       threadId,
       otherMemberId,
       messages,
-      revision: thread ? requiredNumber(thread, "last_event_sequence") : 0,
+      revision: thread ? requiredNumberColumn(thread, "last_event_sequence") : 0,
       readState: this.#readState(memberId, threadId, messages),
     };
   }
@@ -130,7 +138,7 @@ export class TeamChatStore {
       );
       if (!anchorRow) rows = [];
       else {
-        const sequence = requiredNumber(anchorRow, "last_event_sequence");
+        const sequence = requiredNumberColumn(anchorRow, "last_event_sequence");
         const olderLimit = Math.floor(limit / 2) + 1;
         const older = databaseRows(
           this.database.connection
@@ -153,8 +161,8 @@ export class TeamChatStore {
         rows = [...older, ...newer];
       }
     }
-    const messages = rows.map((row) => decodeDirectMessage(JSON.parse(requiredString(row, "message_json"))));
-    const firstSequence = rows[0] ? requiredNumber(rows[0], "last_event_sequence") : 0;
+    const messages = rows.map((row) => decodeDirectMessage(JSON.parse(requiredStringColumn(row, "message_json"))));
+    const firstSequence = rows[0] ? requiredNumberColumn(rows[0], "last_event_sequence") : 0;
     const hasOlder = Boolean(
       firstSequence > 0 &&
         this.database.connection
@@ -168,7 +176,7 @@ export class TeamChatStore {
       threadId,
       otherMemberId,
       messages,
-      revision: thread ? requiredNumber(thread, "last_event_sequence") : 0,
+      revision: thread ? requiredNumberColumn(thread, "last_event_sequence") : 0,
       pageInfo: {
         hasOlder,
         olderCursor: hasOlder ? encodeDirectCursor(firstSequence) : null,
@@ -185,12 +193,12 @@ export class TeamChatStore {
     createdAt?: string;
   }): DirectMessage {
     const text = input.text.trim();
-    if (!text) throw new Error("Write a message first.");
+    if (!text) throw new Error(sourceText("error.backend.directMessageRequired"));
     if (text.length > INPUT_LIMITS.directMessageText) {
-      throw new Error(`A direct message can have up to ${INPUT_LIMITS.directMessageText} characters.`);
+      throw new Error(sourceText("error.backend.directMessageTooLong", { limit: INPUT_LIMITS.directMessageText }));
     }
     if (input.senderMemberId === input.recipientMemberId) {
-      throw new Error("You cannot send a direct message to yourself.");
+      throw new Error(sourceText("error.backend.directMessageSelf"));
     }
     const memberIds = sortedMemberIds(input.senderMemberId, input.recipientMemberId);
     const threadId = directThreadId(memberIds[0], memberIds[1]);
@@ -263,8 +271,8 @@ export class TeamChatStore {
     if (!state) {
       return { unreadCount: 0, firstUnreadMessageId: null, throughSequence: 0 };
     }
-    const lastEventSequence = requiredNumber(state, "last_event_sequence");
-    const lastReadSequence = nullableNumber(state, "last_read_sequence");
+    const lastEventSequence = requiredNumberColumn(state, "last_event_sequence");
+    const lastReadSequence = optionalNumberColumn(state, "last_read_sequence");
     const nextSequence = Math.max(lastReadSequence ?? 0, Math.min(Math.max(0, throughSequence), lastEventSequence));
     if ((lastReadSequence ?? 0) >= nextSequence) {
       return this.#readStateFromDatabase(memberId, threadId);
@@ -305,7 +313,7 @@ export class TeamChatStore {
         )
         .get(threadId, memberId),
     );
-    const throughSequence = row ? requiredNumber(row, "last_read_sequence") : 0;
+    const throughSequence = row ? requiredNumberColumn(row, "last_read_sequence") : 0;
     const unread = messages.filter(
       (message) => message.senderMemberId !== memberId && message.sequence > throughSequence,
     );
@@ -325,7 +333,7 @@ export class TeamChatStore {
         )
         .get(threadId, memberId),
     );
-    const throughSequence = row ? requiredNumber(row, "last_read_sequence") : 0;
+    const throughSequence = row ? requiredNumberColumn(row, "last_read_sequence") : 0;
     const unreadCountRow = databaseRow(
       this.database.connection
         .prepare(
@@ -351,8 +359,8 @@ export class TeamChatStore {
         .get(threadId, memberId, throughSequence),
     );
     return {
-      unreadCount: unreadCountRow ? requiredNumber(unreadCountRow, "unread_count") : 0,
-      firstUnreadMessageId: firstUnreadRow ? requiredString(firstUnreadRow, "message_id") : null,
+      unreadCount: unreadCountRow ? requiredNumberColumn(unreadCountRow, "unread_count") : 0,
+      firstUnreadMessageId: firstUnreadRow ? requiredStringColumn(firstUnreadRow, "message_id") : null,
       throughSequence,
     };
   }
@@ -391,19 +399,6 @@ function decodeDirectCursor(value: string): number {
   }
 }
 
-function databaseRow(value: unknown): DynamicRecord | null {
-  return isDynamicRecord(value) ? value : null;
-}
-
-function databaseRows(value: unknown): DynamicRecord[] {
-  if (!Array.isArray(value)) throw new Error("Invalid direct-message query result.");
-  return value.map((row) => {
-    const record = databaseRow(row);
-    if (!record) throw new Error("Invalid direct-message query row.");
-    return record;
-  });
-}
-
 function decodeDirectMessage(value: unknown): DirectMessage {
   if (
     !isDynamicRecord(value) ||
@@ -427,24 +422,6 @@ function decodeDirectMessage(value: unknown): DirectMessage {
     createdAt: value.createdAt,
     sequence: value.sequence,
   };
-}
-
-function requiredString(row: DynamicRecord, key: string): string {
-  const value = row[key];
-  if (!isString(value)) throw new Error(`Invalid direct-message column ${key}.`);
-  return value;
-}
-
-function requiredNumber(row: DynamicRecord, key: string): number {
-  const value = row[key];
-  if (!isNumber(value)) throw new Error(`Invalid direct-message column ${key}.`);
-  return value;
-}
-
-function nullableNumber(row: DynamicRecord, key: string): number | null {
-  const value = row[key];
-  if (value === null || isNumber(value)) return value;
-  throw new Error(`Invalid direct-message column ${key}.`);
 }
 
 function sortedMemberIds(leftMemberId: string, rightMemberId: string): [string, string] {

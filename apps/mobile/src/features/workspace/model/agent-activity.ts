@@ -1,3 +1,4 @@
+import type { AvatarMood } from "@openbot/brand/bloub-avatar-motion";
 import type { AgentEvent, TeamRealtimeEvent } from "@openbot/contracts/ipc";
 
 export interface MobileAgentActivity {
@@ -8,6 +9,42 @@ export interface MobileAgentActivity {
 }
 
 export type MobileAgentActivities = Record<string, MobileAgentActivity>;
+
+/**
+ * The face an avatar wears for an activity. An agent that waits on an answer holds its resting
+ * face and stops moving; anything else it does is work. The mood table itself is shared with the
+ * desktop, so the two cannot drift.
+ */
+export function agentActivityMood(activity: MobileAgentActivity | undefined): AvatarMood {
+  if (!activity) return "idle";
+  return activity.phase === "waiting" ? "waiting" : "working";
+}
+
+function sameActivity(left: MobileAgentActivity | undefined, right: MobileAgentActivity) {
+  return (
+    left !== undefined &&
+    left.agentId === right.agentId &&
+    left.turnId === right.turnId &&
+    left.phase === right.phase &&
+    left.detail === right.detail
+  );
+}
+
+/** Keep `current` when an event does not change what an agent shows, so consumers are not notified. */
+function withActivity(current: MobileAgentActivities, agentId: string, activity: MobileAgentActivity) {
+  return sameActivity(current[agentId], activity) ? current : { ...current, [agentId]: activity };
+}
+
+function sameActivities(left: MobileAgentActivities, right: MobileAgentActivities) {
+  const keys = Object.keys(right);
+  return (
+    keys.length === Object.keys(left).length &&
+    keys.every((key) => {
+      const activity = right[key];
+      return activity !== undefined && (left[key] === activity || sameActivity(left[key], activity));
+    })
+  );
+}
 
 export function reduceAgentActivity(
   current: MobileAgentActivities,
@@ -33,25 +70,23 @@ export function reduceAgentActivity(
     ]) {
       next[request.agentId] = { turnId: request.turnId, phase: "waiting", detail: null };
     }
-    return next;
+    return sameActivities(current, next) ? current : next;
   }
   if (event.type === "agents-changed") {
     const ids = new Set(event.agents.map((agent) => agent.id));
+    if (Object.keys(current).every((id) => ids.has(id))) return current;
     return Object.fromEntries(Object.entries(current).filter(([id]) => ids.has(id)));
   }
   if (event.type === "turn-started" || event.type === "turn-progress" || event.type === "conversation-delta") {
     const previous = current[event.agentId];
     if (event.type === "conversation-delta" && previous?.turnId === event.turnId && previous.phase === "responding")
       return current;
-    return {
-      ...current,
-      [event.agentId]: {
-        turnId: event.turnId,
-        phase: event.type === "conversation-delta" ? "responding" : "working",
-        detail:
-          event.type === "turn-progress" ? event.detail : previous?.turnId === event.turnId ? previous.detail : null,
-      },
-    };
+    return withActivity(current, event.agentId, {
+      turnId: event.turnId,
+      phase: event.type === "conversation-delta" ? "responding" : "working",
+      detail:
+        event.type === "turn-progress" ? event.detail : previous?.turnId === event.turnId ? previous.detail : null,
+    });
   }
   if (event.type === "conversation") {
     const { agentId, activeTurnId, messages } = event.snapshot;
@@ -67,17 +102,15 @@ export function reduceAgentActivity(
         message.turnId === activeTurnId &&
         message.author === "assistant" &&
         message.itemType !== "commentary" &&
+        message.itemType !== "plan" &&
         message.status === "streaming" &&
         message.text.trim().length > 0,
     );
-    return {
-      ...current,
-      [agentId]: {
-        turnId: activeTurnId,
-        phase: responding ? "responding" : previous?.turnId === activeTurnId ? previous.phase : "working",
-        detail: previous?.turnId === activeTurnId ? previous.detail : null,
-      },
-    };
+    return withActivity(current, agentId, {
+      turnId: activeTurnId,
+      phase: responding ? "responding" : previous?.turnId === activeTurnId ? previous.phase : "working",
+      detail: previous?.turnId === activeTurnId ? previous.detail : null,
+    });
   }
   if (event.type === "turn-completed") {
     if (current[event.agentId]?.turnId !== event.turnId) return current;
@@ -87,10 +120,11 @@ export function reduceAgentActivity(
   }
   if (event.type === "prompt" || event.type === "approval" || event.type === "browser-takeover-requested") {
     const request = event.type === "approval" ? event.approval : event.type === "prompt" ? event : event.request;
-    return { ...current, [request.agentId]: { turnId: request.turnId, phase: "waiting", detail: null } };
+    return withActivity(current, request.agentId, { turnId: request.turnId, phase: "waiting", detail: null });
   }
-  if (event.type === "agent-input-resolved" && current[event.agentId]) {
-    return { ...current, [event.agentId]: { ...current[event.agentId], phase: "working", detail: null } };
+  if (event.type === "agent-input-resolved") {
+    const activity = current[event.agentId];
+    if (activity) return withActivity(current, event.agentId, { ...activity, phase: "working", detail: null });
   }
   return current;
 }

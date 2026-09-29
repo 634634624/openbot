@@ -1,15 +1,21 @@
 import { decodeAgentAnalytics } from "../ipc-agent-analytics";
-import { isAgentModel, isReasoningEffort } from "../ipc-agent-identity";
-import {
-  decodeAgentProfileDraft,
-  decodeSaveAgentProfileResult,
-  parseGenerateAgentProfile,
-  parseSaveAgentProfile,
-} from "../ipc-agent-profile";
-import { isAgentProvider } from "../ipc-agent-status";
+import { BROWSER_SECRET_RESPONSE_PATH, parseBrowserSecretResponse } from "../ipc-browser-secret";
 import { decodeHostAnalytics } from "../ipc-host-analytics";
-import { isBoolean, isDynamicRecord, isString } from "../runtime-values";
+import { isBoolean, isDynamicRecord, isOneOf, isString } from "../runtime-values";
 import { decodeAnalyticsV1Response } from "./analytics-v1";
+import {
+  decodeBrowserDisplayResponse,
+  decodeBrowserLoadRequest,
+  isBrowserDisplayRoute,
+  isBrowserLoadRoute,
+} from "./browser-navigation-v1";
+import {
+  decodeBrowserViewSessionRequest,
+  decodeBrowserViewSessionResponse,
+  isBrowserViewSessionRoute,
+  isBrowserViewSessionsRoute,
+} from "./browser-view-v1";
+import { withConversationPlans } from "./conversation-plan-v4";
 import {
   isAgentAnalyticsRoute,
   isAgentCreateRoute,
@@ -19,10 +25,23 @@ import {
   isHostAnalyticsRoute,
   isQueueSnapshotRoute,
 } from "./current";
+import {
+  currentProfileRoutes,
+  decodeScopedUsageRequest,
+  decodeUnreadRequest,
+  duplicateRoute,
+  readPath,
+  scopedUsageRoute,
+} from "./current-adapter-routes";
 import { toCurrentAgentKeys, toCurrentAgentKeysObjectForPath, toWireAgentKeys } from "./current-agent-keys";
 import { decodeHostAnalyticsV1Response } from "./host-analytics-v1";
 import { decodeProfileV4Request, decodeProfileV4Response } from "./profile-v4";
 import { decodeQueueEditRequest, isQueueEditRoute } from "./queue-edit-v1";
+import {
+  decodeRemoteDesktopSetupRequest,
+  decodeRemoteDesktopSetupResponse,
+  isRemoteDesktopSetupRoute,
+} from "./remote-desktop-setup-v1";
 import { decodeTeamProtocolV4HttpRequest, decodeTeamProtocolV4HttpResponse } from "./v4";
 import type { TeamProtocolV4BaseJsonObject, TeamProtocolV4BaseJsonValue } from "./v4-base";
 import {
@@ -33,29 +52,40 @@ import {
 } from "./v4-base-adapter";
 
 /**
- * `editing` rides beside the frozen queue projection: the shipped key lists drop it, so a client on
- * protocol 1-3 reads the queue exactly as it did before, and only the current protocol carries the
- * mark that another editor holds a message.
+ * `editing` and `expectsReply` ride beside the frozen queue projection: the shipped key lists drop
+ * them, so a client on protocol 1-3 reads the queue exactly as it did before, and only the current
+ * protocol carries the mark that another editor holds a message, or that a teammate's message
+ * needs no answer. A client uses the second mark to keep a teammate's answer out of the actions it
+ * offers on queued messages.
  *
- * A present mark must be a boolean. The projection removes the key, so an unchecked value would
- * reach the client as a message nobody holds, and enable the edit actions the hold disables.
- * Fail closed instead; an absent mark still means an older host that never sends one.
+ * A present mark must be a boolean. The projection removes the key, so an unchecked `editing` would
+ * reach the client as a message nobody holds, and enable the edit actions the hold disables; an
+ * unchecked `expectsReply` would reach it as a question. Fail closed instead; an absent mark still
+ * means an older host that never sends one: no hold, and an answer expected.
  */
-function withQueueEditing(projected: TeamProtocolV4BaseJsonValue, source: unknown): TeamProtocolV4BaseJsonValue {
+const QUEUE_MARKS = { editing: "Invalid queue edit mark.", expectsReply: "Invalid queue reply mark." } as const;
+
+function withQueueMarks(projected: TeamProtocolV4BaseJsonValue, source: unknown): TeamProtocolV4BaseJsonValue {
   if (!isDynamicRecord(projected) || !Array.isArray(projected.deliveries)) return projected;
   if (!isDynamicRecord(source) || !Array.isArray(source.deliveries)) return projected;
-  const marks = new Map<string, boolean>();
+  const marks = new Map<string, TeamProtocolV4BaseJsonObject>();
   for (const delivery of source.deliveries) {
-    if (!isDynamicRecord(delivery) || delivery.editing === undefined) continue;
-    if (!isBoolean(delivery.editing)) throw new Error("Invalid queue edit mark.");
-    if (isString(delivery.id)) marks.set(delivery.id, delivery.editing);
+    if (!isDynamicRecord(delivery)) continue;
+    const present: TeamProtocolV4BaseJsonObject = {};
+    for (const [key, error] of Object.entries(QUEUE_MARKS)) {
+      const mark = delivery[key];
+      if (mark === undefined) continue;
+      if (!isBoolean(mark)) throw new Error(error);
+      present[key] = mark;
+    }
+    if (isString(delivery.id) && Object.keys(present).length > 0) marks.set(delivery.id, present);
   }
   if (marks.size === 0) return projected;
   return {
     ...projected,
     deliveries: projected.deliveries.map((delivery) =>
       isDynamicRecord(delivery) && isString(delivery.id) && marks.has(delivery.id)
-        ? { ...delivery, editing: marks.get(delivery.id) ?? false }
+        ? { ...delivery, ...marks.get(delivery.id) }
         : delivery,
     ),
   };
@@ -105,8 +135,13 @@ function withExchangeExpectsReply(
 }
 
 function encodeQueueSnapshot(json: string, source: unknown): string {
-  return JSON.stringify(withQueueEditing(JSON.parse(json), source));
+  return JSON.stringify(withQueueMarks(JSON.parse(json), source));
 }
+
+const profile = currentProfileRoutes({
+  decodeRequest: decodeProfileV4Request,
+  decodeResponse: decodeProfileV4Response,
+});
 
 export function encodeTeamProtocolV4CurrentHttpRequest(
   method: string,
@@ -114,10 +149,15 @@ export function encodeTeamProtocolV4CurrentHttpRequest(
   value: unknown,
   options: { preserveSemanticTags?: boolean; agentCreateModel?: boolean } = {},
 ): string {
+  if (isRemoteDesktopSetupRoute(method, path)) return JSON.stringify(decodeRemoteDesktopSetupRequest(path, value));
+  if (method === "POST" && path === BROWSER_SECRET_RESPONSE_PATH)
+    return JSON.stringify(parseBrowserSecretResponse(value));
+  if (isBrowserLoadRoute(method, path)) return JSON.stringify(decodeBrowserLoadRequest(value));
+  if (isBrowserViewSessionsRoute(method, path)) return JSON.stringify(decodeBrowserViewSessionRequest(value));
   if (isQueueEditRoute(method, path)) return JSON.stringify(decodeQueueEditRequest(value));
   if (isAgentAnalyticsRoute(method, path) || isHostAnalyticsRoute(method, path))
     return JSON.stringify(decodeScopedUsageRequest(value));
-  if (isAgentProfileRoute(method, path)) return JSON.stringify(encodeProfileRequest(path, value));
+  if (isAgentProfileRoute(method, path)) return JSON.stringify(profile.encodeRequest(path, value));
   if (isConversationUnreadRoute(method, path)) return JSON.stringify(decodeUnreadRequest(value));
   if (scopedUsageRoute(method, path)) {
     return JSON.stringify(decodeScopedUsageRequest(value));
@@ -146,10 +186,13 @@ export function decodeTeamProtocolV4CurrentHttpRequest(
   value: unknown,
   options: { preserveSemanticTags?: boolean; agentCreateModel?: boolean } = {},
 ): TeamProtocolV4BaseJsonObject {
+  if (isRemoteDesktopSetupRoute(method, path)) return decodeRemoteDesktopSetupRequest(path, value);
+  if (method === "POST" && path === BROWSER_SECRET_RESPONSE_PATH) return { ...parseBrowserSecretResponse(value) };
+  if (isBrowserLoadRoute(method, path)) return { ...decodeBrowserLoadRequest(value) };
+  if (isBrowserViewSessionsRoute(method, path)) return { ...decodeBrowserViewSessionRequest(value) };
   if (isQueueEditRoute(method, path)) return { ...decodeQueueEditRequest(value) };
   if (isAgentAnalyticsRoute(method, path) || isHostAnalyticsRoute(method, path)) return decodeScopedUsageRequest(value);
-  if (isAgentProfileRoute(method, path))
-    return profileRequest(path, decodeProfileV4Request(profileGeneration(path), value));
+  if (isAgentProfileRoute(method, path)) return profile.decodeRequest(path, value);
   if (isConversationUnreadRoute(method, path)) return decodeUnreadRequest(value);
   if (scopedUsageRoute(method, path)) {
     return decodeScopedUsageRequest(value);
@@ -183,11 +226,22 @@ export function encodeTeamProtocolV4CurrentHttpResponse(
   value: unknown,
   options: { preserveSemanticTags?: boolean } = {},
 ): string {
+  if (isRemoteDesktopSetupRoute(method, path) && status < 400)
+    return JSON.stringify(decodeRemoteDesktopSetupResponse(path, value));
   if (isHostAnalyticsRoute(method, path) && status < 400)
     return JSON.stringify(decodeHostAnalyticsV1Response(decodeHostAnalytics(value)));
   if (isAgentAnalyticsRoute(method, path) && status < 400)
     return JSON.stringify(decodeAnalyticsV1Response(decodeAgentAnalytics(value)));
-  if (isAgentProfileRoute(method, path) && status < 400) return JSON.stringify(encodeProfileResponse(path, value));
+  if (isAgentProfileRoute(method, path) && status < 400) return JSON.stringify(profile.encodeResponse(path, value));
+  if (isBrowserLoadRoute(method, path) && status < 400) return "{}";
+  if (path === BROWSER_SECRET_RESPONSE_PATH && status === 204) return "{}";
+  if (isBrowserViewSessionRoute(method, path) && status < 400) return "{}";
+  if (isBrowserViewSessionsRoute(method, path) && status < 400)
+    return JSON.stringify(decodeBrowserViewSessionResponse(value));
+  // The tabs keep the released projection, and that projection names `ownerBotId`, so the swap the
+  // base adapter does by path has to happen here too.
+  if (isBrowserDisplayRoute(method, path) && status < 400)
+    return JSON.stringify(decodeBrowserDisplayResponse(toWireAgentKeys(JSON.parse(JSON.stringify(value ?? null)))));
   if (isQueueEditRoute(method, path) && status === 204) return "{}";
   if (isQueueEditRoute(method, path))
     return encodeQueueSnapshot(
@@ -201,8 +255,11 @@ export function encodeTeamProtocolV4CurrentHttpResponse(
     );
   if (isConversationRoute(method, path) && status < 400)
     return JSON.stringify(
-      withExchangeExpectsReply(
-        JSON.parse(encodeTeamProtocolV4BaseCurrentHttpResponse(method, path, status, value, options)),
+      withConversationPlans(
+        withExchangeExpectsReply(
+          JSON.parse(encodeTeamProtocolV4BaseCurrentHttpResponse(method, path, status, value, options)),
+          value,
+        ),
         value,
       ),
     );
@@ -225,21 +282,31 @@ export function decodeTeamProtocolV4CurrentHttpResponse(
   status: number,
   value: unknown,
 ): TeamProtocolV4BaseJsonValue {
+  if (isRemoteDesktopSetupRoute(method, path) && status < 400) return decodeRemoteDesktopSetupResponse(path, value);
   if (isHostAnalyticsRoute(method, path) && status < 400)
     return JSON.parse(JSON.stringify(decodeHostAnalytics(decodeHostAnalyticsV1Response(value))));
   if (isAgentAnalyticsRoute(method, path) && status < 400)
     return JSON.parse(JSON.stringify(decodeAgentAnalytics(decodeAnalyticsV1Response(value))));
-  if (isAgentProfileRoute(method, path) && status < 400) return decodeProfileResponse(path, value);
+  if (isAgentProfileRoute(method, path) && status < 400) return profile.decodeResponse(path, value);
+  if (isBrowserLoadRoute(method, path) && status < 400) return {};
+  if (path === BROWSER_SECRET_RESPONSE_PATH && status === 204) return {};
+  if (isBrowserViewSessionRoute(method, path) && status < 400) return {};
+  if (isBrowserViewSessionsRoute(method, path) && status < 400) return { ...decodeBrowserViewSessionResponse(value) };
+  if (isBrowserDisplayRoute(method, path) && status < 400)
+    return toCurrentAgentKeys(structuredClone(decodeBrowserDisplayResponse(value)));
   if (isQueueEditRoute(method, path) && status === 204) return {};
   if (isQueueEditRoute(method, path))
-    return withQueueEditing(
+    return withQueueMarks(
       decodeTeamProtocolV4BaseCurrentHttpResponse("GET", "/v1/agents/queue/queue", status, value),
       value,
     );
   if (isQueueSnapshotRoute(method, path) && status < 400)
-    return withQueueEditing(decodeTeamProtocolV4BaseCurrentHttpResponse(method, path, status, value), value);
+    return withQueueMarks(decodeTeamProtocolV4BaseCurrentHttpResponse(method, path, status, value), value);
   if (isConversationRoute(method, path) && status < 400)
-    return withExchangeExpectsReply(decodeTeamProtocolV4BaseCurrentHttpResponse(method, path, status, value), value);
+    return withConversationPlans(
+      withExchangeExpectsReply(decodeTeamProtocolV4BaseCurrentHttpResponse(method, path, status, value), value),
+      value,
+    );
   if (isConversationUnreadRoute(method, path))
     return decodeTeamProtocolV4BaseCurrentHttpResponse(method, readPath(path), status, value);
   if (scopedUsageRoute(method, path) || isAgentAnalyticsRoute(method, path) || isHostAnalyticsRoute(method, path)) {
@@ -249,12 +316,14 @@ export function decodeTeamProtocolV4CurrentHttpResponse(
   return toCurrentAgentKeys(structuredClone(decodeTeamProtocolV4HttpResponse(method, path, status, value)));
 }
 
-function decodeUnreadRequest(value: unknown): TeamProtocolV4BaseJsonObject {
-  if (value === null || typeof value !== "object" || Array.isArray(value) || Object.keys(value).length !== 0) {
-    throw new Error("Invalid conversation-unread request.");
-  }
-  return {};
-}
+/**
+ * The providers, model ids and reasoning efforts v4 shipped with, as in the `v4-base.ts` agent
+ * validator. They are not the app's lists: a value the app adds later is not part of this frozen
+ * protocol, so a v4 request cannot name it.
+ */
+const V4_AGENT_PROVIDERS = ["codex", "claude", "grok", "opencode"] as const;
+const V4_AGENT_MODEL = /^[A-Za-z0-9][A-Za-z0-9._:/[\]-]{0,159}$/u;
+const V4_REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 
 /**
  * The provider, model and reasoning effort of an agent creation request, validated and fail-closed:
@@ -265,82 +334,16 @@ function decodeAgentCreateModel(value: unknown): TeamProtocolV4BaseJsonObject {
   if (!isDynamicRecord(value)) throw new Error("Invalid agent creation request.");
   const result: TeamProtocolV4BaseJsonObject = {};
   if (value.provider !== undefined) {
-    if (!isAgentProvider(value.provider)) throw new Error("Invalid agent provider.");
+    if (!isOneOf(V4_AGENT_PROVIDERS, value.provider)) throw new Error("Invalid agent provider.");
     result.provider = value.provider;
   }
   if (value.model !== undefined) {
-    if (!isAgentModel(value.model)) throw new Error("Invalid agent model.");
+    if (!isString(value.model) || !V4_AGENT_MODEL.test(value.model)) throw new Error("Invalid agent model.");
     result.model = value.model;
   }
   if (value.reasoningEffort !== undefined) {
-    if (!isReasoningEffort(value.reasoningEffort)) throw new Error("Invalid reasoning effort.");
+    if (!isOneOf(V4_REASONING_EFFORTS, value.reasoningEffort)) throw new Error("Invalid reasoning effort.");
     result.reasoningEffort = value.reasoningEffort;
   }
   return result;
-}
-
-function readPath(path: string): string {
-  return new URL(path, "http://openbot.invalid").pathname.replace(/\/unread$/u, "/read");
-}
-
-function scopedUsageRoute(method: string, path: string): boolean {
-  const pathname = new URL(path, "http://openbot.invalid").pathname;
-  return method === "GET" && /^\/v1\/agents\/[^/]+\/usage$/u.test(pathname);
-}
-
-function decodeScopedUsageRequest(value: unknown): TeamProtocolV4BaseJsonObject {
-  if (!isDynamicRecord(value) || Object.keys(value).length > 0) {
-    throw new Error("Invalid model-scoped usage request.");
-  }
-  return {};
-}
-
-function duplicateRoute(method: string, path: string): boolean {
-  const pathname = new URL(path, "http://openbot.invalid").pathname;
-  return method === "POST" && /^\/v1\/agents\/[^/]+\/duplicate$/u.test(pathname);
-}
-
-function profileRequest(path: string, value: unknown): TeamProtocolV4BaseJsonObject {
-  const parsed = new URL(path, "http://openbot.invalid").pathname.endsWith("/generate")
-    ? parseGenerateAgentProfile(value)
-    : parseSaveAgentProfile(value);
-  return JSON.parse(JSON.stringify(parsed));
-}
-function profileResponse(path: string, value: unknown): TeamProtocolV4BaseJsonObject {
-  const parsed = new URL(path, "http://openbot.invalid").pathname.endsWith("/generate")
-    ? decodeAgentProfileDraft(value)
-    : decodeSaveAgentProfileResult(value);
-  return JSON.parse(JSON.stringify(parsed));
-}
-
-function profileGeneration(path: string): boolean {
-  return new URL(path, "http://openbot.invalid").pathname.endsWith("/generate");
-}
-function encodeProfileRequest(path: string, value: unknown): TeamProtocolV4BaseJsonObject {
-  return decodeProfileV4Request(profileGeneration(path), profileRequest(path, value));
-}
-
-function encodeProfileResponse(path: string, value: unknown): TeamProtocolV4BaseJsonObject {
-  const parsed = profileResponse(path, value);
-  return decodeProfileV4Response(
-    profileGeneration(path),
-    profileGeneration(path)
-      ? parsed
-      : {
-          agent: toWireAgentKeys(parsed.agent),
-          layout: parsed.layout,
-        },
-  );
-}
-function decodeProfileResponse(path: string, value: unknown): TeamProtocolV4BaseJsonObject {
-  const parsed = decodeProfileV4Response(profileGeneration(path), value);
-  return profileResponse(
-    path,
-    profileGeneration(path)
-      ? parsed
-      : {
-          agent: toCurrentAgentKeys(parsed.agent),
-          layout: parsed.layout,
-        },
-  );
 }

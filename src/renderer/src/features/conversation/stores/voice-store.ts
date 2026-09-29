@@ -1,14 +1,15 @@
 import { VOICE_AUDIO_LIMITS } from "@openbot/contracts/ipc";
+import { currentText } from "@openbot/ui/text";
 import { onCleanup } from "solid-js";
 import { desktopAnalytics } from "../../../analytics";
-import { errorMessage } from "../../../error-message";
 import { appendVoiceTranscript, recordingToWav } from "../../../voice-recording";
 import { EMPTY_DRAFT } from "../composer-draft";
 import { composerDraftKey } from "../conversation-keys";
+import { conversationRuntime } from "../conversation-runtime";
 import type { ComposerDraft, ConversationProps, ConversationTarget } from "../conversation-types";
 import { voiceCaptureError, voiceTranscriptionError } from "../voice-status";
 
-export interface VoiceSubmitHooks {
+interface VoiceSubmitHooks {
   saveEdit: (
     draftOverride?: ComposerDraft,
     target?: ConversationTarget & { deliveryId: string; originalAttachmentIds: string[] },
@@ -74,14 +75,14 @@ export function createVoiceStore(deps: VoiceStoreDeps) {
     deps.setVoicePhase("preparing");
     deps.setVoiceModelProgress(0);
     try {
-      const modelStatus = await window.openbot.voice.prepareModel();
+      const modelStatus = await conversationRuntime(deps.props).voice.prepareModel();
       if (resources.voiceDisposed || resources.voiceRequestGeneration !== generation) return;
       if (modelStatus.phase !== "ready") {
         deps.setVoicePhase("idle");
         deps.setVoiceModelProgress(null);
         deps.setConversationError(
           target,
-          errorMessage(modelStatus.message, "Could not prepare the voice model. Try again."),
+          currentText().errorMessage(modelStatus.message, currentText().t("composer.voice.prepareFailed")),
         );
         return;
       }
@@ -118,7 +119,7 @@ export function createVoiceStore(deps: VoiceStoreDeps) {
     }
   }
 
-  const removeVoiceModelListener = window.openbot.voice.onModelStatus((status) => {
+  const removeVoiceModelListener = conversationRuntime(deps.props).voice.onModelStatus((status) => {
     if (deps.voicePhase() !== "preparing") return;
     deps.setVoiceModelProgress(status.progress);
   });
@@ -149,10 +150,10 @@ export function createVoiceStore(deps: VoiceStoreDeps) {
     const audioDurationSeconds = deps.voiceElapsedSeconds();
     const startedAt = performance.now();
     try {
-      if (chunks.length === 0) throw new Error("No speech was recorded.");
+      if (chunks.length === 0) throw new Error(currentText().t("composer.voice.noSpeechRecorded"));
       const audio = await recordingToWav(new Blob(chunks, { type: mimeType }));
-      const result = await window.openbot.voice.transcribe({ audio });
-      if (!result.text.trim()) throw new Error("No speech was detected.");
+      const result = await conversationRuntime(deps.props).voice.transcribe({ audio });
+      if (!result.text.trim()) throw new Error(currentText().t("composer.voice.noSpeechDetected"));
       analytics.track("voice_transcription", {
         result: "succeeded",
         audio_duration_seconds: audioDurationSeconds,
@@ -235,5 +236,3 @@ export function createVoiceStore(deps: VoiceStoreDeps) {
     stopVoiceElapsedTimer,
   };
 }
-
-export type VoiceStore = ReturnType<typeof createVoiceStore>;

@@ -47,7 +47,9 @@ export const FALLBACK_PROVIDER_RUNTIMES: ProviderRuntimeSnapshot = {
     claude: NO_PROVIDER_RUNTIME,
     grok: NO_PROVIDER_RUNTIME,
     opencode: NO_PROVIDER_RUNTIME,
+    antigravity: NO_PROVIDER_RUNTIME,
   },
+  toolRuntimes: { bun: NO_PROVIDER_RUNTIME },
 };
 
 export const FALLBACK_HOST_STATUS: HostStatus = {

@@ -1,74 +1,54 @@
 import { stat } from "node:fs/promises";
-import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import type {
   BrowserActionHistoryEntry,
   BrowserDiagnosticEntry,
-  BrowserElement,
   BrowserEnvironment,
-  BrowserFocus,
   BrowserJsonValue,
   BrowserSnapshot,
   BrowserTarget,
 } from "@openbot/contracts/ipc";
 import { type DynamicRecord, isBoolean, isDynamicRecord, isNumber, isString } from "@openbot/contracts/runtime-values";
 import type { NativeImage, WebContents } from "electron";
+import { buttonMask, dispatchMouseClick, dispatchShortcut, dispatchTextKey, modifierMask } from "./browser-cdp-input";
+import {
+  boundSerializedSnapshot,
+  collectBoundedSnapshot,
+  collectFocus,
+  cssObjectMatch,
+  fallbackRole,
+  MAX_SNAPSHOT_SCANNED_NODES,
+  pageContainsText,
+  type SemanticMatch,
+  type SnapshotTarget,
+  semanticAxMatches,
+  type TargetRecord,
+  visibleTextObjectMatches,
+} from "./browser-cdp-snapshot";
+import {
+  assertBeforeDeadline,
+  automationContextId,
+  axValue,
+  type CdpResult,
+  clamp,
+  exceptionDescription,
+  isFiniteNumber,
+  isRecord,
+  numberValue,
+  recordValue,
+  type SendCommand,
+  stringValue,
+} from "./browser-cdp-values";
+import { describeBrowserTarget, stopLoadingAndWait, waitForLoading } from "./browser-navigation";
+import { createFramePacer } from "./browser-screencast-pacing";
 
 const ACTION_TIMEOUT_MS = 10_000;
 const WAIT_TIMEOUT_MS = 30_000;
 const MAX_RESULT_BYTES = 64 * 1024;
-const AUTOMATION_WORLD_NAME = "openbot-browser-automation";
 const DOCUMENT_ID_PROPERTY = "__openbot_browser_document_id__";
 const MAX_SNAPSHOT_FRAMES = 12;
-const MAX_SNAPSHOT_ELEMENTS = 200;
-const MAX_SNAPSHOT_CANDIDATES = MAX_SNAPSHOT_ELEMENTS * 2;
-const MAX_SNAPSHOT_TEXT = 100_000;
-const MAX_SNAPSHOT_SCANNED_NODES = 10_000;
-const MAX_SNAPSHOT_ELEMENT_VALUE = 2_000;
-const MAX_SERIALIZED_SNAPSHOT_BYTES = 1024 * 1024;
 const DOM_QUIET_MS = 250;
-const ACTIONABLE_ROLES = new Set([
-  "button",
-  "checkbox",
-  "combobox",
-  "link",
-  "listbox",
-  "menuitem",
-  "menuitemcheckbox",
-  "menuitemradio",
-  "option",
-  "radio",
-  "searchbox",
-  "slider",
-  "spinbutton",
-  "switch",
-  "tab",
-  "textbox",
-  "treeitem",
-]);
 
-type CdpResult = DynamicRecord;
 type ActionDispatch = () => void;
-
-interface TargetRecord {
-  backendNodeId: number;
-  targetId?: string;
-  element: BrowserElement;
-  visibleText: string;
-}
-
-interface SnapshotTarget {
-  sessionId?: string;
-  targetId?: string;
-  url?: string;
-}
-
-interface SemanticMatch {
-  backendNodeId: number;
-  sessionId?: string;
-  targetId?: string;
-  role: string;
-  name: string;
-}
 
 export interface SnapshotReadResult {
   snapshot: BrowserSnapshot;
@@ -89,14 +69,170 @@ export interface SnapshotContext {
   actions: BrowserActionHistoryEntry[];
 }
 
+export interface BrowserScreencastOptions {
+  quality: number;
+  maxWidth: number;
+  maxHeight: number;
+}
+
+export interface BrowserScreencastFrame {
+  sequence: number;
+  width: number;
+  height: number;
+  image: Uint8Array;
+}
+
+/** Pointer and key input in the page's own CSS pixels. */
+export type BrowserViewportInput =
+  | {
+      type: "pointer";
+      action: "move" | "down" | "up" | "wheel";
+      x: number;
+      y: number;
+      button: "left" | "middle" | "right";
+      clickCount: number;
+      deltaX: number;
+      deltaY: number;
+      modifiers: number;
+    }
+  | { type: "key"; action: "down" | "up" | "char"; key: string; code: string; text: string; modifiers: number };
+
 export class BrowserCdpEngine {
   readonly #contents: WebContents;
   #targets = new Map<string, TargetRecord>();
   #lastSnapshot: BrowserSnapshot | null = null;
   #environment: BrowserEnvironment | null = null;
   #navigationGeneration = 0;
+
+  /** Resolves nodes before consent; the returned operation never resolves a replacement target. */
+  async prepareSecret(
+    targets: BrowserTarget[],
+    origin: string,
+    submission: "on_input" | "enter" | "click",
+    submitTarget?: BrowserTarget,
+  ): Promise<{ enter: (secret: string) => Promise<void>; clear: (secret: string) => Promise<boolean> }> {
+    const generation = this.#navigationGeneration;
+    const fingerprint = `function() { return JSON.stringify([this.localName, this.type, this.id, this.name, this.getAttribute('autocomplete'), this.getAttribute('aria-label'), this.form?.action, this.form?.method]); }`;
+    const nodes = await this.#lease(async (send) => {
+      const inputs = [];
+      for (const target of targets) inputs.push(await this.#resolveElement(send, target, Date.now() + 10_000));
+      const button = submitTarget ? await this.#resolveElement(send, submitTarget, Date.now() + 10_000) : undefined;
+      for (const node of [...inputs, ...(button ? [button] : [])]) {
+        if (node.sessionId) throw new Error("Use takeover for authentication inside a frame.");
+        const valid = await this.#callOnNode(
+          send,
+          node.backendNodeId,
+          `function(origin, input) { return this.isConnected && this.ownerDocument === document && location.origin === origin && (!input || (this.localName === 'input' && !this.disabled && !this.readOnly && ['password','text','tel','number'].includes(this.type))); }`,
+          [origin, inputs.includes(node)],
+        );
+        if (valid !== true) throw new Error("Authentication target is unavailable.");
+      }
+      if (new Set(inputs.map((node) => node.backendNodeId)).size !== inputs.length)
+        throw new Error("Authentication fields must be distinct.");
+      const fingerprints: string[] = [];
+      for (const node of [...inputs, ...(button ? [button] : [])]) {
+        const value = await this.#callOnNode(send, node.backendNodeId, fingerprint, []);
+        if (!isString(value)) throw new Error("Authentication target is unavailable.");
+        fingerprints.push(value);
+      }
+      return { inputs, button, fingerprints };
+    });
+    if (generation !== this.#navigationGeneration) throw new Error("Authentication page changed.");
+    const enter = async (secret: string) => {
+      try {
+        await this.#lease(async (send) => {
+          if (generation !== this.#navigationGeneration) throw new Error("Authentication page changed.");
+          for (const [index, node] of [...nodes.inputs, ...(nodes.button ? [nodes.button] : [])].entries()) {
+            if ((await this.#callOnNode(send, node.backendNodeId, fingerprint, [])) !== nodes.fingerprints[index])
+              throw new Error("Authentication target changed.");
+            const valid = await this.#callOnNode(
+              send,
+              node.backendNodeId,
+              `function(origin, input) { return this.isConnected && this.ownerDocument === document && location.origin === origin && (!input || (!this.disabled && !this.readOnly)); }`,
+              [origin, nodes.inputs.includes(node)],
+            );
+            if (valid !== true) throw new Error("Authentication target changed.");
+          }
+          for (const [index, node] of nodes.inputs.entries()) {
+            if (generation !== this.#navigationGeneration) throw new Error("Authentication page changed.");
+            await send("DOM.focus", { backendNodeId: node.backendNodeId });
+            await this.#callOnNode(
+              send,
+              node.backendNodeId,
+              `function(origin) {
+                if (!this.isConnected || this.ownerDocument !== document || location.origin !== origin || this.disabled || this.readOnly) throw new Error('Authentication target changed.');
+                this.select();
+              }`,
+              [origin],
+            );
+            if (generation !== this.#navigationGeneration) throw new Error("Authentication page changed.");
+            // Native entry emits trusted input events across shadow roots, as regular browser typing
+            // does. Synthetic value setters can leave component forms unaware of the filled field.
+            await send("Input.insertText", { text: nodes.inputs.length === 1 ? secret : secret[index] });
+          }
+          if (submission === "on_input" || generation !== this.#navigationGeneration) return;
+          if (submission === "click" && nodes.button) {
+            await this.#callOnNode(
+              send,
+              nodes.button.backendNodeId,
+              `function(origin, expected) {
+                return new Promise((resolve, reject) => {
+                  const finish = (error) => { observer.disconnect(); clearTimeout(timer); error ? reject(new Error(error)) : resolve(); };
+                  const check = () => {
+                    if (!this.isConnected || this.ownerDocument !== document || location.origin !== origin || JSON.stringify([this.localName, this.type, this.id, this.name, this.getAttribute('autocomplete'), this.getAttribute('aria-label'), this.form?.action, this.form?.method]) !== expected) return finish('Authentication target changed.');
+                    if (!this.disabled && this.getAttribute('aria-disabled') !== 'true') finish();
+                  };
+                  const observer = new MutationObserver(check);
+                  const timer = setTimeout(() => finish('Authentication submit button is not ready.'), 2000);
+                  observer.observe(this, { attributes: true });
+                  observer.observe(this.getRootNode(), { childList: true, subtree: true });
+                  check();
+                });
+              }`,
+              [origin, nodes.fingerprints.at(-1)],
+            );
+            const point = await this.#elementPoint(send, nodes.button.backendNodeId, true);
+            if (generation !== this.#navigationGeneration) throw new Error("Authentication page changed.");
+            await dispatchMouseClick(send, point, "left", 1, 0);
+          } else if (submission === "enter") {
+            const last = nodes.inputs.at(-1);
+            if (!last) throw new Error("Authentication target changed.");
+            await send("DOM.focus", { backendNodeId: last.backendNodeId });
+            await dispatchShortcut(send, "Enter");
+          }
+        });
+      } catch {
+        throw new Error("Secure authentication could not be completed. Take over to check the page.");
+      }
+    };
+    /**
+     * Empties the filled fields, attached or detached, and reports whether the document is now free
+     * of the value: every field is empty and no title, URL, text, value or attribute contains it.
+     */
+    const clear = (secret: string) =>
+      this.#lease(async (send) => {
+        for (const node of nodes.inputs) {
+          const cleared = await this.#callOnNode(
+            send,
+            node.backendNodeId,
+            `function() { this.value = ''; return this.value === ''; }`,
+            [],
+          ).catch(() => false);
+          if (cleared !== true) return false;
+        }
+        const scan = await send("Runtime.callFunctionOn", {
+          executionContextId: await automationContextId(send),
+          functionDeclaration: SECRET_SCAN_FUNCTION,
+          arguments: [{ value: secret }],
+          returnByValue: true,
+        });
+        return !recordValue(scan.exceptionDetails) && recordValue(scan.result)?.value === false;
+      }).catch(() => false);
+    return { enter, clear };
+  }
   #retainDebugger = false;
   #ownsDebugger = false;
+  #closing = false;
   /**
    * How many leases are running. A lease detaches on the way out, and until this counter existed it
    * detached whenever it was the one that had attached -- which is wrong as soon as two overlap. An
@@ -112,6 +248,11 @@ export class BrowserCdpEngine {
 
   constructor(contents: WebContents) {
     this.#contents = contents;
+    contents.once("close", () => {
+      // Native teardown can start before isDestroyed() becomes true. Detaching a debugger
+      // during that interval can crash Electron; Chromium will dispose it with the page.
+      this.#closing = true;
+    });
     contents.on("did-start-navigation", (details) => {
       if (details.isMainFrame) this.#navigationGeneration += 1;
       this.#targets.clear();
@@ -157,6 +298,7 @@ export class BrowserCdpEngine {
         viewport,
         text: parsed.text,
         elements: parsed.elements,
+        truncated: parsed.truncated,
         focus,
         diagnostics: context.diagnostics,
         actions: context.actions,
@@ -190,19 +332,7 @@ export class BrowserCdpEngine {
       const modifiers = modifierMask(options.modifiers ?? []);
       assertBeforeDeadline(deadline);
       onDispatch?.();
-      await send("Input.dispatchMouseEvent", { type: "mouseMoved", ...coordinates, modifiers }, sessionId);
-      for (let clickCount = 1; clickCount <= totalClicks; clickCount += 1) {
-        await send(
-          "Input.dispatchMouseEvent",
-          { type: "mousePressed", ...coordinates, button, clickCount, modifiers },
-          sessionId,
-        );
-        await send(
-          "Input.dispatchMouseEvent",
-          { type: "mouseReleased", ...coordinates, button, clickCount, modifiers },
-          sessionId,
-        );
-      }
+      await dispatchMouseClick(send, coordinates, button, totalClicks, modifiers, sessionId);
     });
   }
 
@@ -429,7 +559,8 @@ export class BrowserCdpEngine {
       const desiredIndices = Array.isArray(plan.desiredIndices) ? plan.desiredIndices.filter(isNumber) : [];
       if (plan.multiple) desiredIndices.sort((left, right) => left - right);
       const enabledIndices = Array.isArray(plan.enabledIndices) ? plan.enabledIndices.filter(isNumber) : [];
-      if (desiredIndices.length === 0 || desiredIndices.some((index) => !enabledIndices.includes(index))) {
+      const [firstDesiredIndex] = desiredIndices;
+      if (firstDesiredIndex === undefined || desiredIndices.some((index) => !enabledIndices.includes(index))) {
         throw new Error("Select target returned an invalid option plan.");
       }
       assertBeforeDeadline(deadline);
@@ -443,11 +574,11 @@ export class BrowserCdpEngine {
           throw new Error("Select target returned an invalid keyboard navigation plan.");
         }
         const selectedIndex = plan.selectedIndex;
-        const targetRank = enabledIndices.indexOf(desiredIndices[0]);
-        if (desiredIndices[0] !== selectedIndex && cycleIndices.length > 0) {
+        const targetRank = enabledIndices.indexOf(firstDesiredIndex);
+        if (firstDesiredIndex !== selectedIndex && cycleIndices.length > 0) {
           const firstCycleRank = cycleIndices.findIndex((index) => index > selectedIndex);
           const startCycleRank = firstCycleRank < 0 ? 0 : firstCycleRank;
-          const targetCycleRank = cycleIndices.indexOf(desiredIndices[0]);
+          const targetCycleRank = cycleIndices.indexOf(firstDesiredIndex);
           if (targetCycleRank < 0) {
             throw new Error("Select target returned an invalid typeahead navigation plan.");
           }
@@ -464,7 +595,7 @@ export class BrowserCdpEngine {
           for (let index = 0; index < steps; index++) {
             await dispatchTextKey(send, initial, resolved.sessionId);
           }
-        } else if (desiredIndices[0] !== selectedIndex) {
+        } else if (firstDesiredIndex !== selectedIndex) {
           await dispatchShortcut(send, "Home", resolved.sessionId);
           for (let index = 0; index < targetRank; index++) {
             await dispatchShortcut(send, "ArrowDown", resolved.sessionId);
@@ -472,11 +603,11 @@ export class BrowserCdpEngine {
         }
       } else {
         const additiveModifiers = process.platform === "darwin" ? ["Meta"] : ["Control"];
-        for (let index = 0; index < desiredIndices.length; index++) {
+        for (const [index, desiredIndex] of desiredIndices.entries()) {
           const optionNodeId = await this.#optionBackendNodeId(
             send,
             resolved.backendNodeId,
-            desiredIndices[index],
+            desiredIndex,
             resolved.sessionId,
           );
           const point = await this.#elementPoint(send, optionNodeId, false, resolved.sessionId);
@@ -610,15 +741,32 @@ export class BrowserCdpEngine {
         };
         debuggerClient.on("message", listener);
       });
-      assertBeforeDeadline(deadline);
-      onDispatch?.();
-      await send("Input.setInterceptDrags", { enabled: true }, sessionId);
-      await send("Input.dispatchMouseEvent", { type: "mouseMoved", x: from.x, y: from.y }, sessionId);
-      await send(
-        "Input.dispatchMouseEvent",
-        { type: "mousePressed", x: from.x, y: from.y, button: "left", clickCount: 1 },
-        sessionId,
-      );
+      let pressSent = false;
+      try {
+        assertBeforeDeadline(deadline);
+        onDispatch?.();
+        await send("Input.setInterceptDrags", { enabled: true }, sessionId);
+        await send("Input.dispatchMouseEvent", { type: "mouseMoved", x: from.x, y: from.y }, sessionId);
+        pressSent = true;
+        await send(
+          "Input.dispatchMouseEvent",
+          { type: "mousePressed", x: from.x, y: from.y, button: "left", clickCount: 1 },
+          sessionId,
+        );
+      } catch (error) {
+        // The listener and the drag intercept would otherwise outlive a drag that never started.
+        stopWaitingForIntercept();
+        await send("Input.setInterceptDrags", { enabled: false }, sessionId).catch(() => undefined);
+        // The press can reach the page even when its reply fails, and a held button breaks later input.
+        if (pressSent) {
+          await send(
+            "Input.dispatchMouseEvent",
+            { type: "mouseReleased", x: from.x, y: from.y, button: "left", clickCount: 1 },
+            sessionId,
+          ).catch(() => undefined);
+        }
+        throw error;
+      }
       let released = false;
       try {
         const activationX = from.x + Math.sign(to.x - from.x) * 4;
@@ -803,13 +951,20 @@ export class BrowserCdpEngine {
     return this.#lease(async (send) => {
       const fill = !this.#environment || this.#environment.viewport.mode === "fill";
       if (fill) {
-        // A hidden fill-mode view needs an explicit viewport to paint a capture surface.
-        const metrics = await send("Page.getLayoutMetrics");
-        const viewport = recordValue(metrics.cssLayoutViewport);
+        // Hidden views need a capture surface. Preserve the page's full viewport,
+        // including scrollbars: layoutViewport.clientWidth would shrink it and
+        // can dispose a responsive page's OAuth callback during preview capture.
+        const contextId = await automationContextId(send);
+        const result = await send("Runtime.evaluate", {
+          expression: "({ width: innerWidth, height: innerHeight, scale: devicePixelRatio })",
+          contextId,
+          returnByValue: true,
+        });
+        const viewport = recordValue(recordValue(result.result)?.value);
         await send("Emulation.setDeviceMetricsOverride", {
-          width: numberValue(viewport?.clientWidth),
-          height: numberValue(viewport?.clientHeight),
-          deviceScaleFactor: 1,
+          width: numberValue(viewport?.width),
+          height: numberValue(viewport?.height),
+          deviceScaleFactor: numberValue(viewport?.scale),
           mobile: false,
         });
       }
@@ -819,6 +974,149 @@ export class BrowserCdpEngine {
         if (fill) await send("Emulation.clearDeviceMetricsOverride");
       }
     });
+  }
+
+  /**
+   * A live view of the page for as long as the returned stop function is not called.
+   *
+   * The lease is held open for the whole stream rather than taken per frame, so the debugger stays
+   * attached and the agent's own operations keep running beside it -- overlapping leases are what
+   * the lease counter is for. Every frame is acknowledged, which is how the page learns to send the
+   * next one: without the acknowledgement the screencast stops after the first frame. Frames are
+   * acknowledged as fast as they arrive and forwarded no faster than `createFramePacer` allows, so a
+   * page that animates cannot raise what the link and the client have to carry.
+   *
+   * `onEnded` runs when the stream stops after it started and before the stop function is called:
+   * a view that cannot start again must not freeze on its last frame.
+   */
+  async startScreencast(
+    options: BrowserScreencastOptions,
+    onFrame: (frame: BrowserScreencastFrame) => void,
+    onEnded?: (error: unknown) => void,
+  ): Promise<() => Promise<void>> {
+    let live = false;
+    let stopRequested = false;
+    let stop = (): void => undefined;
+    const stopped = new Promise<void>((resolve) => {
+      stop = () => {
+        stopRequested = true;
+        resolve();
+      };
+    });
+    let started = (): void => undefined;
+    let failed = (_error: unknown): void => undefined;
+    const ready = new Promise<void>((resolve, reject) => {
+      started = resolve;
+      failed = reject;
+    });
+    let sequence = 0;
+    // The number counts the frames the client is given, not the ones the page drew.
+    const pacer = createFramePacer<Omit<BrowserScreencastFrame, "sequence">>((frame) => {
+      sequence += 1;
+      onFrame({ ...frame, sequence });
+    });
+    const listener = (_event: unknown, method: string, params?: DynamicRecord | unknown, sessionId?: string): void => {
+      if (method !== "Page.screencastFrame" || !isDynamicRecord(params)) return;
+      const metadata = recordValue(params.metadata);
+      const data = stringValue(params.data);
+      const frameSessionId = numberValue(params.sessionId);
+      // The page is told it may send the next frame whether or not this one could be read, so a
+      // frame the client cannot use never ends the stream.
+      // The root session is reported as an empty string, which `sendCommand` refuses: sending it
+      // would fail every acknowledgement, and the page stops after the few frames it may hold
+      // unacknowledged.
+      void this.#contents.debugger
+        .sendCommand("Page.screencastFrameAck", { sessionId: frameSessionId }, sessionId || undefined)
+        .catch(() => undefined);
+      if (!data) return;
+      pacer.offer({
+        image: Buffer.from(data, "base64"),
+        // The device size is the CSS viewport the fractional input coordinates are measured against.
+        width: Math.max(1, Math.round(numberValue(metadata?.deviceWidth))),
+        height: Math.max(1, Math.round(numberValue(metadata?.deviceHeight))),
+      });
+    };
+    // A stalled agent operation can detach the debugger under the stream, which ends the screencast
+    // without a word. The stream then starts again on a new lease, so the view does not freeze.
+    const running = (async () => {
+      try {
+        while (!stopRequested) {
+          let onDetach = (): void => undefined;
+          const detached = new Promise<void>((resolve) => {
+            onDetach = () => resolve();
+          });
+          await this.#lease(async (send) => {
+            this.#contents.debugger.on("message", listener);
+            this.#contents.debugger.on("detach", onDetach);
+            try {
+              await send("Page.startScreencast", {
+                format: "jpeg",
+                quality: options.quality,
+                maxWidth: options.maxWidth,
+                maxHeight: options.maxHeight,
+                everyNthFrame: 1,
+              });
+              live = true;
+              started();
+              await Promise.race([stopped, detached]);
+            } finally {
+              this.#contents.debugger.off("message", listener);
+              this.#contents.debugger.off("detach", onDetach);
+              if (stopRequested) await send("Page.stopScreencast").catch(() => undefined);
+            }
+          }, false);
+        }
+      } finally {
+        pacer.stop();
+      }
+    })();
+    void running.catch((error: unknown) => {
+      if (!live) failed(error);
+      else if (!stopRequested) onEnded?.(error);
+    });
+    await ready;
+    return async () => {
+      stop();
+      await running.catch(() => undefined);
+    };
+  }
+
+  /**
+   * Input from a person watching the live view. The coordinates are already in this page's CSS
+   * pixels: the fraction of a frame the remote client sends is turned into them by the caller, which
+   * is the only place that knows which frame the person was looking at.
+   */
+  async dispatchViewportInput(input: BrowserViewportInput): Promise<void> {
+    await this.#lease(async (send) => {
+      if (input.type === "key") {
+        await send("Input.dispatchKeyEvent", {
+          type: input.action === "char" ? "char" : input.action === "down" ? "rawKeyDown" : "keyUp",
+          modifiers: input.modifiers,
+          ...(input.action === "char" ? { text: input.text } : { key: input.key, code: input.code }),
+        });
+        return;
+      }
+      if (input.action === "wheel") {
+        await send("Input.dispatchMouseEvent", {
+          type: "mouseWheel",
+          x: input.x,
+          y: input.y,
+          deltaX: input.deltaX,
+          deltaY: input.deltaY,
+          modifiers: input.modifiers,
+        });
+        return;
+      }
+      await send("Input.dispatchMouseEvent", {
+        type: input.action === "move" ? "mouseMoved" : input.action === "down" ? "mousePressed" : "mouseReleased",
+        x: input.x,
+        y: input.y,
+        button: input.action === "move" ? "none" : input.button,
+        buttons: input.action === "down" ? buttonMask(input.button) : 0,
+        clickCount: input.action === "move" ? 0 : input.clickCount,
+        modifiers: input.modifiers,
+      });
+    }, false);
   }
 
   async navigate(url: string): Promise<void> {
@@ -1113,7 +1411,8 @@ export class BrowserCdpEngine {
     if (navigationGeneration !== this.#navigationGeneration) {
       throw new Error("Page navigated during semantic target collection. Take a fresh snapshot.");
     }
-    if (candidates.length === 0) throw new Error(`No element matches ${describeTarget(target)}.`);
+    const [found] = candidates;
+    if (!found) throw new Error(`No element matches ${describeBrowserTarget(target)}.`);
     if (candidates.length > 1) {
       const sample = candidates
         .slice(0, 5)
@@ -1125,8 +1424,8 @@ export class BrowserCdpEngine {
       throw new Error(`Target is ambiguous (at least 2 matches). Candidates: ${sample}`);
     }
     return {
-      backendNodeId: candidates[0].backendNodeId,
-      sessionId: candidates[0].sessionId,
+      backendNodeId: found.backendNodeId,
+      sessionId: found.sessionId,
       x: 0,
       y: 0,
     };
@@ -1205,8 +1504,9 @@ export class BrowserCdpEngine {
     const viewport = recordValue(metrics.cssLayoutViewport);
     const viewportWidth = numberValue(viewport?.clientWidth);
     const viewportHeight = numberValue(viewport?.clientHeight);
-    const xs = [quad[0], quad[2], quad[4], quad[6]];
-    const ys = [quad[1], quad[3], quad[5], quad[7]];
+    const corners = quad.slice(0, 8);
+    const xs = corners.filter((_, index) => index % 2 === 0);
+    const ys = corners.filter((_, index) => index % 2 === 1);
     const left = Math.max(0, Math.min(...xs));
     const right = Math.min(viewportWidth - 1, Math.max(...xs));
     const top = Math.max(0, Math.min(...ys));
@@ -1216,14 +1516,15 @@ export class BrowserCdpEngine {
     }
     const insetX = Math.min(4, Math.max(0, (right - left) / 4));
     const insetY = Math.min(4, Math.max(0, (bottom - top) / 4));
+    const center = { x: (left + right) / 2, y: (top + bottom) / 2 };
+    if (!hitTest) return { ...center, sessionId };
     const points = uniquePoints([
-      { x: (left + right) / 2, y: (top + bottom) / 2 },
+      center,
       { x: left + insetX, y: top + insetY },
       { x: right - insetX, y: top + insetY },
       { x: left + insetX, y: bottom - insetY },
       { x: right - insetX, y: bottom - insetY },
     ]);
-    if (!hitTest) return { ...points[0], sessionId };
     let blockerId = 0;
     for (const point of points) {
       const hit = await send(
@@ -1324,7 +1625,7 @@ export class BrowserCdpEngine {
   }
 
   async #lease<T>(operation: (send: SendCommand) => Promise<T>, attachFrames = true): Promise<T> {
-    if (this.#contents.isDestroyed()) throw new Error("Browser tab was closed.");
+    if (this.#closing || this.#contents.isDestroyed()) throw new Error("Browser tab was closed.");
     if (!this.#contents.debugger.isAttached()) {
       this.#contents.debugger.attach("1.3");
       this.#ownsDebugger = true;
@@ -1357,7 +1658,7 @@ export class BrowserCdpEngine {
     if (!this.#ownsDebugger) return;
     this.#ownsDebugger = false;
     this.#clearDebuggerSessions();
-    if (this.#contents.isDestroyed() || !this.#contents.debugger.isAttached()) return;
+    if (this.#closing || this.#contents.isDestroyed() || !this.#contents.debugger.isAttached()) return;
     this.#contents.debugger.detach();
   }
 
@@ -1394,723 +1695,11 @@ export class BrowserCdpEngine {
   }
 }
 
-type SendCommand = (method: string, params?: DynamicRecord, sessionId?: string) => Promise<CdpResult>;
-
-async function collectBoundedSnapshot(
-  send: SendCommand,
-  captures: SnapshotTarget[],
-  revision: number,
-  includeText: boolean,
-  deadline?: number,
-) {
-  const targets = new Map<string, TargetRecord>();
-  const elements: BrowserElement[] = [];
-  const textParts: string[] = [];
-  let textLength = 0;
-  let hasVisualSurface = false;
-  let hasFrame = captures.length > 1;
-  for (const capture of captures) {
-    assertBeforeDeadline(deadline);
-    if (includeText) {
-      const remainingText = Math.max(0, MAX_SNAPSHOT_TEXT - textLength);
-      const summary = await collectPageSummary(send, capture.sessionId, remainingText).catch(() => null);
-      if (summary) {
-        if (summary.text) {
-          textParts.push(summary.text);
-          textLength += summary.text.length;
-        }
-        hasVisualSurface ||= summary.hasVisualSurface;
-        hasFrame ||= summary.hasFrame;
-      }
-    }
-    const remainingElements = MAX_SNAPSHOT_ELEMENTS - elements.length;
-    if (remainingElements <= 0) break;
-    const candidates =
-      capture.sessionId && deadline === undefined
-        ? await collectActionableNodes(send, capture, remainingElements).catch(() => [])
-        : await collectActionableNodes(send, capture, remainingElements, deadline);
-    for (const candidate of candidates) {
-      const properties = Array.isArray(candidate.ax.properties) ? candidate.ax.properties.filter(isRecord) : [];
-      const states = properties
-        .filter((property) =>
-          ["checked", "disabled", "expanded", "focused", "pressed", "readonly", "required", "selected"].includes(
-            stringValue(property.name),
-          ),
-        )
-        .map((property) => `${stringValue(property.name)}:${axValue(property.value)}`);
-      const frameId = stringValue(candidate.node.frameId) || capture.targetId || "";
-      const ref = `${revision}:${capture.targetId ?? "main"}:${candidate.backendNodeId}`;
-      const element: BrowserElement = {
-        ref,
-        role: candidate.role,
-        name: axValue(candidate.ax.name).slice(0, 500),
-        description: axValue(candidate.ax.description).slice(0, 500),
-        tag: (stringValue(candidate.node.localName) || stringValue(candidate.node.nodeName)).toLowerCase(),
-        value: axValue(candidate.ax.value).slice(0, MAX_SNAPSHOT_ELEMENT_VALUE) || null,
-        states,
-        disabled: states.includes("disabled:true"),
-        bounds: null,
-        frame: frameId ? { id: frameId, url: redactedMetadataUrl(capture.url) } : null,
-      };
-      elements.push(element);
-      targets.set(ref, {
-        backendNodeId: candidate.backendNodeId,
-        targetId: capture.targetId,
-        element,
-        visibleText: candidate.visibleText,
-      });
-      if (elements.length >= MAX_SNAPSHOT_ELEMENTS) break;
-    }
-  }
-  return {
-    targets,
-    elements,
-    text: textParts.join(" ").replace(/\s+/g, " ").trim().slice(0, MAX_SNAPSHOT_TEXT),
-    hasVisualSurface,
-    hasFrame,
-  };
-}
-
-async function collectPageSummary(
-  send: SendCommand,
-  sessionId: string | undefined,
-  maxText: number,
-): Promise<{ text: string; hasVisualSurface: boolean; hasFrame: boolean }> {
-  const contextId = await automationContextId(send, sessionId);
-  const result = await send(
-    "Runtime.evaluate",
-    {
-      expression: `(() => {
-        const maxNodes = ${MAX_SNAPSHOT_SCANNED_NODES};
-        const maxText = ${maxText};
-        const roots = [document];
-        const seen = new Set();
-        const text = [];
-        let chars = 0;
-        let scanned = 0;
-        let hasVisualSurface = false;
-        let hasFrame = false;
-        const isVisibleText = node => {
-          let element = node.parentElement;
-          while (element) {
-            if (element.hidden || element.inert || String(element.getAttribute('aria-hidden')).toLowerCase() === 'true') return false;
-            const style = getComputedStyle(element);
-            if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse' || style.contentVisibility === 'hidden' || style.opacity === '0') return false;
-            const parent = element.parentElement;
-            if (parent) element = parent;
-            else {
-              const root = element.getRootNode();
-              element = root?.nodeType === Node.DOCUMENT_FRAGMENT_NODE ? root.host : null;
-            }
-          }
-          const range = node.ownerDocument.createRange();
-          range.selectNodeContents(node);
-          return range.getClientRects().length > 0;
-        };
-        while (roots.length && scanned < maxNodes) {
-          const root = roots.shift();
-          if (!root || seen.has(root)) continue;
-          seen.add(root);
-          const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
-          let node;
-          while ((node = walker.nextNode()) && scanned < maxNodes) {
-            scanned++;
-            if (node.nodeType === Node.TEXT_NODE && chars < maxText) {
-              const parentTag = node.parentElement?.localName;
-              if (parentTag === 'script' || parentTag === 'style' || parentTag === 'noscript' || parentTag === 'template') continue;
-              if (!isVisibleText(node)) continue;
-              const value = String(node.nodeValue || '').replace(/\\s+/g, ' ').trim();
-              if (value) {
-                const part = value.slice(0, Math.max(0, maxText - chars));
-                text.push(part);
-                chars += part.length + 1;
-              }
-              continue;
-            }
-            if (node.nodeType !== 1) continue;
-            const tag = node.localName;
-            if (tag === 'canvas' || tag === 'video') hasVisualSurface = true;
-            if (tag === 'iframe' || tag === 'frame') {
-              hasFrame = true;
-              try { if (node.contentDocument) roots.push(node.contentDocument); } catch {}
-            }
-            if (node.shadowRoot) roots.push(node.shadowRoot);
-          }
-        }
-        return { text: text.join(' '), hasVisualSurface, hasFrame };
-      })()`,
-      contextId,
-      returnByValue: true,
-    },
-    sessionId,
-  );
-  const value = recordValue(recordValue(result.result)?.value);
-  return {
-    text: stringValue(value?.text),
-    hasVisualSurface: value?.hasVisualSurface === true,
-    hasFrame: value?.hasFrame === true,
-  };
-}
-
-// Focus is what `type` writes to when it has no target, and an application that draws its own
-// surface keeps it on a node no semantic target names -- Google Sheets parks it on a hidden editor
-// beside the grid, and on its Name box the moment that box was used. Without this a caller cannot
-// tell the two apart until the data lands in the wrong place.
-async function collectFocus(send: SendCommand, sessionId?: string): Promise<BrowserFocus | null> {
-  const contextId = await automationContextId(send, sessionId);
-  const result = await send(
-    "Runtime.evaluate",
-    {
-      expression: `(() => {
-        let node = document.activeElement;
-        let inFrame = false;
-        for (let depth = 0; depth < 10 && node; depth += 1) {
-          const shadowed = node.shadowRoot?.activeElement;
-          if (shadowed) { node = shadowed; continue; }
-          let nested = null;
-          try { nested = node.contentDocument?.activeElement ?? null; } catch {}
-          if (!nested) break;
-          inFrame = true;
-          node = nested;
-        }
-        if (!node) return null;
-        const tag = node.localName || '';
-        const label = node.getAttribute?.('aria-label') || node.getAttribute?.('placeholder') || node.id || '';
-        return {
-          tag,
-          role: node.getAttribute?.('role') || null,
-          name: String(label).slice(0, 500),
-          editable: node.isContentEditable === true || ['input', 'textarea', 'select'].includes(tag),
-          inFrame,
-        };
-      })()`,
-      contextId,
-      returnByValue: true,
-    },
-    sessionId,
-  );
-  const value = recordValue(recordValue(result.result)?.value);
-  if (!value) return null;
-  return {
-    tag: stringValue(value.tag),
-    role: stringValue(value.role) || null,
-    name: stringValue(value.name),
-    editable: value.editable === true,
-    inFrame: value.inFrame === true,
-  };
-}
-
-async function pageContainsText(
-  send: SendCommand,
-  captures: SnapshotTarget[],
-  text: string,
-  deadline: number,
-): Promise<boolean> {
-  for (const capture of captures) {
-    assertBeforeDeadline(deadline);
-    const scanBudgetMs = Math.max(1, deadline - Date.now());
-    const contextId = await automationContextId(send, capture.sessionId);
-    const result = await send(
-      "Runtime.evaluate",
-      {
-        expression: `(() => {
-          const needle = ${JSON.stringify(text)};
-          const scanDeadline = performance.now() + ${scanBudgetMs};
-          const roots = [document];
-          const seen = new Set();
-          let combined = '';
-          let chars = 0;
-          let scanned = 0;
-          const isVisibleText = node => {
-            let element = node.parentElement;
-            while (element) {
-              if (element.hidden || element.inert || String(element.getAttribute('aria-hidden')).toLowerCase() === 'true') return false;
-              const style = getComputedStyle(element);
-              if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse' || style.contentVisibility === 'hidden' || style.opacity === '0') return false;
-              const parent = element.parentElement;
-              if (parent) element = parent;
-              else {
-                const root = element.getRootNode();
-                element = root?.nodeType === Node.DOCUMENT_FRAGMENT_NODE ? root.host : null;
-              }
-            }
-            const range = node.ownerDocument.createRange();
-            range.selectNodeContents(node);
-            return range.getClientRects().length > 0;
-          };
-          while (roots.length && scanned < ${MAX_SNAPSHOT_SCANNED_NODES} && chars < ${MAX_SNAPSHOT_TEXT}) {
-            if (performance.now() >= scanDeadline) return { matched: false, expired: true };
-            const root = roots.shift();
-            if (!root || seen.has(root)) continue;
-            seen.add(root);
-            const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
-            let node;
-            while ((node = walker.nextNode()) && scanned < ${MAX_SNAPSHOT_SCANNED_NODES}) {
-              if (performance.now() >= scanDeadline) return { matched: false, expired: true };
-              scanned++;
-              if (node.nodeType === Node.TEXT_NODE) {
-                const parentTag = node.parentElement?.localName;
-                if (parentTag === 'script' || parentTag === 'style' || parentTag === 'noscript' || parentTag === 'template') continue;
-                if (!isVisibleText(node)) continue;
-                const value = String(node.nodeValue || '').replace(/\\s+/g, ' ').trim();
-                if (value) {
-                  const part = value.slice(0, Math.max(0, ${MAX_SNAPSHOT_TEXT} - chars));
-                  combined += (combined ? ' ' : '') + part;
-                  chars += part.length + 1;
-                  if (combined.includes(needle)) return { matched: true, expired: false };
-                }
-                continue;
-              }
-              if (node.nodeType !== 1) continue;
-              if ((node.localName === 'iframe' || node.localName === 'frame')) {
-                try { if (node.contentDocument) roots.push(node.contentDocument); } catch {}
-              }
-              if (node.shadowRoot) roots.push(node.shadowRoot);
-            }
-          }
-          return { matched: combined.includes(needle), expired: false };
-        })()`,
-        contextId,
-        returnByValue: true,
-      },
-      capture.sessionId,
-    ).catch(() => null);
-    assertBeforeDeadline(deadline);
-    const value = recordValue(recordValue(result?.result)?.value);
-    if (value?.expired === true) throw new Error("Browser wait condition timed out.");
-    if (value?.matched === true) return true;
-  }
-  return false;
-}
-
-async function cssObjectMatch(
-  send: SendCommand,
-  selector: string,
-  sessionId?: string,
-): Promise<{ objectId?: string; ambiguous: boolean }> {
-  const contextId = await automationContextId(send, sessionId);
-  const collection = await send(
-    "Runtime.evaluate",
-    {
-      expression: `(() => {
-        const selector = ${JSON.stringify(selector)};
-        const roots = [document];
-        const seen = new Set();
-        const matches = [];
-        let scanned = 0;
-        let truncated = false;
-        while (roots.length && matches.length < 2) {
-          if (scanned >= ${MAX_SNAPSHOT_SCANNED_NODES}) {
-            truncated = true;
-            break;
-          }
-          const root = roots.shift();
-          if (!root || seen.has(root)) continue;
-          seen.add(root);
-          const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
-          while (matches.length < 2) {
-            const node = walker.nextNode();
-            if (!node) break;
-            if (scanned >= ${MAX_SNAPSHOT_SCANNED_NODES}) {
-              truncated = true;
-              break;
-            }
-            scanned++;
-            if (node.matches(selector)) matches.push(node);
-            if (node.localName === 'iframe' || node.localName === 'frame') {
-              try { if (node.contentDocument) roots.push(node.contentDocument); } catch {}
-            }
-            if (node.shadowRoot) roots.push(node.shadowRoot);
-          }
-          if (truncated) break;
-        }
-        if (truncated && matches.length < 2) throw new Error('CSS selector uniqueness scan exceeded the safe node limit.');
-        return matches;
-      })()`,
-      contextId,
-      returnByValue: false,
-    },
-    sessionId,
-  );
-  const exception = recordValue(collection.exceptionDetails);
-  if (exception) throw new Error(exceptionDescription(exception));
-  const collectionId = stringValue(recordValue(collection.result)?.objectId);
-  if (!collectionId) return { ambiguous: false };
-  try {
-    const lengthResult = await send(
-      "Runtime.callFunctionOn",
-      {
-        objectId: collectionId,
-        functionDeclaration: "function() { return this.length; }",
-        returnByValue: true,
-      },
-      sessionId,
-    );
-    const length = numberValue(recordValue(lengthResult.result)?.value);
-    if (length === 0) return { ambiguous: false };
-    if (length > 1) return { ambiguous: true };
-    const element = await send(
-      "Runtime.callFunctionOn",
-      {
-        objectId: collectionId,
-        functionDeclaration: "function() { return this[0]; }",
-        returnByValue: false,
-      },
-      sessionId,
-    );
-    const objectId = stringValue(recordValue(element.result)?.objectId);
-    if (!objectId) throw new Error(`Unable to resolve CSS selector: ${selector}`);
-    return { objectId, ambiguous: false };
-  } finally {
-    await send("Runtime.releaseObject", { objectId: collectionId }, sessionId).catch(() => undefined);
-  }
-}
-
-async function semanticAxMatches(
-  send: SendCommand,
-  capture: SnapshotTarget,
-  target: Extract<BrowserTarget, { kind: "role" | "text" }>,
-  allowNonActionableRole: boolean,
-  deadline?: number,
-): Promise<SemanticMatch[]> {
-  assertBeforeDeadline(deadline);
-  await send("Accessibility.enable", {}, capture.sessionId);
-  const matches: SemanticMatch[] = [];
-  const seen = new Set<number>();
-  const frameTree = await send("Page.getFrameTree", {}, capture.sessionId);
-  for (const frameId of frameIds(frameTree)) {
-    const tree = await send("Accessibility.getFullAXTree", { frameId }, capture.sessionId);
-    assertBeforeDeadline(deadline);
-    for (const node of Array.isArray(tree.nodes) ? tree.nodes.filter(isRecord) : []) {
-      if (node.ignored === true) continue;
-      const backendNodeId = numberValue(node.backendDOMNodeId);
-      const role = axValue(node.role).toLowerCase();
-      if (!backendNodeId || seen.has(backendNodeId)) continue;
-      seen.add(backendNodeId);
-      const name = axValue(node.name).slice(0, 500);
-      const description = axValue(node.description).slice(0, 500);
-      const matched =
-        target.kind === "role"
-          ? (allowNonActionableRole || ACTIONABLE_ROLES.has(role)) &&
-            role === target.role.toLowerCase() &&
-            (!target.name || textMatches(name, target.name, target.exact))
-          : ACTIONABLE_ROLES.has(role) &&
-            [name, description].some((value) => textMatches(value, target.text, target.exact));
-      if (!matched) continue;
-      matches.push({
-        backendNodeId,
-        sessionId: capture.sessionId,
-        targetId: capture.targetId,
-        role,
-        name,
-      });
-      if (matches.length >= 2) return matches;
-    }
-  }
-  return matches;
-}
-
-async function visibleTextObjectMatches(
-  send: SendCommand,
-  capture: SnapshotTarget,
-  target: Extract<BrowserTarget, { kind: "text" }>,
-  deadline?: number,
-): Promise<string[]> {
-  assertBeforeDeadline(deadline);
-  const contextId = await automationContextId(send, capture.sessionId);
-  const collection = await send(
-    "Runtime.evaluate",
-    {
-      expression: `(() => {
-        const roles = new Set(${JSON.stringify([...ACTIONABLE_ROLES])});
-        const needle = ${JSON.stringify(target.text.trim().toLocaleLowerCase())};
-        const exact = ${target.exact === true};
-        const roots = [document];
-        const seenRoots = new Set();
-        const matches = [];
-        let scanned = 0;
-        let truncated = false;
-        const isCandidate = node => {
-          if (node.nodeType !== 1) return false;
-          let element = node;
-          while (element) {
-            if (element.hidden || element.inert || String(element.getAttribute('aria-hidden')).toLowerCase() === 'true') return false;
-            const style = element.ownerDocument.defaultView?.getComputedStyle(element);
-            if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse' || style.contentVisibility === 'hidden' || style.opacity === '0') return false;
-            const parent = element.parentElement;
-            if (parent) element = parent;
-            else {
-              const root = element.getRootNode();
-              element = root?.nodeType === Node.DOCUMENT_FRAGMENT_NODE ? root.host : null;
-            }
-          }
-          const explicitRole = (node.getAttribute('role') || '').trim().split(/\\s+/)[0].toLowerCase();
-          const tag = node.localName;
-          const semantic = tag === 'button' || tag === 'summary' || (tag === 'a' && node.hasAttribute('href')) ||
-            tag === 'select' || tag === 'textarea' || (tag === 'input' && node.type !== 'hidden') || node.isContentEditable;
-          if (!semantic && !roles.has(explicitRole)) return false;
-          return node.getClientRects().length > 0;
-        };
-        while (roots.length && matches.length < 2) {
-          if (scanned >= ${MAX_SNAPSHOT_SCANNED_NODES}) {
-            truncated = true;
-            break;
-          }
-          const root = roots.shift();
-          if (!root || seenRoots.has(root)) continue;
-          seenRoots.add(root);
-          const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
-          while (matches.length < 2) {
-            const node = walker.nextNode();
-            if (!node) break;
-            if (scanned >= ${MAX_SNAPSHOT_SCANNED_NODES}) {
-              truncated = true;
-              break;
-            }
-            scanned++;
-            if (node.shadowRoot) roots.push(node.shadowRoot);
-            if (node.localName === 'iframe' || node.localName === 'frame') {
-              try { if (node.contentDocument) roots.push(node.contentDocument); } catch {}
-            }
-            if (!isCandidate(node)) continue;
-            const value = String(node.innerText ?? node.textContent ?? '').replace(/\\s+/g, ' ').trim().toLocaleLowerCase();
-            if (exact ? value === needle : value.includes(needle)) matches.push(node);
-          }
-          if (truncated) break;
-        }
-        if (truncated && matches.length < 2) throw new Error('Semantic target uniqueness scan exceeded the safe node limit.');
-        return matches;
-      })()`,
-      contextId,
-      returnByValue: false,
-    },
-    capture.sessionId,
-  );
-  const exception = recordValue(collection.exceptionDetails);
-  if (exception) throw new Error(exceptionDescription(exception));
-  const collectionId = stringValue(recordValue(collection.result)?.objectId);
-  if (!collectionId) return [];
-  try {
-    const properties = await send(
-      "Runtime.getProperties",
-      { objectId: collectionId, ownProperties: true },
-      capture.sessionId,
-    );
-    return (Array.isArray(properties.result) ? properties.result.filter(isRecord) : [])
-      .filter((descriptor) => /^\d+$/.test(stringValue(descriptor.name)))
-      .sort((left, right) => Number(left.name) - Number(right.name))
-      .map((descriptor) => stringValue(recordValue(descriptor.value)?.objectId))
-      .filter(Boolean)
-      .slice(0, 2);
-  } finally {
-    await send("Runtime.releaseObject", { objectId: collectionId }, capture.sessionId).catch(() => undefined);
-  }
-}
-
-async function collectActionableNodes(
-  send: SendCommand,
-  capture: SnapshotTarget,
-  limit: number,
-  deadline?: number,
-): Promise<Array<{ backendNodeId: number; node: CdpResult; ax: CdpResult; role: string; visibleText: string }>> {
-  assertBeforeDeadline(deadline);
-  await Promise.all([send("DOM.enable", {}, capture.sessionId), send("Accessibility.enable", {}, capture.sessionId)]);
-  assertBeforeDeadline(deadline);
-  const contextId = await automationContextId(send, capture.sessionId);
-  const results: Array<{
-    backendNodeId: number;
-    node: CdpResult;
-    ax: CdpResult;
-    role: string;
-    visibleText: string;
-  }> = [];
-  const batchSize = MAX_SNAPSHOT_ELEMENTS;
-  const collection = await send(
-    "Runtime.evaluate",
-    {
-      expression: actionableNodesExpression(MAX_SNAPSHOT_CANDIDATES),
-      contextId,
-      returnByValue: false,
-    },
-    capture.sessionId,
-  );
-  const exception = recordValue(collection.exceptionDetails);
-  if (exception) throw new Error(exceptionDescription(exception));
-  const collectionId = stringValue(recordValue(collection.result)?.objectId);
-  if (!collectionId) return results;
-  const objectIds: string[] = [];
-  try {
-    const properties = await send(
-      "Runtime.getProperties",
-      { objectId: collectionId, ownProperties: true },
-      capture.sessionId,
-    );
-    const descriptors = Array.isArray(properties.result) ? properties.result.filter(isRecord) : [];
-    objectIds.push(
-      ...descriptors
-        .filter((descriptor) => /^\d+$/.test(stringValue(descriptor.name)))
-        .sort((left, right) => Number(left.name) - Number(right.name))
-        .map((descriptor) => stringValue(recordValue(descriptor.value)?.objectId))
-        .filter(Boolean)
-        .slice(0, MAX_SNAPSHOT_CANDIDATES),
-    );
-    for (let offset = 0; offset < objectIds.length && results.length < limit; offset += batchSize) {
-      const batch = objectIds.slice(offset, offset + batchSize);
-      const resolved = await Promise.all(
-        batch.map(async (objectId) => {
-          const [description, partialAxTree, visibleTextResult] = await Promise.all([
-            send("DOM.describeNode", { objectId, depth: 0 }, capture.sessionId),
-            send("Accessibility.getPartialAXTree", { objectId, fetchRelatives: false }, capture.sessionId),
-            send(
-              "Runtime.callFunctionOn",
-              {
-                objectId,
-                functionDeclaration:
-                  "function() { return String(this.innerText ?? this.textContent ?? '').replace(/\\s+/g, ' ').trim().slice(0, 500); }",
-                returnByValue: true,
-              },
-              capture.sessionId,
-            ),
-          ]);
-          const node = recordValue(description.node);
-          const backendNodeId = numberValue(node?.backendNodeId);
-          if (!node || !backendNodeId) return null;
-          const axNodes = Array.isArray(partialAxTree.nodes) ? partialAxTree.nodes.filter(isRecord) : [];
-          const ax =
-            axNodes.find((candidate) => numberValue(candidate.backendDOMNodeId) === backendNodeId) ?? axNodes[0];
-          if (!ax || ax.ignored === true) return null;
-          const role = axValue(ax.role).toLowerCase() || fallbackRole(node);
-          if (!ACTIONABLE_ROLES.has(role)) return null;
-          return {
-            backendNodeId,
-            node,
-            ax,
-            role,
-            visibleText: stringValue(recordValue(visibleTextResult.result)?.value),
-          };
-        }),
-      );
-      results.push(...resolved.filter((candidate) => candidate !== null).slice(0, limit - results.length));
-      assertBeforeDeadline(deadline);
-    }
-  } finally {
-    await Promise.allSettled([
-      ...objectIds.map((objectId) => send("Runtime.releaseObject", { objectId }, capture.sessionId)),
-      send("Runtime.releaseObject", { objectId: collectionId }, capture.sessionId),
-    ]);
-  }
-  return results;
-}
-
-function actionableNodesExpression(limit: number): string {
-  return `(() => {
-    const roles = new Set(${JSON.stringify([...ACTIONABLE_ROLES])});
-    const roots = [document];
-    const seenRoots = new Set();
-    const matches = [];
-    let scanned = 0;
-    const isCandidate = node => {
-      if (node.nodeType !== 1) return false;
-      let element = node;
-      while (element) {
-        if (element.hidden || element.inert || String(element.getAttribute('aria-hidden')).toLowerCase() === 'true') return false;
-        const style = element.ownerDocument.defaultView?.getComputedStyle(element);
-        if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse' || style.contentVisibility === 'hidden' || style.opacity === '0') return false;
-        const parent = element.parentElement;
-        if (parent) element = parent;
-        else {
-          const root = element.getRootNode();
-          element = root?.nodeType === Node.DOCUMENT_FRAGMENT_NODE ? root.host : null;
-        }
-      }
-      const explicitRole = (node.getAttribute('role') || '').trim().split(/\\s+/)[0].toLowerCase();
-      const tag = node.localName;
-      const semantic = tag === 'button' || tag === 'summary' || (tag === 'a' && node.hasAttribute('href')) ||
-        tag === 'select' || tag === 'textarea' || (tag === 'input' && node.type !== 'hidden') || node.isContentEditable;
-      if (!semantic && !roles.has(explicitRole)) return false;
-      return node.getClientRects().length > 0;
-    };
-    while (roots.length && scanned < ${MAX_SNAPSHOT_SCANNED_NODES} && matches.length < ${Math.max(0, limit)}) {
-      const root = roots.shift();
-      if (!root || seenRoots.has(root)) continue;
-      seenRoots.add(root);
-      const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
-      let node;
-      while ((node = walker.nextNode()) && scanned < ${MAX_SNAPSHOT_SCANNED_NODES} && matches.length < ${Math.max(0, limit)}) {
-        scanned++;
-        if (node.shadowRoot) roots.push(node.shadowRoot);
-        if (node.localName === 'iframe' || node.localName === 'frame') {
-          try { if (node.contentDocument) roots.push(node.contentDocument); } catch {}
-        }
-        if (isCandidate(node)) matches.push(node);
-      }
-    }
-    return matches;
-  })()`;
-}
-
-function redactedMetadataUrl(value: string | undefined): string {
-  if (!value) return "";
-  try {
-    const url = new URL(value);
-    url.username = "";
-    url.password = "";
-    url.search = "";
-    url.hash = "";
-    return url.toString().slice(0, INPUT_LIMITS.browserUrl);
-  } catch {
-    return "";
-  }
-}
-
-function boundSerializedSnapshot(snapshot: BrowserSnapshot): void {
-  let bytes = Buffer.byteLength(JSON.stringify(snapshot));
-  while (bytes > MAX_SERIALIZED_SNAPSHOT_BYTES) {
-    if (snapshot.diagnostics.length > 20) snapshot.diagnostics.shift();
-    else if (snapshot.actions.length > 20) snapshot.actions.shift();
-    else if (snapshot.elements.length > 0) snapshot.elements.pop();
-    else if (snapshot.text.length > 0) {
-      const excess = bytes - MAX_SERIALIZED_SNAPSHOT_BYTES;
-      snapshot.text = snapshot.text.slice(0, Math.max(0, snapshot.text.length - Math.max(1, excess)));
-    } else if (snapshot.diagnostics.length > 0) snapshot.diagnostics.shift();
-    else if (snapshot.actions.length > 0) snapshot.actions.shift();
-    else throw new Error("Browser snapshot exceeds its serialized size limit.");
-    bytes = Buffer.byteLength(JSON.stringify(snapshot));
-  }
-}
-
 function assertTypingProgressBeforeDeadline(deadline: number | undefined, sent: number, total: number): void {
   if (deadline === undefined || Date.now() < deadline) return;
   throw new Error(
     `Browser typing timed out after ${sent} of ${total} characters reached the page. The page kept them. Read the page before sending the rest, or the repeated part is entered twice.`,
   );
-}
-
-function assertBeforeDeadline(deadline: number | undefined): void {
-  if (deadline !== undefined && Date.now() >= deadline) throw new Error("Browser wait condition timed out.");
-}
-
-function fallbackRole(node: CdpResult): string {
-  const tag = (stringValue(node.localName) || stringValue(node.nodeName)).toLowerCase();
-  const attributes = nodeAttributes(node.attributes);
-  if (attributes.role) return attributes.role.toLowerCase();
-  if (tag === "button" || tag === "summary") return "button";
-  if (tag === "a") return "link";
-  if (tag === "select") return attributes.multiple === undefined ? "combobox" : "listbox";
-  if (tag === "textarea" || attributes.contenteditable !== undefined) return "textbox";
-  if (tag !== "input") return "";
-  if (attributes.type === "checkbox") return "checkbox";
-  if (attributes.type === "radio") return "radio";
-  if (attributes.type === "range") return "slider";
-  if (attributes.type === "number") return "spinbutton";
-  return "textbox";
-}
-
-function nodeAttributes(value: unknown): Record<string, string> {
-  const raw = Array.isArray(value) ? value.filter(isString) : [];
-  const result: Record<string, string> = {};
-  for (let index = 0; index + 1 < raw.length; index += 2) result[raw[index].toLowerCase()] = raw[index + 1];
-  return result;
 }
 
 function readViewport(metrics: CdpResult, environment: BrowserEnvironment): BrowserEnvironment["viewport"] {
@@ -2120,163 +1709,6 @@ function readViewport(metrics: CdpResult, environment: BrowserEnvironment): Brow
     width: Math.round(numberValue(viewport?.clientWidth) || environment.viewport.width),
     height: Math.round(numberValue(viewport?.clientHeight) || environment.viewport.height),
   };
-}
-
-async function dispatchShortcut(send: SendCommand, shortcut: string, sessionId?: string): Promise<void> {
-  const parts = shortcut
-    .split("+")
-    .map((part) => part.trim())
-    .filter(Boolean);
-  if (parts.length === 0 || parts.length > 5) throw new Error("Invalid browser shortcut.");
-  const key = parts.pop();
-  if (!key) throw new Error("Invalid browser shortcut.");
-  const modifierNames: string[] = [];
-  for (const part of parts) {
-    const modifier = normalizeModifier(part);
-    if (!modifier) throw new Error(`Invalid browser shortcut: ${shortcut}`);
-    modifierNames.push(modifier);
-  }
-  const { text: keyText, ...normalized } = normalizeKey(key);
-  const modifiers = modifierMask(modifierNames);
-  const shiftOnly = modifiers === SHIFT_MODIFIER;
-  // A named key gets its character from the alias table; a single-character shortcut is its own.
-  // A command modifier gets none, because `Ctrl+S` is a command rather than an `s` in the document.
-  // Shift is not one of those: `Shift+Enter` is how a composer spells "line break, do not submit",
-  // and suppressing its character made the shortcut fire a key event, insert nothing, and report
-  // success. Which glyph Shift produces is only knowable for the alias keys, whose text does not
-  // depend on it, and for a letter -- `Shift+1` is `!` on a US layout and something else on half a
-  // dozen others, so it stays a key event rather than a guessed character.
-  const character = keyText ?? (key.length === 1 ? (shiftOnly ? shiftedLetter(key) : key) : undefined);
-  // A real `Shift+a` reports `A` in `event.key`, not an `a` with a shift flag beside it, and the
-  // character event has to agree with the key events around it.
-  const keyInfo = shiftOnly && keyText === undefined && character ? { ...normalized, key: character } : normalized;
-  const pressedModifiers: string[] = [];
-  let keyPressed = false;
-  try {
-    for (const modifier of modifierNames) {
-      await send(
-        "Input.dispatchKeyEvent",
-        {
-          type: "rawKeyDown",
-          key: modifier,
-          code: `${modifier}Left`,
-          modifiers: modifierMask([...pressedModifiers, modifier]),
-        },
-        sessionId,
-      );
-      pressedModifiers.push(modifier);
-    }
-    await send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...keyInfo, modifiers }, sessionId);
-    keyPressed = true;
-    if (character !== undefined && (modifiers === 0 || shiftOnly))
-      // The keypress has to agree with the keydown around it. Without the mask CDP defaults it to
-      // zero, so `Shift+Enter` arrives at the page as an unshifted Enter -- and a composer that
-      // decides between "send" and "line break" in its keypress handler sends the message.
-      await send("Input.dispatchKeyEvent", { type: "char", ...keyInfo, modifiers, text: character }, sessionId);
-    await send("Input.dispatchKeyEvent", { type: "keyUp", ...keyInfo, modifiers }, sessionId);
-    keyPressed = false;
-  } finally {
-    if (keyPressed) {
-      await send("Input.dispatchKeyEvent", { type: "keyUp", ...keyInfo, modifiers }, sessionId).catch(() => undefined);
-    }
-    for (const modifier of [...pressedModifiers].reverse()) {
-      await send(
-        "Input.dispatchKeyEvent",
-        { type: "keyUp", key: modifier, code: `${modifier}Left`, modifiers: 0 },
-        sessionId,
-      ).catch(() => undefined);
-    }
-  }
-}
-
-function normalizeModifier(value: string) {
-  const lower = value.toLowerCase();
-  if (lower === "cmd" || lower === "command" || lower === "meta") return "Meta";
-  if (lower === "ctrl" || lower === "control") return "Control";
-  if (lower === "alt" || lower === "option") return "Alt";
-  if (lower === "shift") return "Shift";
-  return null;
-}
-
-async function dispatchTextKey(send: SendCommand, character: string, sessionId?: string): Promise<void> {
-  const upper = character.toUpperCase();
-  const code = /^[a-z]$/i.test(character) ? `Key${upper}` : "Unidentified";
-  await send(
-    "Input.dispatchKeyEvent",
-    { type: "rawKeyDown", key: character, code, text: character, unmodifiedText: character },
-    sessionId,
-  );
-  await send(
-    "Input.dispatchKeyEvent",
-    { type: "char", key: character, code, text: character, unmodifiedText: character },
-    sessionId,
-  );
-  await send("Input.dispatchKeyEvent", { type: "keyUp", key: character, code }, sessionId);
-}
-
-function normalizeKey(key: string): {
-  key: string;
-  code: string;
-  windowsVirtualKeyCode?: number;
-  nativeVirtualKeyCode?: number;
-  text?: string;
-} {
-  // `text` is the character the key produces, and only the keys that produce one carry it. Chromium
-  // decides implicit form submission and text insertion from the character event, not the key event:
-  // without `\r` here, `press("Enter")` fires `keydown` and nothing else, so a plain `<form>` with no
-  // script never submits and a textarea never gains a line. `Tab` stays characterless on purpose --
-  // the browser moves focus on the key event, and a character dispatched afterwards would land in
-  // whatever gained focus.
-  const aliases: Record<string, [string, string, number?, string?]> = {
-    enter: ["Enter", "Enter", 13, "\r"],
-    tab: ["Tab", "Tab", 9],
-    escape: ["Escape", "Escape", 27],
-    esc: ["Escape", "Escape", 27],
-    backspace: ["Backspace", "Backspace", 8],
-    delete: ["Delete", "Delete", 46],
-    space: [" ", "Space", 32, " "],
-    arrowup: ["ArrowUp", "ArrowUp", 38],
-    arrowdown: ["ArrowDown", "ArrowDown", 40],
-    arrowleft: ["ArrowLeft", "ArrowLeft", 37],
-    arrowright: ["ArrowRight", "ArrowRight", 39],
-    home: ["Home", "Home", 36],
-    end: ["End", "End", 35],
-    pageup: ["PageUp", "PageUp", 33],
-    pagedown: ["PageDown", "PageDown", 34],
-  };
-  const alias = aliases[key.toLowerCase()];
-  const macNativeVirtualKeyCode =
-    process.platform === "darwin" ? { ArrowUp: 126, ArrowDown: 125, Home: 115 }[alias?.[0] ?? ""] : undefined;
-  if (alias)
-    return {
-      ...(alias[3] === undefined ? {} : { text: alias[3] }),
-      key: alias[0],
-      code: alias[1],
-      windowsVirtualKeyCode: alias[2],
-      nativeVirtualKeyCode: macNativeVirtualKeyCode,
-    };
-  if (!/^[\w\-.,/;='[\]`]{1,20}$/u.test(key)) throw new Error(`Unsupported browser key: ${key}`);
-  const upper = key.length === 1 ? key.toUpperCase() : key;
-  return { key, code: key.length === 1 && /[a-z]/i.test(key) ? `Key${upper}` : upper };
-}
-
-/** Chromium's `Input.dispatchKeyEvent` bit for Shift, the one modifier that still yields a character. */
-const SHIFT_MODIFIER = 8;
-
-function shiftedLetter(key: string): string | undefined {
-  return /^[a-z]$/i.test(key) ? key.toUpperCase() : undefined;
-}
-
-function modifierMask(values: string[]) {
-  let result = 0;
-  for (const value of values) {
-    const normalized = normalizeModifier(value) ?? value;
-    if (normalized === "Alt") result |= 1;
-    if (normalized === "Control") result |= 2;
-    if (normalized === "Meta") result |= 4;
-    if (normalized === "Shift") result |= SHIFT_MODIFIER;
-  }
-  return result;
 }
 
 function uniquePoints(points: Array<{ x: number; y: number }>): Array<{ x: number; y: number }> {
@@ -2295,92 +1727,39 @@ async function isNodeOrDescendant(
   target: number,
   sessionId?: string,
 ): Promise<boolean> {
-  let current = candidate;
-  for (let depth = 0; depth < 50; depth++) {
-    if (current === target) return true;
-    const result = await send("DOM.describeNode", { backendNodeId: current, depth: 0 }, sessionId);
-    const node = recordValue(result.node);
-    const parentId = numberValue(node?.parentId);
-    if (!parentId) return false;
-    const parent = await send("DOM.describeNode", { nodeId: parentId, depth: 0 }, sessionId);
-    current = numberValue(recordValue(parent.node)?.backendNodeId);
-    if (!current) return false;
-  }
-  return false;
-}
-
-function waitForLoading(contents: WebContents, timeoutMs: number): Promise<void> {
-  if (!contents.isLoading()) return Promise.resolve();
-  return new Promise<void>((resolve, reject) => {
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      try {
-        contents.stop();
-      } catch (error) {
-        cleanup();
-        reject(error);
-      }
-    }, timeoutMs);
-    timer.unref();
-    const stopped = () => {
-      cleanup();
-      if (timedOut) reject(new Error("Navigation timed out."));
-      else resolve();
-    };
-    const failed = (_event: unknown, code: number, description: string, _url: string, isMainFrame: boolean) => {
-      if (!isMainFrame) return;
-      cleanup();
-      if (timedOut) reject(new Error("Navigation timed out."));
-      else reject(new Error(`Navigation failed (${code}): ${description}`));
-    };
-    const destroyed = () => {
-      cleanup();
-      reject(new Error("Browser tab was closed during navigation."));
-    };
-    const cleanup = () => {
-      clearTimeout(timer);
-      contents.off("did-stop-loading", stopped);
-      contents.off("did-fail-load", failed);
-      contents.off("destroyed", destroyed);
-    };
-    contents.once("did-stop-loading", stopped);
-    contents.on("did-fail-load", failed);
-    contents.once("destroyed", destroyed);
-  });
-}
-
-function stopLoadingAndWait(contents: WebContents): Promise<void> {
-  if (!contents.isLoading()) return Promise.resolve();
-  return new Promise<void>((resolve, reject) => {
-    let settled = false;
-    const cleanup = () => {
-      contents.off("did-stop-loading", stopped);
-      contents.off("destroyed", destroyed);
-    };
-    const stopped = () => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      resolve();
-    };
-    const destroyed = () => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(new Error("Browser tab was closed during navigation."));
-    };
-    contents.once("did-stop-loading", stopped);
-    contents.once("destroyed", destroyed);
-    try {
-      contents.stop();
-      if (!contents.isLoading()) setImmediate(stopped);
-    } catch (error) {
-      settled = true;
-      cleanup();
-      reject(error);
+  if (candidate === target) return true;
+  const executionContextId = await automationContextId(send, sessionId);
+  const objectIds: string[] = [];
+  try {
+    // describeNode does not reliably include parentId. Resolve both nodes in
+    // our isolated world so a button's own child is not treated as an overlay.
+    for (const backendNodeId of [target, candidate]) {
+      const resolved = await send("DOM.resolveNode", { backendNodeId, executionContextId }, sessionId);
+      const objectId = stringValue(recordValue(resolved.object)?.objectId);
+      if (!objectId) return false;
+      objectIds.push(objectId);
     }
-  });
+    const result = await send(
+      "Runtime.callFunctionOn",
+      {
+        objectId: objectIds[0],
+        functionDeclaration: `function(candidate) {
+          for (let node = candidate; node; node = node.parentNode || node.host) {
+            if (node === this) return true;
+          }
+          return false;
+        }`,
+        arguments: [{ objectId: objectIds[1] }],
+        returnByValue: true,
+      },
+      sessionId,
+    );
+    return recordValue(result.result)?.value === true;
+  } finally {
+    await Promise.all(
+      objectIds.map((objectId) => send("Runtime.releaseObject", { objectId }, sessionId).catch(() => undefined)),
+    );
+  }
 }
 
 async function waitForDomQuietAcrossTargets(
@@ -2460,19 +1839,26 @@ async function waitForDomQuietAcrossTargets(
   }
 }
 
-async function automationContextId(send: SendCommand, sessionId?: string): Promise<number> {
-  const tree = await send("Page.getFrameTree", {}, sessionId);
-  const frameId = frameTreeRootId(tree);
-  if (!frameId) throw new Error("The browser automation world has no frame.");
-  const world = await send(
-    "Page.createIsolatedWorld",
-    { frameId, worldName: AUTOMATION_WORLD_NAME, grantUniveralAccess: false },
-    sessionId,
-  );
-  const contextId = numberValue(world.executionContextId);
-  if (!contextId) throw new Error("The browser automation world is unavailable.");
-  return contextId;
-}
+/** Runs in the automation world. Returns true when the document shows the value anywhere a snapshot reads. */
+const SECRET_SCAN_FUNCTION = `function(secret) {
+  const found = (value) => typeof value === 'string' && value.includes(secret);
+  if (found(document.title) || found(location.href)) return true;
+  const walk = (root) => {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+    for (let node = walker.currentNode; node; node = walker.nextNode()) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        if (found(node.data)) return true;
+        continue;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) continue;
+      if ('value' in node && found(String(node.value))) return true;
+      for (const attribute of node.attributes) if (found(attribute.value)) return true;
+      if (node.shadowRoot && walk(node.shadowRoot)) return true;
+    }
+    return false;
+  };
+  return walk(document);
+}`;
 
 function documentIdFunctionDeclaration(): string {
   return `function() {
@@ -2539,67 +1925,4 @@ function waitForPageSignal(contents: WebContents, timeoutMs: number): Promise<vo
     contents.once("did-stop-loading", signal);
     contents.once("did-navigate-in-page", signal);
   });
-}
-
-function frameTreeRootId(value: CdpResult): string {
-  return stringValue(recordValue(recordValue(value.frameTree)?.frame)?.id);
-}
-
-function frameIds(value: CdpResult): string[] {
-  const ids: string[] = [];
-  const pending = [recordValue(value.frameTree)];
-  while (pending.length > 0) {
-    const tree = pending.shift();
-    if (!tree) continue;
-    const id = stringValue(recordValue(tree.frame)?.id);
-    if (id) ids.push(id);
-    if (Array.isArray(tree.childFrames)) pending.push(...tree.childFrames.map(recordValue));
-  }
-  return ids;
-}
-
-function exceptionDescription(value: CdpResult): string {
-  return stringValue(recordValue(value.exception)?.description) || stringValue(value.text) || "Unknown page error";
-}
-
-function describeTarget(target: Exclude<BrowserTarget, { kind: "ref" | "css" | "point" }>): string {
-  return target.kind === "role"
-    ? `role ${target.role}${target.name ? ` named “${target.name}”` : ""}`
-    : `text “${target.text}”`;
-}
-
-function textMatches(actual: string, expected: string, exact = false): boolean {
-  const left = actual.trim().toLocaleLowerCase();
-  const right = expected.trim().toLocaleLowerCase();
-  return exact ? left === right : left.includes(right);
-}
-
-function axValue(value: unknown): string {
-  const record = recordValue(value);
-  const raw = record?.value;
-  return isString(raw) || isNumber(raw) || isBoolean(raw) ? String(raw) : "";
-}
-
-function recordValue(value: unknown): CdpResult | undefined {
-  return isRecord(value) ? value : undefined;
-}
-
-function isRecord(value: unknown): value is CdpResult {
-  return isDynamicRecord(value);
-}
-
-function stringValue(value: unknown): string {
-  return isString(value) ? value : "";
-}
-
-function numberValue(value: unknown): number {
-  return isFiniteNumber(value) ? value : 0;
-}
-
-function isFiniteNumber(value: unknown): value is number {
-  return isNumber(value) && Number.isFinite(value);
-}
-
-function clamp(value: number, minimum: number, maximum: number): number {
-  return Math.min(maximum, Math.max(minimum, value));
 }

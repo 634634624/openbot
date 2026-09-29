@@ -1,11 +1,13 @@
 import { MCP_SERVERS_CAPABILITY } from "@openbot/contracts/ipc";
 import { MCP_ROUTES, mcpRequest } from "@openbot/contracts/team-protocol/mcp-v1";
+import { sourceText } from "@openbot/i18n/source";
 import {
   parseRemoveMcpServer,
   parseSaveMcpServer,
   parseSetMcpServerEnabled,
   parseTestMcpServer,
 } from "../ipc/mcp-inputs";
+import { type McpToolRuntimePreparation, prepareToolRuntimeForTest } from "../ipc/mcp-server-handlers";
 import type { TeamApiMcpServers } from "./dependencies";
 import { HttpError } from "./http-error";
 import type { RouteOutcome, TeamApiRequestContext } from "./request-context";
@@ -25,6 +27,7 @@ import { readJson, requireAdmin } from "./request-helpers";
 export async function routeMcpServers(
   context: TeamApiRequestContext,
   mcpServers: TeamApiMcpServers | undefined,
+  toolRuntimes?: McpToolRuntimePreparation,
 ): Promise<RouteOutcome> {
   const { method, url, capabilities, member, request, json } = context;
   const list = method === "GET" && url.pathname === MCP_ROUTES.list;
@@ -34,14 +37,27 @@ export async function routeMcpServers(
   const test = method === "POST" && url.pathname === MCP_ROUTES.test;
   if (!list && !save && !remove && !toggle && !test) return "unmatched";
   if (!mcpServers || !capabilities.has(MCP_SERVERS_CAPABILITY))
-    throw new HttpError(400, "MCP servers are not supported by this connection.");
+    throw new HttpError(400, sourceText("error.team.mcpUnsupported"));
   requireAdmin(member);
   if (list) return json(200, mcpServers.listMcpServers());
   // `readJson` has already run the body through the MCP wire codec, so every field below is decoded
   // and bounded before the IPC parsers see it.
   const body = mcpRequest(url.pathname, await readJson(request));
-  if (save) return json(200, mcpServers.saveMcpServer(parseSaveMcpServer(body)));
+  if (save) {
+    // The local save starts the runtime download; the host route shares it, or a first server
+    // added remotely never gets the runtime its test and its spawn need.
+    toolRuntimes?.startToolRuntimes();
+    return json(200, mcpServers.saveMcpServer(parseSaveMcpServer(body)));
+  }
   if (remove) return json(200, mcpServers.removeMcpServer(parseRemoveMcpServer(body)));
-  if (test) return json(200, await mcpServers.testMcpServer(parseTestMcpServer(body)));
-  return json(200, mcpServers.setMcpServerEnabled(parseSetMcpServerEnabled(body)));
+  if (test) {
+    const parsed = parseTestMcpServer(body);
+    if (toolRuntimes) await prepareToolRuntimeForTest(parsed.config, toolRuntimes);
+    // The administrator tests the host's servers, so the host's stored sign-ins are spent - but no
+    // browser opens on a machine nobody is sitting at. Only the tool count and the error travel back.
+    return json(200, await mcpServers.testMcpServer(parsed, { storedCredentials: true }));
+  }
+  const toggled = parseSetMcpServerEnabled(body);
+  if (toggled.enabled) toolRuntimes?.startToolRuntimes();
+  return json(200, mcpServers.setMcpServerEnabled(toggled));
 }

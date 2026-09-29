@@ -1,16 +1,84 @@
-import { analyticsRange, parseAnalyticsRange } from "@openbot/contracts/ipc";
+import { analyticsRange, type InstalledSkill, parseAnalyticsRange } from "@openbot/contracts/ipc";
+import type { MobileTextKey } from "@openbot/i18n/mobile";
 import { useQuery } from "@tanstack/react-query";
 import { router, useLocalSearchParams } from "expo-router";
 import { Button, Typography } from "heroui-native";
-import { type PropsWithChildren, useEffect, useState } from "react";
+import { type PropsWithChildren, useEffect, useRef, useState } from "react";
 import { View } from "react-native";
 import { mobileAnalytics } from "@/features/analytics/mobile-analytics";
 import { useMobileSession } from "@/features/auth/context/mobile-session-context";
-import { SettingsRow, SettingsSection } from "@/features/settings/components/settings-content";
+import { SettingsNote, SettingsRow, SettingsSection } from "@/features/settings/components/settings-content";
 import { type MobileAgent, useMobileWorkspace } from "@/features/workspace/context/mobile-workspace-context";
 import { SheetFormField } from "@/shared/components/sheet-form-field";
+import { haptics } from "@/shared/lib/haptics";
+import { useText } from "@/shared/lib/text";
+import { AgentFiles } from "./agent-files";
 import { MemoryEditor, RoutineEditor } from "./agent-record-editor";
+import { AgentSkills, CreateSkillAction } from "./agent-skills";
 import { AgentUsageReport } from "./agent-usage-report";
+
+type ListKind = "usage" | "memories" | "routines" | "skills" | "files";
+type RecordKind = "memory" | "routine";
+
+const LIST_SECTION_TEXT = {
+  usage: {
+    title: "mobile.agent.info.usage.title",
+    loading: "mobile.agent.info.usage.loading",
+    reconnect: "mobile.agent.info.usage.reconnect",
+    failed: "mobile.agent.info.usage.failed",
+    retry: "mobile.agent.info.usage.retry",
+  },
+  memories: {
+    title: "mobile.agent.info.memories.title",
+    loading: "mobile.agent.info.memories.loading",
+    reconnect: "mobile.agent.info.memories.reconnect",
+    failed: "mobile.agent.info.memories.failed",
+    retry: "mobile.agent.info.memories.retry",
+  },
+  routines: {
+    title: "mobile.agent.info.routines.title",
+    loading: "mobile.agent.info.routines.loading",
+    reconnect: "mobile.agent.info.routines.reconnect",
+    failed: "mobile.agent.info.routines.failed",
+    retry: "mobile.agent.info.routines.retry",
+  },
+  skills: {
+    title: "mobile.agent.info.skills.title",
+    loading: "mobile.agent.info.skills.loading",
+    reconnect: "mobile.agent.info.skills.reconnect",
+    failed: "mobile.agent.info.skills.failed",
+    retry: "mobile.agent.info.skills.retry",
+  },
+  files: {
+    title: "mobile.agent.info.files.title",
+    loading: "mobile.agent.info.files.loading",
+    reconnect: "mobile.agent.info.files.reconnect",
+    failed: "mobile.agent.info.files.failed",
+    retry: "mobile.agent.info.files.retry",
+  },
+} as const satisfies Record<
+  ListKind,
+  {
+    title: MobileTextKey;
+    loading: MobileTextKey;
+    reconnect: MobileTextKey;
+    failed: MobileTextKey;
+    retry: MobileTextKey;
+  }
+>;
+
+const RECORD_SECTION_TEXT = {
+  memory: {
+    loading: "mobile.agent.info.memory.loading",
+    failed: "mobile.agent.info.memory.failed",
+    retry: "mobile.agent.info.memory.retry",
+  },
+  routine: {
+    loading: "mobile.agent.info.routine.loading",
+    failed: "mobile.agent.info.routine.failed",
+    retry: "mobile.agent.info.routine.retry",
+  },
+} as const satisfies Record<RecordKind, { loading: MobileTextKey; failed: MobileTextKey; retry: MobileTextKey }>;
 
 export function AgentInformation({
   agent,
@@ -19,11 +87,12 @@ export function AgentInformation({
 }: {
   agent: MobileAgent;
   available: boolean;
-  section: "usage" | "memories" | "routines" | "memory" | "routine";
+  section: "usage" | "memories" | "routines" | "memory" | "routine" | "skills" | "files";
 }) {
   useEffect(() => {
     if (section === "usage") mobileAnalytics.track("usage_viewed", {});
   }, [section]);
+  const { t } = useText();
   const { recordId } = useLocalSearchParams<{ recordId?: string }>();
   const workspace = useMobileWorkspace();
   const { session, sessionScope } = useMobileSession();
@@ -39,10 +108,10 @@ export function AgentInformation({
       setRange({ ...selected, agentId: agent.id });
       setDays(0);
       setRangeError(null);
+      void haptics.selection();
     } catch {
-      setRangeError(
-        "Enter valid dates in YYYY-MM-DD format, with the start on or before the end. Select at most 367 days.",
-      );
+      void haptics.notification("error");
+      setRangeError(t("mobile.agent.usage.rangeInvalid"));
     }
   }
   const key = ["agent-info", session?.apiUrl, session?.user.id, sessionScope, agent.serverId, agent.id];
@@ -59,6 +128,35 @@ export function AgentInformation({
     queryKey: [...key, "routines"],
     queryFn: () => workspace.loadAgentRoutines(agent.id, agent.serverId),
   });
+  // An owner or admin reads the admin list, which has the enabled state, and can change it.
+  const manageSkills = workspace.canManageAgentSkills(agent.serverId);
+  const skillsKey = [...key, "skills", manageSkills];
+  const skills = useQuery({
+    ...options,
+    enabled: available && section === "skills",
+    queryKey: skillsKey,
+    queryFn: async () => {
+      const installed = await workspace.loadAgentSkills(agent.id, agent.serverId, manageSkills);
+      return installed && userAssignedSkills(installed);
+    },
+  });
+  // The host caches a scan. A retry or a deletion measures again, as on desktop.
+  const forceStorageScan = useRef(false);
+  const storage = useQuery({
+    ...options,
+    enabled: available && section === "files",
+    queryKey: [...key, "storage"],
+    queryFn: () => {
+      const force = forceStorageScan.current;
+      forceStorageScan.current = false;
+      return workspace.loadAgentStorage(agent.id, agent.serverId, force);
+    },
+  });
+  function rescanStorage() {
+    forceStorageScan.current = true;
+    void storage.refetch();
+  }
+  const role = workspace.servers.find((server) => server.id === agent.serverId)?.role;
   const usage = useQuery({
     ...options,
     enabled: available && section === "usage",
@@ -78,13 +176,16 @@ export function AgentInformation({
                 variant={days === value ? "secondary" : "ghost"}
                 accessibilityState={{ selected: days === value }}
                 onPress={() => {
+                  void haptics.selection();
                   setCustom(false);
                   setRangeError(null);
                   setDays(value);
                   setRange(analyticsRange(agent.id, value));
                 }}
               >
-                <Button.Label>{value === 365 ? "1 year" : `${value} days`}</Button.Label>
+                <Button.Label>
+                  {value === 365 ? t("mobile.agent.usage.oneYear") : t("mobile.agent.usage.days", { count: value })}
+                </Button.Label>
               </Button>
             ))}
           </View>
@@ -92,6 +193,7 @@ export function AgentInformation({
             variant="ghost"
             accessibilityState={{ expanded: custom }}
             onPress={() => {
+              void haptics.selection();
               if (!custom) {
                 setCustomStart(range.startDate);
                 setCustomEnd(range.endDate);
@@ -100,12 +202,12 @@ export function AgentInformation({
               setCustom(!custom);
             }}
           >
-            <Button.Label>Custom range</Button.Label>
+            <Button.Label>{t("mobile.agent.usage.customRange")}</Button.Label>
           </Button>
           {custom ? (
             <View className="gap-3">
               <SheetFormField
-                label="Start date"
+                label={t("mobile.agent.usage.startDate")}
                 hint="YYYY-MM-DD"
                 appearance="soft"
                 value={customStart}
@@ -114,7 +216,7 @@ export function AgentInformation({
                 maxLength={10}
               />
               <SheetFormField
-                label="End date"
+                label={t("mobile.agent.usage.endDate")}
                 hint="YYYY-MM-DD"
                 appearance="soft"
                 value={customEnd}
@@ -128,12 +230,12 @@ export function AgentInformation({
                 </Typography.Paragraph>
               ) : null}
               <Button variant="secondary" onPress={applyCustomRange}>
-                <Button.Label>Apply range</Button.Label>
+                <Button.Label>{t("mobile.agent.usage.applyRange")}</Button.Label>
               </Button>
             </View>
           ) : null}
           <InformationSection
-            title="Usage"
+            kind="usage"
             list
             available={available}
             pending={usage.isPending}
@@ -143,14 +245,14 @@ export function AgentInformation({
             {usage.data ? (
               <AgentUsageReport result={usage.data} />
             ) : (
-              <Typography.Paragraph>This host does not support agent analytics.</Typography.Paragraph>
+              <Typography.Paragraph>{t("mobile.agent.usage.unsupported")}</Typography.Paragraph>
             )}
           </InformationSection>
         </View>
       ) : null}
       {section === "memories" ? (
         <InformationSection
-          title="Memories"
+          kind="memories"
           list
           available={available}
           pending={memories.isPending}
@@ -172,7 +274,9 @@ export function AgentInformation({
           ))}
           {!memories.data?.length ? (
             <SettingsRow>
-              <Typography.Paragraph className="text-grouped-secondary">No memories yet.</Typography.Paragraph>
+              <Typography.Paragraph className="text-grouped-secondary">
+                {t("mobile.agent.info.noMemories")}
+              </Typography.Paragraph>
             </SettingsRow>
           ) : null}
           <SettingsRow
@@ -183,13 +287,13 @@ export function AgentInformation({
               })
             }
           >
-            <Typography.Paragraph>Add memory</Typography.Paragraph>
+            <Typography.Paragraph>{t("mobile.agent.info.addMemory")}</Typography.Paragraph>
           </SettingsRow>
         </InformationSection>
       ) : null}
       {section === "routines" ? (
         <InformationSection
-          title="Routines"
+          kind="routines"
           list
           available={available}
           pending={routines.isPending}
@@ -199,7 +303,7 @@ export function AgentInformation({
           {routines.data?.map((routine) => (
             <SettingsRow
               key={routine.id}
-              supportingText={routine.active ? "Active" : "Paused"}
+              supportingText={t(routine.active ? "mobile.agent.info.routineActive" : "mobile.agent.info.routinePaused")}
               onPress={() =>
                 router.push({
                   pathname: "/agent-info/[agentId]/routine",
@@ -212,7 +316,9 @@ export function AgentInformation({
           ))}
           {!routines.data?.length ? (
             <SettingsRow>
-              <Typography.Paragraph className="text-grouped-secondary">No routines yet.</Typography.Paragraph>
+              <Typography.Paragraph className="text-grouped-secondary">
+                {t("mobile.agent.info.noRoutines")}
+              </Typography.Paragraph>
             </SettingsRow>
           ) : null}
           <SettingsRow
@@ -223,17 +329,67 @@ export function AgentInformation({
               })
             }
           >
-            <Typography.Paragraph>Add routine</Typography.Paragraph>
+            <Typography.Paragraph>{t("mobile.agent.info.addRoutine")}</Typography.Paragraph>
           </SettingsRow>
+        </InformationSection>
+      ) : null}
+      {section === "skills" ? (
+        <>
+          {available && manageSkills ? <CreateSkillAction agent={agent} /> : null}
+          <InformationSection
+            kind="skills"
+            list
+            available={available}
+            pending={skills.isPending}
+            failed={skills.isError}
+            retry={() => void skills.refetch()}
+          >
+            {skills.data === null ? (
+              <SettingsSection>
+                <SettingsRow>
+                  <Typography.Paragraph>{t("mobile.agent.info.skillsUnsupported")}</Typography.Paragraph>
+                </SettingsRow>
+              </SettingsSection>
+            ) : skills.data ? (
+              <AgentSkills agent={agent} skills={skills.data} manage={manageSkills} queryKey={skillsKey} />
+            ) : null}
+          </InformationSection>
+          <SettingsNote>
+            {t(manageSkills ? "mobile.agent.info.skillsAddOnComputer" : "mobile.agent.info.skillsManaged")}
+          </SettingsNote>
+        </>
+      ) : null}
+      {section === "files" ? (
+        <InformationSection
+          kind="files"
+          list
+          available={available}
+          pending={storage.isPending}
+          failed={storage.isError}
+          retry={rescanStorage}
+        >
+          {storage.data ? (
+            <AgentFiles
+              agent={agent}
+              usage={storage.data}
+              canDelete={role === "owner" || role === "admin"}
+              onChanged={rescanStorage}
+            />
+          ) : (
+            <SettingsSection>
+              <SettingsRow>
+                <Typography.Paragraph>{t("mobile.agent.info.filesUnsupported")}</Typography.Paragraph>
+              </SettingsRow>
+            </SettingsSection>
+          )}
         </InformationSection>
       ) : null}
       {section === "memory" ? (
         !recordId ? (
           <MemoryEditor agent={agent} available={available} />
         ) : (
-          <InformationSection
-            title="Memory"
-            list
+          <RecordSection
+            kind="memory"
             available={available}
             pending={memories.isPending}
             failed={memories.isError}
@@ -248,19 +404,18 @@ export function AgentInformation({
               />
             ) : (
               <SettingsRow>
-                <Typography.Paragraph>This memory is no longer available.</Typography.Paragraph>
+                <Typography.Paragraph>{t("mobile.agent.info.memoryGone")}</Typography.Paragraph>
               </SettingsRow>
             )}
-          </InformationSection>
+          </RecordSection>
         )
       ) : null}
       {section === "routine" ? (
         !recordId ? (
           <RoutineEditor agent={agent} available={available} />
         ) : (
-          <InformationSection
-            title="Routine"
-            list
+          <RecordSection
+            kind="routine"
             available={available}
             pending={routines.isPending}
             failed={routines.isError}
@@ -275,18 +430,53 @@ export function AgentInformation({
               />
             ) : (
               <SettingsRow>
-                <Typography.Paragraph>This routine is no longer available.</Typography.Paragraph>
+                <Typography.Paragraph>{t("mobile.agent.info.routineGone")}</Typography.Paragraph>
               </SettingsRow>
             )}
-          </InformationSection>
+          </RecordSection>
         )
       ) : null}
     </>
   );
 }
 
+function RecordSection({
+  kind,
+  available,
+  pending,
+  failed,
+  retry,
+  children,
+}: PropsWithChildren<{
+  kind: RecordKind;
+  available: boolean;
+  pending: boolean;
+  failed: boolean;
+  retry: () => void;
+}>) {
+  const { t } = useText();
+  const text = RECORD_SECTION_TEXT[kind];
+  return (
+    <View className="gap-4">
+      {!pending ? children : null}
+      {!available ? (
+        <Typography.Paragraph>{t("mobile.agent.info.reconnectToSave")}</Typography.Paragraph>
+      ) : pending ? (
+        <Typography.Paragraph>{t(text.loading)}</Typography.Paragraph>
+      ) : failed ? (
+        <View className="gap-2">
+          <Typography.Paragraph accessibilityRole="alert">{t(text.failed)}</Typography.Paragraph>
+          <Button variant="ghost" onPress={retry}>
+            <Button.Label>{t(text.retry)}</Button.Label>
+          </Button>
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
 function InformationSection({
-  title,
+  kind,
   list = false,
   available,
   pending,
@@ -294,51 +484,30 @@ function InformationSection({
   retry,
   children,
 }: PropsWithChildren<{
-  title: string;
+  kind: ListKind;
   list?: boolean;
   available: boolean;
   pending: boolean;
   failed: boolean;
   retry: () => void;
 }>) {
-  if (list && (title === "Memory" || title === "Routine")) {
-    return (
-      <View className="gap-4">
-        {!pending ? children : null}
-        {!available ? (
-          <Typography.Paragraph>Reconnect to save changes.</Typography.Paragraph>
-        ) : pending ? (
-          <Typography.Paragraph>Loading {title.toLowerCase()}…</Typography.Paragraph>
-        ) : failed ? (
-          <View className="gap-2">
-            <Typography.Paragraph accessibilityRole="alert">
-              Could not refresh {title.toLowerCase()}.
-            </Typography.Paragraph>
-            <Button variant="ghost" onPress={retry}>
-              <Button.Label>Retry {title.toLowerCase()}</Button.Label>
-            </Button>
-          </View>
-        ) : null}
-      </View>
-    );
-  }
+  const { t } = useText();
+  const text = LIST_SECTION_TEXT[kind];
   if (list && available && !pending && !failed)
-    return title === "Memories" || title === "Routines" ? <SettingsSection>{children}</SettingsSection> : children;
+    return kind === "memories" || kind === "routines" ? <SettingsSection>{children}</SettingsSection> : children;
   return (
-    <SettingsSection title={title}>
+    <SettingsSection title={t(text.title)}>
       <SettingsRow>
         <View className="gap-2">
           {!available ? (
-            <Typography.Paragraph>Reconnect to load {title.toLowerCase()}.</Typography.Paragraph>
+            <Typography.Paragraph>{t(text.reconnect)}</Typography.Paragraph>
           ) : pending ? (
-            <Typography.Paragraph>Loading {title.toLowerCase()}…</Typography.Paragraph>
+            <Typography.Paragraph>{t(text.loading)}</Typography.Paragraph>
           ) : failed ? (
             <>
-              <Typography.Paragraph accessibilityRole="alert">
-                Could not load {title.toLowerCase()}.
-              </Typography.Paragraph>
+              <Typography.Paragraph accessibilityRole="alert">{t(text.failed)}</Typography.Paragraph>
               <Button variant="ghost" onPress={retry}>
-                <Button.Label>Retry {title.toLowerCase()}</Button.Label>
+                <Button.Label>{t(text.retry)}</Button.Label>
               </Button>
             </>
           ) : (
@@ -348,4 +517,14 @@ function InformationSection({
       </SettingsRow>
     </SettingsSection>
   );
+}
+
+/** The skills the user assigned, as the desktop agent settings list them: built-in skills are hidden. */
+function userAssignedSkills(skills: InstalledSkill[]): InstalledSkill[] {
+  return skills
+    .filter(
+      (skill) =>
+        skill.origin !== "managed" && skill.slug !== "openbot-site-hosting" && skill.skillId !== "openbot-site-hosting",
+    )
+    .sort((left, right) => left.name.localeCompare(right.name));
 }

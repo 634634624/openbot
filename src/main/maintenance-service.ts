@@ -5,10 +5,12 @@ import { arch, release as osRelease, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import type { AgentSummary, ExportResult } from "@openbot/contracts/ipc";
+import type { AppTranslate } from "@openbot/i18n";
 import { app, type BrowserWindow, dialog } from "electron";
 import type { AgentService } from "../backend/agent-service";
 import type { BrowserHost } from "../backend/browser-host";
 import type { MailboxStore } from "../backend/mailbox-store";
+import type { TraceFile } from "./trace-file";
 import type { UpdateService } from "./update-service";
 
 const execFileAsync = promisify(execFile);
@@ -18,16 +20,18 @@ interface MaintenanceContext {
   browser: BrowserHost;
   mailbox: MailboxStore;
   updater: UpdateService;
+  trace: TraceFile;
   parentWindow: BrowserWindow | null;
+  translate: AppTranslate;
 }
 
 export async function exportOpenBotData(
-  context: Pick<MaintenanceContext, "service" | "mailbox" | "parentWindow">,
+  context: Pick<MaintenanceContext, "service" | "mailbox" | "parentWindow" | "translate">,
 ): Promise<ExportResult> {
   const destination = await chooseExportDestination(
     context.parentWindow,
     `OpenBot-backup-${new Date().toISOString().slice(0, 10)}.zip`,
-    [{ name: "ZIP archive", extensions: ["zip"] }],
+    [{ name: context.translate("dialog.filter.zipArchive"), extensions: ["zip"] }],
   );
   if (!destination) return { saved: false };
 
@@ -55,6 +59,7 @@ export async function exportOpenBotData(
           "Codex credentials",
           "OpenCode Go key",
           "custom provider API keys",
+          "custom agent environment values",
           "browser cookies",
           "agent workspace files",
         ],
@@ -95,12 +100,12 @@ function powerShellLiteral(value: string): string {
 }
 
 export async function exportDiagnostics(
-  context: Pick<MaintenanceContext, "service" | "browser" | "updater" | "parentWindow">,
+  context: Pick<MaintenanceContext, "service" | "browser" | "updater" | "trace" | "parentWindow" | "translate">,
 ): Promise<ExportResult> {
   const destination = await chooseExportDestination(
     context.parentWindow,
     `OpenBot-diagnostics-${new Date().toISOString().slice(0, 10)}.json`,
-    [{ name: "JSON document", extensions: ["json"] }],
+    [{ name: context.translate("dialog.filter.jsonDocument"), extensions: ["json"] }],
   );
   if (!destination) return { saved: false };
 
@@ -158,6 +163,7 @@ export async function exportDiagnostics(
       tabCount: context.browser.listTabs().length,
       activeControlCount: context.browser.getControlState().sessions.length,
     },
+    memory: readMemoryDiagnostics(),
     update: {
       phase: update.phase,
       currentVersion: update.currentVersion,
@@ -167,6 +173,8 @@ export async function exportDiagnostics(
       errorCode: update.errorCode,
       history: context.updater.getDiagnostics(),
     },
+    // IPC channels and turn origins with counts, outcomes and durations, from the local trace file.
+    trace: await context.trace.summarize(),
     privacy:
       "Contains no conversations, URLs, email addresses, tokens, file contents, file paths, or raw error messages.",
   };
@@ -175,6 +183,30 @@ export async function exportDiagnostics(
     mode: 0o600,
   });
   return { saved: true };
+}
+
+const KB_PER_MB = 1_024;
+const BYTES_PER_MB = 1_024 * 1_024;
+
+/**
+ * Memory of the Electron processes and the main process heap, in MB. Provider CLIs are not Electron
+ * processes, so `getAppMetrics` leaves them out; each one reports as its own OS process.
+ */
+function readMemoryDiagnostics() {
+  const usage = process.memoryUsage();
+  return {
+    mainProcess: {
+      rssMb: Math.round(usage.rss / BYTES_PER_MB),
+      heapUsedMb: Math.round(usage.heapUsed / BYTES_PER_MB),
+      heapTotalMb: Math.round(usage.heapTotal / BYTES_PER_MB),
+      externalMb: Math.round(usage.external / BYTES_PER_MB),
+    },
+    processes: app.getAppMetrics().map((metric) => ({
+      type: metric.type,
+      workingSetMb: Math.round(metric.memory.workingSetSize / KB_PER_MB),
+      peakWorkingSetMb: Math.round(metric.memory.peakWorkingSetSize / KB_PER_MB),
+    })),
+  };
 }
 
 async function chooseExportDestination(

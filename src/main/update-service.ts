@@ -1,9 +1,12 @@
 import { EventEmitter } from "node:events";
 import { appendFile, mkdir, readdir, rename, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
-import type { UpdateBusyPhase, UpdateFailureCode, UpdateStatus } from "@openbot/contracts/ipc";
+import type { ScheduledUpdateRestart, UpdateBusyPhase, UpdateFailureCode, UpdateStatus } from "@openbot/contracts/ipc";
 import { isUpdateBusyPhase } from "@openbot/contracts/ipc";
+import { sourceText } from "@openbot/i18n/source";
 import type { ProgressInfo, UpdateInfo } from "electron-updater";
+import type { HostUpdateState } from "../../packages/contracts/src/host-manager";
+import type { OpenBotSiblingInstance } from "./update-sibling-instances";
 
 /** Only the part of electron-updater's cancellation token this service depends on. */
 export type UpdateCancellationToken = {
@@ -78,6 +81,7 @@ interface UpdateServiceOptions {
   enabled: boolean;
   autoDownload: boolean;
   beforeInstall: () => Promise<void>;
+  checkSiblingInstances?: () => Promise<readonly OpenBotSiblingInstance[]>;
   platform?: NodeJS.Platform;
   logDirectory?: string;
   shipItDirectory?: string;
@@ -149,7 +153,7 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
   readonly #options: Required<
     Pick<UpdateServiceOptions, "currentVersion" | "enabled" | "platform" | "initialCheckDelayMs" | "checkIntervalMs">
   > &
-    Pick<UpdateServiceOptions, "beforeInstall" | "logDirectory" | "shipItDirectory"> & {
+    Pick<UpdateServiceOptions, "beforeInstall" | "checkSiblingInstances" | "logDirectory" | "shipItDirectory"> & {
       phaseTimeoutsMs: Record<UpdateBusyPhase, number>;
     };
   #status: UpdateStatus;
@@ -162,6 +166,8 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
   #logWrite = Promise.resolve();
   #autoDownload: boolean;
   #downloadedVersion: string | null = null;
+  #managedByHost = false;
+  #scheduledRestart: ScheduledUpdateRestart | null = null;
   #cancellationToken: UpdateCancellationToken | null = null;
   #checkGeneration = 0;
   #downloadGeneration = 0;
@@ -193,7 +199,7 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
       availableVersion: null,
       progress: null,
       checkedAt: null,
-      message: options.enabled ? null : "Updates are available in installed desktop builds.",
+      message: options.enabled ? null : sourceText("error.update.unsupported"),
       errorCode: null,
     };
     this.#recordStatus();
@@ -251,7 +257,20 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
   }
 
   getStatus(): UpdateStatus {
-    return { ...this.#status };
+    const status = { ...this.#status };
+    if (this.#managedByHost) status.managedByHost = true;
+    if (this.#scheduledRestart)
+      status.scheduledRestart = { ...this.#scheduledRestart, waitingFor: [...this.#scheduledRestart.waitingFor] };
+    return status;
+  }
+
+  /**
+   * Shows the restart a joined server's admin asked for. `RequestedUpdate` owns the schedule; this
+   * only carries it to the renderer. It is not a phase change, so the phase deadline stays as it is.
+   */
+  setScheduledRestart(restart: ScheduledUpdateRestart | null): void {
+    this.#scheduledRestart = restart ? { ...restart, waitingFor: [...restart.waitingFor] } : null;
+    this.emit("status", this.getStatus());
   }
 
   getDiagnostics(): UpdateDiagnosticEvent[] {
@@ -267,6 +286,51 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
     if (enabled && this.#options.enabled && this.#status.phase === "available") void this.downloadUpdate();
   }
 
+  /** Host-managed sessions display host state and never invoke the tenant updater. */
+  setManagedByHost(managed: boolean): void {
+    if (this.#managedByHost === managed) return;
+    this.#managedByHost = managed;
+    if (!managed) {
+      this.#downloadedVersion = null;
+      this.#setStatus({
+        phase: this.#options.enabled ? "idle" : "unsupported",
+        availableVersion: null,
+        progress: null,
+        message: null,
+        errorCode: null,
+      });
+      if (this.#options.enabled) this.#scheduleCheck(this.#options.initialCheckDelayMs);
+    }
+    this.#setStatus({});
+  }
+
+  setHostState(state: HostUpdateState): void {
+    if (!this.#managedByHost) return;
+    const phases = {
+      idle: "up-to-date",
+      downloading: "downloading",
+      waiting: "ready",
+      stopping: "ready",
+      installing: "installing",
+      released: "up-to-date",
+      failed: "error",
+      aborted: "error",
+    } as const;
+    if (
+      this.#status.phase === phases[state.phase] &&
+      this.#status.availableVersion === state.version &&
+      this.#status.message === state.error
+    )
+      return;
+    this.#setStatus({
+      phase: phases[state.phase],
+      availableVersion: state.version,
+      message: state.error,
+      errorCode: state.phase === "failed" || state.phase === "aborted" ? "install_failed" : null,
+      progress: null,
+    });
+  }
+
   /**
    * The user-facing check. Unlike the periodic loop this one always reports: it moves into
    * "checking" and settles on a real outcome even when an earlier call is still unsettled, because
@@ -277,7 +341,7 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
   }
 
   async #check(joinOutstandingRequest: boolean): Promise<UpdateStatus> {
-    if (!this.#options.enabled || this.#teardownCommitted) return this.getStatus();
+    if (this.#managedByHost || !this.#options.enabled || this.#teardownCommitted) return this.getStatus();
     if (["checking", "downloading", "ready", "installing"].includes(this.#status.phase)) {
       return this.getStatus();
     }
@@ -331,6 +395,7 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
   }
 
   async downloadUpdate(): Promise<UpdateStatus> {
+    if (this.#managedByHost) return this.getStatus();
     if (!this.#options.enabled || this.#teardownCommitted || !this.#canDownload()) return this.getStatus();
     // Same deduplication applies to downloads, and starting a second attempt while the abandoned one
     // is still unsettled is also what would let its buffered events be read as the new attempt's.
@@ -366,8 +431,27 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
 
   async installUpdate(): Promise<void> {
     if (!this.#canInstall() || this.#installStarted) {
-      throw new Error("An update is not ready to install.");
+      throw new Error(sourceText("error.update.notReady"));
     }
+    // Host-managed tenants never install on their own, even with no sibling in sight: the
+    // host owns the timing. Like the sibling refusal this throws before the latch, so the
+    // update stays ready.
+    if (this.#managedByHost) {
+      throw new Error(MANAGED_HOST_MESSAGE);
+    }
+    await this.#install();
+  }
+
+  async #install(): Promise<void> {
+    // Replacing the application bundle while another login session runs OpenBot from it breaks
+    // that session, so refuse before the one-shot install latch and before shutdown preparation.
+    // Nothing is torn down, the update stays ready, and the user retries once every session stopped.
+    const siblings = (await this.#options.checkSiblingInstances?.()) ?? [];
+    if (siblings.length > 0) {
+      throw new Error(SIBLING_SESSION_MESSAGE);
+    }
+    if (this.#managedByHost) throw new Error(MANAGED_HOST_MESSAGE);
+    if (!this.#canInstall() || this.#installStarted) throw new Error(sourceText("error.update.notReady"));
     const generation = ++this.#installGeneration;
     this.#activeInstall = generation;
     this.#installStarted = true;
@@ -390,7 +474,7 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
     } catch {
       if (this.#installGeneration !== generation) return;
       this.#setError("install_failed", INSTALL_FAILED_MESSAGE);
-      throw new Error("OpenBot could not restart to install the update.");
+      throw new Error(sourceText("error.update.restartFailed"));
     }
   }
 
@@ -491,7 +575,7 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
   #armPhaseTimer(): void {
     this.#clearPhaseTimer();
     const timeoutMs = this.#phaseTimeoutMs();
-    if (timeoutMs === null) return;
+    if (this.#managedByHost || timeoutMs === null) return;
     this.#phaseTimer = setTimeout(() => {
       this.#phaseTimer = null;
       this.#failStalledPhase();
@@ -518,7 +602,7 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
       this.#activeDownload = null;
       this.#cancellationToken?.cancel();
       this.#cancellationToken = null;
-      this.#setError("download_failed", "The update download stopped responding. Try again.");
+      this.#setError("download_failed", sourceText("error.update.downloadStalled"));
       return;
     }
     if (this.#status.phase === "installing") {
@@ -557,12 +641,13 @@ export class UpdateService extends EventEmitter<UpdateServiceEvents> {
   }
 }
 
-const INSTALL_FAILED_MESSAGE = "Could not install the update. Quit and reopen OpenBot, then try again.";
-const CHECK_STALLED_MESSAGE = "The update check stopped responding. Try again.";
-const CHECK_OFFLINE_MESSAGE = "Could not reach the update service. Check your internet connection, then try again.";
-const CHECK_SERVICE_MESSAGE = "The update service did not answer. OpenBot tries again on its own in a few minutes.";
-const CHECK_NO_RELEASE_MESSAGE =
-  "No published update was found for this platform. OpenBot tries again on its own in a few minutes.";
+const INSTALL_FAILED_MESSAGE = sourceText("error.update.installFailed");
+const MANAGED_HOST_MESSAGE = sourceText("error.update.managedByHost");
+const SIBLING_SESSION_MESSAGE = sourceText("error.update.siblingSession");
+const CHECK_STALLED_MESSAGE = sourceText("error.update.checkStalled");
+const CHECK_OFFLINE_MESSAGE = sourceText("error.update.checkOffline");
+const CHECK_SERVICE_MESSAGE = sourceText("error.update.checkUnavailable");
+const CHECK_NO_RELEASE_MESSAGE = sourceText("error.update.checkNoRelease");
 
 /**
  * Node reports a link that never carried the request through `error.code`. electron-updater wraps
@@ -612,9 +697,9 @@ function describeCheckFailure(error: unknown) {
 }
 
 function errorMessage(code: UpdateFailureCode) {
-  if (code === "download_failed") return "Could not download the update. Try again.";
+  if (code === "download_failed") return sourceText("error.update.downloadFailed");
   if (code === "install_failed") return INSTALL_FAILED_MESSAGE;
-  return "Could not check for updates. Try again.";
+  return sourceText("error.update.checkFailed");
 }
 
 async function appendUpdateLog(directory: string, event: UpdateDiagnosticEvent): Promise<void> {

@@ -17,8 +17,11 @@ import {
 import { createOpenBotLogger } from "@openbot/logging";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SidebarLayoutStore } from "../backend/sidebar-layout-store";
+import { TeamApiServer } from "./team-api-server";
 import {
   createAgents,
+  createBrowser,
+  createMailbox,
   createTeamApiFixture,
   rawRequest,
   stopTeamApiFixtures,
@@ -58,6 +61,24 @@ describe("TeamApiServer teardown", () => {
     // is one that no longer notices a revoked session - and the next start would hand it back.
     await expect(fetch(`http://127.0.0.1:${port}/v1/compatibility`)).rejects.toThrow();
   });
+
+  it("opens one listener for two starts, and closes it for a stop that arrives during them", async () => {
+    const { store } = await createTeamApiFixture("start-race");
+    const api = new TeamApiServer({
+      store,
+      agents: createAgents(),
+      mailbox: createMailbox(),
+      browser: createBrowser(),
+    });
+
+    const starts = Promise.all([api.start(), api.start()]);
+    await api.stop();
+    const [first, second] = await starts;
+
+    expect(second).toBe(first);
+    expect(api.port).toBeNull();
+    await expect(fetch(`http://127.0.0.1:${first}/v1/compatibility`)).rejects.toThrow();
+  });
 });
 
 describe("TeamApiServer compatibility", () => {
@@ -71,7 +92,7 @@ describe("TeamApiServer compatibility", () => {
     expect(compatibility.status).toBe(200);
     await expect(compatibility.json()).resolves.toMatchObject({
       appVersion: "0.4.0",
-      protocol: { minimum: 1, maximum: 4 },
+      protocol: { minimum: 1, maximum: 5 },
       capabilities: expect.arrayContaining(["browser-control", "remote-desktop", TEAM_SEMANTIC_TAGS_CAPABILITY]),
     });
 
@@ -80,7 +101,7 @@ describe("TeamApiServer compatibility", () => {
     await expect(missing.json()).resolves.toMatchObject({ code: "client_update_required" });
 
     const newerClient = await fetch(`${base}/v1/identity`, {
-      headers: { [TEAM_PROTOCOL_VERSION_HEADER]: "5", [TEAM_APP_VERSION_HEADER]: "0.5.0" },
+      headers: { [TEAM_PROTOCOL_VERSION_HEADER]: "6", [TEAM_APP_VERSION_HEADER]: "0.5.0" },
     });
     expect(newerClient.status).toBe(426);
     await expect(newerClient.json()).resolves.toMatchObject({ code: "host_update_required" });
@@ -150,6 +171,8 @@ const ROUTE_METHODS: Record<string, string> = {
   "team.logo": "GET",
   "team.members": "GET",
   "team.member": "PATCH",
+  // The walk signs in as the owner, whom the route refuses, so it removes nothing and needs no order.
+  "team.leave": "POST",
   "team.invites": "GET",
   "team.invite": "DELETE",
   "team.sessions": "GET",
@@ -169,7 +192,13 @@ const ROUTE_METHODS: Record<string, string> = {
   "browser.control": "GET",
   "browser.preview": "POST",
   "browser.visible": "POST",
+  "browser.display": "GET",
+  "browser.load": "POST",
+  "browser.viewSessions": "POST",
+  "browser.viewSession": "DELETE",
   "remoteScreen.capabilities": "GET",
+  "remoteScreen.setup": "POST",
+  "remoteScreen.test": "POST",
   "remoteScreen.sessions": "POST",
   "remoteScreen.session": "DELETE",
   "remoteScreen.display": "PUT",
@@ -229,6 +258,7 @@ const ROUTES_WITHOUT_A_CLASSIFIED_JSON_BODY = new Set([
   // Answered with 204 and no body at all.
   "attachment",
   "auth.logout",
+  "team.leave",
   "team.invite",
   "team.session",
   "remoteScreen.session",
@@ -258,6 +288,17 @@ const ROUTES_WITHOUT_A_CLASSIFIED_JSON_BODY = new Set([
   // Same reason, one adapter deeper: v3 rewrites this to the `read` path before the v1 codec sees a
   // body, so v1 classifies `conversation/read` and never this spelling.
   "agent.conversationUnread",
+  // Additive `browser-navigation` routes: they ride beside the frozen codec, which classifies
+  // neither, exactly as the additive v3 routes above do.
+  "browser.display",
+  "browser.load",
+  // Behind `browser-view`, and the same again: the session body rides beside the frozen codec, and
+  // the deletion is answered with 204 and no body at all.
+  "browser.viewSessions",
+  "browser.viewSession",
+  // Optional v4 setup routes. Their separate request/response codec is tested in v4.test.ts.
+  "remoteScreen.setup",
+  "remoteScreen.test",
 ]);
 
 const ROUTE_SAMPLE_IDS = ["route-sample", "route-sample-other"];
@@ -303,7 +344,7 @@ describe("TeamApiServer routing", () => {
     // notices, because the frozen adapter does not move with them.
     const unclassified = routes
       .filter((route) => !ROUTES_WITHOUT_A_CLASSIFIED_JSON_BODY.has(route.name))
-      .filter((route) => !teamProtocolV1HttpRoute(ROUTE_METHODS[route.name], route.path))
+      .filter((route) => !teamProtocolV1HttpRoute(ROUTE_METHODS[route.name] ?? "", route.path))
       .map((route) => `${ROUTE_METHODS[route.name]} ${route.path} (${route.name})`);
     expect(unclassified).toEqual([]);
 

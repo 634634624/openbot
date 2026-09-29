@@ -1,48 +1,40 @@
 import type { CentralAuthUser, ServerSummary } from "@openbot/contracts/ipc";
-import { MCP_SERVERS_CAPABILITY } from "@openbot/contracts/ipc";
+import type { CustomAgentSettingsApi } from "@openbot/ui/features/custom-providers/CustomAgentSettings";
+import { currentText } from "@openbot/ui/text";
 import { createMemo, Loading, Show } from "solid-js";
+import { appPort } from "./app-port";
 import { useAuth } from "./features/account/account-context";
 import { useAgents } from "./features/agents/agents-context";
-import { useConversationController } from "./features/conversation/conversation-controller-context";
+import { useCustomAgents } from "./features/custom-agents/custom-agents-context";
 import { useCustomProviders } from "./features/custom-providers/custom-providers-context";
+import { useProviderDetection } from "./features/custom-providers/provider-detection-context";
+import type { ServerStorageOptions } from "./features/files/ServerStoragePanel";
 import { useSetup } from "./features/onboarding/onboarding-context";
+import { useSetupProviderProps } from "./features/onboarding/setup-provider-props";
 import { useRemoteDesktop } from "./features/remote-desktop/remote-desktop-context";
-import { serverSupportsCapability } from "./features/servers/server-capabilities";
+import { mcpToolRuntimeNote } from "./features/servers/mcp-servers";
 import { useServerSelection } from "./features/servers/server-selection";
 import { useServerSettings } from "./features/servers/server-settings";
+import { useServerSwitch } from "./features/servers/server-switch";
 import { useServers } from "./features/servers/servers-context";
-import type { ProviderKeyApi } from "./features/settings/OpenCodeKeyDialog";
 import { useSettings } from "./features/settings/settings-context";
 import { useUpdates } from "./features/updates/updates-context";
-import {
-  GlobalSearch,
-  InitialSetup,
-  JoinServerDialog,
-  RemoteDesktopWorkspace,
-  ServerSettingsModal,
-  SettingsModal,
-  SkillsMarketplaceModal,
-} from "./lazy-views";
+import { InitialSetup, RemoteDesktopWorkspace, SettingsModal } from "./lazy-views";
 import { useNavigation } from "./navigation";
 import { usePlatform } from "./platform";
 import { useProviders } from "./providers";
+import {
+  ChannelCreateOverlay,
+  GlobalSearchOverlay,
+  JoinServerOverlay,
+  MarketplaceOverlay,
+  ServerSettingsOverlay,
+  SharedAgentInstallOverlay,
+} from "./WorkspaceOverlayViews";
 
 interface AccountProps {
   account: () => CentralAuthUser;
 }
-
-/**
- * The four calls the OpenCode key dialog makes, bound once.
- *
- * It is a narrow object rather than `window.openbot` itself so the dialog's props say exactly what
- * it reaches for, and so a test hands it four functions instead of the whole bridge.
- */
-const providerKeyApi: ProviderKeyApi = {
-  getProviderApiKeyState: (provider) => window.openbot.getProviderApiKeyState(provider),
-  setProviderApiKey: (input) => window.openbot.setProviderApiKey(input),
-  clearProviderApiKey: (provider) => window.openbot.clearProviderApiKey(provider),
-  openExternal: (destination) => window.openbot.openExternal(destination),
-};
 
 /**
  * Everything the workspace raises over itself: modals, dialogs and the two
@@ -56,17 +48,22 @@ const providerKeyApi: ProviderKeyApi = {
  * single-use modules at the renderer root because each is a dozen lines of
  * wiring, and the list of what can cover the workspace is worth reading in one
  * place.
+ *
+ * The overlays the web client also raises are views in `WorkspaceOverlayViews`, which take props:
+ * the components here read the desktop contexts and pass them on.
  */
 export function WorkspaceOverlays(props: AccountProps) {
   return (
     <>
       <PermissionsReview account={props.account} />
       <SkillsMarketplace />
+      <SharedAgentInstall />
       <JoinServer account={props.account} />
       <ServerSettings />
       <AppSettings account={props.account} />
       <GlobalMessageSearch />
       <RemoteDesktop />
+      <ChannelCreateOverlay />
     </>
   );
 }
@@ -76,16 +73,17 @@ function PermissionsReview(props: AccountProps) {
   const platform = usePlatform();
   const auth = useAuth();
   const setup = useSetup();
-  const { agentStatus } = useAgents();
+  const { activeServer } = useServers();
   const { joinRemoteDuringSetup } = useServerSelection();
+  const setupProviders = useSetupProviderProps(() => activeServer()?.kind === "local");
 
   return (
     <Show when={setup.permissionsOpen()}>
       <Loading>
         <InitialSetup
+          {...setupProviders}
           reviewing
           state={setup.setupState() ?? { completed: true, preferredProvider: "codex", preferredModel: null }}
-          agentStatus={agentStatus()}
           platform={platform.appInfo()?.platform ?? "darwin"}
           accountEmail={props.account().email}
           onSave={setup.saveSetup}
@@ -100,47 +98,51 @@ function PermissionsReview(props: AccountProps) {
 }
 
 /**
- * Skills and marketplace agents, which install into an Agent's workspace on this
- * machine, so the picker is empty for a remote server.
+ * Skills and marketplace agents, which install into an Agent's workspace on the host. The picker
+ * lists the agents of this computer, or of a joined server this account administers; a member
+ * browses and installs nothing. A marketplace agent is added to that joined server when its host
+ * serves `agent-install-v1`, otherwise to this computer. An agent of a joined server is updated from
+ * its listing only when its host serves `agent-update-v1`.
  */
 function SkillsMarketplace() {
-  const { skillsMarketplaceOpen, setSkillsMarketplaceOpen } = useSettings();
+  const { skillsMarketplaceOpen, setSkillsMarketplaceOpen, pendingPluginSlug, setPendingPluginSlug } = useSettings();
   const { agentList, activeAgent, agentStatus, agentSetupOpen, creatingAgent } = useAgents();
-  const controller = useConversationController();
   const { selectAgent } = useNavigation();
   const { activeServer } = useServers();
   const { openInstalledMarketplaceAgent } = useServerSelection();
-  const local = createMemo(() => activeServer()?.kind === "local");
 
   return (
-    <Show when={skillsMarketplaceOpen()}>
-      <Loading>
-        <SkillsMarketplaceModal
-          open={true}
-          agents={local() ? agentList() : []}
-          activeAgentId={local() ? (activeAgent()?.id ?? "") : ""}
-          onOpenChange={setSkillsMarketplaceOpen}
-          onTrySkill={
-            local() &&
-            agentStatus().phase === "ready" &&
-            !controller.submitting() &&
-            !controller.selectionSending() &&
-            controller.voicePhase() === "idle" &&
-            !controller.editingDeliveryId() &&
-            !(agentSetupOpen() && creatingAgent())
-              ? (agentId, skill) => {
-                  const server = activeServer();
-                  if (server?.kind !== "local" || !agentList().some((agent) => agent.id === agentId)) return;
-                  selectAgent(agentId);
-                  controller.appendSkillExample({ serverId: server.id, agentId }, skill);
-                  setSkillsMarketplaceOpen(false);
-                }
-              : undefined
-          }
-          onAgentInstalled={openInstalledMarketplaceAgent}
-        />
-      </Loading>
-    </Show>
+    <MarketplaceOverlay
+      open={skillsMarketplaceOpen()}
+      onOpenChange={setSkillsMarketplaceOpen}
+      server={activeServer()}
+      agents={agentList()}
+      activeAgentId={activeAgent()?.id ?? ""}
+      composerAvailable={agentStatus().phase === "ready" && !(agentSetupOpen() && creatingAgent())}
+      onOpenAgent={selectAgent}
+      onAgentInstalled={openInstalledMarketplaceAgent}
+      pluginSlug={pendingPluginSlug()}
+      onPluginSlugConsumed={() => setPendingPluginSlug(null)}
+    />
+  );
+}
+
+/**
+ * A shared agent from an `openbot://agents/<id>` link. It is added where a marketplace agent is: on
+ * the selected joined server when this account administers it, otherwise on this computer.
+ */
+function SharedAgentInstall() {
+  const { pendingAgentTemplateId, setPendingAgentTemplateId } = useSettings();
+  const { openInstalledMarketplaceAgent } = useServerSelection();
+  const { activeServer } = useServers();
+
+  return (
+    <SharedAgentInstallOverlay
+      templateId={pendingAgentTemplateId()}
+      server={activeServer()}
+      onClose={() => setPendingAgentTemplateId(null)}
+      onInstalled={openInstalledMarketplaceAgent}
+    />
   );
 }
 
@@ -151,20 +153,17 @@ function JoinServer(props: AccountProps) {
   const { joinServer } = useServerSelection();
 
   return (
-    <Show when={joinServerOpen()}>
-      <Loading>
-        <JoinServerDialog
-          inviteUrl={setup.pendingInviteUrl()}
-          accountEmail={props.account().email}
-          onClose={() => {
-            setJoinServerOpen(false);
-            setup.setPendingInviteUrl("");
-          }}
-          onPreview={setup.previewInvite}
-          onJoin={joinServer}
-        />
-      </Loading>
-    </Show>
+    <JoinServerOverlay
+      open={joinServerOpen()}
+      inviteUrl={setup.pendingInviteUrl()}
+      accountEmail={props.account().email}
+      onClose={() => {
+        setJoinServerOpen(false);
+        setup.setPendingInviteUrl("");
+      }}
+      onPreview={setup.previewInvite}
+      onJoin={joinServer}
+    />
   );
 }
 
@@ -174,9 +173,20 @@ function JoinServer(props: AccountProps) {
  */
 function ServerSettings() {
   const platform = usePlatform();
-  const { hostStatus, setServerMuted } = useServers();
+  const { hostStatus, setServerMuted, setServerNotificationLevel } = useServers();
+  const { selectAgent, selectGlobalSearchMessage } = useNavigation();
+  const { selectServer } = useServerSelection();
+  const { setPendingAgentSelection } = useServerSwitch();
+  const { toolRuntimeStatuses, providerAdminServerId } = useProviders();
+  /**
+   * Whether the tool runtimes the providers context holds are this server's: this computer's, or,
+   * over `providers-v1`, those of the host of the joined server on screen.
+   */
+  const holdsToolRuntimes = (server: ServerSummary) =>
+    server.kind === "local" ? providerAdminServerId() === undefined : server.id === providerAdminServerId();
   const {
     serverSettingsTarget,
+    serverSettingsSection,
     serverSettingsOpen,
     setServerSettingsOpen,
     serverSettingsRestoreTarget,
@@ -191,6 +201,7 @@ function ServerSettings() {
     createServerInvite,
     updateServerMember,
     removeServerMember,
+    leaveServer,
     revokeServerInvite,
     serverSettingsMcp,
     serverSettingsMcpError,
@@ -201,48 +212,78 @@ function ServerSettings() {
     testMcpServer,
   } = useServerSettings();
 
-  /**
-   * The gate on the whole feature: the tab and the panel both hang off `mcpServers`. A remote host
-   * answers 403 to a `member` and 400 without the capability, so neither ever sees the section.
-   */
-  const canUseMcp = (server: ServerSummary) =>
-    server.kind === "local" || (serverSupportsCapability(server, MCP_SERVERS_CAPABILITY) && server.role !== "member");
+  // The workspace belongs to the selected server. For another server, the switch comes first and
+  // the agent is published for the scope it lands in; a message there opens as its agent's chat.
+  const openOnServer = (server: ServerSummary, agentId: string, open: () => void) => {
+    setServerSettingsOpen(false);
+    if (server.active) return open();
+    void selectServer(server.id).then((selected) => {
+      if (selected) setPendingAgentSelection(agentId);
+    });
+  };
+
+  const storageOptions = (server: ServerSummary): Omit<ServerStorageOptions, "canManage"> => ({
+    hostName:
+      server.kind === "local"
+        ? platform.appInfo()?.platform === "darwin"
+          ? currentText().t("app.host.thisMac")
+          : currentText().t("app.host.thisComputer")
+        : server.name,
+    onOpenAgent: (agentId) => openOnServer(server, agentId, () => selectAgent(agentId)),
+    onShowMessage: (agentId, messageId) =>
+      openOnServer(server, agentId, () => selectGlobalSearchMessage(agentId, messageId)),
+  });
 
   return (
     <Show when={serverSettingsTarget()}>
       {(server) => (
-        <Loading>
-          <ServerSettingsModal
-            open={serverSettingsOpen()}
-            onOpenChange={setServerSettingsOpen}
-            restoreFocusTarget={serverSettingsRestoreTarget()}
-            platform={platform.appInfo()?.platform ?? "darwin"}
-            server={server()}
-            hostStatus={server().kind === "local" ? hostStatus() : null}
-            members={serverSettingsMembers()}
-            invites={serverSettingsInvites()}
-            loading={serverSettingsLoading()}
-            loadError={serverSettingsError()}
-            onRetry={() => refreshServerSettings(server().id)}
-            onSaveIdentity={saveServerIdentity}
-            onSetPublished={setServerPublished}
-            onSetMuted={(muted) => setServerMuted(server().id, muted)}
-            onCreateInvite={createServerInvite}
-            onUpdateMember={updateServerMember}
-            onRemoveMember={removeServerMember}
-            onRevokeInvite={revokeServerInvite}
-            onOpenScreenRecordingSettings={() => window.openbot.openExternal("mac-screen-recording")}
-            onRecheckScreenRecording={recheckScreenRecording}
-            mcpServers={canUseMcp(server()) ? serverSettingsMcp() : undefined}
-            mcpLoadError={serverSettingsMcpError()}
-            onMcpSectionShown={() => void refreshMcpServers()}
-            onRetryMcpServers={() => void refreshMcpServers()}
-            onSaveMcpServer={saveMcpServer}
-            onRemoveMcpServer={removeMcpServer}
-            onSetMcpServerEnabled={setMcpServerEnabled}
-            onTestMcpServer={testMcpServer}
-          />
-        </Loading>
+        <ServerSettingsOverlay
+          open={serverSettingsOpen()}
+          onOpenChange={setServerSettingsOpen}
+          restoreFocusTarget={serverSettingsRestoreTarget()}
+          platform={platform.appInfo()?.platform ?? "darwin"}
+          server={server()}
+          hostStatus={server().kind === "local" ? hostStatus() : null}
+          members={serverSettingsMembers()}
+          invites={serverSettingsInvites()}
+          loading={serverSettingsLoading()}
+          loadError={serverSettingsError()}
+          onRetry={() => refreshServerSettings(server().id)}
+          onSaveIdentity={saveServerIdentity}
+          onSetPublished={setServerPublished}
+          onSetMuted={(muted) => setServerMuted(server().id, muted)}
+          onSetNotificationLevel={(level) => setServerNotificationLevel(server().id, level)}
+          onCreateInvite={createServerInvite}
+          onUpdateMember={updateServerMember}
+          onRemoveMember={removeServerMember}
+          onRevokeInvite={revokeServerInvite}
+          onLeaveServer={leaveServer}
+          onOpenScreenRecordingSettings={() => appPort().openExternal("mac-screen-recording")}
+          onRecheckScreenRecording={recheckScreenRecording}
+          mcpServers={serverSettingsMcp()}
+          // Only for the computer whose runtimes this window holds: another host starts its servers
+          // with its own runtime, which this window has not read.
+          mcpToolRuntimeNote={holdsToolRuntimes(server()) ? mcpToolRuntimeNote(toolRuntimeStatuses().bun) : null}
+          mcpLoadError={serverSettingsMcpError()}
+          onMcpSectionShown={() => void refreshMcpServers()}
+          onRetryMcpServers={() => void refreshMcpServers()}
+          onSaveMcpServer={saveMcpServer}
+          onRemoveMcpServer={removeMcpServer}
+          onSetMcpServerEnabled={setMcpServerEnabled}
+          onTestMcpServer={testMcpServer}
+          storage={storageOptions(server())}
+          hostUpdate={{}}
+          initialSection={serverSettingsSection()}
+          // Agents import into this computer only; a remote host has no Import section.
+          agentImport={
+            server().kind === "local"
+              ? {
+                  onOpenAgent: (agentId) => openOnServer(server(), agentId, () => selectAgent(agentId)),
+                  onClose: () => setServerSettingsOpen(false),
+                }
+              : undefined
+          }
+        />
       )}
     </Show>
   );
@@ -259,8 +300,16 @@ function AppSettings(props: AccountProps) {
   const updates = useUpdates();
   const { agentStatus } = useAgents();
   const { activeServer } = useServers();
-  const { appSettingsOpen, setAppSettingsOpen, generalSettings, updateGeneralSettings, appSettingsRestoreTarget } =
-    useSettings();
+  const {
+    appSettingsOpen,
+    setAppSettingsOpen,
+    generalSettings,
+    updateGeneralSettings,
+    appSettingsRestoreTarget,
+    turboModePending,
+    sendTestNotification,
+    openNotificationSettings,
+  } = useSettings();
   const {
     providerRuntimeStatuses,
     providerAvailableVersions,
@@ -270,19 +319,42 @@ function AppSettings(props: AccountProps) {
     cancelProviderRuntimeDownload,
     connectProvider,
     openProviderInstallGuide,
+    codeLogin,
+    providerAdminServerId,
+    providerKeys,
+    hostCustomProviders,
   } = useProviders();
-  const { customProviders, saveCustomProvider, deleteCustomProvider } = useCustomProviders();
-  /** Provider downloads are the local machine's business, never a remote host's. */
-  const localProviderDownloads = createMemo(
-    () => activeServer()?.kind === "local" && providerRuntimeDownloadsAvailable(),
-  );
+  const localEndpoints = useCustomProviders();
+  const localAgents = useCustomAgents();
+  const detection = useProviderDetection();
+  /** A custom agent is a command on this computer, so only the local host lists or runs one. */
+  const customAgents: CustomAgentSettingsApi = {
+    get agents() {
+      return localAgents.customAgents();
+    },
+    save: localAgents.saveCustomAgent,
+    remove: localAgents.deleteCustomAgent,
+    check: localAgents.checkCustomAgent,
+  };
+  const local = () => activeServer()?.kind === "local";
   /**
-   * A named endpoint merges into the `opencode acp` process on *this* computer, so a remote server
-   * must show no custom row, no list and no Add. This is not `localProviderDownloads()`: that one
-   * also needs `providerRuntimeDownloadsAvailable()`, which is about managed runtime downloads and
-   * would hide this feature on a build without them.
+   * The providers of the computer the agents run on: this one, or the host of a joined server the
+   * account administers over `providers-v1`. Any other server shows none of these controls.
    */
-  const localCustomProviders = createMemo(() => activeServer()?.kind === "local");
+  const providerDownloads = createMemo(
+    () => (local() || providerAdminServerId() !== undefined) && providerRuntimeDownloadsAvailable(),
+  );
+  /** The browser sign-in and the install guide open on this computer, so they stay local. */
+  const localProviderDownloads = createMemo(() => local() && providerRuntimeDownloadsAvailable());
+  /**
+   * A named endpoint merges into the `opencode acp` process of the computer the agents run on, so a
+   * server this window cannot manage shows no custom row, no list and no Add. This is not
+   * `providerDownloads()`: that one also needs `providerRuntimeDownloadsAvailable()`, which is about
+   * managed runtime downloads and would hide this feature on a build without them.
+   */
+  const endpoints = createMemo(() =>
+    local() ? localEndpoints : providerAdminServerId() !== undefined ? hostCustomProviders : undefined,
+  );
 
   return (
     <Loading>
@@ -294,6 +366,7 @@ function AppSettings(props: AccountProps) {
         appInfo={platform.appInfo()}
         updateStatus={updates.status()}
         onUpdateAction={updates.runAction}
+        onCancelScheduledRestart={updates.cancelScheduledRestart}
         account={props.account()}
         onUpdateAccountName={auth.updateAccountName}
         onUpdateAccountAvatar={auth.updateAccountAvatar}
@@ -303,18 +376,34 @@ function AppSettings(props: AccountProps) {
         onListAccountSessions={auth.listAccountSessions}
         onRevokeAccountSession={auth.revokeAccountSession}
         agentStatus={agentStatus()}
-        providerRuntimeStatuses={localProviderDownloads() ? providerRuntimeStatuses() : undefined}
-        providerAvailableVersions={localProviderDownloads() ? providerAvailableVersions() : undefined}
-        onUpdateProvider={localProviderDownloads() ? startProviderUpdate : undefined}
-        onDownloadProvider={localProviderDownloads() ? downloadProviderRuntime : undefined}
-        onCancelProviderDownload={localProviderDownloads() ? cancelProviderRuntimeDownload : undefined}
+        providerRuntimeStatuses={providerDownloads() ? providerRuntimeStatuses() : undefined}
+        providerAvailableVersions={providerDownloads() ? providerAvailableVersions() : undefined}
+        onUpdateProvider={providerDownloads() ? startProviderUpdate : undefined}
+        onDownloadProvider={providerDownloads() ? downloadProviderRuntime : undefined}
+        onCancelProviderDownload={providerDownloads() ? cancelProviderRuntimeDownload : undefined}
         onConnectProvider={localProviderDownloads() ? connectProvider : undefined}
         onInstallProvider={localProviderDownloads() ? openProviderInstallGuide : undefined}
-        customProviders={localCustomProviders() ? customProviders() : undefined}
-        onAddCustomProvider={localCustomProviders() ? saveCustomProvider : undefined}
-        onDeleteCustomProvider={localCustomProviders() ? deleteCustomProvider : undefined}
-        providerKeys={localProviderDownloads() ? providerKeyApi : undefined}
-        hostedSitesApi={window.openbot.hostedSites}
+        customProviders={endpoints()?.customProviders()}
+        onAddCustomProvider={endpoints()?.saveCustomProvider}
+        onDeleteCustomProvider={endpoints()?.deleteCustomProvider}
+        customAgents={local() ? customAgents : undefined}
+        // The scan is of this computer, so a joined server's tab shows no found list and no Edit.
+        providerDetection={local() ? detection.detection() : undefined}
+        detectedProviderApi={local() ? detection.api : undefined}
+        takenAgentIds={detection.takenAgentIds()}
+        detectionSettings={local() ? (detection.settingsValue() ?? undefined) : undefined}
+        onDetectionSettingsChange={detection.setSettings}
+        detectionSettingsError={detection.settingsError()}
+        onProvidersShown={() => {
+          if (local()) void detection.scan();
+        }}
+        providerKeys={providerDownloads() ? providerKeys() : undefined}
+        providerHostName={providerAdminServerId() === undefined ? undefined : activeServer()?.name}
+        codeLogin={providerDownloads() ? codeLogin : undefined}
+        hostedSitesApi={appPort().hostedSites}
+        turboModePending={turboModePending()}
+        onTestNotification={sendTestNotification}
+        onOpenNotificationSettings={openNotificationSettings}
         restoreFocusTarget={appSettingsRestoreTarget()}
       />
     </Loading>
@@ -328,18 +417,14 @@ function GlobalMessageSearch() {
     useNavigation();
 
   return (
-    <Show when={globalSearchOpen()}>
-      <Loading>
-        <GlobalSearch
-          open={true}
-          agents={agentList()}
-          onSearchMessages={searchGlobalMessages}
-          onOpenChange={setGlobalSearchVisibility}
-          onSelectAgent={selectAgent}
-          onSelectMessage={selectGlobalSearchMessage}
-        />
-      </Loading>
-    </Show>
+    <GlobalSearchOverlay
+      open={globalSearchOpen()}
+      agents={agentList()}
+      onSearchMessages={searchGlobalMessages}
+      onOpenChange={setGlobalSearchVisibility}
+      onSelectAgent={selectAgent}
+      onSelectMessage={selectGlobalSearchMessage}
+    />
   );
 }
 

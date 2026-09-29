@@ -5,11 +5,16 @@ import {
 } from "@openbot/contracts/attachment-references";
 import { expandChatTagReferences } from "@openbot/contracts/chat-tag-references";
 import type { InstalledSkill, MessageReaction } from "@openbot/contracts/ipc";
+import type { AgentMessage } from "@openbot/ui/data";
+import { currentText } from "@openbot/ui/text";
 import { desktopAnalytics } from "../../../analytics";
-import type { AgentMessage } from "../../../data";
-import { errorMessage } from "../../../error-message";
+import { writeClipboardText } from "../../../clipboard";
 import type { StoredQueueEdit } from "../composer-draft";
+import { conversationRuntime } from "../conversation-runtime";
 import type { ComposerDraft, ConversationProps, ConversationTarget } from "../conversation-types";
+
+// Each member reads the interface language when it is called.
+const { t, errorMessage } = currentText();
 
 export interface MessageActionsDeps {
   props: ConversationProps;
@@ -44,7 +49,7 @@ export function createMessageActions(deps: MessageActionsDeps) {
     deps.setOpenReactionMessageId(null);
     deps.setExpandedEmojiMessageId(null);
     try {
-      await window.openbot.agent.setMessageReaction({
+      await conversationRuntime(deps.props).agent.setMessageReaction({
         agentId,
         messageId: message.id,
         emoji,
@@ -56,7 +61,7 @@ export function createMessageActions(deps: MessageActionsDeps) {
         result: "failed",
         failure_code: "reaction_failed",
       });
-      deps.setComposerError(errorMessage(error, "Could not update the reaction. Try again."), target);
+      deps.setComposerError(errorMessage(error, t("chat.actions.reactionFailed")), target);
     }
   }
 
@@ -79,24 +84,13 @@ export function createMessageActions(deps: MessageActionsDeps) {
     const agentId = deps.props.agent?.id;
     const target = agentId ? { agentId, serverId: deps.props.server?.id ?? "local" } : undefined;
     try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text);
-      } else {
-        const input = document.createElement("textarea");
-        input.value = text;
-        input.style.position = "fixed";
-        input.style.opacity = "0";
-        document.body.append(input);
-        input.select();
-        document.execCommand("copy");
-        input.remove();
-      }
+      await writeClipboardText(text);
       deps.setCopiedMessageId(message.id);
       window.setTimeout(() => {
         if (deps.copiedMessageId() === message.id) deps.setCopiedMessageId(null);
       }, 1_400);
     } catch (error) {
-      deps.setComposerError(errorMessage(error, "Could not copy the message."), target);
+      deps.setComposerError(errorMessage(error, t("chat.actions.copyFailed")), target);
     }
   }
 
@@ -117,7 +111,7 @@ export function createMessageActions(deps: MessageActionsDeps) {
       attachments: deps.currentDraft().attachments.filter((attachment) => attachment.id !== id),
       text: removeAttachmentReferences(deps.currentDraft().text, id),
     });
-    void window.openbot.agent.discardDraftAttachment(id, serverId);
+    void conversationRuntime(deps.props).agent.discardDraftAttachment(id, serverId);
   }
 
   function draftAttachmentIds(): Set<string> {
@@ -132,5 +126,3 @@ export function createMessageActions(deps: MessageActionsDeps) {
     draftAttachmentIds,
   };
 }
-
-export type MessageActions = ReturnType<typeof createMessageActions>;

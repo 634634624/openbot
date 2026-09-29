@@ -1,7 +1,8 @@
 import { RemoteTeamDirectoryClient } from "@openbot/team-client";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, assert, beforeEach, describe, expect, it, vi } from "vitest";
 import { MobileChannelStore } from "../channels/model/channel-store";
 import { MobileConversationStore } from "../workspace/model/conversation-store";
+import { LiveWorkspaceStore } from "../workspace/model/live-workspace-store";
 import type { MobileWorkspaceContextValue } from "../workspace/model/workspace-types";
 import { MobileAnalytics, type MobileAnalyticsClient } from "./analytics-core";
 import { MobileConnectionAnalytics } from "./connection";
@@ -225,7 +226,9 @@ describe("installed React Native SDK", () => {
     if (kind === "track") mobileAnalytics.track("usage_viewed", {});
     await vi.advanceTimersByTimeAsync(0);
     expect(requests).toHaveLength(1);
-    expect(JSON.parse(requests[0]).type).toBe(kind);
+    const [request] = requests;
+    assert(request);
+    expect(JSON.parse(request).type).toBe(kind);
     expect(vi.getTimerCount()).toBeGreaterThan(0);
 
     mobileAnalytics.setEnabled(false);
@@ -237,7 +240,9 @@ describe("installed React Native SDK", () => {
     expect(requests.map((body) => JSON.parse(body).type)).toEqual(
       kind === "identify" ? ["identify", "identify", "track"] : ["track", "identify", "track"],
     );
-    expect(JSON.parse(requests[requests.length - 1]).payload.name).toBe("mobile_app_opened");
+    const lastRequest = requests[requests.length - 1];
+    assert(lastRequest);
+    expect(JSON.parse(lastRequest).payload.name).toBe("mobile_app_opened");
   });
 
   it("uses the native endpoint and strips SDK referrers, identifiers and content from actual HTTP requests", async () => {
@@ -348,9 +353,15 @@ it("instruments message commands without sending their contents or changing the 
   };
   const sendMessage = vi.fn(async () => "message-receipt");
   const workspace: MobileWorkspaceContextValue = {
+    respondToBrowserTakeover: async () => undefined,
+    respondToBrowserSecret: async () => undefined,
+    sidebarByServer: {},
+    mutateSidebarLayout: async () => {},
     loadQueue: async (agentId) => ({ agentId, deliveries: [] }),
     canEditQueue: () => false,
+    attachmentSupport: () => ({ eml: true, media: true }),
     changeQueue: async () => {},
+    interruptTurn: async () => {},
     editQueue: async (agentId) => ({ agentId, deliveries: [] }),
     channelStore: new MobileChannelStore(async () => {
       throw new Error("Unexpected channel request");
@@ -365,8 +376,7 @@ it("instruments message commands without sending their contents or changing the 
     hideChannel: () => true,
     unhideChannel: () => true,
     toggleChannelPin: () => "pinned",
-    unreadAgentIds: [],
-    activityByServer: {},
+    liveState: new LiveWorkspaceStore(),
     serverDirectoryState: "ready",
     serverDirectoryError: null,
     teamDirectory: new RemoteTeamDirectoryClient({ apiUrl: "https://example.com", token: "test", fetch }),
@@ -380,6 +390,7 @@ it("instruments message commands without sending their contents or changing the 
       address: null,
       accent: "",
       publicKey: "",
+      logoKey: null,
       membershipId: "",
       role: "member",
     },
@@ -387,7 +398,10 @@ it("instruments message commands without sending their contents or changing the 
     selectServer: () => {},
     leaveServer: unexpected,
     refreshServers: unexpected,
+    reorderServers: () => false,
     refreshServer: unexpected,
+    canEditServerIdentity: () => false,
+    updateServerIdentity: unexpected,
     addRemoteServer: unexpected,
     setAgentAvatar: async () => {},
     loadAgentAvatar: async () => "",
@@ -400,10 +414,22 @@ it("instruments message commands without sending their contents or changing the 
     createAgentRoutine: unexpected,
     updateAgentRoutine: unexpected,
     deleteAgentRoutine: unexpected,
+    testAgentRoutine: unexpected,
     loadAgentModels: unexpected,
     loadAgentMemories: unexpected,
     loadAgentRoutines: unexpected,
+    searchMessages: unexpected,
     loadAgentAnalytics: unexpected,
+    loadAgentSkills: unexpected,
+    canManageAgentSkills: () => false,
+    setAgentSkillEnabled: unexpected,
+    uninstallAgentSkill: unexpected,
+    loadAgentStorage: unexpected,
+    loadAgentAdminSettings: unexpected,
+    updateAgentAdminSettings: unexpected,
+    canInstallAgentTemplate: () => false,
+    installAgentTemplate: unexpected,
+    deleteStoredFile: unexpected,
     loadConversation: unexpected,
     loadOlderMessages: unexpected,
     respondToPrompt: unexpected,

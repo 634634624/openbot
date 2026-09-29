@@ -8,11 +8,12 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import { constants } from "node:fs";
-import { copyFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rm } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { avatarFileExtension, isAvatarMimeType, isValidAvatarImage } from "@openbot/contracts/avatar-images";
-import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
+import { DEFAULT_TEAM_MEMBER_LIMIT, INPUT_LIMITS } from "@openbot/contracts/input-limits";
+import { permanentInviteExpiresAt } from "@openbot/contracts/invite-links";
 import type {
   AvatarImageInput,
   CentralAuthUser,
@@ -23,6 +24,8 @@ import type {
 } from "@openbot/contracts/ipc";
 import { isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
 import { normalizeEmailAddress, slugifyTeamServerName } from "@openbot/contracts/validation";
+import { sourceText } from "@openbot/i18n/source";
+import { writeFileAtomically, writeJsonFileAtomically } from "../backend/atomic-json-file";
 
 const scrypt = promisify(scryptCallback);
 const INVITE_TTL_MS = 24 * 60 * 60 * 1_000;
@@ -43,6 +46,9 @@ interface StoredInvite {
   expiresAt: string;
   usedAt: string | null;
   email?: string | null;
+  // Optional so files written before permanent links still read. Absent means single-use.
+  permanent?: boolean;
+  useCount?: number;
 }
 
 interface StoredSession {
@@ -107,12 +113,15 @@ export interface CreatedInvite {
   token: string;
   expiresAt: string;
   email: string | null;
+  permanent: boolean;
+  useCount: number;
 }
 
 export interface TeamInvitePreview {
   role: Exclude<TeamRole, "owner">;
   expiresAt: string;
   emailBound: boolean;
+  permanent: boolean;
 }
 
 export interface AuthenticatedMember {
@@ -348,7 +357,7 @@ export class TeamStore {
   assertOwnerAccount(user: CentralAuthUser): void {
     const owner = this.#state?.members.find((member) => member.role === "owner");
     if (!owner?.email) {
-      throw new TeamStoreError("This host is not linked to an OpenBot owner account.");
+      throw new TeamStoreError(sourceText("error.team.ownerNotLinked"));
     }
     // The account is the identity once one is recorded; the address is only what an owner
     // from before accounts can be recognized by, and it can change hands.
@@ -356,7 +365,7 @@ export class TeamStore {
       ? owner.accountId === user.id
       : normalizeEmail(user.email) === normalizeEmail(owner.email);
     if (!matches) {
-      throw new TeamStoreError("Sign in with the OpenBot email that created this host.");
+      throw new TeamStoreError(sourceText("error.team.ownerEmailRequired"));
     }
   }
 
@@ -368,7 +377,7 @@ export class TeamStore {
   }
 
   signRemoteAuthentication(transcript: string): string {
-    if (!this.#state) throw new TeamStoreError("The team host is not configured.");
+    if (!this.#state) throw new TeamStoreError(sourceText("error.team.hostNotConfigured"));
     return sign(null, Buffer.from(transcript), this.#state.privateKey).toString("base64url");
   }
 
@@ -379,7 +388,7 @@ export class TeamStore {
    * second owner-less host from being created beside it.
    */
   async configure(serverName: string, username: string, password: string): Promise<TeamIdentity> {
-    if (this.#state) throw new TeamStoreError("The team server is already configured.");
+    if (this.#state) throw new TeamStoreError(sourceText("error.team.alreadyConfigured"));
     validateServerName(serverName);
     validateUsername(username);
     validatePassword(password);
@@ -389,7 +398,7 @@ export class TeamStore {
     });
     const credentials = await hashPassword(password);
     // Hashing yields, so a second request could have configured a host meanwhile.
-    if (this.#state) throw new TeamStoreError("The team server is already configured.");
+    if (this.#state) throw new TeamStoreError(sourceText("error.team.alreadyConfigured"));
     this.#state = {
       version: 1,
       serverId: randomUUID(),
@@ -422,7 +431,7 @@ export class TeamStore {
       throw error;
     }
     const identity = this.getIdentity();
-    if (!identity) throw new Error("The team identity could not be created.");
+    if (!identity) throw new Error(sourceText("error.team.identityCreateFailed"));
     return identity;
   }
 
@@ -450,7 +459,7 @@ export class TeamStore {
       // restart would activate the one the status never showed.
       this.#assertNoHostFor(user.id, email);
       if (this.#file.activeAccountId !== activeAccountBefore) {
-        throw new TeamStoreError("The signed-in account changed while this server was being created.");
+        throw new TeamStoreError(sourceText("error.team.accountChangedDuringCreate"));
       }
     } catch (error) {
       if (serverLogo) await this.#removeLogo(serverLogo).catch(() => undefined);
@@ -500,7 +509,7 @@ export class TeamStore {
     // account that asked for it - but the caller must not go on to apply this configuration,
     // its logo and its remote registration, to whichever host is active now.
     if (this.#state !== created) {
-      throw new TeamStoreError("The signed-in account changed while this server was being created.");
+      throw new TeamStoreError(sourceText("error.team.accountChangedDuringCreate"));
     }
     return identityOf(created);
   }
@@ -510,7 +519,7 @@ export class TeamStore {
     if (input.serverName !== undefined) validateServerName(input.serverName);
     if (input.serverName === undefined && input.logo === undefined) {
       const identity = this.getIdentity();
-      if (!identity) throw new TeamStoreError("This OpenBot has not been configured.");
+      if (!identity) throw new TeamStoreError(sourceText("error.team.notConfigured"));
       return identity;
     }
 
@@ -525,7 +534,7 @@ export class TeamStore {
       if (nextLogo && nextLogo.version !== previousLogo?.version) {
         await this.#removeLogo(nextLogo).catch(() => undefined);
       }
-      throw new TeamStoreError("This server is no longer the active one for the signed-in account.");
+      throw new TeamStoreError(sourceText("error.team.serverNotActive"));
     }
     if (input.serverName !== undefined) state.serverName = input.serverName.trim();
     state.serverLogo = nextLogo;
@@ -546,7 +555,7 @@ export class TeamStore {
     // asked for it, but the caller must not go on to push it to the remote host under the
     // authentication - and the owner membership - of whichever account is active now.
     if (this.#state !== state) {
-      throw new TeamStoreError("This server is no longer the active one for the signed-in account.");
+      throw new TeamStoreError(sourceText("error.team.serverNotActive"));
     }
     return identityOf(state);
   }
@@ -596,14 +605,11 @@ export class TeamStore {
 
   async #writeLogo(image: AvatarImageInput): Promise<NonNullable<StoredTeam["serverLogo"]>> {
     if (!isValidAvatarImage(image.mimeType, image.bytes)) {
-      throw new TeamStoreError("Choose a valid PNG, JPEG, or WebP image up to 512 KB.");
+      throw new TeamStoreError(sourceText("error.team.logoInvalid"));
     }
     const version = randomUUID();
     const target = join(this.#logoRoot, `${version}.${avatarFileExtension(image.mimeType)}`);
-    const temporary = `${target}.tmp`;
-    await mkdir(this.#logoRoot, { recursive: true, mode: 0o700 });
-    await writeFile(temporary, image.bytes, { mode: 0o600 });
-    await rename(temporary, target);
+    await writeFileAtomically(target, image.bytes, { createDirectory: true });
     return { version, mimeType: image.mimeType };
   }
 
@@ -619,7 +625,7 @@ export class TeamStore {
   async setEnabledOnLaunch(serverId: string, enabled: boolean): Promise<void> {
     const state = this.#requireState();
     if (state.serverId !== serverId) {
-      throw new TeamStoreError("This server is no longer the active one for the signed-in account.");
+      throw new TeamStoreError(sourceText("error.team.serverNotActive"));
     }
     state.enabledOnLaunch = enabled;
     await this.#persist();
@@ -645,13 +651,13 @@ export class TeamStore {
   async syncRemoteDirectory(serverId: string, remoteMembers: RemoteDirectoryMember[]): Promise<void> {
     const state = this.#requireState();
     if (state.serverId !== serverId) {
-      throw new TeamStoreError("This server is no longer the active one for the signed-in account.");
+      throw new TeamStoreError(sourceText("error.team.serverNotActive"));
     }
     const remoteOwner = remoteMembers.find((member) => member.role === "owner");
     const localOwner = state.members.find((member) => member.role === "owner");
     if (remoteOwner && localOwner && remoteOwner.membershipId !== localOwner.id) {
       if (state.members.some((member) => member.id === remoteOwner.membershipId)) {
-        throw new TeamStoreError("The control-plane owner membership conflicts with this host.");
+        throw new TeamStoreError(sourceText("error.team.ownerMembershipConflict"));
       }
       const previousOwnerId = localOwner.id;
       localOwner.id = remoteOwner.membershipId;
@@ -663,8 +669,7 @@ export class TeamStore {
     for (const remote of remoteMembers) {
       const member = state.members.find((candidate) => candidate.id === remote.membershipId);
       if (!member) {
-        if (remote.role === "owner")
-          throw new TeamStoreError("The control-plane owner identity does not match this host.");
+        if (remote.role === "owner") throw new TeamStoreError(sourceText("error.team.ownerIdentityMismatch"));
         state.members.push({
           id: remote.membershipId,
           username: normalizeEmail(remote.email),
@@ -738,6 +743,8 @@ export class TeamStore {
       expiresAt: invite.expiresAt,
       usedAt: invite.usedAt,
       email: invite.email ?? null,
+      permanent: invite.permanent ?? false,
+      useCount: invite.useCount ?? 0,
     }));
   }
 
@@ -768,37 +775,57 @@ export class TeamStore {
     return [...persisted, ...remote];
   }
 
-  async createInvite(role: Exclude<TeamRole, "owner">, emailInput?: string): Promise<CreatedInvite> {
+  async createInvite(
+    role: Exclude<TeamRole, "owner">,
+    emailInput?: string,
+    options?: { permanent?: boolean },
+  ): Promise<CreatedInvite> {
     if (role !== "admin" && role !== "member") throw new TeamStoreError("Invalid invite role.");
+    const permanent = options?.permanent ?? false;
+    const email = emailInput?.trim() ? normalizeEmail(emailInput) : null;
+    // A permanent link is a shareable URL, never an addressed message: binding it to an
+    // email would promise a restriction the token cannot enforce.
+    if (permanent && email) throw new TeamStoreError(sourceText("error.team.permanentInviteEmail"));
     const state = this.#requireState();
-    const activeInvites = state.invites.filter(
-      (invite) => invite.usedAt === null && Date.parse(invite.expiresAt) > Date.now(),
-    ).length;
-    if (activeInvites >= INPUT_LIMITS.activeInvites) {
-      throw new TeamStoreError(`A host can have up to ${INPUT_LIMITS.activeInvites} active invitations.`);
+    if (permanent) {
+      const permanentInvites = state.invites.filter((invite) => invite.permanent === true).length;
+      if (permanentInvites >= INPUT_LIMITS.maxPermanentInvites) {
+        throw new TeamStoreError(
+          sourceText("error.team.permanentInviteLimit", { limit: INPUT_LIMITS.maxPermanentInvites }),
+        );
+      }
+    } else {
+      const activeInvites = state.invites.filter(
+        (invite) => invite.permanent !== true && invite.usedAt === null && Date.parse(invite.expiresAt) > Date.now(),
+      ).length;
+      if (activeInvites >= INPUT_LIMITS.activeInvites) {
+        throw new TeamStoreError(sourceText("error.team.activeInviteLimit", { limit: INPUT_LIMITS.activeInvites }));
+      }
     }
     const token = randomBytes(32).toString("base64url");
-    const email = emailInput?.trim() ? normalizeEmail(emailInput) : null;
     const invite: StoredInvite = {
       id: randomUUID(),
       tokenHash: hashToken(token),
       role,
-      expiresAt: new Date(Date.now() + INVITE_TTL_MS).toISOString(),
+      expiresAt: permanent ? permanentInviteExpiresAt() : new Date(Date.now() + INVITE_TTL_MS).toISOString(),
       usedAt: null,
       email,
+      permanent,
+      useCount: 0,
     };
     state.invites.push(invite);
     await this.#persist();
-    return { id: invite.id, role, token, expiresAt: invite.expiresAt, email };
+    return { id: invite.id, role, token, expiresAt: invite.expiresAt, email, permanent, useCount: 0 };
   }
 
   previewInvite(token: string): TeamInvitePreview {
     const invite = this.#findUsableInvite(token);
-    if (!invite) throw new TeamStoreError("The invitation is invalid or expired.");
+    if (!invite) throw new TeamStoreError(sourceText("error.team.inviteInvalid"));
     return {
       role: invite.role,
       expiresAt: invite.expiresAt,
       emailBound: Boolean(invite.email),
+      permanent: invite.permanent ?? false,
     };
   }
 
@@ -806,26 +833,24 @@ export class TeamStore {
     const state = this.#requireState();
     const email = normalizeEmail(user.email);
     const invite = this.#findUsableInvite(token);
-    if (!invite) throw new TeamStoreError("The invitation is invalid or expired.");
+    if (!invite) throw new TeamStoreError(sourceText("error.team.inviteInvalid"));
     if (invite.email && invite.email !== email) {
-      throw new TeamStoreError("This invitation belongs to a different email address.");
+      throw new TeamStoreError(sourceText("error.team.inviteEmailMismatch"));
     }
     const existingMember = state.members.find((member) => member.email === email || member.username === email);
     if (existingMember) {
-      if (existingMember.disabled) throw new TeamStoreError("This team member is disabled.");
+      if (existingMember.disabled) throw new TeamStoreError(sourceText("error.team.memberDisabled"));
       existingMember.email = email;
       existingMember.accountId = user.id;
       existingMember.username = email;
       existingMember.name = normalizeName(user.name);
       existingMember.avatarUrl = normalizeAvatarUrl(user.avatarUrl);
-      invite.usedAt = new Date().toISOString();
+      this.#consumeInvite(invite);
       const result = this.#createSession(existingMember);
       await this.#persist();
       return result;
     }
-    if (state.members.length >= INPUT_LIMITS.teamMembers) {
-      throw new TeamStoreError(`A host can have up to ${INPUT_LIMITS.teamMembers} members.`);
-    }
+    requireNewMemberSeat(state);
     const member: StoredMember = {
       id: randomUUID(),
       accountId: user.id,
@@ -837,7 +862,7 @@ export class TeamStore {
       disabled: false,
       createdAt: new Date().toISOString(),
     };
-    invite.usedAt = new Date().toISOString();
+    this.#consumeInvite(invite);
     state.members.push(member);
     const result = this.#createSession(member);
     await this.#persist();
@@ -850,7 +875,7 @@ export class TeamStore {
     const member = state.members.find(
       (candidate) => (candidate.email === email || candidate.username === email) && !candidate.disabled,
     );
-    if (!member) throw new TeamStoreError("This OpenBot account is not a member of the team.");
+    if (!member) throw new TeamStoreError(sourceText("error.team.accountNotMember"));
     member.email = email;
     member.accountId = user.id;
     member.username = email;
@@ -866,17 +891,21 @@ export class TeamStore {
     validatePassword(password);
     const state = this.#requireState();
     const normalizedUsername = username.trim().toLowerCase();
-    if (state.members.some((member) => member.username === normalizedUsername)) {
-      throw new TeamStoreError("This username is already in use.");
-    }
-    const invite = this.#findUsableInvite(token);
-    if (!invite) throw new TeamStoreError("The invitation is invalid or expired.");
-    if (invite.email) throw new TeamStoreError("This invitation requires a verified OpenBot account.");
-    if (state.members.length >= INPUT_LIMITS.teamMembers) {
-      throw new TeamStoreError(`A host can have up to ${INPUT_LIMITS.teamMembers} members.`);
-    }
+    const requireJoin = () => {
+      if (state.members.some((member) => member.username === normalizedUsername)) {
+        throw new TeamStoreError(sourceText("error.team.usernameTaken"));
+      }
+      const invite = this.#findUsableInvite(token);
+      if (!invite) throw new TeamStoreError(sourceText("error.team.inviteInvalid"));
+      if (invite.email) throw new TeamStoreError(sourceText("error.team.inviteRequiresAccount"));
+      requireNewMemberSeat(state);
+      return invite;
+    };
+    requireJoin();
     const credentials = await hashPassword(password);
     this.#requireUnchangedState(state);
+    // A concurrent join can take the username, the invitation or the last seat during the hash.
+    const invite = requireJoin();
     const member: StoredMember = {
       id: randomUUID(),
       username: normalizedUsername,
@@ -888,7 +917,7 @@ export class TeamStore {
       createdAt: new Date().toISOString(),
       ...credentials,
     };
-    invite.usedAt = new Date().toISOString();
+    this.#consumeInvite(invite);
     state.members.push(member);
     const result = this.#createSession(member);
     await this.#persist();
@@ -901,7 +930,7 @@ export class TeamStore {
       (candidate) => candidate.username === username.trim().toLowerCase() && !candidate.disabled,
     );
     if (!member || !(await verifyPassword(password, member))) {
-      throw new TeamStoreError("The username or password is incorrect.");
+      throw new TeamStoreError(sourceText("error.team.loginIncorrect"));
     }
     this.#requireUnchangedState(state);
     const result = this.#createSession(member);
@@ -943,7 +972,7 @@ export class TeamStore {
     const state = this.#requireState();
     const member = state.members.find((candidate) => candidate.id === memberId);
     if (!member || !(await verifyPassword(currentPassword, member))) {
-      throw new TeamStoreError("The current password is incorrect.");
+      throw new TeamStoreError(sourceText("error.team.currentPasswordIncorrect"));
     }
     const credentials = await hashPassword(nextPassword);
     this.#requireUnchangedState(state);
@@ -958,8 +987,9 @@ export class TeamStore {
   ): Promise<TeamMemberSummary> {
     const state = this.#requireState();
     const member = state.members.find((candidate) => candidate.id === memberId);
-    if (!member) throw new TeamStoreError("Team member not found.");
-    if (member.role === "owner") throw new TeamStoreError("The owner account cannot be changed.");
+    if (!member) throw new TeamStoreError(sourceText("error.team.memberNotFound"));
+    if (member.role === "owner") throw new TeamStoreError(sourceText("error.team.ownerCannotChange"));
+    if (patch.disabled === false && member.disabled) requireMemberSeat(state);
     if (patch.role !== undefined) {
       if (patch.role !== "admin" && patch.role !== "member") throw new TeamStoreError("Invalid role.");
       member.role = patch.role;
@@ -975,8 +1005,8 @@ export class TeamStore {
   async removeMember(memberId: string): Promise<void> {
     const state = this.#requireState();
     const member = state.members.find((candidate) => candidate.id === memberId);
-    if (!member) throw new TeamStoreError("Team member not found.");
-    if (member.role === "owner") throw new TeamStoreError("The owner account cannot be removed.");
+    if (!member) throw new TeamStoreError(sourceText("error.team.memberNotFound"));
+    if (member.role === "owner") throw new TeamStoreError(sourceText("error.team.ownerCannotRemove"));
     state.members = state.members.filter((candidate) => candidate.id !== memberId);
     state.sessions = state.sessions.filter((session) => session.memberId !== memberId);
     await this.#persist();
@@ -1056,14 +1086,28 @@ export class TeamStore {
   #findUsableInvite(token: string): StoredInvite | undefined {
     return this.#requireState().invites.find(
       (candidate) =>
-        candidate.usedAt === null &&
+        // A permanent link stays usable after joins; only expiry (never, by construction)
+        // or revocation (deletion) retires it.
+        (candidate.permanent === true || candidate.usedAt === null) &&
         Date.parse(candidate.expiresAt) > Date.now() &&
         safeTextEqual(candidate.tokenHash, hashToken(token)),
     );
   }
 
+  /**
+   * Records one join against an invitation. Single-use links burn; permanent links
+   * count the join and stay usable.
+   */
+  #consumeInvite(invite: StoredInvite): void {
+    if (invite.permanent === true) {
+      invite.useCount = (invite.useCount ?? 0) + 1;
+      return;
+    }
+    invite.usedAt = new Date().toISOString();
+  }
+
   #requireState(): StoredTeam {
-    if (!this.#state) throw new TeamStoreError("The team server is not configured.");
+    if (!this.#state) throw new TeamStoreError(sourceText("error.team.serverNotConfigured"));
     return this.#state;
   }
 
@@ -1075,7 +1119,7 @@ export class TeamStore {
    */
   #requireUnchangedState(state: StoredTeam): void {
     if (this.#state !== state) {
-      throw new TeamStoreError("The signed-in account changed while the request was in flight.");
+      throw new TeamStoreError(sourceText("error.team.accountChangedDuringRequest"));
     }
   }
 
@@ -1091,7 +1135,7 @@ export class TeamStore {
       return owner !== undefined && !owner.accountId && !owner.email;
     });
     if (this.#hostFor(accountId, email) || ownerless) {
-      throw new TeamStoreError("The team server is already configured.");
+      throw new TeamStoreError(sourceText("error.team.alreadyConfigured"));
     }
   }
 
@@ -1126,20 +1170,10 @@ export class TeamStore {
 
   async #persistFile(): Promise<void> {
     if (this.#unreadableFile) {
-      throw new TeamStoreError(
-        "This computer's team server file could not be read. Move it aside before configuring a server, so it is not overwritten.",
-      );
+      throw new TeamStoreError(sourceText("error.team.serverFileUnreadable"));
     }
     const snapshot = structuredClone(this.#file);
-    const operation = this.#writeChain.then(async () => {
-      const temporary = `${this.#path}.${randomUUID()}.tmp`;
-      try {
-        await writeFile(temporary, `${JSON.stringify(snapshot)}\n`, { encoding: "utf8", mode: 0o600 });
-        await rename(temporary, this.#path);
-      } finally {
-        await rm(temporary, { force: true });
-      }
-    });
+    const operation = this.#writeChain.then(() => writeJsonFileAtomically(this.#path, snapshot));
     this.#writeChain = operation.catch(() => undefined);
     await operation;
   }
@@ -1193,22 +1227,23 @@ function publicMember(member: StoredMember): TeamMemberSummary {
 
 function normalizeEmail(value: string): string {
   const normalized = normalizeEmailAddress(value);
-  if (!normalized) throw new TeamStoreError("Enter a valid email address.");
+  if (!normalized) throw new TeamStoreError(sourceText("error.team.emailInvalid"));
   return normalized;
 }
 
 function normalizeName(value: string | null): string | null {
   const normalized = value?.trim() ?? "";
-  if (normalized.length > INPUT_LIMITS.accountName) throw new TeamStoreError("Account name is too long.");
+  if (normalized.length > INPUT_LIMITS.accountName)
+    throw new TeamStoreError(sourceText("error.team.accountNameTooLong"));
   return normalized || null;
 }
 
 function normalizeAvatarUrl(value: string | null): string | null {
   if (!value) return null;
-  if (value.length > INPUT_LIMITS.avatarUrl) throw new TeamStoreError("The account avatar URL is too long.");
+  if (value.length > INPUT_LIMITS.avatarUrl) throw new TeamStoreError(sourceText("error.team.avatarUrlTooLong"));
   const url = new URL(value);
   if (url.protocol !== "https:" && url.protocol !== "http:") {
-    throw new TeamStoreError("The account avatar URL is invalid.");
+    throw new TeamStoreError(sourceText("error.team.avatarUrlInvalid"));
   }
   return url.toString();
 }
@@ -1217,23 +1252,23 @@ function validateServerName(value: string): void {
   const normalized = value.trim();
   if (normalized.length < INPUT_LIMITS.serverNameMin || normalized.length > INPUT_LIMITS.serverName) {
     throw new TeamStoreError(
-      `Server name must contain ${INPUT_LIMITS.serverNameMin} to ${INPUT_LIMITS.serverName} characters.`,
+      sourceText("error.team.serverNameLength", { min: INPUT_LIMITS.serverNameMin, max: INPUT_LIMITS.serverName }),
     );
   }
   if (slugifyTeamServerName(normalized).length < INPUT_LIMITS.serverNameMin) {
-    throw new TeamStoreError("Server name must produce a valid public hostname.");
+    throw new TeamStoreError(sourceText("error.team.serverNameHostname"));
   }
 }
 
 function validateUsername(value: string): void {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{2,31}$/.test(value.trim())) {
-    throw new TeamStoreError("Username must contain 3 to 32 letters, numbers, dots, dashes, or underscores.");
+    throw new TeamStoreError(sourceText("error.team.usernameInvalid"));
   }
 }
 
 function validatePassword(value: string): void {
   if (value.length < 12 || value.length > 256) {
-    throw new TeamStoreError("Password must contain 12 to 256 characters.");
+    throw new TeamStoreError(sourceText("error.team.passwordLength"));
   }
 }
 
@@ -1246,6 +1281,21 @@ function identityOf(host: StoredTeam): TeamIdentity {
     enabledOnLaunch: host.enabledOnLaunch,
     logoVersion: host.serverLogo?.version ?? null,
   };
+}
+
+/** A new member needs a stored record and a seat. */
+function requireNewMemberSeat(host: StoredTeam): void {
+  if (host.members.length >= INPUT_LIMITS.teamMembers) {
+    throw new TeamStoreError(sourceText("error.team.memberLimit", { limit: INPUT_LIMITS.teamMembers }));
+  }
+  requireMemberSeat(host);
+}
+
+/** Disabled members keep their record but not their seat, so a remote revoke frees one. */
+function requireMemberSeat(host: StoredTeam): void {
+  if (host.members.filter((member) => !member.disabled).length >= DEFAULT_TEAM_MEMBER_LIMIT) {
+    throw new TeamStoreError(sourceText("error.team.memberLimit", { limit: DEFAULT_TEAM_MEMBER_LIMIT }));
+  }
 }
 
 function hostOwner(host: StoredTeam): StoredMember | undefined {

@@ -1,12 +1,13 @@
 import solidPlugin from "@solidjs/vite-plugin";
 import { defineConfig } from "vitest/config";
-import { rendererPreviewAlias } from "./renderer-preview-alias";
+import { rendererPreviewAlias, rendererWebAlias } from "./renderer-preview-alias";
 
 export default defineConfig({
   plugins: [solidPlugin({ ssr: true })],
   resolve: {
     alias: {
       "@openbot/renderer-preview": rendererPreviewAlias,
+      "@openbot/renderer-web": rendererWebAlias,
     },
   },
   test: {
@@ -22,6 +23,7 @@ export default defineConfig({
       "test/landing-glow.test.tsx",
       "test/landing-reveal.test.tsx",
       "test/content.test.tsx",
+      "test/plugins-page.test.tsx",
     ],
   },
 });

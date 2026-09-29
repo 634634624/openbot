@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { sortConversationMessages } from "@openbot/contracts/conversation-order";
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import type {
   AgentEvent,
@@ -17,19 +18,21 @@ import type {
   UpdateRoutineInput,
 } from "@openbot/contracts/ipc";
 import { routineConversationEventItemType, routineRunConversationEventItemType } from "@openbot/contracts/ipc";
-import { isBoolean } from "@openbot/contracts/runtime-values";
+import { type DynamicRecord, isBoolean } from "@openbot/contracts/runtime-values";
+import { sourceText } from "@openbot/i18n/source";
 import { AgentRoutineStore } from "../agent-routine-store";
 import type { AgentStore } from "../agent-store";
-import { sortConversationMessages } from "../conversation-snapshots";
 import type { MailboxStore } from "../mailbox-store";
 import type { DynamicToolCallParams } from "../protocol";
-import { collapseMissedOccurrences } from "../routine-schedule";
+import { recordRestartActivity } from "../restart-activity";
+import { collapseMissedOccurrences, RoutineInputError } from "../routine-schedule";
 import type { RoutineDueSource, RoutineTimer } from "../routine-timer";
 import { type ConversationRuntime, withDatabaseTransaction } from "./conversation-runtime";
 import { routineStatusForDelivery } from "./delivery-content";
 import {
   localTimezone,
   type OpenBotToolResponse,
+  openBotToolFailure,
   openBotToolResult,
   routineToolAgentId,
   routineToolArguments,
@@ -125,6 +128,21 @@ export class RoutineScheduler implements RoutineDueSource {
     return this.#routines.list(agentId);
   }
 
+  /**
+   * Whether any routine run is executing right now. Scheduled future runs do not count: they
+   * resume from durable rows after a restart. An executing run also holds a turn or a delivery,
+   * which the wider activity check sees, so this covers the gap between the run firing and that
+   * work appearing.
+   */
+  hasActiveRuns(): boolean {
+    for (const agent of this.#hooks.listAgents()) {
+      for (const routine of this.#routines.list(agent.id)) {
+        if (this.#routines.activeRuns(agent.id, routine.id).length > 0) return true;
+      }
+    }
+    return false;
+  }
+
   runForDelivery(deliveryId: string): RoutineRun | null {
     return this.#routines.runForDelivery(deliveryId);
   }
@@ -174,9 +192,9 @@ export class RoutineScheduler implements RoutineDueSource {
   async delete(input: DeleteRoutineInput, options: RoutineMutationOptions = {}): Promise<void> {
     this.#conversation.requireKnownAgent(input.agentId);
     const routine = this.#routines.get(input.agentId, input.routineId);
-    if (!routine) throw new Error("This routine no longer exists.");
+    if (!routine) throw new RoutineInputError(sourceText("error.backend.routineGone"));
     if (this.#deletionAgents.has(input.agentId)) {
-      throw new Error("Another routine deletion is already in progress for this agent.");
+      throw new RoutineInputError(sourceText("error.backend.routineDeletionBusy"));
     }
     this.#deletionAgents.add(input.agentId);
     try {
@@ -234,11 +252,10 @@ export class RoutineScheduler implements RoutineDueSource {
   }
 
   async test(input: TestRoutineInput): Promise<RoutineRun> {
-    if (!this.mayDrain(input.agentId))
-      throw new Error("Wait until the agent operation finishes before running a routine.");
+    if (!this.mayDrain(input.agentId)) throw new RoutineInputError(sourceText("error.backend.routineWaitForAgent"));
     this.#conversation.requireKnownAgent(input.agentId);
     const routine = this.#routines.get(input.agentId, input.routineId);
-    if (!routine) throw new Error("This routine no longer exists.");
+    if (!routine) throw new RoutineInputError(sourceText("error.backend.routineGone"));
     const run = this.#routines.createRun(routine, null, "manual", new Date().toISOString());
     await this.#enqueueRun(run);
     this.stateChanged(input.agentId);
@@ -247,15 +264,42 @@ export class RoutineScheduler implements RoutineDueSource {
 
   listRuns(input: ListRoutineRunsInput): RoutineRun[] {
     this.#conversation.requireKnownAgent(input.agentId);
-    if (!this.#routines.get(input.agentId, input.routineId)) throw new Error("This routine no longer exists.");
+    if (!this.#routines.get(input.agentId, input.routineId))
+      throw new RoutineInputError(sourceText("error.backend.routineGone"));
     return this.#routines.listRuns(input.agentId, input.routineId, input.limit);
   }
 
-  /** The six `openbot` routine tools. Returns null when `tool` is not one of them. */
+  /**
+   * The six `openbot` routine tools. Returns null when `tool` is not one of them.
+   *
+   * A request the model can correct is a tool failure, not a throw: a throw becomes a provider error
+   * toast, although the model's corrected retry then creates the routine. Other errors are faults
+   * and still throw.
+   */
   async handleTool(params: DynamicToolCallParams, senderAgentId: string): Promise<OpenBotToolResponse | null> {
+    try {
+      return await this.#handleTool(params, senderAgentId);
+    } catch (error) {
+      if (!(error instanceof RoutineInputError)) throw error;
+      return openBotToolFailure(error.message);
+    }
+  }
+
+  /** The target agent of a routine tool call. An unknown agent is a request the model can correct. */
+  #toolAgentId(args: DynamicRecord, senderAgentId: string): string {
+    const agentId = routineToolAgentId(args, senderAgentId);
+    try {
+      this.#conversation.requireKnownAgent(agentId);
+    } catch (error) {
+      throw new RoutineInputError(error instanceof Error ? error.message : String(error));
+    }
+    return agentId;
+  }
+
+  async #handleTool(params: DynamicToolCallParams, senderAgentId: string): Promise<OpenBotToolResponse | null> {
     if (params.tool === "list_routines") {
       const args = routineToolArguments(params.arguments, ["agentId"]);
-      const agentId = routineToolAgentId(args, senderAgentId);
+      const agentId = this.#toolAgentId(args, senderAgentId);
       return openBotToolResult({ routines: this.list(agentId) });
     }
 
@@ -268,17 +312,25 @@ export class RoutineScheduler implements RoutineDueSource {
         "active",
         "timezone",
       ]);
-      const agentId = routineToolAgentId(args, senderAgentId);
+      const agentId = this.#toolAgentId(args, senderAgentId);
       const active = args.active === undefined ? true : args.active;
-      if (!isBoolean(active)) throw new Error("active must be a boolean.");
+      if (!isBoolean(active)) throw new RoutineInputError("active must be a boolean.");
       const timezone =
         args.timezone === undefined
           ? localTimezone()
           : routineToolString(args.timezone, "timezone", 128, "A routine timezone is required.");
+      const name = routineToolString(args.name, "name", INPUT_LIMITS.routineName, "A routine name is required.");
+      const key = name.trim().toLowerCase();
+      const existing = this.list(agentId).find((routine) => routine.name.trim().toLowerCase() === key);
+      if (existing) {
+        throw new RoutineInputError(
+          `Routine "${existing.name}" already exists with routineId ${existing.id}. Call update_routine to change it instead of creating another.`,
+        );
+      }
       const routine = this.create(
         {
           agentId,
-          name: routineToolString(args.name, "name", INPUT_LIMITS.routineName, "A routine name is required."),
+          name,
           instruction: routineToolString(
             args.instruction,
             "instruction",
@@ -304,7 +356,7 @@ export class RoutineScheduler implements RoutineDueSource {
         "active",
       ]);
       const input: UpdateRoutineInput = {
-        agentId: routineToolAgentId(args, senderAgentId),
+        agentId: this.#toolAgentId(args, senderAgentId),
         routineId: routineToolString(args.routineId, "routineId", INPUT_LIMITS.identifier, "routineId is required."),
       };
       let hasUpdate = false;
@@ -322,7 +374,7 @@ export class RoutineScheduler implements RoutineDueSource {
         hasUpdate = true;
       }
       if (args.active !== undefined) {
-        if (!isBoolean(args.active)) throw new Error("active must be a boolean.");
+        if (!isBoolean(args.active)) throw new RoutineInputError("active must be a boolean.");
         input.active = args.active;
         hasUpdate = true;
       }
@@ -330,7 +382,7 @@ export class RoutineScheduler implements RoutineDueSource {
         input.schedule = routineToolSchedule(args.schedule);
         hasUpdate = true;
       }
-      if (!hasUpdate) throw new Error("At least one routine update is required.");
+      if (!hasUpdate) throw new RoutineInputError("At least one routine update is required.");
       return openBotToolResult(
         this.update(input, { turnId: input.agentId === senderAgentId ? params.turnId : undefined }),
       );
@@ -338,7 +390,7 @@ export class RoutineScheduler implements RoutineDueSource {
 
     if (params.tool === "delete_routine") {
       const args = routineToolArguments(params.arguments, ["agentId", "routineId"]);
-      const agentId = routineToolAgentId(args, senderAgentId);
+      const agentId = this.#toolAgentId(args, senderAgentId);
       const routineId = routineToolString(
         args.routineId,
         "routineId",
@@ -351,7 +403,7 @@ export class RoutineScheduler implements RoutineDueSource {
 
     if (params.tool === "test_routine") {
       const args = routineToolArguments(params.arguments, ["agentId", "routineId"]);
-      const agentId = routineToolAgentId(args, senderAgentId);
+      const agentId = this.#toolAgentId(args, senderAgentId);
       const routineId = routineToolString(
         args.routineId,
         "routineId",
@@ -455,6 +507,7 @@ export class RoutineScheduler implements RoutineDueSource {
   }
 
   async #enqueueRun(run: RoutineRun): Promise<void> {
+    recordRestartActivity();
     const validateRecipient = this.#mailbox.prepareDelivery([run.agentId]);
     const agent = await this.#store.getOrCreate(run.agentId);
     try {
@@ -513,14 +566,14 @@ export class RoutineScheduler implements RoutineDueSource {
       }
       if (delivery.status !== "starting" && delivery.status !== "running") continue;
       if (!delivery.turnId) {
-        throw new Error("This routine run is still starting. Try again after its turn starts.");
+        throw new Error(sourceText("error.backend.routineRunStarting"));
       }
       cancellableRuns.push(run);
       activeTurnIds.add(delivery.turnId);
     }
     if (activeTurnIds.size === 0) return cancellableRuns;
     if (!this.#store.activeProviderSession(agentId)) {
-      throw new Error("OpenBot cannot interrupt the active routine run because its provider session is unavailable.");
+      throw new Error(sourceText("error.backend.routineRunNoSession"));
     }
     for (const turnId of activeTurnIds) await this.#hooks.interrupt(agentId, turnId);
     return cancellableRuns;

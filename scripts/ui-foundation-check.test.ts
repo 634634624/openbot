@@ -9,6 +9,9 @@
 // line for line. It is the contract tools/biome/anti-slop/fixtures holds the GritQL
 // rules to, applied to the one guard in this repository that is not a GritQL rule.
 
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { checkUiFoundation } from "./ui-foundation-check";
@@ -35,6 +38,7 @@ describe("ui foundation check", () => {
         // nothing about this branch of the pattern.
         "components/Icons.tsx: Kobalte/Lucide imports are allowed only in components/ui",
         "components/ui/complex.tsx: a Kobalte namespace must go through an adapter, not a direct alias",
+        "components/ui/features/Bad.tsx: use a components/ui control instead of a native element",
         // A sibling directory whose name starts with "ui". Skipping the design system is a
         // path-prefix comparison, so without a separator this line and the second composite
         // role below both disappear, and a components/ui-kit could hold anything.
@@ -75,13 +79,11 @@ describe("ui foundation check", () => {
         budget("untokenized font-size", 1),
         budget("untokenized border-radius", 1),
         budget("untokenized transition durations", 2),
-        // Six against a budget of five, because a non-zero budget only reports once the tree
-        // exceeds it: five in branches/TestHooks.tsx and the sixth in components/ui/Button.tsx.
-        // That sixth is the whole reason this budget reads its own source join rather than the
-        // one the composite scan uses - exempt components/ui and the count reads 5, meets the
-        // budget and says nothing. The hook in Bad.test.tsx is the other side: count test files
-        // and this reads 7.
-        budget("data-testid hooks in renderer markup", 6, 5),
+        // Six: five in branches/TestHooks.tsx and the sixth in components/ui/Button.tsx. That
+        // sixth is why this budget reads its own source join rather than the one the composite
+        // scan uses - exempt components/ui and the count reads 5. The hook in Bad.test.tsx is
+        // the other side: count test files and this reads 7.
+        budget("data-testid hooks in renderer markup", 6),
       ].sort(),
     );
   });
@@ -140,4 +142,101 @@ describe("ui foundation check", () => {
       "renderer/components/ui/complex.tsx: a Kobalte namespace must go through an adapter, not a direct alias",
     );
   });
+});
+
+it("checks primitive adapters when the shared UI is outside the renderer", () => {
+  const report = checkUiFoundation(
+    cleanRenderer,
+    fixtureRenderer,
+    [cleanRenderer, fixtureRenderer],
+    resolve(fixtureRenderer, "components/ui"),
+  );
+  expect(report.failures).toContain(
+    "components/ui/complex.tsx: a Kobalte namespace must go through an adapter, not a direct alias",
+  );
+  const clean = checkUiFoundation(
+    cleanRenderer,
+    cleanRenderer,
+    [cleanRenderer],
+    resolve(cleanRenderer, "components/ui"),
+  );
+  expect(clean.failures).toEqual([]);
+});
+
+interface PluginDiagnostic {
+  category: string;
+  severity: string;
+  message: string;
+  location?: { start?: { line?: number } };
+}
+
+/** Runs one GritQL plugin on one fixture file and returns only the plugin's diagnostics. */
+function pluginDiagnostics(plugin: string, fixture: string, extension: string): PluginDiagnostic[] {
+  const workspace = mkdtempSync(resolve(tmpdir(), "ui-plugin-"));
+  try {
+    writeFileSync(
+      resolve(workspace, "biome.json"),
+      JSON.stringify({
+        plugins: [resolve(import.meta.dirname, "../tools/ui-foundation", plugin)],
+        linter: { enabled: true, rules: { recommended: false } },
+        formatter: { enabled: false },
+        assist: { enabled: false },
+      }),
+    );
+    const target = resolve(workspace, `fixture.${extension}`);
+    writeFileSync(target, readFileSync(fixture));
+    const result = spawnSync(
+      resolve(import.meta.dirname, "../node_modules/.bin/biome"),
+      ["check", target, `--config-path=${workspace}`, "--reporter=json"],
+      { encoding: "utf8" },
+    );
+    const report: { diagnostics: PluginDiagnostic[] } = JSON.parse(result.stdout);
+    const diagnostics = report.diagnostics.filter((item) => item.category === "plugin");
+    expect(diagnostics.filter((item) => item.message.includes("errored"))).toEqual([]);
+    return diagnostics;
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+}
+
+it("rejects desktop preload access in shared UI while allowing browser APIs and documentation", () => {
+  for (const [sourceRoot, file, expected] of [
+    [fixtureRenderer, "DesktopPreload.ts", 6],
+    [fixtureRenderer, "OptionalPreload.ts", 1],
+    [fixtureRenderer, "IndexedPreload.ts", 1],
+    [cleanRenderer, "BrowserGlobals.ts", 0],
+  ] as const) {
+    const diagnostics = pluginDiagnostics("no-desktop-preload.grit", resolve(sourceRoot, "components/ui", file), "ts");
+    expect(diagnostics).toHaveLength(expected);
+    if (expected) expect(diagnostics[0]?.severity).toBe("error");
+  }
+});
+
+it("rejects a story play function on each line its fixture marks, and nothing in a visual story", () => {
+  const fixture = resolve(fixtureRenderer, "stories/Play.stories.tsx");
+  const marked = readFileSync(fixture, "utf8")
+    .split("\n")
+    .flatMap((line, index) => (line.trimEnd().endsWith("// flag") ? [index + 1] : []));
+  const flagged = pluginDiagnostics("no-story-play.grit", fixture, "tsx").map((item) => item.location?.start?.line);
+
+  expect(marked.length).toBeGreaterThan(0);
+  expect(flagged).toEqual(marked);
+  expect(pluginDiagnostics("no-story-play.grit", resolve(cleanRenderer, "stories/Visual.stories.tsx"), "tsx")).toEqual(
+    [],
+  );
+});
+
+it("flags hardcoded interface text on each line its fixture marks, and not on translated text", () => {
+  const fixture = resolve(fixtureRenderer, "components/HardcodedText.tsx");
+  const marked = readFileSync(fixture, "utf8")
+    .split("\n")
+    .flatMap((line, index) => (line.trimEnd().endsWith("// flag") ? [index + 1] : []));
+  const diagnostics = pluginDiagnostics("no-hardcoded-ui-text.grit", fixture, "tsx");
+
+  expect(marked.length).toBeGreaterThan(0);
+  expect(diagnostics.map((item) => item.location?.start?.line)).toEqual(marked);
+  expect(diagnostics.every((item) => item.message.startsWith("[no-hardcoded-ui-text]"))).toBe(true);
+  expect(
+    pluginDiagnostics("no-hardcoded-ui-text.grit", resolve(cleanRenderer, "components/TranslatedText.tsx"), "tsx"),
+  ).toEqual([]);
 });

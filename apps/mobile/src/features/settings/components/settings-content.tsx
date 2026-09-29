@@ -4,6 +4,7 @@ import { Children, type PropsWithChildren, type ReactNode } from "react";
 import { View } from "react-native";
 import { useCSSVariable } from "uniwind";
 import { SheetScrollView } from "@/shared/components/sheet-scroll-view";
+import { haptics } from "@/shared/lib/haptics";
 
 export function SettingsContent({ children }: PropsWithChildren) {
   return (
@@ -18,7 +19,11 @@ export function SettingsContent({ children }: PropsWithChildren) {
   );
 }
 
-export function SettingsSection({ title, children }: PropsWithChildren<{ title?: string }>) {
+export function SettingsSection({
+  title,
+  footer,
+  children,
+}: PropsWithChildren<{ title?: string; footer?: ReactNode }>) {
   return (
     <View className="gap-2">
       {title ? (
@@ -36,6 +41,11 @@ export function SettingsSection({ title, children }: PropsWithChildren<{ title?:
           ) : null,
         )}
       </ListGroup>
+      {footer ? (
+        <Typography.Paragraph type="body-xs" className="px-4 text-grouped-secondary">
+          {footer}
+        </Typography.Paragraph>
+      ) : null}
     </View>
   );
 }
@@ -58,6 +68,7 @@ export function SettingsRow({
   disabled = false,
   leading,
   disclosure = true,
+  accessibilityLabel,
 }: PropsWithChildren<{
   supportingText?: string;
   onPress?: () => void;
@@ -65,6 +76,8 @@ export function SettingsRow({
   disabled?: boolean;
   leading?: ReactNode;
   disclosure?: boolean;
+  /** For an action row whose visible text needs its context, such as the item it acts on. */
+  accessibilityLabel?: string;
 }>) {
   const muted = String(useCSSVariable("--openbot-text-grouped-secondary"));
   const content = (
@@ -84,9 +97,13 @@ export function SettingsRow({
   return onPress ? (
     <ListGroup.Item
       accessibilityRole="button"
+      accessibilityLabel={accessibilityLabel}
       accessibilityState={{ disabled }}
       disabled={disabled}
-      onPress={onPress}
+      onPress={() => {
+        void haptics.impact("soft");
+        onPress();
+      }}
       className="min-h-12 flex-row items-center gap-3 px-4 py-3"
       style={({ pressed }) => ({ opacity: disabled ? 0.45 : pressed ? 0.6 : 1 })}
     >

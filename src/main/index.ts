@@ -1,12 +1,14 @@
 import { join, resolve } from "node:path";
 import { parseInviteUrl } from "@openbot/contracts/invite-links";
-import { type CentralAuthState, IPC_CHANNELS } from "@openbot/contracts/ipc";
-import { translateFor } from "@openbot/i18n";
+import { type CentralAuthState, IPC_ENDPOINTS } from "@openbot/contracts/ipc";
+import { resolveLocale, translateFor } from "@openbot/i18n";
 import { createOpenBotLogger, toLogValue } from "@openbot/logging";
 import { createRemoteDirectoryRefresh } from "@openbot/team-client/remote-directory";
-import { app, BrowserWindow, dialog, powerMonitor, protocol, screen } from "electron";
+import { app, BrowserWindow, dialog, Notification, powerMonitor, protocol, screen, shell } from "electron";
 import { readAppVariant, resolveAppIconPath } from "./app-icon";
 import { type ApplicationServices, createApplicationServices } from "./application-services";
+import { type DeepLink, findDeepLink, parseDeepLink } from "./deep-link-router";
+import { requestNotificationPermission, showRetainedNotification } from "./desktop-notifications";
 import { guardDevelopmentOutput } from "./development-output";
 import {
   developmentUserDataName,
@@ -15,25 +17,36 @@ import {
   readDevelopmentRemoteDebuggingPort,
   shouldAutoStartHost,
 } from "./development-profile";
+import { hostAllowsTenantLaunch } from "./host-update-coordinator";
 import { accountIpcHandlers } from "./ipc/account-handlers";
+import { agentAdminIpcHandlers } from "./ipc/agent-admin-handlers";
 import { agentIpcHandlers } from "./ipc/agent-handlers";
+import { agentImportIpcHandlers } from "./ipc/agent-import-handlers";
+import { agentTemplateIpcHandlers } from "./ipc/agent-template-handlers";
 import { appIpcHandlers } from "./ipc/app-handlers";
 import { attachmentIpcHandlers } from "./ipc/attachment-handlers";
 import { browserIpcHandlers } from "./ipc/browser-handlers";
 import { channelMemoryIpcHandlers } from "./ipc/channel-memory-handlers";
 import { channelRoutineIpcHandlers } from "./ipc/channel-routine-handlers";
 import { computerUseIpcHandlers } from "./ipc/computer-use-handlers";
+import { customAgentIpcHandlers } from "./ipc/custom-agent-handlers";
 import { customProviderIpcHandlers } from "./ipc/custom-provider-handlers";
 import { registerIpcGroups } from "./ipc/define-ipc-group";
 import { dynamicIslandIpcHandlers } from "./ipc/dynamic-island-handlers";
+import { hostAdminIpcHandlers } from "./ipc/host-admin-handlers";
 import { hostedSiteIpcHandlers } from "./ipc/hosted-site-handlers";
 import { marketplaceAgentIpcHandlers } from "./ipc/marketplace-agent-handlers";
 import { mcpServerIpcHandlers } from "./ipc/mcp-server-handlers";
 import { memoryIpcHandlers } from "./ipc/memory-handlers";
+import { notificationIpcHandlers } from "./ipc/notification-handlers";
+import { pluginIpcHandlers } from "./ipc/plugin-handlers";
+import { providerAdminIpcHandlers } from "./ipc/provider-admin-handlers";
+import { providerDetectionIpcHandlers } from "./ipc/provider-detection-handlers";
 import { providerIpcHandlers } from "./ipc/provider-handlers";
 import { routineIpcHandlers } from "./ipc/routine-handlers";
 import { sharedTableIpcHandlers } from "./ipc/shared-table-handlers";
 import { skillIpcHandlers } from "./ipc/skill-handlers";
+import { storageIpcHandlers } from "./ipc/storage-handlers";
 import { teamIpcHandlers } from "./ipc/team-handlers";
 import { updateIpcHandlers } from "./ipc/update-handlers";
 import { voiceIpcHandlers } from "./ipc/voice-handlers";
@@ -45,14 +58,30 @@ import {
   createMainWindowHolder,
   showMainWindow,
 } from "./main-window";
-import { ensureMacApplicationPresence } from "./main-window-state";
+import { ensureMacApplicationPresence, secondLaunchResponse } from "./main-window-state";
 import { watchRemoteHostDirectory } from "./remote-server-host-directory";
 import { createRendererForwarders } from "./renderer-forwarders";
 import { sendToRenderer } from "./renderer-ipc";
 import { configureContentSecurityPolicy, configureRendererPermissions } from "./session-configuration";
 import { TeardownRegistry } from "./teardown-registry";
+import type { TraceFile } from "./trace-file";
+import { setIpcCallObserver } from "./trusted-ipc";
 
 const logger = createOpenBotLogger("main");
+
+// Electron keeps running after both events: an unhandled rejection only prints a warning, and a
+// monitor leaves the default exception handling in place. These add a redacted log line and a
+// trace span, so a diagnostics export shows that the main process failed and how often.
+let crashTrace: TraceFile | null = null;
+process.on("unhandledRejection", (reason) => reportMainProcessFailure("unhandledRejection", reason));
+process.on("uncaughtExceptionMonitor", (error, origin) => reportMainProcessFailure(origin, error));
+
+function reportMainProcessFailure(origin: "uncaughtException" | "unhandledRejection", error: unknown): void {
+  logger.error(`Main process ${origin}:`, toLogValue(error));
+  if (!crashTrace) return;
+  crashTrace.record({ kind: "crash", name: origin, durationMs: 0, outcome: "reported" });
+  void crashTrace.flush();
+}
 
 const commandLineUserDataDirectory = app.commandLine.getSwitchValue("user-data-dir").trim();
 const developmentProfile = !app.isPackaged ? readDevelopmentProfile(process.env.OPENBOT_DEV_PROFILE) : null;
@@ -68,6 +97,13 @@ const developmentInviteLinkOptions = {
 const developmentRemoteDebuggingPort = !app.isPackaged
   ? readDevelopmentRemoteDebuggingPort(process.env.OPENBOT_DEV_REMOTE_DEBUGGING_PORT)
   : null;
+// Electron exposes FedCM without an account chooser, so every request fails with a NetworkError.
+// Sites such as Google Sign-In use FedCM when it exists and fall back to their popup when it does not.
+app.commandLine.appendSwitch("disable-features", "FedCm");
+// On some Linux GPU drivers the GPU process dies with no fallback mode left, and Chromium then
+// stops the main process with SIGTRAP ("GPU process isn't usable. Goodbye."). Software rendering
+// keeps the window up. The renderer sandbox stays on.
+if (process.platform === "linux") app.disableHardwareAcceleration();
 if (developmentRemoteDebuggingPort) {
   app.commandLine.appendSwitch("remote-debugging-port", developmentRemoteDebuggingPort);
   app.commandLine.appendSwitch("remote-debugging-address", "127.0.0.1");
@@ -148,8 +184,23 @@ let isQuitting = false;
 let shutdownStarted = false;
 let systemSessionEnding = false;
 let systemSessionEndFlushStarted = false;
-let pendingInviteUrl: string | null = findInviteUrl(process.argv);
-let inviteReceiverReady = false;
+let relaunchRequested = false;
+/**
+ * The link kinds a renderer is ever told about.
+ *
+ * `mcp-auth` is not one of them. It carries an OAuth grant for an MCP server, which is a secret,
+ * and the sign-in waiting for that grant lives in this process. It is also never held: a grant is
+ * answered by the sign-in that started it, and there is no such sign-in before the app is running.
+ */
+type RendererDeepLink = Exclude<DeepLink, { kind: "mcp-auth" }>;
+
+// One link at a time, of whichever kind: a second replaces the first, because what a user opened
+// last is what they meant. `deepLinkReceiverReady` says a window has asked for it, which is what
+// tells a link that arrives now to be sent rather than held.
+let pendingDeepLink: RendererDeepLink | null = takeRendererDeepLink(
+  findDeepLink(process.argv, developmentInviteLinkOptions),
+);
+let deepLinkReceiverReady = false;
 
 const MAIN_WINDOW_STATE_FILE = "openbot-main-window-state-v1.json";
 
@@ -177,6 +228,7 @@ const {
   forwardAgentEvent,
   forwardBrowserDisplayState,
   forwardUpdateStatus,
+  forwardUpdatePreference,
   forwardVoiceModelStatus,
   forwardProviderRuntimeStatus,
   forwardHostStatus,
@@ -195,6 +247,7 @@ const {
   // An agent event cannot arrive before the services that raise it, so the fallback stands only so
   // that this module-level value needs no null check on the notification path.
   getTranslate: () => services?.language.translate ?? translateFor("en"),
+  desktopNotificationsEnabled: () => services?.notificationPreference.get().desktopNotifications ?? true,
 });
 
 // Resolved once, safely: every `app.setPath("userData", ...)` above has already run.
@@ -207,13 +260,34 @@ const windows = createMainWindowController({
   developmentTestClientEnabled,
   isQuitting: () => isQuitting,
   getServices: () => services,
+  getTranslate: () => services?.language.translate ?? translateFor(resolveLocale("system", app.getLocale())),
   forwardAgentEvent,
   onRendererLoadStarted: () => {
-    inviteReceiverReady = false;
+    deepLinkReceiverReady = false;
   },
-  onMainWindowCreated: attachWindowsSessionEndHandlers,
+  onMainWindowCreated: (window) => {
+    attachWindowsSessionEndHandlers(window);
+    attachQuitOnMainWindowClose(window);
+  },
   reportError: (message, error) => logger.error(message, toLogValue(error)),
 });
+
+/**
+ * Outside macOS, closing the main window ends OpenBot.
+ *
+ * `window-all-closed` cannot carry that on its own any more. The Computer Use overlays are built
+ * once and then hidden between actions rather than closed, and a hidden window is still a window,
+ * so the event never arrives: the user would close the last window they can see and leave OpenBot
+ * and the driver running with no way back to them.
+ */
+function attachQuitOnMainWindowClose(window: BrowserWindow): void {
+  if (process.platform === "darwin") return;
+  window.on("closed", () => {
+    // `quit`, not a teardown of its own: `before-quit` below is what OpenBot shuts down through,
+    // and it already ignores a second request while the first one runs.
+    app.quit();
+  });
+}
 
 /**
  * Windows gives an application a few seconds between announcing a session end and killing it, so
@@ -262,11 +336,16 @@ function registerIpcHandlers({
   mailbox,
   browser,
   browserPictureInPicture,
+  browserView,
   updater,
   setupFile,
   analyticsPreferenceFile,
   updatePreferenceFile,
+  requestedUpdate,
+  approvalAutomation,
+  agentAdminSettings,
   language,
+  notificationPreference,
   agentInitialization,
   sidebarLayout,
   host,
@@ -275,12 +354,20 @@ function registerIpcHandlers({
   centralAuth,
   skills,
   hostedSites,
-  customProviders,
+  customProviderChanges,
+  customAgentChanges,
+  providerDetection,
+  providerDetectionSettings,
   marketplaceAgents,
+  agentTemplates,
+  agentImport,
   voice,
   dynamicIsland,
-  computerUseMacSetup,
+  cuaDriver,
+  computerUsePermissionHelp,
   analytics,
+  storageUsage,
+  trace,
 }: ApplicationServices): void {
   // Every renderer-to-main endpoint is bound by one of these, one file per domain under ./ipc.
   // Nothing is bound inline here: this is the trust boundary, and a reviewer should be able to read
@@ -297,42 +384,110 @@ function registerIpcHandlers({
       updater,
       setupFile,
       analyticsPreferenceFile,
+      approvalAutomation,
       language,
       initializeAgent: () => agentInitialization.start(),
       appVariant,
       getMainWindow,
       setAnalyticsTrackingEnabled: (enabled) => analytics.setTrackingEnabled(enabled),
+      trace,
     }),
     ...dynamicIslandIpcHandlers({ dynamicIsland }),
-    ...computerUseIpcHandlers({ computerUseMacSetup }),
+    ...computerUseIpcHandlers({
+      cuaDriver,
+      openExternal: (url) => shell.openExternal(url),
+      permissionHelp: computerUsePermissionHelp,
+    }),
     ...providerIpcHandlers({ service, providerRuntimes, credentials: providerCredentials }),
     ...voiceIpcHandlers({ voice }),
     ...accountIpcHandlers({ centralAuth, host }),
-    ...skillIpcHandlers({ skills, getMainWindow }),
-    ...hostedSiteIpcHandlers({ hostedSites, getMainWindow }),
-    ...customProviderIpcHandlers({ service, customProviders }),
+    ...skillIpcHandlers({ skills, getMainWindow, translate: language.translate }),
+    ...hostedSiteIpcHandlers({ hostedSites, getMainWindow, translate: language.translate }),
+    ...customProviderIpcHandlers(customProviderChanges),
+    ...customAgentIpcHandlers(customAgentChanges),
+    ...providerDetectionIpcHandlers({ detection: providerDetection, settings: providerDetectionSettings }),
     ...marketplaceAgentIpcHandlers({ marketplaceAgents }),
-    ...updateIpcHandlers({ updater, updatePreferenceFile }),
+    ...agentTemplateIpcHandlers({
+      agentTemplates,
+      takePendingLink: () => takePendingDeepLink("agent-template"),
+    }),
+    ...agentImportIpcHandlers({
+      agentImport,
+      getMainWindow,
+      translate: language.translate,
+      exportSkillPath: app.isPackaged
+        ? join(process.resourcesPath, "agent-import", "grok-bot", "SKILL.md")
+        : resolve(__dirname, "../../resources/agent-import/grok-bot/SKILL.md"),
+    }),
+    ...updateIpcHandlers({ updater, updatePreferenceFile, requestedUpdate }),
+    ...notificationIpcHandlers({
+      notificationPreference,
+      translate: language.translate,
+      requestPermission: () => requestDesktopNotificationPermission(notificationPreference, language.translate),
+      openExternal: (url) => shell.openExternal(url),
+    }),
     ...teamIpcHandlers({
       host,
       remoteDesktop,
       remoteServers,
-      takePendingInvite: () => {
-        inviteReceiverReady = true;
-        const inviteUrl = pendingInviteUrl;
-        pendingInviteUrl = null;
-        return inviteUrl;
-      },
+      takePendingInvite: () => takePendingDeepLink("invite"),
+    }),
+    ...pluginIpcHandlers({
+      takePendingPluginSlug: () => takePendingDeepLink("plugin"),
     }),
     ...memoryIpcHandlers({ service, remoteServers }),
-    ...sharedTableIpcHandlers({ service }),
+    ...sharedTableIpcHandlers({ service, remoteServers }),
     ...routineIpcHandlers({ service, remoteServers }),
     ...channelMemoryIpcHandlers({ service, remoteServers }),
     ...channelRoutineIpcHandlers({ service, remoteServers }),
-    ...mcpServerIpcHandlers({ service, remoteServers }),
-    ...attachmentIpcHandlers({ service, mailbox, remoteServers, getMainWindow }),
+    ...agentAdminIpcHandlers({
+      settings: agentAdminSettings,
+      skills,
+      marketplaceAgents,
+      agentTemplates,
+      remoteServers,
+    }),
+    ...hostAdminIpcHandlers({ host, remoteServers }),
+    ...providerAdminIpcHandlers({
+      service,
+      credentials: providerCredentials,
+      runtimes: providerRuntimes,
+      customProviders: customProviderChanges,
+      remoteServers,
+    }),
+    ...mcpServerIpcHandlers({
+      service,
+      remoteServers,
+      startToolRuntimes: () => providerRuntimes.ensureToolRuntimes(),
+      ensureToolRuntimesReady: () => providerRuntimes.ensureToolRuntimesReady(),
+      toolRuntimes: () => providerRuntimes.mcpToolRuntimes(),
+    }),
+    ...attachmentIpcHandlers({ service, mailbox, remoteServers, getMainWindow, translate: language.translate }),
+    ...storageIpcHandlers({
+      storage: storageUsage,
+      mailbox,
+      remoteServers,
+      getMainWindow,
+      translate: language.translate,
+      agents: () => service.listAgents(),
+      openPath: (path) => shell.openPath(path),
+    }),
     ...agentIpcHandlers({ service, sidebarLayout, host, remoteServers, skills }),
-    ...browserIpcHandlers({ browserPictureInPicture, browser, remoteServers }),
+    ...browserIpcHandlers({ browserPictureInPicture, browser, remoteServers, browserView }),
+  });
+}
+
+function requestDesktopNotificationPermission(
+  preference: ApplicationServices["notificationPreference"],
+  translate: ApplicationServices["language"]["translate"],
+): Promise<void> {
+  return requestNotificationPermission({
+    platform: process.platform,
+    preference,
+    showWelcome: () => {
+      if (!Notification.isSupported()) return;
+      showRetainedNotification(new Notification({ title: "OpenBot", body: translate("notification.welcome") }));
+    },
   });
 }
 
@@ -413,47 +568,67 @@ function forwardCentralAuth(state: CentralAuthState): void {
     });
   const window = windowHolder.current;
   if (!window || window.isDestroyed()) return;
-  sendToRenderer(window, IPC_CHANNELS.authEvent, state);
+  sendToRenderer(window, IPC_ENDPOINTS.auth.event, state);
 }
 
-function acceptInviteUrl(value: string): void {
-  try {
-    parseInviteUrl(value, developmentInviteLinkOptions);
-  } catch {
+/**
+ * Holds the link, and hands it over when there is a window listening for that kind.
+ *
+ * A link the renderer never received stays pending rather than being dropped, which is what makes a
+ * cold start work: the window that the link itself opened asks for it once it is ready.
+ */
+function acceptDeepLink(link: DeepLink): void {
+  if (link.kind === "mcp-auth") {
+    receiveMcpAuthorizationCode(link.state, link.code);
     return;
   }
-  pendingInviteUrl = value;
+  pendingDeepLink = link;
   const window = windowHolder.current;
-  if (window && !window.isDestroyed() && inviteReceiverReady) {
-    showMainWindow(window);
-    if (sendToRenderer(window, IPC_CHANNELS.serversInvite, value)) pendingInviteUrl = null;
-  }
+  if (!window || window.isDestroyed() || !deepLinkReceiverReady) return;
+  showMainWindow(window);
+  const delivered =
+    link.kind === "invite"
+      ? sendToRenderer(window, IPC_ENDPOINTS.servers.invite, link.url)
+      : link.kind === "plugin"
+        ? sendToRenderer(window, IPC_ENDPOINTS.plugins.openListing, link.slug)
+        : sendToRenderer(window, IPC_ENDPOINTS.agentTemplates.openLink, link.id);
+  if (delivered) pendingDeepLink = null;
 }
 
-function acceptOpenbotUrl(value: string): void {
-  acceptInviteUrl(value);
+/**
+ * The pending link, if it is the kind that asked. Any request marks the receiver ready, because
+ * the renderer subscribes to every kind before it asks for any.
+ */
+function takePendingDeepLink(kind: RendererDeepLink["kind"]): string | null {
+  deepLinkReceiverReady = true;
+  const link = pendingDeepLink;
+  if (link?.kind !== kind) return null;
+  pendingDeepLink = null;
+  return link.kind === "invite" ? link.url : link.kind === "plugin" ? link.slug : link.id;
 }
 
-function findInviteUrl(values: string[]): string | null {
-  for (const value of values) {
-    try {
-      parseInviteUrl(value, developmentInviteLinkOptions);
-      return value;
-    } catch {
-      // Most command-line arguments are not invitations.
-    }
-  }
-  return null;
+/** A link of a kind a renderer can be sent, or null for one it cannot - which includes no link. */
+function takeRendererDeepLink(link: DeepLink | null): RendererDeepLink | null {
+  return link && link.kind !== "mcp-auth" ? link : null;
+}
+
+/**
+ * Hands one MCP sign-in the grant it is waiting for, and shows the window that asked for it.
+ *
+ * The grant travels no further. A `state` this run did not start finds no sign-in and does nothing,
+ * which is what makes a forged or replayed link inert - so an unknown one raises no window either.
+ */
+function receiveMcpAuthorizationCode(state: string, code: string): void {
+  if (!services?.mcpOAuth.receiveAuthorizationCode(state, code)) return;
+  const window = windowHolder.current;
+  if (window && !window.isDestroyed()) showMainWindow(window);
 }
 
 app.on("open-url", (event, url) => {
-  try {
-    parseInviteUrl(url, developmentInviteLinkOptions);
-  } catch {
-    return;
-  }
+  const link = parseDeepLink(url, developmentInviteLinkOptions);
+  if (!link) return;
   event.preventDefault();
-  acceptOpenbotUrl(url);
+  acceptDeepLink(link);
 });
 
 app.on("continue-activity", (event, type, _userInfo, details) => {
@@ -464,7 +639,7 @@ app.on("continue-activity", (event, type, _userInfo, details) => {
     return;
   }
   event.preventDefault();
-  acceptInviteUrl(details.webpageURL);
+  acceptDeepLink({ kind: "invite", url: details.webpageURL });
 });
 
 if (!hasSingleInstanceLock) {
@@ -472,16 +647,35 @@ if (!hasSingleInstanceLock) {
   process.exit(0);
 } else {
   app.on("second-instance", (_event, argv) => {
-    const deepLink = findInviteUrl(argv);
-    if (deepLink) acceptOpenbotUrl(deepLink);
+    const deepLink = findDeepLink(argv, developmentInviteLinkOptions);
+    if (deepLink) acceptDeepLink(deepLink);
     const window = windowHolder.current;
-    if (!window || window.isDestroyed()) return;
-    showMainWindow(window);
+    const hasMainWindow = Boolean(window && !window.isDestroyed());
+    const response = secondLaunchResponse({
+      sessionEnding: systemSessionEnding,
+      quitting: isQuitting,
+      hasMainWindow,
+      started: services !== null,
+    });
+    if (response === "present" && window) showMainWindow(window);
+    else if (response === "reopen") reopenMainWindow();
+    else if (response === "relaunch" && !relaunchRequested) {
+      relaunchRequested = true;
+      // The new instance takes this launch's link, not the one this process may have started with.
+      const isLink = (value: string) => parseDeepLink(value, developmentInviteLinkOptions) !== null;
+      const link = argv.find(isLink);
+      const args = process.argv.slice(1).filter((value) => !isLink(value));
+      app.relaunch({ args: link ? [...args, link] : args });
+    }
   });
 
   void app
     .whenReady()
     .then(async () => {
+      if (!(await hostAllowsTenantLaunch())) {
+        app.quit();
+        return;
+      }
       await ensureMacApplicationPresence(
         process.platform,
         (policy) => app.setActivationPolicy(policy),
@@ -544,10 +738,19 @@ if (!hasSingleInstanceLock) {
         dynamicIsland,
         teamStore,
         language,
+        trace,
       } = built;
 
+      crashTrace = trace;
+      setIpcCallObserver((call) => trace.record({ kind: "ipc", ...call }));
+      service.on("event", (event) => trace.observeAgentEvent(event));
       service.on("event", (event) => forwardAgentEvent("local", event));
       sidebarLayout.on("changed", (layout) => forwardAgentEvent("local", { type: "sidebar-layout-changed", layout }));
+      built.approvalAutomation.subscribe((preference) => {
+        for (const window of BrowserWindow.getAllWindows()) {
+          sendToRenderer(window, IPC_ENDPOINTS.app.approvalAutomation, preference);
+        }
+      });
       host.on("changed", forwardHostStatus);
       host.on("presence", (snapshot) => forwardTeamPresence("local", snapshot));
       host.on("directMessage", (event) => forwardDirectMessage("local", event));
@@ -561,10 +764,19 @@ if (!hasSingleInstanceLock) {
       remoteServers.on("directMessage", forwardDirectMessage);
       remoteServers.on("directTyping", forwardDirectTyping);
       updater.on("status", forwardUpdateStatus);
+      built.requestedUpdate.on("preference", forwardUpdatePreference);
       updater.start();
+      // Each tenant quits only itself. The host verifies process exit independently.
+      built.hostUpdateCoordinator.setStopHandler(async () => {
+        await prepareForUpdateInstall();
+        app.quit();
+      });
       // Before the renderer loads: the trust boundary and every protocol it fetches through have to
       // be in place before the first request can arrive.
       registerIpcHandlers(built);
+      void requestDesktopNotificationPermission(built.notificationPreference, language.translate).catch((error) =>
+        logger.warn("Unable to ask for notification permission:", toLogValue(error)),
+      );
       configureApplicationMenu(service, updater, language.translate);
       // One place turns a language change into every visible consequence: the menu is built again
       // because a native label cannot be changed in place, and every window is told, including the
@@ -572,7 +784,7 @@ if (!hasSingleInstanceLock) {
       language.subscribe((preference) => {
         configureApplicationMenu(service, updater, language.translate);
         for (const window of BrowserWindow.getAllWindows()) {
-          sendToRenderer(window, IPC_CHANNELS.appLanguagePreference, preference);
+          sendToRenderer(window, IPC_ENDPOINTS.app.appLanguagePreference, preference);
         }
       });
       await dynamicIsland
@@ -589,6 +801,7 @@ if (!hasSingleInstanceLock) {
       screen.on("display-removed", reconcileDynamicIsland);
       screen.on("display-metrics-changed", reconcileDynamicIsland);
       powerMonitor.on("resume", reconcileDynamicIsland);
+      powerMonitor.on("resume", () => remoteServers.wake());
       const teamIdentity = teamStore.getIdentity();
       if (
         shouldAutoStartHost({
@@ -618,8 +831,10 @@ if (!hasSingleInstanceLock) {
       app.on("browser-window-focus", (_event, window) => {
         if (window === windowHolder.current) {
           startDirectoryWatch();
+          remoteServers.setAppFocused(true);
         }
       });
+      app.on("browser-window-blur", () => remoteServers.setAppFocused(BrowserWindow.getFocusedWindow() !== null));
       const refreshMemberships = () => void directoryRefresh.refresh(true);
       remoteServers.on("directoryInvalidated", refreshMemberships);
       let stopDirectoryWatch = () => {};
@@ -643,19 +858,15 @@ if (!hasSingleInstanceLock) {
           showMainWindow(window);
           return;
         }
-        void windows
-          .ensureMainWindow()
-          .then(showMainWindow)
-          .catch((error) => logger.error("Unable to open the main window:", toLogValue(error)));
+        reopenMainWindow();
       });
     })
     .catch((error) => {
       const message = error instanceof Error ? error.message : String(error);
       logger.error("OpenBot failed to start:", toLogValue(error));
-      dialog.showErrorBox(
-        "OpenBot couldn’t start",
-        `${message}\n\nYour local data was not reset or overwritten. See the troubleshooting guide for recovery steps.`,
-      );
+      // The services, and with them the saved language, may not exist yet. Then the system language applies.
+      const translate = services?.language.translate ?? translateFor(resolveLocale("system", app.getLocale()));
+      dialog.showErrorBox(translate("startup.failedTitle"), translate("startup.failedBody", { message }));
       app.quit();
     });
 }
@@ -676,6 +887,27 @@ app.on("before-quit", (event) => {
   void prepareForShutdown().finally(() => app.quit());
 });
 
+function reopenMainWindow(): void {
+  void windows
+    .ensureMainWindow()
+    .then(showMainWindow)
+    .catch((error) => logger.error("Unable to open the main window:", toLogValue(error)));
+}
+
+/**
+ * The teardown gives up on each step after its own limit, but steps run one after another, and
+ * something outside it can still hold the quit. A process that outlives its window keeps the
+ * single-instance lock, so every later launch exits without opening anything.
+ */
+const SHUTDOWN_DEADLINE_MS = 30_000;
+
+function forceExitAfterShutdownDeadline(): void {
+  setTimeout(() => {
+    logger.error(`OpenBot did not quit within ${SHUTDOWN_DEADLINE_MS} ms and will exit now.`);
+    app.exit(0);
+  }, SHUTDOWN_DEADLINE_MS);
+}
+
 async function prepareForUpdateInstall(): Promise<void> {
   await (services?.browser.flushPersistentStorage() ?? Promise.resolve());
   await prepareForShutdown();
@@ -692,6 +924,7 @@ async function prepareForShutdown(): Promise<void> {
   if (shutdownStarted) return;
   shutdownStarted = true;
   isQuitting = true;
+  forceExitAfterShutdownDeadline();
   services?.updater.stop();
   await windows
     .flushMainWindowBounds()

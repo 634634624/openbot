@@ -20,11 +20,17 @@ export function ThinkingTextGradient({
   enabled,
   foreground,
   muted,
+  type = "body-sm",
+  fill = true,
 }: PropsWithChildren<{
   text: string;
   enabled: boolean;
   foreground: ColorValue;
   muted: ColorValue;
+  /** The text size of `children`, so the sizing copy lays out the same lines. */
+  type?: "body" | "body-sm";
+  /** False keeps the width of the text, for a label beside other content in a row. */
+  fill?: boolean;
 }>) {
   const [width, setWidth] = useState(0);
   const progress = useSharedValue(0);
@@ -49,7 +55,7 @@ export function ThinkingTextGradient({
   }));
   return (
     <MaskedView
-      style={{ flex: 1 }}
+      style={fill ? { flex: 1 } : undefined}
       androidRenderingMode="software"
       onLayout={(event) => setWidth(event.nativeEvent.layout.width)}
       maskElement={<View>{children}</View>}
@@ -57,7 +63,7 @@ export function ThinkingTextGradient({
       accessibilityElementsHidden
       importantForAccessibility="no-hide-descendants"
     >
-      <Typography.Paragraph type="body-sm" style={{ opacity: 0 }}>
+      <Typography.Paragraph type={type} style={{ opacity: 0 }}>
         {text}
       </Typography.Paragraph>
       <Animated.View

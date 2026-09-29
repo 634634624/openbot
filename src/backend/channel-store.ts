@@ -16,6 +16,7 @@ import {
   SIGNED_OUT_CHANNEL_MEMBER_ID,
 } from "@openbot/contracts/ipc";
 import { isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
+import { sourceText } from "@openbot/i18n/source";
 import { databaseRow, databaseRows, requiredNumberColumn, requiredStringColumn } from "./database/database-rows";
 import type { OpenBotDatabase } from "./openbot-database";
 
@@ -71,7 +72,7 @@ export class ChannelStore {
         .prepare("SELECT channel_json FROM projection_channels WHERE channel_id = ?")
         .get(channelId),
     );
-    if (!row) throw new Error("Channel not found.");
+    if (!row) throw new Error(sourceText("error.backend.channelNotFound"));
     return decodeChannel(JSON.parse(requiredStringColumn(row, "channel_json")));
   }
 
@@ -117,6 +118,7 @@ export class ChannelStore {
           `SELECT c.channel_json AS channel_json,
             (SELECT m.message_json FROM projection_channel_messages AS m
               WHERE m.channel_id = c.channel_id
+                AND COALESCE(json_extract(m.message_json, '$.message.itemType'), '') != 'plan'
               ORDER BY m.sequence DESC, m.message_id DESC LIMIT 1) AS latest_json,
             (SELECT COUNT(*) FROM projection_channel_messages AS m
               WHERE m.channel_id = c.channel_id
@@ -125,6 +127,7 @@ export class ChannelStore {
                     WHERE r.channel_id = c.channel_id AND r.member_id = ?), 0)
                 AND json_extract(m.message_json, '$.author.id') IS NOT ?
                 AND json_extract(m.message_json, '$.author.id') IS NOT ?
+                AND COALESCE(json_extract(m.message_json, '$.message.itemType'), '') != 'plan'
                 AND COALESCE(json_extract(m.message_json, '$.message.itemType'), '') NOT LIKE ?) AS unread,
             (SELECT COUNT(*) FROM projection_channel_tasks AS t
               WHERE t.channel_id = c.channel_id
@@ -179,6 +182,19 @@ export class ChannelStore {
       if (!isChannelMessage(value)) throw new Error("Invalid stored channel message.");
       return value;
     });
+  }
+
+  /** One message by id, read through the primary key rather than the whole history. */
+  message(channelId: string, messageId: string): ChannelMessage | null {
+    const row = databaseRow(
+      this.database.connection
+        .prepare("SELECT message_json FROM projection_channel_messages WHERE channel_id = ? AND message_id = ?")
+        .get(channelId, messageId),
+    );
+    if (!row) return null;
+    const value = JSON.parse(requiredStringColumn(row, "message_json"));
+    if (!isChannelMessage(value)) throw new Error("Invalid stored channel message.");
+    return value;
   }
 
   tasks(channelId: string): ChannelTask[] {
@@ -418,7 +434,7 @@ export class ChannelStore {
 
   /** Permanently removes a channel and its execution threads from every local projection. */
   delete(channelId: string, operationId: string = randomUUID()): void {
-    if (!this.exists(channelId)) throw new Error("Channel not found.");
+    if (!this.exists(channelId)) throw new Error(sourceText("error.backend.channelNotFound"));
     const threadIds = this.contextThreads(channelId);
     this.database.dispatch(
       `channel-delete:${operationId}`,

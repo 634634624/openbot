@@ -1,5 +1,7 @@
-import type { AgentEvent, TeamRealtimeEvent } from "@openbot/contracts/ipc";
+import type { AgentEvent, ChannelSummary, SidebarLayoutSnapshot, TeamRealtimeEvent } from "@openbot/contracts/ipc";
 import { TEAM_API_ROUTES } from "@openbot/contracts/team-api-routes";
+import { HOST_ADMIN_CAPABILITY, HOST_ADMIN_ROUTES } from "@openbot/contracts/team-protocol/host-admin-v1";
+import type { TeamProtocolV2Json } from "@openbot/contracts/team-protocol/v2";
 import { remoteHostFingerprint } from "@openbot/team-client";
 import type { RemoteTeamConnectionUpdate } from "@openbot/team-client/remote-peer";
 import { QueryClient, QueryClientProvider, QueryObserver } from "@tanstack/react-query";
@@ -7,6 +9,7 @@ import { act, type PropsWithChildren, useImperativeHandle, useRef } from "react"
 import { createRoot } from "react-dom/client";
 import { afterEach, expect, it, vi } from "vitest";
 import type { RemoteTeamTransportRef } from "../components/remote-team-transport";
+import { mobileSidebarItems } from "../model/sidebar-layout";
 import { MobileWorkspaceProvider, useMobileWorkspace } from "./mobile-workspace-context";
 
 const native = vi.hoisted(() => ({
@@ -14,7 +17,15 @@ const native = vi.hoisted(() => ({
   listeners: new Set<(state: string) => void>(),
   storage: new Map<string, string>(),
 }));
-const host = {
+const sent = vi.hoisted((): { method: string; path: string; body: unknown }[] => []);
+const host: {
+  hostId: string;
+  name: string;
+  logoKey: string | null;
+  devicePublicKey: string;
+  membershipId: string;
+  role: string;
+} = {
   hostId: "host",
   name: "Desktop",
   logoKey: null,
@@ -56,6 +67,22 @@ vi.mock("expo-secure-store", () => ({
   },
   WHEN_UNLOCKED_THIS_DEVICE_ONLY: "device-only",
 }));
+let sidebarSupported = false;
+let hostAdminSupported = false;
+let identityFailure: Error | null = null;
+const initialLayout: SidebarLayoutSnapshot = {
+  revision: 1,
+  sections: [
+    { id: "work", name: "Work" },
+    { id: "empty", name: "Empty" },
+  ],
+  order: ["people", "work", "empty", "unassigned"],
+  agentAssignments: { working: "work", waiting: "work" },
+  agentOrder: ["waiting", "working"],
+};
+const sidebarRequest = vi.fn(
+  async (_method: string, _body?: TeamProtocolV2Json): Promise<SidebarLayoutSnapshot> => initialLayout,
+);
 let emit = (_event: AgentEvent | TeamRealtimeEvent) => {};
 let disconnect = () => {};
 let reconnectSnapshot: AgentEvent | null = null;
@@ -80,9 +107,25 @@ vi.mock("../components/remote-team-transport", () => ({
           if (reconnectSnapshot) emit(reconnectSnapshot);
         },
         disconnect: async () => {},
-        request: async <T,>(_method: string, path: string, decode: (value: unknown) => T): Promise<T> => {
+        request: async <T,>(
+          method: string,
+          path: string,
+          decode: (value: unknown) => T,
+          body?: TeamProtocolV2Json,
+        ): Promise<T> => {
+          sent.push({ method, path, body });
+          if (path === TEAM_API_ROUTES.agent.interrupt("working")) return decode({});
+          if (path === TEAM_API_ROUTES.sidebarLayout.state || path === TEAM_API_ROUTES.sidebarLayout.actions)
+            return decode(await sidebarRequest(method, body));
           if (path === TEAM_API_ROUTES.compatibility)
-            return decode({ appVersion: "test", protocol: { minimum: 3, maximum: 3 }, capabilities: [] });
+            return decode({
+              appVersion: "test",
+              protocol: { minimum: 3, maximum: 3 },
+              capabilities: [
+                ...(sidebarSupported ? ["sidebar-layout"] : []),
+                ...(hostAdminSupported ? [HOST_ADMIN_CAPABILITY] : []),
+              ],
+            });
           if (path === TEAM_API_ROUTES.agents.all)
             return decode(
               ["working", "waiting"].map((id) => ({
@@ -97,6 +140,10 @@ vi.mock("../components/remote-team-transport", () => ({
               })),
             );
           if (path === TEAM_API_ROUTES.agents.conversationReads) return decode({});
+          if (path === HOST_ADMIN_ROUTES.identity) {
+            if (identityFailure) throw identityFailure;
+            return decode({});
+          }
           throw new Error(`Unexpected request: ${path}`);
         },
       }),
@@ -120,7 +167,14 @@ afterEach(async () => {
   queryClient.clear();
   native.state = "active";
   native.storage.clear();
+  sent.length = 0;
   reconnectSnapshot = null;
+  sidebarSupported = false;
+  hostAdminSupported = false;
+  identityFailure = null;
+  Object.assign(host, { name: "Desktop", logoKey: null, role: "owner" });
+  sidebarRequest.mockReset();
+  sidebarRequest.mockResolvedValue(initialLayout);
 });
 
 it.each(["foreground", "manual"])(
@@ -163,7 +217,7 @@ it.each(["foreground", "manual"])(
         for (const listener of native.listeners) listener("active");
       });
     } else await act(async () => current.refreshServer(host.hostId));
-    expect(current.activityByServer[host.hostId]).toEqual({
+    expect(current.liveState.get().activityByServer[host.hostId]).toEqual({
       working: { turnId: "running-turn", phase: "working", detail: null },
       waiting: { turnId: "waiting-turn", phase: "waiting", detail: null },
     });
@@ -184,7 +238,7 @@ it.each(["foreground", "manual"])(
       },
     };
     await act(async () => disconnect());
-    expect(current.activityByServer[host.hostId]).toEqual({});
+    expect(current.liveState.get().activityByServer[host.hostId]).toEqual({});
   },
 );
 
@@ -220,4 +274,240 @@ it.each(["memories", "routines"] as const)("refreshes active channel %s after a 
   expect(queryClient.getQueryData(otherKey)).toEqual(["unchanged"]);
   expect(queryClient.getQueryState(otherKey)?.isInvalidated).toBe(false);
   close();
+});
+
+async function mountSidebar() {
+  sidebarSupported = true;
+  await act(async () =>
+    root.render(
+      <QueryClientProvider client={queryClient}>
+        <MobileWorkspaceProvider>
+          <Workspace />
+        </MobileWorkspaceProvider>
+      </QueryClientProvider>,
+    ),
+  );
+}
+function sidebarRows() {
+  return mobileSidebarItems(current.sidebarByServer.host?.layout ?? null, current.activeAgents, []).map(
+    (item) => item.id,
+  );
+}
+
+it("loads host sections and agent order, applies desktop events, and reloads after remount", async () => {
+  await mountSidebar();
+  expect(sidebarRows()).toEqual(["work", "waiting", "working", "empty"]);
+  const changed: SidebarLayoutSnapshot = {
+    ...initialLayout,
+    revision: 2,
+    order: ["empty", "unassigned", "work", "people"],
+    agentAssignments: { working: "work" },
+  };
+  await act(async () => emit({ type: "sidebar-layout-changed", layout: changed }));
+  expect(sidebarRows()).toEqual(["empty", "unassigned", "waiting", "work", "working"]);
+  await act(async () => emit({ type: "sidebar-layout-changed", layout: initialLayout }));
+  expect(current.sidebarByServer.host?.layout).toEqual(changed);
+  sidebarRequest.mockResolvedValue(changed);
+  await act(async () => current.refreshServer("host"));
+  expect(sidebarRows()).toEqual(["empty", "unassigned", "waiting", "work", "working"]);
+  await act(async () => root.unmount());
+  root = createRoot(container);
+  await mountSidebar();
+  expect(current.sidebarByServer.host?.layout).toEqual(changed);
+});
+
+it("sends section actions to the chosen host and keeps a newer event over an action response", async () => {
+  await mountSidebar();
+  const changed = {
+    ...initialLayout,
+    revision: 3,
+    sections: [
+      { id: "work", name: "Renamed" },
+      { id: "empty", name: "Empty" },
+    ],
+  };
+  sidebarRequest.mockImplementationOnce(async () => {
+    emit({ type: "sidebar-layout-changed", layout: changed });
+    return { ...initialLayout, revision: 2 };
+  });
+  await act(async () => current.mutateSidebarLayout("host", { type: "rename", sectionId: "work", name: "Renamed" }));
+  expect(sidebarRequest).toHaveBeenLastCalledWith("POST", { type: "rename", sectionId: "work", name: "Renamed" });
+  expect(current.sidebarByServer.host?.layout).toEqual(changed);
+  await expect(current.mutateSidebarLayout("other-host", { type: "delete", sectionId: "work" })).rejects.toThrow(
+    "does not support",
+  );
+  sidebarRequest.mockRejectedValueOnce(new Error("Save failed"));
+  await act(async () => {
+    await expect(current.mutateSidebarLayout("host", { type: "delete", sectionId: "work" })).rejects.toThrow(
+      "Save failed",
+    );
+  });
+  expect(current.sidebarByServer.host?.layout).toEqual(changed);
+});
+
+it("keeps chats visible on layout failure and recovers on retry", async () => {
+  sidebarRequest.mockRejectedValueOnce(new Error("Layout unavailable"));
+  await mountSidebar();
+  expect(current.sidebarByServer.host?.error).toBeTruthy();
+  expect(sidebarRows()).toEqual(["working", "waiting"]);
+  await act(async () => current.refreshServer("host"));
+  expect(current.sidebarByServer.host?.error).toBeNull();
+  expect(sidebarRows()).toEqual(["work", "waiting", "working", "empty"]);
+});
+
+it("returns chats to Agents on section deletion and supports unassignment", async () => {
+  await mountSidebar();
+  const unassigned = { ...initialLayout, revision: 2, agentAssignments: { waiting: "work" } };
+  sidebarRequest.mockResolvedValueOnce(unassigned);
+  await act(async () => current.mutateSidebarLayout("host", { type: "assign", agentId: "working", sectionId: null }));
+  expect(sidebarRows()).toEqual(["work", "waiting", "empty", "unassigned", "working"]);
+  const deleted = { ...unassigned, revision: 3, sections: [], order: ["people", "unassigned"], agentAssignments: {} };
+  await act(async () => emit({ type: "sidebar-layout-changed", layout: deleted }));
+  expect(sidebarRows()).toEqual(["unassigned", "waiting", "working"]);
+});
+
+it("mixes channels and agents in the host order and retains new and orphaned chats", async () => {
+  await mountSidebar();
+  const channel: ChannelSummary = {
+    id: "channel",
+    name: "Planning",
+    title: "",
+    instructions: "",
+    members: [],
+    leadAgentId: null,
+    archived: false,
+    revision: 1,
+    createdAt: "2026-09-21T00:00:00Z",
+    unreadCount: 0,
+    activeTasks: 0,
+    lastMessage: null,
+  };
+  const layout = {
+    ...initialLayout,
+    agentOrder: ["waiting", "channel"],
+    agentAssignments: { waiting: "work", channel: "work", working: "deleted" },
+  };
+  expect(mobileSidebarItems(layout, current.activeAgents, [channel]).map((item) => item.id)).toEqual([
+    "work",
+    "waiting",
+    "channel",
+    "empty",
+    "unassigned",
+    "working",
+  ]);
+  const many = Array.from({ length: 2000 }, (_, index) => ({ ...channel, id: `channel-${index}` }));
+  const largeLayout = { ...initialLayout, agentAssignments: {}, agentOrder: many.map((item) => item.id).reverse() };
+  expect(
+    mobileSidebarItems(largeLayout, [], many)
+      .filter((item) => item.kind === "channel")
+      .map((item) => item.id),
+  ).toEqual(largeLayout.agentOrder);
+});
+
+it("keeps a desktop event that arrives during a layout read", async () => {
+  const newer = { ...initialLayout, revision: 4, agentOrder: ["working", "waiting"] };
+  sidebarRequest.mockImplementationOnce(async () => {
+    emit({ type: "sidebar-layout-changed", layout: newer });
+    return initialLayout;
+  });
+  await mountSidebar();
+  expect(sidebarRows()).toEqual(["work", "working", "waiting", "empty"]);
+});
+
+it("sends section reorder actions and uses the returned order", async () => {
+  await mountSidebar();
+  const reordered = { ...initialLayout, revision: 2, order: ["people", "empty", "work", "unassigned"] };
+  sidebarRequest.mockResolvedValueOnce(reordered);
+  await act(async () =>
+    current.mutateSidebarLayout("host", { type: "move", sectionId: "empty", direction: "up", steps: 1 }),
+  );
+  expect(sidebarRequest).toHaveBeenLastCalledWith("POST", {
+    type: "move",
+    sectionId: "empty",
+    direction: "up",
+    steps: 1,
+  });
+  expect(sidebarRows()).toEqual(["empty", "work", "waiting", "working"]);
+});
+
+it("stops a running turn through the interrupt route", async () => {
+  await act(async () =>
+    root.render(
+      <QueryClientProvider client={queryClient}>
+        <MobileWorkspaceProvider>
+          <Workspace />
+        </MobileWorkspaceProvider>
+      </QueryClientProvider>,
+    ),
+  );
+  await act(async () => current.interruptTurn("working", "running-turn", host.hostId));
+  expect(sent.at(-1)).toEqual({
+    method: "POST",
+    path: TEAM_API_ROUTES.agent.interrupt("working"),
+    body: { turnId: "running-turn" },
+  });
+});
+
+async function mountWorkspace() {
+  await act(async () =>
+    root.render(
+      <QueryClientProvider client={queryClient}>
+        <MobileWorkspaceProvider>
+          <Workspace />
+        </MobileWorkspaceProvider>
+      </QueryClientProvider>,
+    ),
+  );
+}
+
+it("saves and removes the server logo and name through the host, then reads the new logo key", async () => {
+  hostAdminSupported = true;
+  await mountWorkspace();
+  // The directory as it is after the host saved the change.
+  Object.assign(host, { name: "Research lab", logoKey: "logo-2" });
+  await act(() =>
+    current.updateServerIdentity(host.hostId, {
+      serverName: "Research lab",
+      logo: { mimeType: "image/jpeg", bytes: new Uint8Array([1, 2, 3]) },
+    }),
+  );
+  expect(sent.at(-1)).toEqual({
+    method: "POST",
+    path: HOST_ADMIN_ROUTES.identity,
+    body: { serverName: "Research lab", logo: { mimeType: "image/jpeg", data: "AQID" } },
+  });
+  expect(current.servers[0]).toMatchObject({ name: "Research lab", logoKey: "logo-2" });
+
+  host.logoKey = null;
+  await act(() => current.updateServerIdentity(host.hostId, { logo: null }));
+  expect(sent.at(-1)?.body).toEqual({ logo: null });
+  expect(current.servers[0]?.logoKey).toBeNull();
+});
+
+it("keeps the saved name when the host refuses the change", async () => {
+  hostAdminSupported = true;
+  identityFailure = new Error("Upload failed.");
+  await mountWorkspace();
+  await expect(act(() => current.updateServerIdentity(host.hostId, { serverName: "Other name" }))).rejects.toThrow(
+    "Upload failed.",
+  );
+  expect(current.servers[0]?.name).toBe("Desktop");
+});
+
+it("does not send an identity change for a member", async () => {
+  hostAdminSupported = true;
+  host.role = "member";
+  await mountWorkspace();
+  const before = sent.length;
+  await expect(current.updateServerIdentity(host.hostId, { serverName: "Other name" })).rejects.toThrow();
+  expect(current.canEditServerIdentity(host.hostId)).toBe(false);
+  expect(sent).toHaveLength(before);
+});
+
+it("applies a name and logo change that another client made", async () => {
+  await mountWorkspace();
+  await act(async () =>
+    emit({ type: "team-identity", serverId: host.hostId, serverName: "Renamed", logoVersion: "logo-3" }),
+  );
+  expect(current.servers[0]).toMatchObject({ name: "Renamed", logoKey: "logo-3" });
 });

@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream } from "node:fs";
 import { type FileHandle, mkdir, open, readFile, rm } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { isString } from "@openbot/contracts/runtime-values";
@@ -11,6 +10,9 @@ import {
   TEAM_PROTOCOL_V2_MAX_FILE_BYTES,
   TEAM_PROTOCOL_V2_MAX_FILE_SET_BYTES,
 } from "@openbot/contracts/team-protocol/v2";
+import { sourceText } from "@openbot/i18n/source";
+import { sha256File } from "../backend/file-hash";
+import { recordRestartActivity } from "../backend/restart-activity";
 import type { TeamWebRtcBridge } from "./team-webrtc-bridge";
 
 const FILE_CHUNK_BYTES = 60 * 1024;
@@ -94,14 +96,20 @@ export class TeamWebRtcFileTransfer {
     this.#notifyStateChange();
   }
 
+  /** Whether a transfer is moving right now, either direction. Completed files waiting for pickup do not count. */
+  hasActiveTransfers(): boolean {
+    return this.#incoming.size > 0 || this.#outgoing.size > 0;
+  }
+
   async send(peerId: string, input: { name: string; mimeType: string; bytes: Uint8Array }): Promise<string> {
-    if (this.#stopped) throw new Error("The WebRTC file transport is stopped.");
-    if (input.bytes.byteLength > TEAM_PROTOCOL_V2_MAX_FILE_BYTES) throw new Error("The file is larger than 100 MB.");
+    if (this.#stopped) throw new Error(sourceText("error.remote.fileTransportIsStopped"));
+    if (input.bytes.byteLength > TEAM_PROTOCOL_V2_MAX_FILE_BYTES)
+      throw new Error(sourceText("error.remote.fileTooLarge"));
     const activeBytes = [...this.#outgoing.values()]
       .filter((transfer) => transfer.peerId === peerId)
       .reduce((sum, transfer) => sum + transfer.bytes.byteLength, 0);
     if (activeBytes + input.bytes.byteLength > TEAM_PROTOCOL_V2_MAX_FILE_SET_BYTES) {
-      throw new Error("The active file set is larger than 250 MB.");
+      throw new Error(sourceText("error.remote.fileSetTooLarge"));
     }
     const transferId = randomUUID();
     const sha256 = createHash("sha256").update(input.bytes).digest("hex");
@@ -118,6 +126,7 @@ export class TeamWebRtcFileTransfer {
       cancelled: null,
     };
     this.#outgoing.set(transferKey(peerId, transferId), transfer);
+    recordRestartActivity();
     try {
       await this.#sendWithResume(transfer);
       return transferId;
@@ -135,7 +144,7 @@ export class TeamWebRtcFileTransfer {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.#waiters.delete(key);
-        reject(new Error("The WebRTC file transfer timed out."));
+        reject(new Error(sourceText("error.remote.fileTransferTimeout")));
       }, timeoutMs);
       this.#waiters.set(key, { resolve, reject, timer });
     });
@@ -213,10 +222,11 @@ export class TeamWebRtcFileTransfer {
           .filter((item) => item.peerId === peerId)
           .reduce((sum, item) => sum + item.size, 0);
         if (activeBytes + frame.size > TEAM_PROTOCOL_V2_MAX_FILE_SET_BYTES)
-          throw new Error("The active file set is larger than 250 MB.");
+          throw new Error(sourceText("error.remote.fileSetTooLarge"));
         await mkdir(this.#directory, { recursive: true, mode: 0o700 });
         const path = join(this.#directory, `${frame.transferId}.part`);
         const file = await open(path, "w", 0o600);
+        recordRestartActivity();
         this.#incoming.set(key, {
           peerId,
           transferId: frame.transferId,
@@ -346,7 +356,7 @@ export class TeamWebRtcFileTransfer {
       await this.#bridge.disconnectPeer(peerId).catch(() => undefined);
       return;
     }
-    const failure = error instanceof Error ? error : new Error("The WebRTC file transfer failed.");
+    const failure = error instanceof Error ? error : new Error(sourceText("error.remote.fileTransferFailed"));
     await this.#bridge
       .send(
         peerId,
@@ -426,7 +436,7 @@ export class TeamWebRtcFileTransfer {
         ).catch(() => undefined);
       }
     }
-    throw new Error("The WebRTC file transfer could not resume before its deadline.");
+    throw new Error(sourceText("error.remote.fileResumeFailed"));
   }
 
   #waitUntil(predicate: () => boolean, deadline: number): Promise<void> {
@@ -437,7 +447,7 @@ export class TeamWebRtcFileTransfer {
         if (this.#stopped) {
           clearTimeout(timer);
           this.#stateWaiters.delete(check);
-          reject(new Error("The WebRTC file transport stopped."));
+          reject(new Error(sourceText("error.remote.fileTransportStopped")));
           return;
         }
         if (!predicate()) return;
@@ -448,7 +458,7 @@ export class TeamWebRtcFileTransfer {
       timer = setTimeout(
         () => {
           this.#stateWaiters.delete(check);
-          reject(new Error("The WebRTC file transfer timed out."));
+          reject(new Error(sourceText("error.remote.fileTransferTimeout")));
         },
         Math.max(1, deadline - Date.now()),
       );
@@ -477,7 +487,7 @@ export class TeamWebRtcFileTransfer {
   }
 
   async #expire(key: string): Promise<void> {
-    const error = new Error("The WebRTC file transfer resume deadline expired.");
+    const error = new Error(sourceText("error.remote.fileResumeExpired"));
     const transfer = this.#incoming.get(key);
     if (transfer) {
       this.#incoming.delete(key);
@@ -510,10 +520,4 @@ function fileTransferId(data: string | ArrayBuffer): string | null {
   } catch {
     return null;
   }
-}
-
-async function sha256File(path: string): Promise<string> {
-  const hash = createHash("sha256");
-  for await (const chunk of createReadStream(path)) hash.update(chunk);
-  return hash.digest("hex");
 }

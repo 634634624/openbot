@@ -2,9 +2,12 @@ This is an Expo/React Native mobile application. Prioritize mobile-first pattern
 
 ## Execution and verification limits
 
-- `bun run lint` and `bun run typecheck` are the default checks here and need no permission. Each covers the whole app in seconds, so narrowing them to changed files buys nothing and hides a break in one of the packages the app imports. Run both before you call a task done and before a PR.
-- Everything slower than those two needs explicit user permission for that exact command: builds, packaging, signing, submission, deployment, EAS commands, iOS simulator or Android emulator runs, device runs, and native development clients. One permission authorizes one command and nothing that follows it.
-- If a requested workflow needs a command from that list, explain the limitation and wait for permission. Never substitute a broader command or run one implicitly.
+- Do not run broad checks locally. The user reports that they overload the computer. Follow the
+  root check policy: lint changed files and run one relevant test file, one check at a time.
+- Do not run whole-workspace or parallel typechecks, including the full mobile project. The root
+  pre-commit hook runs them, and CI runs them again. Use one test worker where supported and report what remains unverified.
+- Builds, packaging, signing, deployment, EAS commands, simulator or emulator runs, and native
+  development clients require an explicit user request. Do not start them as routine checks.
 
 ## Design system and native chrome
 
@@ -18,6 +21,12 @@ Read and follow [`DESIGN.md`](./DESIGN.md) before changing mobile UI.
 - Do not fake native chrome with custom blur, gradients, translucent cards, or `GlassView`. Use `expo-glass-effect` only for an intentional custom in-content glass surface, with platform and accessibility fallbacks.
 - If neither an existing OpenBot component nor HeroUI Native fits an application-content need, verify that before creating a reusable component. If native APIs cannot satisfy a system-chrome requirement, document the constraint in the change before using a fallback.
 - Do not add status badges, warnings, or operational guidance unless the application state and repository behavior support the claim. Verify lifecycle and connectivity copy against the implementation before presenting it to users.
+
+## Interface text
+
+Render product text through catalog keys: `useText()` in a component, `currentText()` in a store
+or an `Alert.alert` callback, both from `@/shared/lib/text`. Mobile keys start with `mobile.`. Use
+`format` for numbers and dates, not `toLocaleString()`. See [docs/i18n.md](../../docs/i18n.md).
 
 ## Sheets
 
@@ -60,7 +69,7 @@ Use `bunx` instead of `npx` if the project uses bun (`bun.lock` present).
 bunx expo install <package>  # ALWAYS use instead of npm/yarn/pnpm/bun add — resolves SDK-compatible versions
 bun run start                # start the dev server
 bun run lint                 # lint and format-check with Biome
-bun run typecheck            # typecheck with TypeScript 7
+bun run typecheck            # full mobile typecheck: do not run it by hand; the root pre-commit hook runs it
 bun run doctor               # diagnose dependency and config issues
 bunx expo install --fix      # fix incompatible package versions
 ```

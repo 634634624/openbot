@@ -1,80 +1,57 @@
-import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import type {
   AvatarImageInput,
   HostStatus,
   InviteSummary,
+  ServerNotificationLevel,
   ServerSummary,
   TeamInviteSummary,
   TeamPresenceMember,
-  TeamRole,
   UpdateTeamMemberInput,
 } from "@openbot/contracts/ipc";
-import { normalizeEmailAddress } from "@openbot/contracts/validation";
-import { createEffect, createMemo, createSignal, createStore, For, onCleanup, Show, snapshot } from "solid-js";
-import { normalizeAvatarFile } from "../../avatar-image";
+import type { AppTextKey } from "@openbot/i18n";
 import {
   Alert,
   AlertActions,
   AlertContent,
   AlertDescription,
-  AlertDialog,
   AlertIcon,
   AlertTitle,
-  Badge,
   Blocks,
   Button,
-  buttonVariants,
-  Card,
-  Check,
   ChevronRight,
-  CopyButton,
-  DropdownMenu,
-  Ellipsis,
-  Field,
-  Image,
-  ImageRemoveButton,
-  Input,
-  Item,
-  ItemActions,
-  ItemContent,
-  ItemDescription,
-  ItemGroup,
-  ItemMedia,
-  ItemTitle,
+  Download,
+  HardDrive,
   Monitor,
-  QrCode,
   RefreshCw,
-  ScanLine,
-  Search,
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
   Settings,
-  SettingsSection,
   ShieldCheck,
-  SlidingTabs,
-  SwitchField,
+  Sparkles,
   Tabs,
   Text,
-  Trash2,
   toast,
-  UserRound,
   UsersRound,
-} from "../../components/ui";
-import { truncateMiddle } from "../../components/ui/utils";
-import { errorMessage } from "../../error-message";
-import { SaveBarDock, SettingsDialogShell } from "../settings/SettingsDialogShell";
-import { teamMemberName } from "../team/TeamPersonAvatar";
+} from "@openbot/ui";
+import { SaveBarDock, SettingsDialogShell } from "@openbot/ui/features/settings/SettingsDialogShell";
+import { useText } from "@openbot/ui/text";
+import { createEffect, createSignal, onCleanup, Show, untrack } from "solid-js";
+import { type ServerStorageOptions, ServerStoragePanel } from "../files/ServerStoragePanel";
+import { type HostProviderSettings, HostProviderSettingsPanel } from "../settings/ProviderSettingsSection";
 import type { McpServerConfig, McpTestResult } from "./mcp-servers";
+import { ServerDesktopPanel } from "./ServerDesktopPanel";
+import { createServerGeneralSection } from "./ServerGeneralSection";
+import { type ServerImportOptions, ServerImportPanel } from "./ServerImportPanel";
 import { type McpPanelDetail, ServerMcpPanel } from "./ServerMcpPanel";
-import { serverSupportsCapability } from "./server-capabilities";
+import { createServerMembersSection } from "./ServerMembersSection";
+import { type ServerUpdateOptions, ServerUpdatePanel } from "./ServerUpdatePanel";
+import { serverRoleCanAdminister } from "./server-capabilities";
+import type { ServerSettingsSectionHost } from "./server-settings-section";
 
 export interface ServerSettingsModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   platform: "darwin" | "win32" | "linux";
+  /** False where no remote desktop can start, such as the browser client. The section is then absent. */
+  remoteDesktopSupported?: boolean;
   server: ServerSummary;
   hostStatus?: HostStatus | null;
   members: TeamPresenceMember[];
@@ -85,11 +62,18 @@ export interface ServerSettingsModalProps {
   onRetry: () => Promise<void>;
   onSaveIdentity: (input: { serverName: string; logo?: AvatarImageInput | null }) => Promise<void>;
   onSetPublished: (published: boolean) => Promise<void>;
-  onSetMuted: (muted: boolean) => Promise<void>;
-  onCreateInvite: (input: { role: "admin" | "member"; email?: string }) => Promise<InviteSummary>;
+  /** The Notifications section appears only when a caller supplies both: they are desktop notifications. */
+  onSetMuted?: (muted: boolean) => Promise<void>;
+  onSetNotificationLevel?: (level: ServerNotificationLevel) => Promise<void>;
+  onCreateInvite: (input: { role: "admin" | "member"; email?: string; permanent?: boolean }) => Promise<InviteSummary>;
   onUpdateMember: (input: UpdateTeamMemberInput) => Promise<void>;
   onRemoveMember: (memberId: string) => Promise<void>;
   onRevokeInvite: (inviteId: string) => Promise<void>;
+  /**
+   * Ends this account's membership of a joined server. The Leave section appears only when a
+   * caller supplies this: the browser client is attached to one host and cannot leave it.
+   */
+  onLeaveServer?: () => Promise<void>;
   /** Opens the macOS pane that grants OpenBot screen recording, for the host that was refused it. */
   onOpenScreenRecordingSettings: () => Promise<void>;
   /** Asks the host to read the grant again, so the owner who gave it sees the warning go. */
@@ -99,9 +83,14 @@ export interface ServerSettingsModalProps {
    * servers - a remote host without the capability, or a `member` account - passes nothing, and
    * then neither the tab nor the panel exists.
    */
-  mcpServers?: McpServerConfig[];
+  mcpServers?: McpServerConfig[] | undefined;
   /** Why the MCP list is empty, when the read failed rather than found nothing. */
   mcpLoadError?: string | null;
+  /**
+   * What the managed runtime under a STDIO server is doing, when there is anything to say. The
+   * caller decides: it describes this computer, and this dialog also opens for a remote server.
+   */
+  mcpToolRuntimeNote?: string | null;
   onRetryMcpServers?: () => void;
   onSaveMcpServer?: (config: McpServerConfig) => Promise<void>;
   onRemoveMcpServer?: (id: string) => Promise<void>;
@@ -112,93 +101,56 @@ export interface ServerSettingsModalProps {
    * because most visits to this dialog never reach that section.
    */
   onMcpSectionShown?: () => void;
+  /**
+   * The Storage section appears only when a caller supplies this: a remote host without
+   * `storage-v1` passes nothing. Every member reads it; `canManage` adds Clear and Delete.
+   */
+  storage?: ServerStorageOptions | undefined;
+  /**
+   * The Providers section appears only when a caller supplies this. The desktop app passes nothing:
+   * its own Settings holds the providers of every host it administers.
+   */
+  providers?: HostProviderSettings | undefined;
+  /** The Import section appears only when a caller supplies this: agents import into the local server. */
+  agentImport?: ServerImportOptions;
+  /**
+   * The Updates section appears only when a caller supplies this: a remote host with
+   * `host-update-v1` that this member administers.
+   */
+  hostUpdate?: ServerUpdateOptions | undefined;
+  /** The section to show when the dialog opens. Updates shows General when the server has no Updates section. */
+  initialSection?: ServerSettingsSection | null;
 }
 
-type Section = "general" | "members" | "desktop" | "mcp";
-type InviteMode = "link" | "email";
-type InviteRole = Exclude<TeamRole, "owner">;
+export type ServerSettingsSection =
+  | "general"
+  | "members"
+  | "desktop"
+  | "mcp"
+  | "storage"
+  | "providers"
+  | "updates"
+  | "import";
+type Section = ServerSettingsSection;
 
-const ROLE_OPTIONS = ["Member", "Admin"];
-const INVITE_LINK_PLACEHOLDER = "Create a private one-time link.";
-const sections: Record<Section, { title: string; description: string }> = {
-  general: { title: "General", description: "Manage this server’s identity and published access." },
-  members: { title: "Members", description: "Invite people and manage access to this server." },
-  desktop: { title: "Remote desktop", description: "Configure or connect to this server’s desktop." },
-  mcp: {
-    title: "MCP",
-    description: "Connect MCP servers and choose which ones this server’s agents can use.",
-  },
-};
-
-/**
- * The identity form: the name and logo as the server last confirmed them, the draft the user is
- * editing, and the validation feedback that belongs to that draft. `logo` is `undefined` while the
- * saved image stands, `null` once the user removes it, and an image once one is chosen, so it
- * carries the difference between "unchanged" and "cleared" that a save has to send.
- */
-interface ServerIdentityDraft {
-  editing: boolean;
-  logo: AvatarImageInput | null | undefined;
-  logoError: string | null;
-  logoUrl: string | null;
-  name: string;
-  nameShaking: boolean;
-  nameTouched: boolean;
-  savedLogoUrl: string | null;
-  savedName: string;
-}
-
-/** The invite composer. `mode` picks which of `email` and `link` the panel is filling in. */
-interface InvitePanel {
-  email: string;
-  emailError: string | null;
-  link: string;
-  mode: InviteMode;
-  result: InviteSummary | null;
-  showQr: boolean;
-  role: InviteRole;
-}
-
-interface MembersPanel {
-  removeId: string | null;
-  search: string;
-}
-
-/**
- * One record per panel of the dialog. Each group's fields are written together - a reset rewrites
- * the whole identity draft at once, and switching invite mode clears three of the composer's
- * fields - so they are one store rather than a signal each, and replacing one field re-renders
- * only what read that field.
- */
-interface ServerSettingsPanels {
-  identity: ServerIdentityDraft;
-  invite: InvitePanel;
-  members: MembersPanel;
-}
+const sections = {
+  general: { title: "server.settings.generalTitle", description: "server.settings.generalDescription" },
+  members: { title: "server.settings.membersTitle", description: "server.settings.membersDescription" },
+  desktop: { title: "server.settings.desktopTitle", description: "server.settings.desktopDescription" },
+  mcp: { title: "server.settings.mcpTitle", description: "server.settings.mcpDescription" },
+  storage: { title: "server.settings.storageTitle", description: "server.settings.storageDescription" },
+  providers: { title: "server.settings.providersTitle", description: "server.settings.providersDescription" },
+  updates: { title: "server.settings.updatesTitle", description: "server.settings.updatesDescription" },
+  import: { title: "server.settings.importTitle", description: "server.settings.importDescription" },
+} as const satisfies Record<Section, { title: AppTextKey; description: AppTextKey }>;
 
 export function ServerSettingsModal(props: ServerSettingsModalProps) {
-  const [panels, setPanels] = createStore<ServerSettingsPanels>({
-    identity: {
-      editing: false,
-      logo: undefined,
-      logoError: null,
-      logoUrl: null,
-      name: "",
-      nameShaking: false,
-      nameTouched: false,
-      savedLogoUrl: null,
-      savedName: "",
-    },
-    invite: { email: "", emailError: null, link: "", mode: "email", result: null, showQr: false, role: "member" },
-    members: { removeId: null, search: "" },
-  });
+  const { t, errorMessage } = useText();
   const [section, setSection] = createSignal<Section>("general");
   /** Set while the MCP panel shows a form, so the header reads `MCP › Connect to a custom MCP`. */
   const [mcpDetail, setMcpDetail] = createSignal<McpPanelDetail | null>(null);
   /** The key of the one action in flight, gating every panel at once rather than belonging to any. */
   const [busy, setBusy] = createSignal<string | null>(null);
-  /** A clock, not panel state: it retires an invite row as its `expiresAt` passes. */
-  const [now, setNow] = createSignal(Date.now());
   const [modalElement, setModalElement] = createSignal<HTMLElement | undefined>();
   /**
    * The height of the error toast, or 0 while no toast is shown. The panel reserves this much
@@ -206,42 +158,53 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
    * covers - and swallows the clicks of - whatever the open panel puts last.
    */
   const [toastHeight, setToastHeight] = createSignal(0);
-  let logoInput: HTMLInputElement | undefined;
-  let nameInput: HTMLInputElement | undefined;
-  let removeMemberTrigger: HTMLElement | undefined;
-  let inviteLinkInput: HTMLInputElement | undefined;
   let syncedServerId = "";
-  let expiryTimer: ReturnType<typeof setTimeout> | undefined;
-  let inviteLinkSwapTimer: ReturnType<typeof setTimeout> | undefined;
-  const objectUrls: string[] = [];
 
   const local = () => props.server.kind === "local";
+  const remoteDesktopSection = () => props.remoteDesktopSupported !== false && props.platform === "darwin";
   const configured = () => (local() ? Boolean(props.hostStatus?.configured) : true);
-  const canEditIdentity = () => local();
-  const canManage = () => configured() && (local() || props.server.role === "admin" || props.server.role === "owner");
   /**
-   * The same role check without `configured()`. MCP servers belong to this machine and are spawned
+   * The role check without `configured()`. MCP servers belong to this machine and are spawned
    * by the agents on it, so they are manageable before the user publishes a Team API host at all.
    */
-  const canManageMcp = () => local() || props.server.role === "admin" || props.server.role === "owner";
+  const canManageMcp = () => serverRoleCanAdminister(props.server);
   const actionsAvailable = () => local() || props.server.state === "online";
+  const availableInitialSection = (): Section | null =>
+    props.initialSection === "updates" && !props.hostUpdate ? null : (props.initialSection ?? null);
   const published = () => (local() ? props.hostStatus?.phase === "online" : props.server.state === "online");
-  const address = () => (local() ? props.hostStatus?.apiUrl : props.server.apiUrl);
-  const trimmedName = () => panels.identity.name.trim();
-  const nameError = () => {
-    if (!canEditIdentity()) return null;
-    if (trimmedName().length < INPUT_LIMITS.serverNameMin)
-      return `Enter at least ${INPUT_LIMITS.serverNameMin} characters.`;
-    if (trimmedName().length > INPUT_LIMITS.serverName)
-      return `Use no more than ${INPUT_LIMITS.serverName} characters.`;
-    return null;
+
+  async function run(key: string, action: () => Promise<void>): Promise<boolean> {
+    if (busy()) return false;
+    setBusy(key);
+    try {
+      await action();
+      return true;
+    } catch (error) {
+      toast.error(t("server.settings.actionFailedTitle"), {
+        description: errorMessage(error, t("server.settings.actionFailed")),
+      });
+      return false;
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const host: ServerSettingsSectionHost = {
+    props,
+    local,
+    configured,
+    published,
+    actionsAvailable,
+    menuMount: modalElement,
+    busy,
+    run,
+    showCopyError() {
+      toast.error(t("server.settings.copyFailedTitle"), { description: t("server.settings.copyFailed") });
+    },
   };
-  const visibleNameError = () => (panels.identity.nameTouched ? nameError() : null);
-  const identityDirty = () =>
-    canEditIdentity() &&
-    (trimmedName() !== panels.identity.savedName ||
-      panels.identity.logo !== undefined ||
-      panels.identity.logoUrl !== panels.identity.savedLogoUrl);
+  const general = createServerGeneralSection(host, { onSetUpDesktop: () => setSection("desktop") });
+  const members = createServerMembersSection(host);
+
   /** Publishes the reserve to the shell stylesheet, which spends it as the panel's end padding. */
   createEffect(
     () => ({ element: modalElement(), height: toastHeight() }),
@@ -262,36 +225,7 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
   // Both save bars dock in the same place, so the toast has to lift for either one. It is
   // `position: absolute` over the footer: without this it covers the bar and swallows its clicks.
   const saveBarDocked = () =>
-    (section() === "general" && identityDirty()) || (section() === "mcp" && Boolean(mcpDetail()?.saveBar()));
-  const activeInvites = createMemo(() =>
-    props.invites.filter((item) => item.usedAt === null && Date.parse(item.expiresAt) > now()),
-  );
-  const inviteUsed = () =>
-    Boolean(
-      panels.invite.result && props.invites.some((invite) => invite.id === panels.invite.result?.id && invite.usedAt),
-    );
-  const inviteExpired = () => Boolean(panels.invite.result && Date.parse(panels.invite.result.expiresAt) <= now());
-  const activeMembers = createMemo(() => props.members.filter((member) => !member.disabled));
-  const inactiveLegacyMembers = createMemo(() =>
-    props.server.kind === "remote" && /^https?:\/\//u.test(props.server.apiUrl ?? "")
-      ? props.members.filter((member) => member.disabled && member.role !== "owner")
-      : [],
-  );
-  const filteredMembers = createMemo(() => {
-    const query = panels.members.search.trim().toLowerCase();
-    if (!query) return activeMembers();
-    return activeMembers().filter((member) =>
-      [teamMemberName(member), member.email, member.username].some((value) => value?.toLowerCase().includes(query)),
-    );
-  });
-  const removeMember = createMemo(() => props.members.find((member) => member.id === panels.members.removeId) ?? null);
-  const canInvite = createMemo(
-    () =>
-      canManage() &&
-      published() &&
-      busy() === null &&
-      (panels.invite.mode === "link" || normalizeEmailAddress(panels.invite.email) !== null),
-  );
+    (section() === "general" && general.identityDirty()) || (section() === "mcp" && Boolean(mcpDetail()?.saveBar()));
 
   createEffect(
     () => ({
@@ -299,34 +233,25 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
       id: props.server.id,
       name: props.server.kind === "local" && !props.hostStatus?.configured ? "" : props.server.name,
       logoUrl: props.server.logoUrl,
-      editing: panels.identity.editing,
+      editing: general.editing(),
     }),
     ({ open, id, name, logoUrl, editing }) => {
       if (!open) return;
       if (syncedServerId !== id) {
         syncedServerId = id;
-        setSection("general");
-        setPanels((state) => {
-          state.identity.editing = false;
-          state.identity.nameTouched = false;
-          state.identity.nameShaking = false;
-          state.invite.result = null;
-          state.invite.showQr = false;
-          state.members.search = "";
-        });
-        resetInviteLink();
+        setSection(untrack(availableInitialSection) ?? "general");
+        general.resetForServer();
+        members.resetForServer();
       }
-      if (!editing) {
-        setPanels((state) => {
-          state.identity.savedName = name;
-          state.identity.name = name;
-          state.identity.savedLogoUrl = logoUrl;
-          state.identity.logoUrl = logoUrl;
-          state.identity.logo = undefined;
-          state.identity.nameTouched = false;
-          state.identity.nameShaking = false;
-        });
-      }
+      if (!editing) general.syncFromServer(name, logoUrl);
+    },
+  );
+
+  /** An opener that names a section of the same server moves to it; the effect above covers a new server. */
+  createEffect(
+    () => (props.open ? availableInitialSection() : null),
+    (requested) => {
+      if (requested) setSection(requested);
     },
   );
 
@@ -337,197 +262,9 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
     (visible) => {
       if (visible === mcpSectionVisible) return;
       mcpSectionVisible = visible;
-      if (visible) props.onMcpSectionShown?.();
+      if (visible) untrack(() => props.onMcpSectionShown?.());
     },
   );
-
-  createEffect(
-    () => ({ invites: props.invites, currentTime: now() }),
-    ({ invites, currentTime }) => {
-      const nextExpiry = invites
-        .filter((item) => item.usedAt === null)
-        .map((item) => Date.parse(item.expiresAt))
-        .filter((value) => value > currentTime)
-        .sort((left, right) => left - right)[0];
-      if (expiryTimer) clearTimeout(expiryTimer);
-      expiryTimer = nextExpiry
-        ? setTimeout(() => setNow(Date.now()), Math.min(nextExpiry - currentTime + 1, 2_147_483_647))
-        : undefined;
-    },
-  );
-
-  onCleanup(() => {
-    if (expiryTimer) clearTimeout(expiryTimer);
-    if (inviteLinkSwapTimer) clearTimeout(inviteLinkSwapTimer);
-    for (const url of objectUrls) URL.revokeObjectURL(url);
-  });
-
-  function resetInviteLink(): void {
-    if (inviteLinkSwapTimer) clearTimeout(inviteLinkSwapTimer);
-    inviteLinkSwapTimer = undefined;
-    inviteLinkInput?.classList.remove("is-exit", "is-enter-start");
-    setPanels((state) => {
-      state.invite.link = "";
-    });
-  }
-
-  function swapInviteLink(next: string): void {
-    const element = inviteLinkInput;
-    if (!element || (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false)) {
-      setPanels((state) => {
-        state.invite.link = next;
-      });
-      return;
-    }
-    if (inviteLinkSwapTimer) clearTimeout(inviteLinkSwapTimer);
-    const duration =
-      Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--text-swap-dur")) || 150;
-    element.classList.add("is-exit");
-    inviteLinkSwapTimer = setTimeout(() => {
-      inviteLinkSwapTimer = undefined;
-      setPanels((state) => {
-        state.invite.link = next;
-      });
-      element.classList.remove("is-exit");
-      element.classList.add("is-enter-start");
-      void element.offsetHeight;
-      element.classList.remove("is-enter-start");
-    }, duration);
-  }
-
-  async function run(key: string, action: () => Promise<void>): Promise<boolean> {
-    if (busy()) return false;
-    setBusy(key);
-    try {
-      await action();
-      return true;
-    } catch (error) {
-      toast.error("Server action failed", {
-        description: errorMessage(error, "The server action failed."),
-      });
-      return false;
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function chooseLogo(file: File | undefined): Promise<void> {
-    if (!file) return;
-    setPanels((state) => {
-      state.identity.logoError = null;
-    });
-    try {
-      const image = await normalizeAvatarFile(file);
-      const url = URL.createObjectURL(file);
-      objectUrls.push(url);
-      setPanels((state) => {
-        state.identity.editing = true;
-        state.identity.logo = image;
-        state.identity.logoUrl = url;
-      });
-    } catch (error) {
-      setPanels((state) => {
-        state.identity.logoError = errorMessage(error, "OpenBot could not read this image.");
-      });
-    }
-  }
-
-  function resetIdentity(): void {
-    setPanels((state) => {
-      state.identity.name = state.identity.savedName;
-      state.identity.logoUrl = state.identity.savedLogoUrl;
-      state.identity.logo = undefined;
-      state.identity.editing = false;
-      state.identity.nameTouched = false;
-      state.identity.nameShaking = false;
-      state.identity.logoError = null;
-    });
-  }
-
-  function updateDraftName(value: string): void {
-    const namePristine = value.trim() === panels.identity.savedName;
-    const logoPristine = panels.identity.logo === undefined && panels.identity.logoUrl === panels.identity.savedLogoUrl;
-    // Decided before the write, so `nameError()` still sees the pre-write draft name - the same
-    // value it saw when this was a signal, whose write was equally deferred.
-    const stopShaking = namePristine || !nameError();
-    setPanels((state) => {
-      state.identity.name = value;
-      state.identity.editing = !(namePristine && logoPristine);
-      if (namePristine) state.identity.nameTouched = false;
-      if (stopShaking) state.identity.nameShaking = false;
-    });
-  }
-
-  function restartNameShake(): void {
-    setPanels((state) => {
-      state.identity.nameShaking = false;
-    });
-    queueMicrotask(() => {
-      if (!nameInput || !nameError()) return;
-      void nameInput.offsetWidth;
-      setPanels((state) => {
-        state.identity.nameShaking = true;
-      });
-    });
-  }
-
-  async function saveIdentity(): Promise<void> {
-    setPanels((state) => {
-      state.identity.nameTouched = true;
-    });
-    if (nameError()) {
-      restartNameShake();
-      queueMicrotask(() => nameInput?.focus({ preventScroll: true }));
-      return;
-    }
-    if (!identityDirty()) return;
-    const logo = panels.identity.logo;
-    const serverName = trimmedName();
-    const saved = await run("identity", () =>
-      props.onSaveIdentity({
-        serverName,
-        // The image crosses to IPC, which structured-clones it, so it goes as a snapshot rather
-        // than as whatever the store hands back.
-        ...(logo === undefined ? {} : { logo: snapshot(logo) }),
-      }),
-    );
-    if (!saved) return;
-    setPanels((state) => {
-      state.identity.savedName = serverName;
-      state.identity.savedLogoUrl = state.identity.logoUrl;
-      state.identity.logo = undefined;
-      state.identity.editing = false;
-      state.identity.nameTouched = false;
-      state.identity.nameShaking = false;
-    });
-  }
-
-  function showCopyError(): void {
-    toast.error("Copy failed", { description: "OpenBot could not copy this value." });
-  }
-
-  async function createInvite(): Promise<void> {
-    const email = panels.invite.mode === "email" ? normalizeEmailAddress(panels.invite.email) : null;
-    if (panels.invite.mode === "email" && !email) {
-      setPanels((state) => {
-        state.invite.emailError = "Enter a valid email address.";
-      });
-      return;
-    }
-    let result: InviteSummary | undefined;
-    const role = panels.invite.role;
-    const saved = await run("invite", async () => {
-      result = await props.onCreateInvite({ role, ...(email ? { email } : {}) });
-    });
-    if (!saved || !result) return;
-    const created = result;
-    setPanels((state) => {
-      state.invite.result = created;
-      state.invite.emailError = null;
-      if (email) state.invite.email = "";
-    });
-    if (!created.email) swapInviteLink(created.inviteUrl);
-  }
 
   const sectionTabsProps = {
     get value() {
@@ -536,23 +273,17 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
     orientation: "vertical" as const,
     activationMode: "automatic" as const,
     onChange(value: string) {
-      if (value === "general" || value === "members" || value === "desktop" || value === "mcp") setSection(value);
-    },
-  };
-
-  const inviteTabsProps = {
-    get value() {
-      return panels.invite.mode;
-    },
-    onChange(value: string) {
-      if (value !== "link" && value !== "email") return;
-      setPanels((state) => {
-        state.invite.mode = value;
-        state.invite.result = null;
-        state.invite.showQr = false;
-        state.invite.emailError = null;
-      });
-      resetInviteLink();
+      if (
+        value === "general" ||
+        value === "members" ||
+        value === "desktop" ||
+        value === "mcp" ||
+        value === "storage" ||
+        value === "providers" ||
+        value === "updates" ||
+        value === "import"
+      )
+        setSection(value);
     },
   };
 
@@ -563,11 +294,11 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
         open={props.open}
         onOpenChange={props.onOpenChange}
         title={
-          <Show when={section() === "mcp" && mcpDetail()} fallback={sections[section()].title}>
+          <Show when={section() === "mcp" && mcpDetail()} fallback={t(sections[section()].title)}>
             {(detail) => (
               <span class="settings-modal-crumbs">
                 <Button type="button" variant="ghost" class="settings-modal-crumb-parent" onClick={detail().back}>
-                  {sections.mcp.title}
+                  {t(sections.mcp.title)}
                 </Button>
                 <ChevronRight class="settings-modal-crumb-separator" aria-hidden="true" />
                 <span class="settings-modal-crumb-current">{detail().title}</span>
@@ -575,13 +306,13 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
             )}
           </Show>
         }
-        description={sections[section()].description}
+        description={t(sections[section()].description)}
         contentKey={`${props.server.id}:${section()}`}
-        closeLabel="Close server settings"
+        closeLabel={t("server.settings.close")}
         restoreFocusTarget={props.restoreFocusTarget}
         onContentElement={(element) => setModalElement(element)}
         floatingContent={
-          <Show when={props.loadError}>
+          <Show when={props.loadError && (section() === "general" || section() === "members")}>
             <Alert
               ref={measureToast}
               class="server-settings-error-toast"
@@ -593,7 +324,7 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
                 <ShieldCheck />
               </AlertIcon>
               <AlertContent>
-                <AlertTitle>Server settings unavailable</AlertTitle>
+                <AlertTitle>{t("server.settings.unavailableTitle")}</AlertTitle>
                 <AlertDescription>{props.loadError}</AlertDescription>
               </AlertContent>
               <AlertActions>
@@ -605,7 +336,7 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
                   onClick={() => void run("retry", props.onRetry)}
                 >
                   <RefreshCw aria-hidden="true" />
-                  Retry
+                  {t("common.retry")}
                 </Button>
               </AlertActions>
             </Alert>
@@ -620,7 +351,7 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
               {(detail) => (
                 <SaveBarDock value={detail().saveBar()}>
                   {(bar) => (
-                    <section class="settings-modal-save-bar" aria-label="Unsaved MCP changes">
+                    <section class="settings-modal-save-bar" aria-label={t("server.settings.unsavedMcpChanges")}>
                       <Show
                         when={bar().failed}
                         fallback={
@@ -641,18 +372,18 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
                           disabled={bar().resetDisabled}
                           onClick={detail().reset}
                         >
-                          Reset
+                          {t("server.settings.reset")}
                         </Button>
                         <Button
                           type="button"
                           size="sm"
                           variant="default"
                           loading={bar().saving}
-                          loadingLabel="Saving…"
+                          loadingLabel={t("common.saving")}
                           disabled={bar().saveDisabled}
                           onClick={detail().save}
                         >
-                          Save
+                          {t("common.save")}
                         </Button>
                       </div>
                     </section>
@@ -662,26 +393,32 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
             </Show>
             {/* `true` while the identity form is dirty: the dock only needs to know that there is
                 something to show, so the bar's own markup stays as it was. */}
-            <SaveBarDock value={section() === "general" && identityDirty() ? true : null}>
+            <SaveBarDock value={section() === "general" && general.identityDirty() ? true : null}>
               {() => (
-                <section class="settings-modal-save-bar" aria-label="Unsaved changes">
+                <section class="settings-modal-save-bar" aria-label={t("server.settings.unsavedChanges")}>
                   <Text variant="caption" tone="muted">
-                    Changes not saved
+                    {t("server.settings.changesNotSaved")}
                   </Text>
                   <div class="settings-modal-save-actions">
-                    <Button type="button" size="sm" variant="ghost" disabled={Boolean(busy())} onClick={resetIdentity}>
-                      Reset
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      disabled={Boolean(busy())}
+                      onClick={general.resetIdentity}
+                    >
+                      {t("server.settings.reset")}
                     </Button>
                     <Button
                       type="button"
                       size="sm"
                       variant="default"
                       loading={busy() === "identity"}
-                      loadingLabel="Saving…"
+                      loadingLabel={t("common.saving")}
                       disabled={Boolean(busy())}
-                      onClick={() => void saveIdentity()}
+                      onClick={() => void general.saveIdentity()}
                     >
-                      Save
+                      {t("common.save")}
                     </Button>
                   </div>
                 </section>
@@ -690,39 +427,65 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
           </>
         }
         sidebar={
-          <Tabs.List class="settings-modal-nav" aria-label="Server settings sections">
+          <Tabs.List class="settings-modal-nav" aria-label={t("server.settings.sections")}>
             <Tabs.Trigger class="settings-modal-nav-item" value="general">
               <Settings aria-hidden="true" />
-              <span>General</span>
+              <span>{t(sections.general.title)}</span>
             </Tabs.Trigger>
             <Tabs.Trigger class="settings-modal-nav-item" value="members">
               <UsersRound aria-hidden="true" />
-              <span>Members</span>
+              <span>{t(sections.members.title)}</span>
             </Tabs.Trigger>
-            <Show when={props.platform === "darwin"}>
+            <Show when={remoteDesktopSection()}>
               <Tabs.Trigger class="settings-modal-nav-item" value="desktop">
                 <Monitor aria-hidden="true" />
-                <span>Remote desktop</span>
+                <span>{t(sections.desktop.title)}</span>
               </Tabs.Trigger>
             </Show>
             <Show when={props.mcpServers}>
               <Tabs.Trigger class="settings-modal-nav-item" value="mcp">
                 <Blocks aria-hidden="true" />
-                <span>MCP</span>
+                <span>{t(sections.mcp.title)}</span>
+              </Tabs.Trigger>
+            </Show>
+            <Show when={props.storage}>
+              <Tabs.Trigger class="settings-modal-nav-item" value="storage">
+                <HardDrive aria-hidden="true" />
+                <span>{t(sections.storage.title)}</span>
+              </Tabs.Trigger>
+            </Show>
+            <Show when={props.providers}>
+              <Tabs.Trigger class="settings-modal-nav-item" value="providers">
+                <Sparkles aria-hidden="true" />
+                <span>{t(sections.providers.title)}</span>
+              </Tabs.Trigger>
+            </Show>
+            <Show when={props.hostUpdate}>
+              <Tabs.Trigger class="settings-modal-nav-item" value="updates">
+                <RefreshCw aria-hidden="true" />
+                <span>{t(sections.updates.title)}</span>
+              </Tabs.Trigger>
+            </Show>
+            <Show when={props.agentImport}>
+              <Tabs.Trigger class="settings-modal-nav-item" value="import">
+                <Download aria-hidden="true" />
+                <span>{t(sections.import.title)}</span>
               </Tabs.Trigger>
             </Show>
           </Tabs.List>
         }
       >
         <Tabs.Content value="general" class="settings-modal-tab-panel server-settings-panel" data-tab="general">
-          <GeneralPanel />
+          <general.Panel />
         </Tabs.Content>
         <Tabs.Content value="members" class="settings-modal-tab-panel server-settings-panel" data-tab="members">
-          <MembersPanel />
+          <members.Panel />
         </Tabs.Content>
-        <Tabs.Content value="desktop" class="settings-modal-tab-panel server-settings-panel" data-tab="desktop">
-          <DesktopPanel />
-        </Tabs.Content>
+        <Show when={remoteDesktopSection()}>
+          <Tabs.Content value="desktop" class="settings-modal-tab-panel server-settings-panel" data-tab="desktop">
+            <ServerDesktopPanel server={props.server} platform={props.platform} hostStatus={props.hostStatus} />
+          </Tabs.Content>
+        </Show>
         <Show when={props.mcpServers}>
           {(servers) => (
             <Tabs.Content value="mcp" class="settings-modal-tab-panel server-settings-panel" data-tab="mcp">
@@ -731,6 +494,7 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
                 canManage={canManageMcp()}
                 menuMount={modalElement()}
                 loadError={props.mcpLoadError}
+                toolRuntimeNote={props.mcpToolRuntimeNote}
                 onRetryLoad={props.onRetryMcpServers}
                 onDetailChange={setMcpDetail}
                 onSave={(config) => props.onSaveMcpServer?.(config) ?? Promise.resolve()}
@@ -738,818 +502,50 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
                 onSetEnabled={(id, enabled) => props.onSetMcpServerEnabled?.(id, enabled) ?? Promise.resolve()}
                 onTest={(config) =>
                   props.onTestMcpServer?.(config) ??
-                  Promise.resolve({ toolCount: 0, error: "This server cannot be tested here." })
+                  Promise.resolve({ toolCount: 0, error: t("mcp.panel.testUnavailable") })
                 }
               />
             </Tabs.Content>
           )}
         </Show>
-      </SettingsDialogShell>
-
-      <AlertDialog.Root
-        open={Boolean(removeMember())}
-        onOpenChange={(open) => {
-          if (!open && busy() !== `remove:${panels.members.removeId}`)
-            setPanels((state) => {
-              state.members.removeId = null;
-            });
-        }}
-      >
-        <Show when={removeMember()}>
-          {(member) => (
-            <AlertDialog.Portal>
-              <AlertDialog.Overlay class="server-settings-confirm-backdrop">
-                <AlertDialog.Content
-                  class="server-settings-confirm-dialog"
-                  onCloseAutoFocus={(event) => {
-                    event.preventDefault();
-                    queueMicrotask(() => removeMemberTrigger?.focus({ preventScroll: true }));
-                  }}
-                >
-                  <span class="server-settings-confirm-icon" aria-hidden="true">
-                    <Trash2 />
-                  </span>
-                  <AlertDialog.Title>Remove {teamMemberName(member())}?</AlertDialog.Title>
-                  <AlertDialog.Description>
-                    This person will lose access to the server and its shared conversations.
-                  </AlertDialog.Description>
-                  <div class="server-settings-confirm-actions">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      disabled={busy() === `remove:${member().id}`}
-                      onClick={() =>
-                        setPanels((state) => {
-                          state.members.removeId = null;
-                        })
-                      }
-                    >
-                      Cancel
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="destructive"
-                      loading={busy() === `remove:${member().id}`}
-                      loadingLabel="Removing…"
-                      onClick={() =>
-                        void run(`remove:${member().id}`, async () => {
-                          await props.onRemoveMember(member().id);
-                          setPanels((state) => {
-                            state.members.removeId = null;
-                          });
-                        })
-                      }
-                    >
-                      Remove member
-                    </Button>
-                  </div>
-                </AlertDialog.Content>
-              </AlertDialog.Overlay>
-            </AlertDialog.Portal>
+        {/* Mounted only while selected, so the host is measured when the section opens. */}
+        <Show when={props.storage}>
+          {(storage) => (
+            <Tabs.Content value="storage" class="settings-modal-tab-panel server-settings-panel" data-tab="storage">
+              <ServerStoragePanel serverId={props.server.id} {...storage()} />
+            </Tabs.Content>
           )}
         </Show>
-      </AlertDialog.Root>
+        <Show when={props.providers}>
+          {(providers) => (
+            <Tabs.Content value="providers" class="settings-modal-tab-panel server-settings-panel" data-tab="providers">
+              <HostProviderSettingsPanel {...providers()} hostName={props.server.name} selectMount={modalElement()} />
+            </Tabs.Content>
+          )}
+        </Show>
+        <Show when={props.hostUpdate}>
+          {(hostUpdate) => (
+            <Tabs.Content value="updates" class="settings-modal-tab-panel server-settings-panel" data-tab="updates">
+              <ServerUpdatePanel
+                {...hostUpdate()}
+                serverId={props.server.id}
+                hostName={props.server.name}
+                actionsAvailable={actionsAvailable()}
+              />
+            </Tabs.Content>
+          )}
+        </Show>
+        <Show when={props.agentImport}>
+          {(agentImport) => (
+            <Tabs.Content value="import" class="settings-modal-tab-panel server-settings-panel" data-tab="import">
+              <ServerImportPanel {...agentImport()} />
+            </Tabs.Content>
+          )}
+        </Show>
+      </SettingsDialogShell>
+
+      <members.RemoveDialog />
+      <general.LeaveDialog />
     </Tabs.Root>
-  );
-
-  function GeneralPanel() {
-    return (
-      <>
-        <SettingsSection title="Identity">
-          <Input
-            ref={(element) => (logoInput = element)}
-            hidden
-            type="file"
-            aria-label="Server logo"
-            accept="image/png,image/jpeg,image/webp"
-            disabled={!canEditIdentity()}
-            onChange={(event) => {
-              void chooseLogo(event.currentTarget.files?.[0]);
-              event.currentTarget.value = "";
-            }}
-          />
-          <ItemGroup class="settings-modal-card">
-            <Show
-              when={canEditIdentity()}
-              fallback={
-                <Item class="server-settings-readonly-name">
-                  <ItemContent>
-                    <ItemTitle>Server name</ItemTitle>
-                    <ItemDescription>Only the server owner can change this name.</ItemDescription>
-                  </ItemContent>
-                  <ItemActions>
-                    <Text as="span" class="server-settings-readonly-value" variant="body">
-                      {props.server.name}
-                    </Text>
-                  </ItemActions>
-                </Item>
-              }
-            >
-              <Item class="settings-identity-name-row">
-                <ItemContent>
-                  <ItemTitle id="server-settings-name-label">Server name</ItemTitle>
-                  <ItemDescription id="server-settings-name-description">
-                    Shown in invitations and shared spaces.
-                  </ItemDescription>
-                </ItemContent>
-                <ItemActions class="settings-identity-name-control" data-invalid={visibleNameError() ? "" : undefined}>
-                  <Input
-                    ref={(element) => (nameInput = element)}
-                    class={
-                      panels.identity.nameShaking
-                        ? "settings-identity-name-input is-shaking"
-                        : "settings-identity-name-input"
-                    }
-                    id="server-settings-name"
-                    size="md"
-                    maxlength={INPUT_LIMITS.serverName}
-                    placeholder="e.g. Design studio"
-                    value={panels.identity.name}
-                    aria-labelledby="server-settings-name-label"
-                    aria-describedby={
-                      visibleNameError() ? "server-settings-name-error" : "server-settings-name-description"
-                    }
-                    aria-invalid={visibleNameError() ? "true" : undefined}
-                    onValueChange={updateDraftName}
-                    onBlur={() => {
-                      if (trimmedName() === panels.identity.savedName) return;
-                      setPanels((state) => {
-                        state.identity.nameTouched = true;
-                      });
-                      if (nameError()) restartNameShake();
-                    }}
-                    onAnimationEnd={() =>
-                      setPanels((state) => {
-                        state.identity.nameShaking = false;
-                      })
-                    }
-                    onKeyDown={(event) => {
-                      if (event.key !== "Enter" || event.isComposing) return;
-                      event.preventDefault();
-                      void saveIdentity();
-                    }}
-                  />
-                  <span
-                    id="server-settings-name-error"
-                    class="ui-field-error settings-identity-name-error"
-                    role="alert"
-                    aria-hidden={visibleNameError() ? undefined : "true"}
-                  >
-                    {visibleNameError() ?? ""}
-                  </span>
-                </ItemActions>
-              </Item>
-            </Show>
-            <Item class="settings-identity-image-row">
-              <ItemContent>
-                <ItemTitle>Server logo</ItemTitle>
-                <ItemDescription class={panels.identity.logoError ? "server-settings-item-error" : undefined}>
-                  {panels.identity.logoError ??
-                    (canEditIdentity()
-                      ? "Shown to everyone who connects."
-                      : "Only the server owner can change this logo.")}
-                </ItemDescription>
-              </ItemContent>
-              <ItemActions class="settings-identity-image-control">
-                <Show
-                  when={canEditIdentity()}
-                  fallback={
-                    <ServerLogo name={panels.identity.name || props.server.name} url={panels.identity.logoUrl} />
-                  }
-                >
-                  <div class="settings-identity-image-picker ui-removable-image">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="icon-lg"
-                      class="settings-identity-image-trigger server-settings-logo-trigger"
-                      aria-label={panels.identity.logoUrl ? "Edit server logo" : "Add server logo"}
-                      onClick={() => logoInput?.click()}
-                    >
-                      <Show
-                        when={panels.identity.logoUrl}
-                        fallback={<Image class="server-settings-logo-placeholder" aria-hidden="true" />}
-                      >
-                        {(logoUrl) => <ServerLogo name={panels.identity.name || props.server.name} url={logoUrl()} />}
-                      </Show>
-                    </Button>
-                    <Show when={panels.identity.logoUrl}>
-                      <ImageRemoveButton
-                        class="server-settings-logo-remove"
-                        label="Remove server logo"
-                        onClick={() => {
-                          setPanels((state) => {
-                            state.identity.editing = true;
-                            state.identity.logoUrl = null;
-                            state.identity.logo = null;
-                            state.identity.logoError = null;
-                          });
-                        }}
-                      />
-                    </Show>
-                  </div>
-                </Show>
-              </ItemActions>
-            </Item>
-          </ItemGroup>
-        </SettingsSection>
-        <SettingsSection title="Access">
-          <ItemGroup class="settings-modal-card">
-            <SwitchField
-              class="server-settings-publish-setting"
-              size="default"
-              checked={published()}
-              disabled={!local() || !configured() || Boolean(busy())}
-              onChange={(value) => void run("publish", () => props.onSetPublished(value))}
-              label={local() ? "Publish this server" : "Server is published"}
-              description={accessDescription()}
-            />
-            <Item class="server-settings-address-setting">
-              <ItemContent>
-                <ItemTitle>Server address</ItemTitle>
-                <ItemDescription>Use this address to connect to the server.</ItemDescription>
-              </ItemContent>
-              <Show
-                when={address()}
-                fallback={
-                  <Badge tone="neutral" size="md" shape="pill">
-                    Private
-                  </Badge>
-                }
-              >
-                {(serverAddress) => (
-                  <CopyButton
-                    value={serverAddress()}
-                    label={truncateMiddle(serverAddress(), 31)}
-                    copiedLabel="Copied"
-                    aria-label="Copy server address"
-                    title={serverAddress()}
-                    onCopyError={showCopyError}
-                    class="server-settings-address-control"
-                  />
-                )}
-              </Show>
-            </Item>
-          </ItemGroup>
-        </SettingsSection>
-        <SettingsSection title="Notifications">
-          <ItemGroup class="settings-modal-card">
-            <SwitchField
-              class="server-settings-mute-setting"
-              size="default"
-              checked={props.server.notificationsMuted}
-              disabled={Boolean(busy())}
-              onChange={(value) => void run("mute", () => props.onSetMuted(value))}
-              label="Mute notifications"
-              description="Stop desktop notifications and MacBook notch updates from this server."
-            />
-          </ItemGroup>
-        </SettingsSection>
-      </>
-    );
-  }
-
-  function MembersPanel() {
-    return (
-      <>
-        <Show when={!configured() || !published()}>
-          <Alert class="server-settings-members-alert" tone="warning" role="status">
-            <AlertIcon>
-              <ShieldCheck />
-            </AlertIcon>
-            <AlertContent>
-              <AlertTitle>{configured() ? "Invitations are paused" : "Server setup is required"}</AlertTitle>
-              <AlertDescription>
-                {configured()
-                  ? "Publish the server in General to invite new people."
-                  : "Save the server identity in General first."}
-              </AlertDescription>
-            </AlertContent>
-          </Alert>
-        </Show>
-        <Show when={canManage()}>{inviteComposer()}</Show>
-        <SettingsSection
-          class="server-settings-members-section"
-          title="Server members"
-          description={<>{activeMembers().length} members</>}
-          actions={
-            <label class="server-settings-search">
-              <Search aria-hidden="true" />
-              <span class="sr-only">Search members</span>
-              <Input
-                size="sm"
-                type="search"
-                placeholder="Search members"
-                value={panels.members.search}
-                onValueChange={(value) =>
-                  setPanels((state) => {
-                    state.members.search = value;
-                  })
-                }
-              />
-            </label>
-          }
-        >
-          <ItemGroup class="settings-modal-card server-settings-members-list" data-testid="server-members-list">
-            <Show
-              when={filteredMembers().length > 0}
-              fallback={
-                <Item class="server-settings-empty-row">
-                  <ItemContent>
-                    <ItemDescription>No members match this search.</ItemDescription>
-                  </ItemContent>
-                </Item>
-              }
-            >
-              <For each={filteredMembers()}>{(member) => memberRow(member)}</For>
-            </Show>
-          </ItemGroup>
-        </SettingsSection>
-        <Show when={canManage() && inactiveLegacyMembers().length > 0}>
-          <SettingsSection title="Inactive members" description="Remove an inactive member before inviting them again.">
-            <ItemGroup class="settings-modal-card server-settings-members-list">
-              <For each={inactiveLegacyMembers()}>{(member) => memberRow(member)}</For>
-            </ItemGroup>
-          </SettingsSection>
-        </Show>
-        <Show when={canManage()}>{pendingInvites()}</Show>
-      </>
-    );
-  }
-
-  function inviteComposer() {
-    return (
-      <SlidingTabs.Root {...inviteTabsProps}>
-        <SettingsSection
-          class="server-settings-invite-section"
-          title="Invite people"
-          description="Invitations can be used once and expire after 24 hours."
-          actions={
-            <SlidingTabs.List aria-label="Invitation method">
-              <SlidingTabs.Trigger value="email">Email</SlidingTabs.Trigger>
-              <SlidingTabs.Trigger value="link">Invite link</SlidingTabs.Trigger>
-            </SlidingTabs.List>
-          }
-        >
-          <Card class="server-settings-invite-card">
-            <div class="server-settings-invite-composer">
-              <SlidingTabs.ContentSlot>
-                <SlidingTabs.Content value="email" class="server-settings-invite-mode-panel">
-                  <Field
-                    class="server-settings-invite-email-field"
-                    label="Email address"
-                    error={panels.invite.emailError}
-                  >
-                    <Input
-                      size="md"
-                      type="email"
-                      autocomplete="email"
-                      maxlength={INPUT_LIMITS.email}
-                      disabled={!published()}
-                      placeholder="person@company.com"
-                      value={panels.invite.email}
-                      onValueChange={(value) =>
-                        setPanels((state) => {
-                          state.invite.email = value;
-                          state.invite.emailError = null;
-                        })
-                      }
-                      onBlur={() =>
-                        panels.invite.email &&
-                        !normalizeEmailAddress(panels.invite.email) &&
-                        setPanels((state) => {
-                          state.invite.emailError = "Enter a valid email address.";
-                        })
-                      }
-                    />
-                  </Field>
-                </SlidingTabs.Content>
-                <SlidingTabs.Content value="link" class="server-settings-invite-mode-panel">
-                  <Input
-                    ref={(element) => (inviteLinkInput = element)}
-                    class="server-settings-invite-link-input t-text-swap"
-                    size="md"
-                    readonly
-                    aria-label="Invitation link"
-                    placeholder={INVITE_LINK_PLACEHOLDER}
-                    value={panels.invite.link}
-                    title={panels.invite.link || undefined}
-                    onFocus={(event) => event.currentTarget.select()}
-                  />
-                </SlidingTabs.Content>
-              </SlidingTabs.ContentSlot>
-              <Select<string>
-                options={ROLE_OPTIONS}
-                value={roleLabel(panels.invite.role)}
-                disabled={!published()}
-                placement="bottom-end"
-                onChange={(value) =>
-                  value &&
-                  setPanels((state) => {
-                    state.invite.role = value === "Admin" ? "admin" : "member";
-                  })
-                }
-                itemComponent={(item) => <SelectItem item={item.item}>{item.item.rawValue}</SelectItem>}
-              >
-                <SelectTrigger class="server-settings-role-select" size="sm" aria-label="Invitation role">
-                  <SelectValue<string>>{(state) => state.selectedOption()}</SelectValue>
-                </SelectTrigger>
-                <SelectContent />
-              </Select>
-              <Show
-                when={
-                  panels.invite.mode === "link" && panels.invite.result && !panels.invite.result.email
-                    ? panels.invite.result
-                    : null
-                }
-                fallback={
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="default"
-                    loading={busy() === "invite"}
-                    disabled={!canInvite()}
-                    onClick={() => void createInvite()}
-                  >
-                    {panels.invite.mode === "email" ? "Send invite" : "Create link"}
-                  </Button>
-                }
-              >
-                {(result) => (
-                  <div class="server-settings-invite-share">
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      aria-label="Create new invitation link"
-                      title="Create new link"
-                      loading={busy() === "invite"}
-                      disabled={!canInvite()}
-                      onClick={() => void createInvite()}
-                    >
-                      <RefreshCw />
-                      New link
-                    </Button>
-                    <Show when={!inviteUsed() && !inviteExpired()}>
-                      <CopyButton
-                        class="server-settings-invite-copy"
-                        value={result().inviteUrl}
-                        label="Copy link"
-                        copiedLabel="Copied"
-                        size="sm"
-                        variant="default"
-                        onCopyError={showCopyError}
-                      />
-                      <Button
-                        size="icon-sm"
-                        variant="default"
-                        aria-label="Show invitation QR code"
-                        aria-expanded={panels.invite.showQr ? "true" : "false"}
-                        onClick={() =>
-                          setPanels((state) => {
-                            state.invite.showQr = !state.invite.showQr;
-                          })
-                        }
-                      >
-                        <ScanLine />
-                      </Button>
-                    </Show>
-                  </div>
-                )}
-              </Show>
-            </div>
-            <Show
-              when={
-                panels.invite.showQr &&
-                !inviteUsed() &&
-                !inviteExpired() &&
-                panels.invite.mode === "link" &&
-                panels.invite.result
-              }
-            >
-              {(result) => (
-                <div class="server-settings-invite-qr">
-                  <QrCode value={result().inviteUrl} label="Invitation QR code" />
-                  <Text variant="caption" tone="muted">
-                    Scan this code in OpenBot Mobile to join this server.
-                  </Text>
-                </div>
-              )}
-            </Show>
-            <Show when={panels.invite.result}>
-              {(result) => (
-                <Alert class="server-settings-invite-result" tone="success" role="status">
-                  <AlertIcon>
-                    <Check />
-                  </AlertIcon>
-                  <AlertContent>
-                    <AlertTitle>
-                      {inviteUsed()
-                        ? "Invitation accepted"
-                        : inviteExpired()
-                          ? "Invitation expired"
-                          : result().email
-                            ? "Invitation sent"
-                            : "Invitation link ready"}
-                    </AlertTitle>
-                    <AlertDescription>
-                      {inviteUsed()
-                        ? "The member joined this server. Create a new link to invite someone else."
-                        : inviteExpired()
-                          ? "Create a new link to invite someone."
-                          : result().email || "Share the link or scan the QR code in OpenBot Mobile."}
-                    </AlertDescription>
-                  </AlertContent>
-                </Alert>
-              )}
-            </Show>
-          </Card>
-        </SettingsSection>
-      </SlidingTabs.Root>
-    );
-  }
-
-  function memberRow(member: TeamPresenceMember) {
-    return (
-      <Item class="server-settings-member-row" data-disabled={member.disabled ? "" : undefined}>
-        <ItemContent>
-          <ItemTitle>{teamMemberName(member)}</ItemTitle>
-          <ItemDescription class="server-settings-member-meta">{member.email ?? member.username}</ItemDescription>
-        </ItemContent>
-        <ItemActions class="server-settings-member-actions">
-          <Show when={member.role !== "owner"} fallback={<Badge tone="accent">Owner</Badge>}>
-            <Text variant="label-sm" tone="secondary">
-              {roleLabel(member.role)}
-            </Text>
-            <Show when={canManage() && actionsAvailable()}>
-              <MemberActionsMenu
-                member={member}
-                mount={modalElement()}
-                onRoleChange={(role) =>
-                  void run(`member:${member.id}`, () => props.onUpdateMember({ memberId: member.id, role }))
-                }
-                onRemove={(trigger) => {
-                  removeMemberTrigger = trigger;
-                  setPanels((state) => {
-                    state.members.removeId = member.id;
-                  });
-                }}
-              />
-            </Show>
-          </Show>
-        </ItemActions>
-      </Item>
-    );
-  }
-
-  function pendingInvites() {
-    return (
-      <SettingsSection
-        title="Pending invitations"
-        actions={
-          <Text variant="caption" tone="muted">
-            {activeInvites().length} pending
-          </Text>
-        }
-      >
-        <ItemGroup class="settings-modal-card server-settings-invites-list">
-          <Show
-            when={activeInvites().length > 0}
-            fallback={
-              <Item class="server-settings-empty-row">
-                <ItemContent>
-                  <ItemDescription>No pending invitations.</ItemDescription>
-                </ItemContent>
-              </Item>
-            }
-          >
-            <For each={activeInvites()}>
-              {(invite) => (
-                <Item class="server-settings-invite-row">
-                  <ItemContent>
-                    <ItemTitle>{invite.email ?? "Private invitation link"}</ItemTitle>
-                    <ItemDescription>
-                      {roleLabel(invite.role)} · Expires {formatDate(invite.expiresAt)}
-                    </ItemDescription>
-                  </ItemContent>
-                  <ItemActions>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="destructive-ghost"
-                      disabled={!actionsAvailable() || Boolean(busy())}
-                      onClick={() => void run(`invite:${invite.id}`, () => props.onRevokeInvite(invite.id))}
-                    >
-                      Revoke
-                    </Button>
-                  </ItemActions>
-                </Item>
-              )}
-            </For>
-          </Show>
-        </ItemGroup>
-      </SettingsSection>
-    );
-  }
-
-  function DesktopPanel() {
-    return (
-      <SettingsSection title="Remote desktop access">
-        <Show when={props.hostStatus?.remoteDesktopScreenRecordingDenied}>
-          <Alert tone="warning" role="status">
-            <AlertIcon>
-              <Monitor />
-            </AlertIcon>
-            <AlertContent>
-              <AlertTitle>OpenBot may not record this screen</AlertTitle>
-              <AlertDescription>
-                A member asked for this desktop and got nothing to look at. Open System Settings → Privacy &amp;
-                Security → Screen Recording, turn on OpenBot, then check again.
-              </AlertDescription>
-            </AlertContent>
-            <AlertActions>
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                loading={busy() === "screen-recording"}
-                onClick={() => void run("screen-recording", props.onOpenScreenRecordingSettings)}
-              >
-                Open System Settings
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                variant="ghost"
-                loading={busy() === "screen-recording-recheck"}
-                onClick={() => void run("screen-recording-recheck", props.onRecheckScreenRecording)}
-              >
-                Check again
-              </Button>
-            </AlertActions>
-          </Alert>
-        </Show>
-        <ItemGroup class="settings-modal-card server-settings-desktop-card">
-          <Show when={local()} fallback={remoteDesktopConnection()}>
-            <Item size="spacious">
-              <ItemMedia class="server-settings-desktop-icon">
-                <Monitor />
-              </ItemMedia>
-              <ItemContent>
-                <ItemTitle>OpenBot Remote Host Gateway</ItemTitle>
-                <ItemDescription class="server-settings-desktop-description">
-                  Every active server member can control this host. There is no separate remote desktop password.
-                </ItemDescription>
-              </ItemContent>
-              <ItemActions class="server-settings-desktop-meta">
-                <Badge tone={props.hostStatus?.remoteDesktopReady ? "success" : "warning"} shape="pill">
-                  {props.hostStatus?.remoteDesktopReady ? "Service ready" : "Host component not installed"}
-                </Badge>
-                <Text as="span" variant="caption" tone="muted">
-                  Unattended: {props.hostStatus?.remoteDesktopUnattended ? "enabled" : "not available"} · Active
-                  sessions: {props.hostStatus?.remoteDesktopActiveSessions ?? 0}/
-                  {props.hostStatus?.remoteDesktopMaxSessions ?? 4}
-                </Text>
-              </ItemActions>
-            </Item>
-          </Show>
-        </ItemGroup>
-      </SettingsSection>
-    );
-  }
-
-  function remoteDesktopConnection() {
-    const status = () => {
-      const server = props.server;
-      if (server.issue) {
-        return {
-          title:
-            server.issue.code === "client_update_required"
-              ? "Client update required"
-              : server.issue.code === "host_update_required"
-                ? "Host update required"
-                : "Connection unavailable",
-          message: server.issue.message,
-        };
-      }
-      if (server.state !== "online") {
-        return { title: "Host is offline", message: "Reconnect to the host before you open its desktop." };
-      }
-      if (!serverSupportsCapability(server, "remote-desktop")) {
-        return { title: "Host update required", message: "Update OpenBot on the host to use remote control." };
-      }
-      return server.remoteDesktopAvailable
-        ? { title: "Service available", message: "WebRTC control is available for all active members." }
-        : {
-            title: "Service not ready",
-            message:
-              "Start Remote Control to check the host components and permissions. The host will report any setup error.",
-          };
-    };
-    return (
-      <Item size="spacious">
-        <ItemMedia class="server-settings-desktop-icon">
-          <Monitor />
-        </ItemMedia>
-        <ItemContent>
-          <ItemTitle>Remote control</ItemTitle>
-          <ItemDescription class="server-settings-desktop-description">{status().message}</ItemDescription>
-          <Badge
-            class="server-settings-desktop-status"
-            tone={status().title === "Service available" ? "success" : "warning"}
-            shape="pill"
-          >
-            {status().title}
-          </Badge>
-        </ItemContent>
-        <ItemActions class="server-settings-desktop-hint">
-          <Text as="span" variant="caption" tone="muted">
-            Start Remote Control from the monitor button in the server header.
-          </Text>
-        </ItemActions>
-      </Item>
-    );
-  }
-
-  function accessDescription() {
-    if (!local())
-      return published()
-        ? "The host is online. Publication is controlled by its owner."
-        : "The host is offline. Publication is controlled by its owner.";
-    if (!configured()) return "Save the server identity before publishing.";
-    return published()
-      ? "Reachable online. Only invited people can sign in."
-      : "Not reachable online. Existing members and invitations remain.";
-  }
-}
-
-function ServerLogo(props: { name: string; url: string | null }) {
-  const [failed, setFailed] = createSignal(false);
-  createEffect(
-    () => props.url,
-    () => {
-      setFailed(false);
-    },
-  );
-  return (
-    <span class="server-settings-logo" aria-hidden="true">
-      <Show when={!failed() ? props.url : null} fallback={<span>{initials(props.name)}</span>}>
-        {(url) => <img src={url()} alt="" draggable={false} onError={() => setFailed(true)} />}
-      </Show>
-    </span>
-  );
-}
-
-function MemberActionsMenu(props: {
-  member: TeamPresenceMember;
-  mount: HTMLElement | undefined;
-  onRoleChange: (role: InviteRole) => void;
-  onRemove: (trigger: HTMLElement) => void;
-}) {
-  const name = () => teamMemberName(props.member);
-  let triggerElement: HTMLElement | undefined;
-  return (
-    <DropdownMenu.Root placement="bottom-end" gutter={4} modal={false}>
-      <DropdownMenu.Trigger
-        ref={(element) => (triggerElement = element)}
-        class={`${buttonVariants({ variant: "ghost", size: "icon-sm" })} ui-icon-button server-settings-member-menu-trigger`}
-        aria-label={`Actions for ${name()}`}
-      >
-        <Ellipsis aria-hidden="true" />
-      </DropdownMenu.Trigger>
-      <DropdownMenu.Portal mount={props.mount}>
-        <DropdownMenu.Content class="server-settings-member-menu">
-          <Show when={!props.member.disabled}>
-            <DropdownMenu.Item onSelect={() => props.onRoleChange(props.member.role === "admin" ? "member" : "admin")}>
-              {props.member.role === "admin" ? <UserRound aria-hidden="true" /> : <ShieldCheck aria-hidden="true" />}
-              {props.member.role === "admin" ? "Make member" : "Make admin"}
-            </DropdownMenu.Item>
-            <DropdownMenu.Separator />
-          </Show>
-          <DropdownMenu.Item
-            class="ui-action-menu-danger"
-            onSelect={() => triggerElement && props.onRemove(triggerElement)}
-          >
-            <Trash2 aria-hidden="true" />
-            Remove member
-          </DropdownMenu.Item>
-        </DropdownMenu.Content>
-      </DropdownMenu.Portal>
-    </DropdownMenu.Root>
-  );
-}
-
-function roleLabel(role: TeamRole): "Owner" | "Admin" | "Member" {
-  if (role === "owner") return "Owner";
-  return role === "admin" ? "Admin" : "Member";
-}
-
-function formatDate(value: string): string {
-  return new Date(value).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
-}
-
-function initials(value: string): string {
-  const parts = value.trim().split(/\s+/u).filter(Boolean);
-  return (
-    (parts.length > 1 ? `${parts[0]?.[0] ?? ""}${parts[1]?.[0] ?? ""}` : value.trim().slice(0, 2)).toUpperCase() || "OB"
   );
 }

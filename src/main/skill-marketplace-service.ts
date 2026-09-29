@@ -1,29 +1,39 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import type {
   AgentSummary,
+  AgentTemplateSkill,
   InstalledSkill,
   InstallSkillInput,
   MarketplaceAgentSkill,
   MarketplaceSkillDetail,
   MarketplaceSkillPage,
   MarketplaceSkillQuery,
-  MarketplaceSkillSummary,
   SetEnabledSkillInput,
   SkillPackagePreview,
   SkillSubmission,
   SubmitSkillInput,
   UninstallSkillInput,
 } from "@openbot/contracts/ipc";
-import { isSkillCategory } from "@openbot/contracts/ipc";
+import {
+  AGENT_TEMPLATE_LIMITS,
+  decodeMarketplaceSkillDetail,
+  decodeMarketplaceSkillPage,
+  isSkillCategory,
+  marketplaceQueryParams,
+  SKILL_DESCRIPTION_MAX_LENGTH,
+} from "@openbot/contracts/ipc";
 import { isBoolean, isDynamicRecord, isNumber, isOneOf, isString } from "@openbot/contracts/runtime-values";
+import { sourceText } from "@openbot/i18n/source";
 import { parse as parseYaml } from "yaml";
+import { writeFileAtomically } from "../backend/atomic-json-file";
 import type { CentralAuthManager } from "./central-auth-manager";
 import type { LocalSkillLibrary } from "./local-skill-library";
-import { listManagedSkillsForChat } from "./managed-skill-service";
-import { archiveDirectory, inspectArchive, normalizedFiles } from "./skill-package";
+import { listManagedSkillsForChat, MANAGED_SKILL_FOLDERS } from "./managed-skill-service";
+import { listFolderSkills } from "./skill-folder-discovery";
+import { archiveDirectory, inspectArchive, inspectSkillMarkdown, normalizedFiles } from "./skill-package";
 
 const DRAFT_LIFETIME_MS = 30 * 60 * 1000;
 
@@ -61,14 +71,12 @@ export class SkillMarketplaceService {
   ) {}
 
   async list(query: MarketplaceSkillQuery = {}): Promise<MarketplaceSkillPage> {
-    const params = new URLSearchParams();
-    if (query.query) params.set("query", query.query);
-    if (query.category) params.set("category", query.category);
-    if (query.featured) params.set("featured", "true");
-    if (query.sort) params.set("sort", query.sort);
-    if (query.cursor) params.set("cursor", query.cursor);
-    if (query.limit) params.set("limit", String(query.limit));
-    const page = await this.auth.requestAuthorized(`/v1/skills/?${params}`, { method: "GET" }, decodeSkillPage);
+    const params = marketplaceQueryParams(query);
+    const page = await this.auth.requestAuthorized(
+      `/v1/skills/?${params}`,
+      { method: "GET" },
+      decodeMarketplaceSkillPage,
+    );
     return {
       ...page,
       skills: page.skills.map((skill) => ({
@@ -84,7 +92,7 @@ export class SkillMarketplaceService {
     const detail = await this.auth.requestAuthorized(
       `/v1/skills/${encodeURIComponent(skillId)}`,
       { method: "GET" },
-      decodeSkillDetail,
+      decodeMarketplaceSkillDetail,
     );
     return {
       ...detail,
@@ -113,7 +121,7 @@ export class SkillMarketplaceService {
     if (!isSkillCategory(input.category)) throw new Error("Unknown skill category.");
     const draft = this.#drafts.get(input.draftId);
     if (!draft || Date.now() - draft.createdAt > DRAFT_LIFETIME_MS)
-      throw new Error("The selected skill package expired. Choose it again.");
+      throw new Error(sourceText("error.skill.draftExpired"));
     const form = new FormData();
     form.set("category", input.category);
     if (input.showCreatorAvatar !== undefined) form.set("showCreatorAvatar", String(input.showCreatorAvatar));
@@ -151,6 +159,7 @@ export class SkillMarketplaceService {
         toInstalledSkill(entry, availableVersion, state, await installedSkillDescription(agent.workspacePath, entry)),
       );
     }
+    installed.push(...(await listFolderSkills(agent, lockedSlugs(lock))));
     return installed.sort((a, b) => a.name.localeCompare(b.name));
   }
 
@@ -158,6 +167,7 @@ export class SkillMarketplaceService {
     const agent = this.requireAgent(agentId);
     const lock = await readLock(agent.workspacePath);
     const installed: InstalledSkill[] = await listManagedSkillsForChat(agent);
+    for (const skill of await listFolderSkills(agent, lockedSlugs(lock))) if (!skill.problem) installed.push(skill);
     for (const entry of Object.values(lock.skills)) {
       if (entry.enabled === false) continue;
       installed.push(
@@ -173,6 +183,12 @@ export class SkillMarketplaceService {
   }
 
   async install(input: InstallSkillInput): Promise<InstalledSkill> {
+    // A pinned version is served by the versions endpoint, which a local skill has no entry in: a
+    // local skill is held on this computer and has no published version to ask for.
+    if (input.versionId) {
+      if (input.skillId.startsWith("local-skill-")) throw new Error(sourceText("error.skill.localHasNoVersion"));
+      return this.installVersion({ ...input, versionId: input.versionId });
+    }
     const agent = this.requireAgent(input.agentId);
     const detail = await this.get(input.skillId);
     const bundle = input.skillId.startsWith("local-skill-")
@@ -191,7 +207,7 @@ export class SkillMarketplaceService {
     const detail = await this.auth.requestAuthorized(
       `/v1/skills/${encodeURIComponent(input.skillId)}/versions/${encodeURIComponent(input.versionId)}`,
       { method: "GET" },
-      decodeSkillDetail,
+      decodeMarketplaceSkillDetail,
     );
     const bundle = await this.auth.downloadAuthorized(
       `/v1/skills/${encodeURIComponent(input.skillId)}/versions/${encodeURIComponent(input.versionId)}/content`,
@@ -205,28 +221,58 @@ export class SkillMarketplaceService {
     const result: MarketplaceAgentSkill[] = [];
     for (const entry of Object.values(lock.skills)) {
       if (entry.enabled === false) continue;
-      if (entry.skillId.startsWith("local-skill-"))
-        throw new Error("Publish local skills separately before publishing this agent.");
-      const state = await installedState(agent.workspacePath, entry);
-      if (state !== "installed") throw new Error(`${entry.name} has local changes or needs repair before publishing.`);
-      let versionId = entry.versionId;
-      if (!versionId) {
-        const detail = await this.get(entry.skillId);
-        if (detail.version !== entry.version)
-          throw new Error(
-            `${entry.name} was installed before exact-version tracking. Update or repair it before publishing.`,
-          );
-        versionId = detail.versionId;
-      }
-      result.push({
-        skillId: entry.skillId,
-        versionId,
-        slug: entry.slug,
-        name: entry.name,
-        version: entry.version,
-      });
+      if (entry.skillId.startsWith("local-skill-")) throw new Error(sourceText("error.skill.publishLocalFirst"));
+      result.push(await this.publishedReference(agent, entry));
     }
     return result.sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /**
+   * The skills an agent template carries. A marketplace skill is a reference to its exact version;
+   * a local or workspace skill is its `SKILL.md` text only, never its other files.
+   */
+  async listTemplateSkills(agentId: string): Promise<AgentTemplateSkill[]> {
+    const agent = this.requireAgent(agentId);
+    const lock = await readLock(agent.workspacePath);
+    const result: AgentTemplateSkill[] = [];
+    for (const entry of Object.values(lock.skills)) {
+      if (entry.enabled === false) continue;
+      if (entry.skillId.startsWith("local-skill-")) {
+        const [directory] = targetDirectories(agent.workspacePath, entry.slug);
+        result.push(await embeddedSkill(join(directory, "SKILL.md"), entry.name));
+      } else result.push({ kind: "marketplace", ...(await this.publishedReference(agent, entry)) });
+    }
+    for (const skill of await listFolderSkills(agent, lockedSlugs(lock))) {
+      if (skill.problem || !skill.location) continue;
+      result.push(await embeddedSkill(join(agent.workspacePath, skill.location, "SKILL.md"), skill.name));
+    }
+    // An install writes each skill to a folder named by its slug, so two skills with one slug would
+    // make every install of the template fail.
+    const slugs = new Set<string>();
+    for (const skill of result) {
+      if (slugs.has(skill.slug)) throw new Error(sourceText("error.skill.duplicateSlug", { slug: skill.slug }));
+      slugs.add(skill.slug);
+    }
+    return result.sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  private async publishedReference(agent: AgentSummary, entry: LockEntry): Promise<MarketplaceAgentSkill> {
+    const state = await installedState(agent.workspacePath, entry);
+    if (state !== "installed") throw new Error(sourceText("error.skill.publishNeedsRepair", { name: entry.name }));
+    let versionId = entry.versionId;
+    if (!versionId) {
+      const detail = await this.get(entry.skillId);
+      if (detail.version !== entry.version)
+        throw new Error(sourceText("error.skill.publishUntracked", { name: entry.name }));
+      versionId = detail.versionId;
+    }
+    return {
+      skillId: entry.skillId,
+      versionId,
+      slug: entry.slug,
+      name: entry.name,
+      version: entry.version,
+    };
   }
 
   private serialize<T>(agentId: string, write: () => Promise<T>): Promise<T> {
@@ -257,23 +303,21 @@ export class SkillMarketplaceService {
     bundle: Uint8Array,
     replaceModified = false,
   ): Promise<InstalledSkill> {
-    if (sha256(bundle) !== detail.bundleSha256)
-      throw new Error("The downloaded skill did not match its signed catalog record.");
+    if (sha256(bundle) !== detail.bundleSha256) throw new Error(sourceText("error.skill.bundleMismatch"));
     const archive = inspectArchive(bundle);
-    if (archive.slug !== detail.slug) throw new Error("The downloaded skill metadata does not match the catalog.");
+    if (archive.slug !== detail.slug) throw new Error(sourceText("error.skill.metadataMismatch"));
     const files = normalizedFiles(bundle);
     await assertSkillPaths(agent.workspacePath, detail.slug);
     const lock = await readLock(agent.workspacePath);
     const existing = lock.skills[detail.id];
     if (Object.values(lock.skills).some((entry) => entry.slug === detail.slug && entry.skillId !== detail.id))
-      throw new Error("Another installed skill uses this folder name.");
+      throw new Error(sourceText("error.skill.folderTaken"));
     if (!existing && Object.keys(lock.skills).length >= INPUT_LIMITS.agentSkills) {
-      throw new Error(`An agent can have up to ${INPUT_LIMITS.agentSkills} skills.`);
+      throw new Error(sourceText("error.skill.tooManySkills", { limit: INPUT_LIMITS.agentSkills }));
     }
     if (existing) {
       const state = await installedState(agent.workspacePath, existing);
-      if (state === "modified" && !replaceModified)
-        throw new Error("This skill has local changes. Confirm replacement to continue.");
+      if (state === "modified" && !replaceModified) throw new Error(sourceText("error.skill.replaceModified"));
     }
     for (const target of [
       ...targetDirectories(agent.workspacePath, detail.slug),
@@ -282,7 +326,8 @@ export class SkillMarketplaceService {
       const owner = Object.values(lock.skills).find(
         (entry) => target.endsWith(`/${entry.slug}`) || target.endsWith(`\\${entry.slug}`),
       );
-      if (!owner && (await pathExists(target))) throw new Error(`An unmanaged skill already exists at ${target}.`);
+      if (!owner && (await pathExists(target)))
+        throw new Error(sourceText("error.skill.unmanagedExists", { path: target }));
     }
     const receiptId = existing?.receiptId ?? randomUUID();
     const stayDisabled = existing?.enabled === false;
@@ -325,7 +370,7 @@ export class SkillMarketplaceService {
     if (!entry) return;
     await assertSkillPaths(agent.workspacePath, entry.slug);
     if ((await installedState(agent.workspacePath, entry)) === "modified" && !input.removeModified) {
-      throw new Error("This skill has local changes. Confirm removal to delete them.");
+      throw new Error(sourceText("error.skill.removeModified"));
     }
     for (const target of [
       ...(entry.enabled === false ? [] : targetDirectories(agent.workspacePath, entry.slug)),
@@ -345,7 +390,7 @@ export class SkillMarketplaceService {
     const agent = this.requireAgent(input.agentId);
     const lock = await readLock(agent.workspacePath);
     const entry = lock.skills[input.skillId];
-    if (!entry) throw new Error("Skill not found.");
+    if (!entry) throw new Error(sourceText("error.skill.notFound"));
     await assertSkillPaths(agent.workspacePath, entry.slug);
     const currentlyEnabled = entry.enabled !== false;
     if (currentlyEnabled === input.enabled) {
@@ -358,16 +403,14 @@ export class SkillMarketplaceService {
     }
     if (!input.enabled) {
       const state = await installedState(agent.workspacePath, entry);
-      if (state === "modified")
-        throw new Error("This skill has local changes. Save or reconcile both provider copies before disabling it.");
-      if (state === "needs-repair") throw new Error("This skill needs repair before it can be disabled.");
+      if (state === "modified") throw new Error(sourceText("error.skill.disableModified"));
+      if (state === "needs-repair") throw new Error(sourceText("error.skill.disableNeedsRepair"));
     }
     if (input.enabled) {
       const stash = disabledDirectory(agent.workspacePath, entry.slug);
-      if (!(await pathExists(stash))) throw new Error("This skill needs repair before it can be enabled.");
+      if (!(await pathExists(stash))) throw new Error(sourceText("error.skill.enableNeedsRepair"));
       for (const target of targetDirectories(agent.workspacePath, entry.slug)) {
-        if (await pathExists(target))
-          throw new Error("This skill's provider folder is occupied. Move or reconcile its files before enabling it.");
+        if (await pathExists(target)) throw new Error(sourceText("error.skill.providerFolderOccupied"));
       }
       const files = await readSkillFiles(stash);
       await replaceTargets(agent.workspacePath, entry.slug, files);
@@ -375,14 +418,15 @@ export class SkillMarketplaceService {
       delete entry.enabled;
     } else {
       const live = targetDirectories(agent.workspacePath, entry.slug);
-      const source = (await pathExists(live[0])) ? live[0] : (await pathExists(live[1])) ? live[1] : null;
+      const [primary, fallback] = live;
+      const source = (await pathExists(primary)) ? primary : (await pathExists(fallback)) ? fallback : null;
       const stash = disabledDirectory(agent.workspacePath, entry.slug);
       if (source) {
         await mkdir(dirname(stash), { recursive: true, mode: 0o700 });
         if (await pathExists(stash)) await rm(stash, { recursive: true, force: true });
         await rename(source, stash);
       } else if (!(await pathExists(stash))) {
-        throw new Error("This skill needs repair before it can be disabled.");
+        throw new Error(sourceText("error.skill.disableNeedsRepair"));
       }
       for (const target of live) await rm(target, { recursive: true, force: true });
       entry.enabled = false;
@@ -400,12 +444,12 @@ export class SkillMarketplaceService {
 
   private requireAgent(agentId: string): AgentSummary {
     const agent = this.listAgents().find((candidate) => candidate.id === agentId);
-    if (!agent) throw new Error("Choose a local agent first.");
+    if (!agent) throw new Error(sourceText("error.skill.chooseLocalAgent"));
     return agent;
   }
 
   requireLocalLibrary(): LocalSkillLibrary {
-    if (!this.localLibrary) throw new Error("Local skill library is unavailable.");
+    if (!this.localLibrary) throw new Error(sourceText("error.skill.localLibraryUnavailable"));
     return this.localLibrary;
   }
 
@@ -427,8 +471,9 @@ export class SkillMarketplaceService {
   }
 }
 
-function targetDirectories(workspace: string, slug: string): string[] {
-  return [join(workspace, ".agents", "skills", slug), join(workspace, ".claude", "skills", slug)];
+function targetDirectories(workspace: string, slug: string): [string, string] {
+  const [agents, claude] = MANAGED_SKILL_FOLDERS;
+  return [join(workspace, agents, slug), join(workspace, claude, slug)];
 }
 
 function disabledDirectory(workspace: string, slug: string): string {
@@ -474,7 +519,7 @@ async function installedSkillDescription(workspace: string, entry: LockEntry): P
 function trimmedSkillDescription(value: unknown): string | undefined {
   if (!isString(value)) return undefined;
   const description = value.trim();
-  return description && description.length <= 500 ? description : undefined;
+  return description && description.length <= SKILL_DESCRIPTION_MAX_LENGTH ? description : undefined;
 }
 
 function parseSkillMarkdownDescription(text: string): string | undefined {
@@ -490,7 +535,7 @@ async function readSkillFiles(root: string): Promise<Record<string, Uint8Array>>
   async function visit(directory: string): Promise<void> {
     for (const entry of await readdir(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name);
-      if (entry.isSymbolicLink()) throw new Error("Skill packages cannot contain symbolic links.");
+      if (entry.isSymbolicLink()) throw new Error(sourceText("error.skill.symlinks"));
       if (entry.isDirectory()) await visit(path);
       else if (entry.isFile()) {
         files[relative(root, path).replaceAll("\\", "/")] = new Uint8Array(await readFile(path));
@@ -505,7 +550,7 @@ async function replaceTargets(
   workspace: string,
   slug: string,
   files: Record<string, Uint8Array>,
-  targets = targetDirectories(workspace, slug),
+  targets: readonly string[] = targetDirectories(workspace, slug),
 ): Promise<void> {
   const completed: Array<{ target: string; backup: string | null }> = [];
   try {
@@ -587,6 +632,28 @@ async function installedState(workspace: string, entry: LockEntry): Promise<"ins
   return complete === expected && !missing ? "installed" : "needs-repair";
 }
 
+/**
+ * One skill's `SKILL.md` as a template carries it. The slug and name are what an install derives
+ * from the same text, so a folder name that is not a valid slug does not travel.
+ */
+async function embeddedSkill(path: string, label: string): Promise<AgentTemplateSkill> {
+  const tooLarge = sourceText("error.skill.templateMarkdownTooLarge", { name: label });
+  if ((await stat(path)).size > AGENT_TEMPLATE_LIMITS.skillMarkdown) throw new Error(tooLarge);
+  const markdown = await readFile(path, "utf8");
+  if (markdown.length > AGENT_TEMPLATE_LIMITS.skillMarkdown) throw new Error(tooLarge);
+  let info: { slug: string; name: string };
+  try {
+    info = inspectSkillMarkdown(markdown);
+  } catch (error) {
+    throw new Error(`${label}: ${error instanceof Error ? error.message : "SKILL.md is invalid."}`);
+  }
+  return { kind: "embedded", slug: info.slug, name: info.name, markdown };
+}
+
+function lockedSlugs(lock: SkillsLock): Set<string> {
+  return new Set(Object.values(lock.skills).map((entry) => entry.slug));
+}
+
 function lockPath(workspace: string): string {
   return join(workspace, ".openbot", "skills-lock.json");
 }
@@ -599,15 +666,11 @@ async function readLock(workspace: string): Promise<SkillsLock> {
     throw error;
   }
   const value = JSON.parse(text);
-  if (!isSkillsLock(value)) throw new Error("The installed skill record is invalid. It was left unchanged.");
+  if (!isSkillsLock(value)) throw new Error(sourceText("error.skill.lockInvalid"));
   return value;
 }
 async function writeLock(workspace: string, lock: SkillsLock): Promise<void> {
-  const path = lockPath(workspace);
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  const temporary = `${path}.${randomUUID()}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(lock, null, 2)}\n`, { mode: 0o600 });
-  await rename(temporary, path);
+  await writeFileAtomically(lockPath(workspace), `${JSON.stringify(lock, null, 2)}\n`, { createDirectory: true });
 }
 async function pathExists(path: string): Promise<boolean> {
   try {
@@ -624,16 +687,6 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return Uint8Array.from(bytes).buffer;
 }
 
-function decodeSkillPage(value: unknown): MarketplaceSkillPage {
-  if (!isDynamicRecord(value) || !Array.isArray(value.skills) || !value.skills.every(isMarketplaceSkillSummary))
-    throw new Error("Invalid skill marketplace response.");
-  if (value.nextCursor !== null && !isString(value.nextCursor)) throw new Error("Invalid skill marketplace response.");
-  return { skills: value.skills, nextCursor: value.nextCursor };
-}
-function decodeSkillDetail(value: unknown): MarketplaceSkillDetail {
-  if (!isMarketplaceSkillDetail(value)) throw new Error("Invalid skill detail response.");
-  return value;
-}
 function decodeSubmissions(value: unknown): SkillSubmission[] {
   if (!Array.isArray(value) || !value.every(isSkillSubmission)) throw new Error("Invalid skill submissions.");
   return value;
@@ -645,37 +698,6 @@ function decodeSubmission(value: unknown): SkillSubmission {
 function decodeInstalledReceipt(value: unknown): { installed: true } {
   if (!isDynamicRecord(value) || value.installed !== true) throw new Error("Invalid install receipt response.");
   return { installed: true };
-}
-
-function isMarketplaceSkillSummary(value: unknown): value is MarketplaceSkillSummary {
-  return (
-    isDynamicRecord(value) &&
-    isString(value.id) &&
-    isString(value.slug) &&
-    isString(value.name) &&
-    isString(value.description) &&
-    isSkillCategory(value.category) &&
-    isString(value.creatorName) &&
-    (value.creatorAvatarUrl === undefined || value.creatorAvatarUrl === null || isString(value.creatorAvatarUrl)) &&
-    isNumber(value.version) &&
-    isNumber(value.installs) &&
-    isBoolean(value.featured) &&
-    (value.iconUrl === null || isString(value.iconUrl)) &&
-    isString(value.updatedAt)
-  );
-}
-
-function isMarketplaceSkillDetail(value: unknown): value is MarketplaceSkillDetail {
-  return (
-    isDynamicRecord(value) &&
-    isMarketplaceSkillSummary(value) &&
-    isString(value.versionId) &&
-    isString(value.bundleSha256) &&
-    isString(value.instructions) &&
-    (value.examplePrompt === undefined || (isString(value.examplePrompt) && value.examplePrompt.length <= 1_000)) &&
-    Array.isArray(value.files) &&
-    value.files.every(isString)
-  );
 }
 
 function isSkillSubmission(value: unknown): value is SkillSubmission {
@@ -733,8 +755,7 @@ async function assertSkillPaths(workspace: string, slug: string): Promise<void> 
     for (const part of ["", ...parts]) {
       current = join(current, part);
       try {
-        if ((await lstat(current)).isSymbolicLink())
-          throw new Error("Skill installation paths cannot contain symbolic links.");
+        if ((await lstat(current)).isSymbolicLink()) throw new Error(sourceText("error.skill.installPathSymlink"));
       } catch (error) {
         if (isDynamicRecord(error) && error.code === "ENOENT") break;
         throw error;

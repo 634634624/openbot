@@ -2,9 +2,16 @@ import { describe, expect, it } from "vitest";
 import {
   createInviteUrl,
   createOpenBotInviteUrl,
+  createWebAppInvitePath,
+  inviteUrlFromWebAppSearch,
+  inviteUseCount,
   isCanonicalInviteUrl,
+  isNeverExpiringInvite,
+  isPermanentInvite,
   isValidRemoteApiUrl,
+  PERMANENT_INVITE_EXPIRES_AT_MS,
   parseInviteUrl,
+  permanentInviteExpiresAt,
   toOpenBotInviteUrl,
 } from "./invite-links";
 
@@ -34,6 +41,22 @@ describe("OpenBot invite links", () => {
   it("converts a canonical invitation to the desktop fallback scheme", () => {
     expect(toOpenBotInviteUrl(createInviteUrl(payload))).toBe(createOpenBotInviteUrl(payload));
     expect(parseInviteUrl(createOpenBotInviteUrl(payload))).toEqual(payload);
+  });
+
+  it("reads an invitation from the browser client's entry and refuses any other host", () => {
+    const inviteUrl = createInviteUrl(payload);
+    const path = createWebAppInvitePath(inviteUrl);
+    expect(path.startsWith("/app?")).toBe(true);
+    expect(inviteUrlFromWebAppSearch(new URL(path, "https://openbot.run").search)).toBe(inviteUrl);
+    expect(inviteUrlFromWebAppSearch(`${new URL(path, "https://openbot.run").search}&agent=x`)).toBe(inviteUrl);
+    expect(inviteUrlFromWebAppSearch("?agent=x")).toBeNull();
+
+    const foreign = new URL(path, "https://openbot.run");
+    foreign.searchParams.set("api", "https://example.com/");
+    expect(inviteUrlFromWebAppSearch(foreign.search)).toBeNull();
+    const repeated = new URL(path, "https://openbot.run");
+    repeated.searchParams.append("invite", "c".repeat(43));
+    expect(inviteUrlFromWebAppSearch(repeated.search)).toBeNull();
   });
 
   it("accepts approved root tunnel URLs only", () => {
@@ -75,5 +98,22 @@ describe("OpenBot invite links", () => {
     `${createInviteUrl(payload)}&invite=duplicate`,
   ])("rejects an invalid invitation: %s", (value) => {
     expect(() => parseInviteUrl(value)).toThrow("invalid");
+  });
+
+  it("marks the permanent deadline as never expiring", () => {
+    expect(isNeverExpiringInvite(permanentInviteExpiresAt())).toBe(true);
+    expect(isNeverExpiringInvite(new Date(Date.now() + 24 * 60 * 60 * 1_000).toISOString())).toBe(false);
+    expect(isNeverExpiringInvite("not-a-date")).toBe(false);
+  });
+
+  it("decodes an invitation without the permanent flag or a valid count as an older sender meant it", () => {
+    const tomorrow = Date.now() + 24 * 60 * 60 * 1_000;
+    expect(isPermanentInvite(undefined, PERMANENT_INVITE_EXPIRES_AT_MS)).toBe(true);
+    expect(isPermanentInvite(undefined, permanentInviteExpiresAt())).toBe(true);
+    expect(isPermanentInvite(true, tomorrow)).toBe(true);
+    expect(isPermanentInvite(false, tomorrow)).toBe(false);
+    expect(isPermanentInvite(undefined, new Date(tomorrow).toISOString())).toBe(false);
+    expect([undefined, -1, 1.5, "2"].map(inviteUseCount)).toEqual([0, 0, 0, 0]);
+    expect(inviteUseCount(3)).toBe(3);
   });
 });

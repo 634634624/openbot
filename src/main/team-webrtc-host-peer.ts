@@ -3,18 +3,14 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
 import { TEAM_API_ROUTES } from "@openbot/contracts/team-api-routes";
-import {
-  channelEvent,
-  channelRequest,
-  channelResponse,
-  isChannelRoute,
-} from "@openbot/contracts/team-protocol/channels-v1";
+import { browserViewStreamSessionId } from "@openbot/contracts/team-protocol/browser-view-v1";
 import {
   supportsTeamSemanticTags,
   TEAM_AGENT_CREATE_MODEL_CAPABILITY,
   TEAM_CURRENT_CAPABILITIES,
 } from "@openbot/contracts/team-protocol/current";
-import { isMcpRoute, mcpRequest, mcpResponse } from "@openbot/contracts/team-protocol/mcp-v1";
+import { optionalTeamEvent } from "@openbot/contracts/team-protocol/optional-events";
+import { teamSideRouteCodec } from "@openbot/contracts/team-protocol/side-routes";
 import { encodeTeamProtocolV1ClientEvent } from "@openbot/contracts/team-protocol/v1";
 import {
   decodeTeamProtocolV2AuthFrame,
@@ -37,8 +33,16 @@ import {
   decodeTeamProtocolV4WebRtcHttpRequest,
   encodeTeamProtocolV4WebRtcHttpResponse,
 } from "@openbot/contracts/team-protocol/v4-webrtc-adapter";
+import { TEAM_LOCAL_PROVIDERS_CAPABILITY } from "@openbot/contracts/team-protocol/v5";
+import {
+  createTeamProtocolV5Event,
+  decodeTeamProtocolV5WebRtcHttpRequest,
+  encodeTeamProtocolV5WebRtcHttpResponse,
+} from "@openbot/contracts/team-protocol/v5-webrtc-adapter";
+import { sourceText } from "@openbot/i18n/source";
 import type * as Ws from "ws";
 import type { VerifiedRemoteSessionTicket } from "./central-auth-manager";
+import { contentDispositionFileName } from "./content-disposition";
 import {
   decodeRemoteDesktopSignalBinary,
   decodeRemoteDesktopSignalControl,
@@ -48,10 +52,13 @@ import {
 import type { TeamStore } from "./team-store";
 import type { TeamWebRtcBridge } from "./team-webrtc-bridge";
 import { TeamWebRtcFileTransfer } from "./team-webrtc-file-transfer";
+import { rawDataBytes } from "./ws-raw-data";
 
 const requireModule = createRequire(import.meta.url);
 const webSockets: typeof Ws = requireModule(join(dirname(requireModule.resolve("ws/package.json")), "index.js"));
 const MAXIMUM_BUFFERED_EVENTS = 2_000;
+/** A Moonlight session and a few browser views, which is more than a member watches at once. */
+const MAXIMUM_DESKTOP_STREAMS = 6;
 
 export interface TeamWebRtcHostPeerOptions {
   bridge: TeamWebRtcBridge;
@@ -92,8 +99,7 @@ export class TeamWebRtcHostPeer {
   #eventsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
   #eventsReconnectAttempts = 0;
   #nextEventSequence = 1;
-  #desktopSocket: Ws.WebSocket | null = null;
-  #desktopStreamId: string | null = null;
+  readonly #desktopSockets = new Map<string, Ws.WebSocket>();
   #sessionExpirationTimer: ReturnType<typeof setTimeout> | null = null;
   #sessionPreparation: Promise<void> | null = null;
   #pendingConnection: IncomingConnection | null = null;
@@ -130,6 +136,11 @@ export class TeamWebRtcHostPeer {
     const peerId = this.#peerId;
     this.dispose();
     if (peerId) await this.#bridge.disconnectPeer(peerId).catch(() => undefined);
+  }
+
+  /** Whether this device has a file transfer moving right now, either direction. */
+  hasActiveTransfers(): boolean {
+    return this.#files.hasActiveTransfers();
   }
 
   dispose(): void {
@@ -227,7 +238,7 @@ export class TeamWebRtcHostPeer {
       return;
     }
     if (channel === "desktop") {
-      void this.#handleDesktopSignal(data).catch(() => this.#closeDesktopSocket());
+      void this.#handleDesktopSignal(data).catch(() => this.#closeDesktopSockets());
       return;
     }
     if (!isString(data)) {
@@ -401,7 +412,7 @@ export class TeamWebRtcHostPeer {
         requestId: request.requestId,
         error: {
           code: error instanceof GatewayError ? error.code : "host_error",
-          message: error instanceof Error ? error.message : "The host could not complete the request.",
+          message: error instanceof Error ? error.message : sourceText("error.remote.hostRequestFailed"),
           retryable: status >= 500,
           status,
         },
@@ -411,13 +422,13 @@ export class TeamWebRtcHostPeer {
 
   async #dispatchHttp(input: HttpRequestPayload): Promise<TeamProtocolV2Json> {
     if (!this.#localApiPort || !this.#localSessionToken)
-      throw new GatewayError(401, "remote_session_missing", "The remote session is not ready.");
+      throw new GatewayError(401, "remote_session_missing", sourceText("error.remote.sessionNotReady"));
     const url = new URL(input.path, `http://127.0.0.1:${this.#localApiPort}`);
     if (url.origin !== `http://127.0.0.1:${this.#localApiPort}` || !url.pathname.startsWith("/v1/")) {
       throw new GatewayError(400, "invalid_operation_path", "The Team API path is invalid.");
     }
     const peerId = this.#peerId;
-    if (!peerId) throw new GatewayError(503, "remote_disconnected", "The WebRTC peer disconnected.");
+    if (!peerId) throw new GatewayError(503, "remote_disconnected", sourceText("error.remote.peerDisconnected"));
     const peerCapabilities = new Set(input.capabilities ?? []);
     const capabilitiesChanged =
       peerCapabilities.size !== this.#peerCapabilities.size ||
@@ -425,17 +436,20 @@ export class TeamWebRtcHostPeer {
     this.#peerCapabilities = peerCapabilities;
     if (capabilitiesChanged) this.#sendAgentEventScope();
     const preserveSemanticTags = supportsTeamSemanticTags(this.#peerCapabilities);
+    const sideRoute = teamSideRouteCodec(input.path);
     const uploaded = input.bodyTransferId ? await this.#files.consume(peerId, input.bodyTransferId) : null;
     const response = await fetch(url, {
       method: input.method,
       headers: {
         Authorization: `Bearer ${this.#localSessionToken}`,
         "Content-Type": uploaded?.mimeType ?? input.contentType ?? "application/json",
-        "OpenBot-Protocol-Version": peerCapabilities.has("opencode")
-          ? "4"
-          : isTeamProtocolV3OnlyRoute(input.method, input.path)
-            ? "3"
-            : "1",
+        "OpenBot-Protocol-Version": peerCapabilities.has(TEAM_LOCAL_PROVIDERS_CAPABILITY)
+          ? "5"
+          : peerCapabilities.has("opencode")
+            ? "4"
+            : isTeamProtocolV3OnlyRoute(input.method, input.path)
+              ? "3"
+              : "1",
         "OpenBot-App-Version": this.#appVersion,
         "OpenBot-Capabilities": [...this.#peerCapabilities].join(","),
         ...(this.#localSessionId ? { "X-OpenBot-WebRTC-Session": this.#localSessionId } : {}),
@@ -448,16 +462,16 @@ export class TeamWebRtcHostPeer {
             : input.body === null
               ? undefined
               : JSON.stringify(
-                  (isChannelRoute(input.path)
-                    ? channelRequestForMethod
-                    : isMcpRoute(input.path)
-                      ? mcpRequestForMethod
-                      : peerCapabilities.has("opencode")
-                        ? decodeTeamProtocolV4WebRtcHttpRequest
-                        : decodeTeamProtocolV3WebRtcHttpRequest)(input.method, input.path, input.body, {
-                    preserveSemanticTags,
-                    agentCreateModel: peerCapabilities.has(TEAM_AGENT_CREATE_MODEL_CAPABILITY),
-                  }),
+                  sideRoute
+                    ? sideRoute.request(input.path, input.body)
+                    : (peerCapabilities.has(TEAM_LOCAL_PROVIDERS_CAPABILITY)
+                        ? decodeTeamProtocolV5WebRtcHttpRequest
+                        : peerCapabilities.has("opencode")
+                          ? decodeTeamProtocolV4WebRtcHttpRequest
+                          : decodeTeamProtocolV3WebRtcHttpRequest)(input.method, input.path, input.body, {
+                        preserveSemanticTags,
+                        agentCreateModel: peerCapabilities.has(TEAM_AGENT_CREATE_MODEL_CAPABILITY),
+                      }),
                 ),
     });
     const contentType = response.headers.get("content-type") ?? "";
@@ -473,9 +487,7 @@ export class TeamWebRtcHostPeer {
     }
     if (response.status !== 204 && (isFile || !contentType.includes("json"))) {
       const bytes = new Uint8Array(await response.arrayBuffer());
-      const disposition = response.headers.get("content-disposition") ?? "";
-      const encodedName = disposition.match(/filename\*=UTF-8''([^;]+)/iu)?.[1];
-      const name = encodedName ? decodeURIComponent(encodedName) : "remote-file";
+      const name = contentDispositionFileName(response.headers.get("content-disposition"), "remote-file");
       const transferId = await this.#files.send(peerId, {
         name,
         mimeType: contentType || "application/octet-stream",
@@ -489,15 +501,15 @@ export class TeamWebRtcHostPeer {
     }
     return {
       status: response.status,
-      body: (isChannelRoute(input.path)
-        ? channelResponseForMethod
-        : isMcpRoute(input.path)
-          ? mcpResponseForMethod
-          : peerCapabilities.has("opencode")
-            ? encodeTeamProtocolV4WebRtcHttpResponse
-            : encodeTeamProtocolV3WebRtcHttpResponse)(input.method, input.path, response.status, body, {
-        preserveSemanticTags,
-      }),
+      body: sideRoute
+        ? sideRoute.response(input.path, response.status, body)
+        : (peerCapabilities.has(TEAM_LOCAL_PROVIDERS_CAPABILITY)
+            ? encodeTeamProtocolV5WebRtcHttpResponse
+            : peerCapabilities.has("opencode")
+              ? encodeTeamProtocolV4WebRtcHttpResponse
+              : encodeTeamProtocolV3WebRtcHttpResponse)(input.method, input.path, response.status, body, {
+            preserveSemanticTags,
+          }),
     };
   }
 
@@ -520,9 +532,10 @@ export class TeamWebRtcHostPeer {
         // `channels-changed` is outside the frozen v1 vocabulary, so the base event adapter
         // rejects it and the catch below would drop it without a trace: a remote client would
         // stop seeing incoming messages and task updates until its next refresh. The optional
-        // protocol validates and envelopes its own event, exactly as the request path does.
+        // protocol validates and envelopes its own event, exactly as the request path does. The
+        // `host-update-v1` restart notice and the `skills-events-v1` event take the same path.
         const event = JSON.parse(data.toString());
-        const channel = channelEvent(event);
+        const channel = optionalTeamEvent(event);
         frame = encodeTeamProtocolV2Frame(
           channel
             ? decodeTeamProtocolV2EventFrame({
@@ -531,13 +544,14 @@ export class TeamWebRtcHostPeer {
                 sequence: this.#nextEventSequence,
                 payload: channel,
               })
-            : (this.#peerCapabilities.has("opencode") ? createTeamProtocolV4Event : createTeamProtocolV2Event)(
-                this.#nextEventSequence,
-                event,
-                {
-                  preserveSemanticTags: supportsTeamSemanticTags(this.#peerCapabilities),
-                },
-              ),
+            : (this.#peerCapabilities.has(TEAM_LOCAL_PROVIDERS_CAPABILITY)
+                ? createTeamProtocolV5Event
+                : this.#peerCapabilities.has("opencode")
+                  ? createTeamProtocolV4Event
+                  : createTeamProtocolV2Event)(this.#nextEventSequence, event, {
+                preserveSemanticTags: supportsTeamSemanticTags(this.#peerCapabilities),
+                preserveBrowserSecrets: this.#peerCapabilities.has("browser-secret-handoff"),
+              }),
         );
       } catch {
         return;
@@ -621,100 +635,96 @@ export class TeamWebRtcHostPeer {
     if (!peerId || !this.#localApiPort || !this.#localSessionId) return;
     if (!isString(data)) {
       const frame = decodeRemoteDesktopSignalBinary(data);
-      if (frame.streamId !== this.#desktopStreamId || this.#desktopSocket?.readyState !== webSockets.WebSocket.OPEN)
-        return;
-      this.#desktopSocket.send(frame.bytes, { binary: true });
+      const socket = this.#desktopSockets.get(frame.streamId);
+      if (socket?.readyState !== webSockets.WebSocket.OPEN) return;
+      socket.send(frame.bytes, { binary: true });
       return;
     }
     const control = decodeRemoteDesktopSignalControl(data);
     if (control.type === "open") {
-      const url = new URL(control.path, `ws://127.0.0.1:${this.#localApiPort}`);
-      if (
-        url.origin !== `ws://127.0.0.1:${this.#localApiPort}` ||
-        !/^\/v1\/remote-screen\/sessions\/[A-Za-z0-9-]+\/stream$/u.test(url.pathname)
-      ) {
-        await this.#bridge.send(
-          peerId,
-          "desktop",
-          encodeRemoteDesktopSignalControl({
-            type: "error",
-            streamId: control.streamId,
-            message: "The remote desktop signal path is invalid.",
-          }),
-        );
-        return;
-      }
-      this.#closeDesktopSocket();
-      const socket = new webSockets.WebSocket(url, {
-        headers: { "X-OpenBot-WebRTC-Session": this.#localSessionId },
-      });
-      this.#desktopSocket = socket;
-      this.#desktopStreamId = control.streamId;
-      socket.once("open", () => {
-        this.#sendRecoverable(
-          peerId,
-          "desktop",
-          encodeRemoteDesktopSignalControl({ type: "opened", streamId: control.streamId }),
-        );
-      });
-      socket.on("message", (message, binary) => {
-        if (this.#desktopStreamId !== control.streamId) return;
-        if (binary) {
-          const bytes = rawDataBytes(message);
-          this.#sendRecoverable(peerId, "desktop", encodeRemoteDesktopSignalBinary(control.streamId, bytes));
-        } else {
-          this.#sendRecoverable(
-            peerId,
-            "desktop",
-            encodeRemoteDesktopSignalControl({
-              type: "text",
-              streamId: control.streamId,
-              data: message.toString(),
-            }),
-          );
-        }
-      });
-      socket.once("close", (code, reason) => {
-        if (this.#desktopStreamId !== control.streamId) return;
-        this.#desktopSocket = null;
-        this.#desktopStreamId = null;
-        this.#sendRecoverable(
-          peerId,
-          "desktop",
-          encodeRemoteDesktopSignalControl({
-            type: "close",
-            streamId: control.streamId,
-            code,
-            reason: reason.toString(),
-          }),
-        );
-      });
-      socket.once("error", () => {
-        this.#sendRecoverable(
-          peerId,
-          "desktop",
-          encodeRemoteDesktopSignalControl({
-            type: "error",
-            streamId: control.streamId,
-            message: "The host Moonlight signal socket failed.",
-          }),
-        );
-      });
+      this.#openDesktopSocket(peerId, control.streamId, control.path);
       return;
     }
-    if (control.streamId !== this.#desktopStreamId) return;
-    if (control.type === "text" && this.#desktopSocket?.readyState === webSockets.WebSocket.OPEN) {
-      this.#desktopSocket.send(control.data);
+    const socket = this.#desktopSockets.get(control.streamId);
+    if (!socket) return;
+    if (control.type === "text" && socket.readyState === webSockets.WebSocket.OPEN) {
+      socket.send(control.data);
     } else if (control.type === "close") {
-      this.#desktopSocket?.close(control.code ?? 1000, control.reason);
+      socket.close(control.code ?? 1000, control.reason);
     }
+  }
+
+  /**
+   * The tunnel carries more than one stream at a time: a member can watch a browser tab while a
+   * Moonlight session runs. Each stream keeps its own socket, and only the paths named here are
+   * reachable -- the tunnel opens sockets on the host's own port, so its allowlist is the boundary.
+   */
+  #openDesktopSocket(peerId: string, streamId: string, path: string): void {
+    const url = new URL(path, `ws://127.0.0.1:${this.#localApiPort}`);
+    const allowed =
+      url.origin === `ws://127.0.0.1:${this.#localApiPort}` &&
+      (/^\/v1\/remote-screen\/sessions\/[A-Za-z0-9-]+\/stream$/u.test(url.pathname) ||
+        browserViewStreamSessionId(url.pathname) !== null);
+    if (!allowed || this.#desktopSockets.size >= MAXIMUM_DESKTOP_STREAMS) {
+      void this.#bridge
+        .send(
+          peerId,
+          "desktop",
+          encodeRemoteDesktopSignalControl({
+            type: "error",
+            streamId,
+            message: allowed ? sourceText("error.remote.tooManyStreams") : "The remote desktop signal path is invalid.",
+          }),
+        )
+        .catch(() => undefined);
+      return;
+    }
+    this.#closeDesktopSocket(streamId);
+    const sessionId = this.#localSessionId ?? "";
+    const socket = new webSockets.WebSocket(url, { headers: { "X-OpenBot-WebRTC-Session": sessionId } });
+    this.#desktopSockets.set(streamId, socket);
+    socket.once("open", () => {
+      this.#sendRecoverable(peerId, "desktop", encodeRemoteDesktopSignalControl({ type: "opened", streamId }));
+    });
+    socket.on("message", (message, binary) => {
+      if (this.#desktopSockets.get(streamId) !== socket) return;
+      if (binary) {
+        this.#sendRecoverable(peerId, "desktop", encodeRemoteDesktopSignalBinary(streamId, rawDataBytes(message)));
+      } else {
+        this.#sendRecoverable(
+          peerId,
+          "desktop",
+          encodeRemoteDesktopSignalControl({ type: "text", streamId, data: message.toString() }),
+        );
+      }
+    });
+    socket.once("close", (code, reason) => {
+      if (this.#desktopSockets.get(streamId) !== socket) return;
+      this.#desktopSockets.delete(streamId);
+      this.#sendRecoverable(
+        peerId,
+        "desktop",
+        encodeRemoteDesktopSignalControl({ type: "close", streamId, code, reason: reason.toString() }),
+      );
+    });
+    socket.once("error", () => {
+      this.#sendRecoverable(
+        peerId,
+        "desktop",
+        encodeRemoteDesktopSignalControl({
+          type: "error",
+          streamId,
+          message: sourceText("error.remote.streamSocketFailed"),
+        }),
+      );
+    });
   }
 
   #closeLocalSession(endLogicalSession = true): void {
     if (this.#peerId) this.#files.setPeerAuthenticated(this.#peerId, false);
     if (this.#sessionExpirationTimer) clearTimeout(this.#sessionExpirationTimer);
     this.#sessionExpirationTimer = null;
-    this.#closeDesktopSocket();
+    this.#closeDesktopSockets();
     if (this.#eventsReconnectTimer) clearTimeout(this.#eventsReconnectTimer);
     this.#eventsReconnectTimer = null;
     this.#eventsReconnectAttempts = 0;
@@ -735,18 +745,15 @@ export class TeamWebRtcHostPeer {
     void this.#bridge.send(peerId, channel, data).catch(() => undefined);
   }
 
-  #closeDesktopSocket(): void {
-    const socket = this.#desktopSocket;
-    this.#desktopSocket = null;
-    this.#desktopStreamId = null;
+  #closeDesktopSocket(streamId: string): void {
+    const socket = this.#desktopSockets.get(streamId);
+    this.#desktopSockets.delete(streamId);
     socket?.close(1000, "Remote desktop signal stopped");
   }
-}
 
-function rawDataBytes(data: Ws.RawData): Uint8Array {
-  if (Array.isArray(data)) return new Uint8Array(Buffer.concat(data));
-  if (data instanceof ArrayBuffer) return new Uint8Array(data.slice(0));
-  return new Uint8Array(Buffer.from(data.buffer, data.byteOffset, data.byteLength));
+  #closeDesktopSockets(): void {
+    for (const streamId of [...this.#desktopSockets.keys()]) this.#closeDesktopSocket(streamId);
+  }
 }
 
 interface HttpRequestPayload {
@@ -794,17 +801,4 @@ class GatewayError extends Error {
   ) {
     super(message);
   }
-}
-
-function channelRequestForMethod(_method: string, path: string, value: unknown) {
-  return channelRequest(path, value);
-}
-function channelResponseForMethod(_method: string, path: string, status: number, value: unknown) {
-  return channelResponse(path, status, value);
-}
-function mcpRequestForMethod(_method: string, path: string, value: unknown) {
-  return mcpRequest(path, value);
-}
-function mcpResponseForMethod(_method: string, path: string, status: number, value: unknown) {
-  return mcpResponse(path, status, value);
 }

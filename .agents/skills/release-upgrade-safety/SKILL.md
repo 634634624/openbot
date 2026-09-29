@@ -20,11 +20,11 @@ This runs *before* `docs/RELEASING.md`, which stays authoritative for the publis
   you are separately asked to.
 - It never runs `bun run check`, `check:desktop`, `test`, or `build-storybook` — each takes minutes,
   CI owns them, and the desktop suite flakes under load, so a red result would tell you nothing.
-  Run the narrowest test file named by a gate, then `bun run lint` and `bun run typecheck`.
-- **If gate C or D fired, add `bun run mobile:typecheck`.** `bun run typecheck` is `typecheck:*` and
-  the mobile script is named `mobile:typecheck`, so the aggregate misses it — and `apps/mobile`
-  depends on `@openbot/contracts`, which is exactly what those two gates change. A contract export
-  change passes the aggregate and still breaks the mobile app.
+  Run the narrowest test file named by a gate and lint the changed files. Do not run the repo-wide
+  `bun run lint` or `bun run typecheck`: the pre-commit hook and CI run them.
+- **If gate C or D fired, confirm the mobile typecheck passed.** `apps/mobile` depends on
+  `@openbot/contracts`, which is exactly what those two gates change. `bun run typecheck` includes
+  `typecheck:mobile`, so the pre-commit hook and the CI Surfaces job cover it.
 - It never runs `bun run dev:seed` or `dev:reset` — both destroy the developer's own profile — and
   never `pkill -f`, which kills other sessions' work mid-write.
 
@@ -111,7 +111,7 @@ a gate can be selected without opening anything:
   anything under `packages/contracts/src/team-protocol/`, plus `docs/RELEASING.md`, which this
   audit defers its compatibility matrix to.
 - **D. IPC channels** → [gate-d-ipc.md](references/gate-d-ipc.md)
-  `packages/contracts/src/ipc-channels.ts` **or any of its mirrors** — `src/main/index.ts`,
+  `packages/contracts/src/ipc-endpoints.ts` **or any of its mirrors** — `src/main/index.ts`,
   `src/main/ipc/`, `src/preload/index.ts`, `src/renderer/src/preview/mock-openbot.ts`. Deleting a
   handler or an `invoke` breaks a live channel without touching the list at all.
 - **E. Account Worker** → [gate-e-account-worker.md](references/gate-e-account-worker.md)
@@ -134,6 +134,32 @@ you trust its silence** — run it over a range you know contains a hit, or conf
 to be long is not empty. An empty result means "nothing is wrong" and "I asked the wrong question"
 equally well, and the second is the more common of the two. This is not hypothetical: it is how
 `check:ui` lost two checks (`AGENTS.md`, Tests) and why the repo deleted `no-runtime-typeof`.
+
+## Step 2b — the pinned runtimes
+
+Not a gate: nothing here can strand a user's data, and a stale pin is not a stop. It belongs to
+this audit because this is the one moment per release when somebody looks at the whole range, and a
+pinned runtime only reaches users through a release.
+
+`native-runtime.lock.json` pins the provider CLIs and Bun, the runtime a STDIO MCP server is
+started with. Bun and OpenCode have pin scripts; the rest are pinned by hand:
+
+```bash
+bun run pin:bun-runtime       # prints the block; says "already pins Bun <version>" when it matches
+bun run pin:opencode-runtime
+```
+
+Ask two questions and report the answers with the table:
+
+- **Has the pinned version a published security fix?** If so, moving the pin is part of this
+  release, not the next one. A user cannot update Bun themselves: OpenBot downloaded it, OpenBot
+  owns it.
+- **Did the range move a pin?** Then read the diff as a dependency change. A moved `assetSha256`
+  with an unmoved `version` is a stop and needs a human: the registry does not rewrite a published
+  artifact.
+
+Moving a pin needs the version assertion on a matching host, which `pin:bun-runtime` performs only
+for the target it runs on. [docs/RELEASING.md](../../../docs/RELEASING.md) holds the procedure.
 
 ## Step 3 — report and hand off
 

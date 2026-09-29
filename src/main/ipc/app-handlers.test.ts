@@ -10,13 +10,6 @@ const { EXTERNAL_DESTINATIONS } = await import("./app-handlers");
 const { parseExternalDestination } = await import("./app-inputs");
 
 describe("external destinations", () => {
-  it("sends the OpenCode key request to the OpenCode sign-in page", () => {
-    // The dialog says the key is optional and the free models need no account. A wrong address here
-    // asks the user for a paid credential on a page OpenBot did not choose.
-    expect(EXTERNAL_DESTINATIONS["opencode-auth"]).toBe("https://opencode.ai/auth");
-    expect(EXTERNAL_DESTINATIONS["opencode-install"]).toBe("https://opencode.ai/docs/");
-  });
-
   it("sends the host owner to the macOS pane that grants screen recording", () => {
     // A member who is refused a remote screen cannot grant anything: this address is what the host
     // owner opens, and a wrong one leaves the desktop dark with no way to repair it.
@@ -24,6 +17,13 @@ describe("external destinations", () => {
       "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_ScreenCapture",
     );
     expect(parseExternalDestination("mac-screen-recording")).toBe("mac-screen-recording");
+  });
+
+  it("sends the agent import guide to the Grok Bot export listing", () => {
+    // The Import tab tells the user to install this agent. A wrong address installs some other agent
+    // with access to their Grok Bot data.
+    expect(EXTERNAL_DESTINATIONS["grok-bot-export"]).toBe("https://x.ai/bot/gI0XdhhDYPJeyQaqQBC0O");
+    expect(parseExternalDestination("grok-bot-export")).toBe("grok-bot-export");
   });
 
   it("opens no address the renderer invents", () => {

@@ -3,20 +3,26 @@ import type { JSX } from "@solidjs/web";
 import { createRootRoute, createRoute, createRouter, isNotFound, RouterContextProvider } from "@tanstack/solid-router";
 import { createSignal, flush } from "solid-js";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { CompareIndexPage } from "../src/components/compare/CompareIndexPage";
+import { ComparisonPage } from "../src/components/compare/ComparisonPage";
 import { ArticleGradient } from "../src/components/content/ArticleGradient";
 import { ArticleClip, ArticleGif } from "../src/components/content/ArticleMedia";
 import { ArticlePage } from "../src/components/content/ArticlePage";
 import { CollectionIndexPage } from "../src/components/content/CollectionIndexPage";
 import { LandingPage } from "../src/components/landing/LandingPage";
+import { COMPARISONS } from "../src/content/compare";
 import { landingAnalytics } from "../src/lib/analytics";
 import { articleGradient } from "../src/lib/article-gradient";
-import { CONTENT_COLLECTIONS } from "../src/lib/content";
+import { COMPARE_COLLECTION } from "../src/lib/compare";
+import { CONTENT_COLLECTIONS, HEADER_COLLECTIONS } from "../src/lib/content";
 import {
   articleArtPath,
   articlePath,
   type CollectionArticle,
   type ContentCollection,
 } from "../src/lib/content-collection";
+import { PLUGIN_INDEX_ROUTE } from "../src/lib/plugins";
+import { loadComparison } from "../src/routes/compare/$slug";
 import { loadGuide } from "../src/routes/guides/$slug";
 import { loadNewsArticle } from "../src/routes/news/$slug";
 
@@ -52,6 +58,9 @@ function createTestRouter() {
     createRoute({ getParentRoute: () => rootRoute, path: "/news/$slug" }),
     createRoute({ getParentRoute: () => rootRoute, path: "/guides" }),
     createRoute({ getParentRoute: () => rootRoute, path: "/guides/$slug" }),
+    createRoute({ getParentRoute: () => rootRoute, path: "/plugins" }),
+    createRoute({ getParentRoute: () => rootRoute, path: "/compare" }),
+    createRoute({ getParentRoute: () => rootRoute, path: "/compare/$slug" }),
   ]);
   return createRouter({ routeTree: rootRoute });
 }
@@ -97,10 +106,11 @@ function stubMotionPreference(reduced: boolean, finePointer = false): string[] {
   return asked;
 }
 
-// Every collection gets the same treatment. A section that is added to the registry
-// is held to the index, article and not-found behaviour of the ones before it
-// without anyone writing a second copy of these tests.
-describe.each(CONTENT_COLLECTIONS.map((collection) => [collection.name, collection] as const))(
+// Every prose collection gets the same treatment. A section that is added to the
+// registry is held to the index, article and not-found behaviour of the ones before
+// it without anyone writing a second copy of these tests. Comparisons have their own
+// pages and their own block below.
+describe.each(HEADER_COLLECTIONS.map((collection) => [collection.name, collection] as const))(
   "%s",
   (_name, collection) => {
     it("offers every published article as a link to its page", () => {
@@ -159,14 +169,49 @@ describe.each(CONTENT_COLLECTIONS.map((collection) => [collection.name, collecti
       const article = firstArticle(collection);
       renderPage(() => <ArticlePage collection={collection} article={article} />);
 
+      // Scoped to the page body: the header menu lists the latest articles on every page.
+      const body = within(screen.getByRole("main"));
       for (const other of collection.articles.filter((entry) => entry.slug !== article.slug)) {
-        const links = screen.getAllByRole("link", { name: (name) => name.includes(other.title) });
+        const links = body.getAllByRole("link", { name: (name) => name.includes(other.title) });
         expect(links.map((link) => link.getAttribute("href"))).toContain(articlePath(collection, other.slug));
       }
-      expect(screen.queryAllByRole("link", { name: (name) => name.includes(article.title) })).toHaveLength(0);
+      expect(body.queryAllByRole("link", { name: (name) => name.includes(article.title) })).toHaveLength(0);
     });
   },
 );
+
+describe("Compare", () => {
+  it("offers every published comparison as a link to its page", () => {
+    renderPage(() => <CompareIndexPage collection={COMPARE_COLLECTION} />);
+
+    for (const article of COMPARE_COLLECTION.articles) {
+      const links = screen.getAllByRole("link", { name: (name) => name.includes(article.title) });
+      expect(links.map((link) => link.getAttribute("href"))).toContain(articlePath(COMPARE_COLLECTION, article.slug));
+    }
+  });
+
+  // The table and the questions are what a reader, a crawler and an assistant came
+  // for, so a comparison must not render as a title with nothing under it.
+  it("shows the title, the table and the questions of every comparison", () => {
+    for (const article of COMPARE_COLLECTION.articles) {
+      const comparison = COMPARISONS[article.slug];
+      if (!comparison) throw new Error(`${article.slug} must have comparison data.`);
+      renderPage(() => <ComparisonPage collection={COMPARE_COLLECTION} article={article} comparison={comparison} />);
+
+      expect(screen.getByRole("heading", { level: 1, name: article.title })).toBeInTheDocument();
+      const body = within(screen.getByRole("article"));
+      const table = body.getByRole("table");
+      for (const row of comparison.rows) {
+        expect(within(table).getByRole("rowheader", { name: row.topic })).toBeInTheDocument();
+      }
+      for (const entry of comparison.faq) {
+        expect(body.getByText(entry.question)).toBeInTheDocument();
+      }
+
+      cleanup();
+    }
+  });
+});
 
 describe("landing header", () => {
   it("offers every content section", () => {
@@ -175,8 +220,22 @@ describe("landing header", () => {
     // Scoped to the header: the footer links to the same places, and the point of
     // this assertion is the entry points at the top of the page.
     const navigation = within(screen.getByRole("navigation", { name: "Primary navigation" }));
-    for (const collection of CONTENT_COLLECTIONS) {
-      expect(navigation.getByRole("link", { name: collection.name })).toHaveAttribute("href", collection.indexRoute);
+    const sections = [
+      ...HEADER_COLLECTIONS.map((collection) => ({ name: collection.name, index: collection.indexRoute })),
+      { name: "Plugins", index: PLUGIN_INDEX_ROUTE },
+    ];
+    for (const section of sections) {
+      const trigger = navigation.getByRole("button", { name: section.name });
+      fireEvent.click(trigger);
+      flush();
+
+      expect(trigger).toHaveAttribute("aria-expanded", "true");
+      const panel = document.getElementById(trigger.getAttribute("aria-controls") ?? "");
+      if (!panel) throw new Error(`The ${section.name} trigger must control a panel.`);
+      const indexLinks = within(panel)
+        .getAllByRole("link")
+        .map((link) => link.getAttribute("href"));
+      expect(indexLinks).toContain(section.index);
     }
   });
 });
@@ -186,6 +245,7 @@ describe("landing header", () => {
 describe.each([
   ["news", loadNewsArticle, CONTENT_COLLECTIONS[0]],
   ["guides", loadGuide, CONTENT_COLLECTIONS[1]],
+  ["compare", loadComparison, COMPARE_COLLECTION],
 ] as const)("%s article route", (_id, load, collection) => {
   it("loads a published article and reports an unknown slug as not found", () => {
     if (!collection) throw new Error("The registry must hold this collection.");

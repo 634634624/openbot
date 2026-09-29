@@ -1,7 +1,7 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { isNumber, isString } from "@openbot/contracts/runtime-values";
-import type { AgentProvider } from "./agent-client";
+import { type AgentProvider, RequestTimeoutError } from "./agent-client";
 import { JsonLineDecoder } from "./jsonl";
 import {
   type AppServerNotification,
@@ -153,7 +153,7 @@ export class CodexAppServerClient extends EventEmitter<ClientEvents> {
     return new Promise<T>((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.#pending.delete(id);
-        reject(new Error(`Codex request timed out: ${method}`));
+        reject(new RequestTimeoutError("Codex", method));
       }, timeoutMs);
 
       this.#pending.set(id, {
@@ -241,7 +241,7 @@ export class CodexAppServerClient extends EventEmitter<ClientEvents> {
  * credentials this process handed the CLI, and a value cut in half by a bound applied first is a
  * value that redactor no longer recognises. `shortenDiagnostic` is applied there instead.
  */
-export function redactDiagnostic(message: string): string {
+function redactDiagnostic(message: string): string {
   return message
     .replace(/(?:sk|sess|Bearer|token)[-_a-zA-Z0-9.=]{8,}/gi, "[redacted]")
     .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[redacted-email]");

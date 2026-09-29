@@ -1,4 +1,11 @@
-import type { AgentStatus, AgentSummary, ConversationPage, ConversationSnapshot } from "@openbot/contracts/ipc";
+import type {
+  AgentStatus,
+  AgentSummary,
+  ConversationPage,
+  ConversationSnapshot,
+  Routine,
+} from "@openbot/contracts/ipc";
+import { Toaster, toast } from "@openbot/ui";
 import { fireEvent, render, screen, waitFor, within } from "@solidjs/testing-library";
 import { createSignal, Show } from "solid-js";
 import { expect, it, vi } from "vitest";
@@ -16,15 +23,46 @@ import {
   testConversationPage,
   testServer,
 } from "./app-test-harness";
-import { toast } from "./components/ui";
 import { AGENT_SELECTION_STORAGE_KEY } from "./features/agents/agent-selection";
 import { useAgents } from "./features/agents/agents-context";
 import { useConversation } from "./features/conversation/conversation-context";
 import { useServers } from "./features/servers/servers-context";
-import { SIDEBAR_PINS_STORAGE_KEY } from "./features/sidebar/sidebar-pins";
-import { SIDEBAR_COLLAPSED_STORAGE_KEY } from "./features/sidebar/sidebar-sections";
+import { SIDEBAR_PINS_STORAGE_KEY } from "./features/sidebar/sidebar-pins-storage";
+import { SIDEBAR_COLLAPSED_STORAGE_KEY } from "./features/sidebar/sidebar-sections-storage";
 import { useLayout } from "./layout";
 import { useNavigation } from "./navigation";
+import { useProviders } from "./providers";
+
+const morningBrief: Routine = {
+  id: "routine-1",
+  agentId: "chief",
+  name: "Morning brief",
+  instruction: "Summarize the overnight changes.",
+  active: true,
+  timezone: "UTC",
+  trigger: {
+    id: "trigger-1",
+    routineId: "routine-1",
+    schedule: { kind: "weekdays", time: "07:00" },
+    nextRunAt: "2026-08-26T07:00:00.000Z",
+    createdAt: "2026-08-25T12:00:00.000Z",
+    updatedAt: "2026-08-25T12:05:00.000Z",
+  },
+  createdAt: "2026-08-25T12:00:00.000Z",
+  updatedAt: "2026-08-25T12:05:00.000Z",
+};
+
+/** A routine record in the chat. Only a record from an agent turn has a `turnId`. */
+const routineEvent = (id: string, action: "created" | "updated", createdAt: string, turnId?: string) => ({
+  id,
+  ...(turnId ? { turnId } : {}),
+  author: "system" as const,
+  source: "system" as const,
+  text: morningBrief.name,
+  createdAt,
+  status: "completed" as const,
+  itemType: `routine-event:${action}:${morningBrief.id}`,
+});
 
 describe("OpenBot connected desktop shell", () => {
   beforeEach(() => {
@@ -34,6 +72,41 @@ describe("OpenBot connected desktop shell", () => {
   // The toast store is module-global, so a notification outlives the render that raised it.
   afterEach(() => {
     toast.dismiss();
+  });
+
+  it("keeps the agent's routine card live after a change the person made in the app", async () => {
+    vi.mocked(window.openbot.agent.listRoutines).mockResolvedValue([morningBrief]);
+    vi.mocked(window.openbot.agent.readConversationPage).mockResolvedValue(
+      testConversationPage("chief", [
+        routineEvent("routine-created", "created", "2026-08-25T12:00:00.000Z", "turn-1"),
+        routineEvent("routine-updated", "updated", "2026-08-25T12:05:00.000Z"),
+      ]),
+    );
+    render(() => <App />);
+
+    const card = await screen.findByRole("article", { name: "Morning brief" });
+    expect(card).toHaveTextContent("Created routine");
+    expect(within(card).getByRole("button", { name: "Days: Weekdays" })).toBeEnabled();
+    expect(screen.getAllByRole("article", { name: "Morning brief" })).toHaveLength(1);
+    expect(screen.getByText("Updated routine")).toBeInTheDocument();
+  });
+
+  it("moves focus to the latest card of a routine from Show latest", async () => {
+    vi.mocked(window.openbot.agent.listRoutines).mockResolvedValue([morningBrief]);
+    vi.mocked(window.openbot.agent.readConversationPage).mockResolvedValue(
+      testConversationPage("chief", [
+        routineEvent("routine-created", "created", "2026-08-25T12:00:00.000Z", "turn-1"),
+        routineEvent("routine-updated", "updated", "2026-08-25T12:05:00.000Z", "turn-2"),
+      ]),
+    );
+    render(() => <App />);
+
+    await fireEvent.click(await screen.findByRole("button", { name: "Show latest" }));
+    const latest = screen.getAllByRole("article", { name: "Morning brief" }).at(-1);
+    expect(latest).toHaveTextContent("Updated routine");
+    await waitFor(() =>
+      expect(within(latest ?? document.body).getByRole("button", { name: "Open routine Morning brief" })).toHaveFocus(),
+    );
   });
 
   it("restores the selected agent after the app remounts", async () => {
@@ -237,16 +310,9 @@ describe("OpenBot connected desktop shell", () => {
     });
     vi.mocked(window.openbot.servers.list).mockResolvedValueOnce([
       {
-        id: "remote-1",
-        name: "Studio Mac",
-        logoUrl: null,
-        notificationsMuted: false,
-        kind: "remote",
-        state: "online",
-        apiUrl: "https://studio.example.com",
+        ...testServer("remote-1", true),
         remoteDesktopAvailable: true,
         role: "owner",
-        active: true,
         compatibility: {
           localAppVersion: "1.0.0",
           hostAppVersion: "1.0.0",
@@ -354,7 +420,9 @@ describe("OpenBot connected desktop shell", () => {
       });
 
     render(() => <App />);
-    await screen.findByText("Connecting to agent CLIs…");
+    // The first read must land before the ready status, or the refresh it triggers has nothing
+    // stored to replace.
+    await waitFor(() => expect(window.openbot.agent.readConversation).toHaveBeenCalledTimes(1));
     emitAgentEvent?.({
       type: "status",
       status: {
@@ -1001,11 +1069,27 @@ describe("OpenBot connected desktop shell", () => {
     };
   }
 
-  it("offers a provider sign-in above the composer before the user sends", async () => {
+  /**
+   * An agent on `provider`, with that provider reporting a signed-out CLI. Every composer sign-in
+   * case starts here and differs only in what it expects the notice to offer.
+   */
+  async function renderSignedOutProvider(provider: "codex" | "claude" | "opencode", model: string): Promise<void> {
+    if (provider !== "codex") {
+      vi.mocked(window.openbot.agent.listAgents).mockResolvedValueOnce([{ ...AGENTS[0], provider, model }]);
+    }
     render(() => <App />);
     await screen.findByRole("heading", { name: "Chief" });
+    emitAgentEvent?.({
+      type: "status",
+      status: {
+        ...signedOutCodexStatus(),
+        providers: [{ id: provider, state: "sign-in-required" as const, version: "1.0.0", message: null }],
+      },
+    });
+  }
 
-    emitAgentEvent?.({ type: "status", status: signedOutCodexStatus() });
+  it("offers a provider sign-in above the composer before the user sends", async () => {
+    await renderSignedOutProvider("codex", "gpt-5");
 
     const signIn = await screen.findByRole("button", { name: "Sign in to ChatGPT" });
     expect(screen.getByText("Sign in to ChatGPT to send messages.")).toBeVisible();
@@ -1014,6 +1098,27 @@ describe("OpenBot connected desktop shell", () => {
 
     await fireEvent.click(signIn);
     await waitFor(() => expect(window.openbot.connectProvider).toHaveBeenCalledWith("codex"));
+  });
+
+  it("starts the Claude login from the composer notice rather than opening a page", async () => {
+    await renderSignedOutProvider("claude", "claude-sonnet-5");
+
+    await fireEvent.click(await screen.findByRole("button", { name: "Sign in to Claude" }));
+
+    // Claude signs in through its own CLI login, so the button connects the provider. It used to
+    // open the authentication docs, which left the user to finish the sign-in themselves.
+    await waitFor(() => expect(window.openbot.connectProvider).toHaveBeenCalledWith("claude"));
+    expect(window.openbot.openExternal).not.toHaveBeenCalled();
+  });
+
+  it("offers no composer sign-in for OpenCode, whose key is pasted in settings", async () => {
+    await renderSignedOutProvider("opencode", "opencode/big-pickle");
+
+    // The notice would carry a button that starts nothing: OpenCode has no login to open, only a
+    // key to paste in settings. The composer still takes the draft.
+    expect(await screen.findByRole("textbox", { name: "Message Chief" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Sign in to OpenCode" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Sign in required")).not.toBeInTheDocument();
   });
 
   it("states a spent plan window above the composer, and drops it when the window ends", async () => {
@@ -1042,5 +1147,130 @@ describe("OpenBot connected desktop shell", () => {
     emitAgentEvent?.({ type: "usage-changed", usage: { limits: [] } });
 
     await waitFor(() => expect(screen.queryByText("Usage limit reached")).not.toBeInTheDocument());
+  });
+  /**
+   * A ChatGPT row signed in to one account, and the code sign-in that reaches another one.
+   *
+   * The provider is `available` before the login starts, so nothing about the account alone says
+   * this login is over. What says it is the row reporting it is no longer connecting. The end of it
+   * is a notification rather than a last screen, so the dialog is gone by the time it arrives.
+   */
+  function CodeLoginProbe() {
+    const { codeLogin } = useProviders();
+    const { agentStatus } = useAgents();
+    const phase = () => {
+      if (codeLogin.provider() === null) return "closed";
+      const state = codeLogin.state();
+      return state.phase === "waiting" ? `waiting ${state.userCode}` : state.phase;
+    };
+    const row = () => agentStatus().providers?.find((provider) => provider.id === "codex");
+    return (
+      <>
+        <button type="button" onClick={() => codeLogin.start("codex")}>
+          Log in with code
+        </button>
+        <button type="button" onClick={() => codeLogin.cancel()}>
+          Cancel code login
+        </button>
+        <output aria-label="Code sign-in">{phase()}</output>
+        <output aria-label="ChatGPT row">{`${row()?.state} ${row()?.connectionState ?? "idle"} ${row()?.email}`}</output>
+        <Toaster />
+      </>
+    );
+  }
+  function codexStatus(codex: Partial<NonNullable<AgentStatus["providers"]>[number]>): AgentStatus {
+    return {
+      phase: "ready",
+      cliVersion: "0.155.0",
+      auth: { kind: "chatgpt", email: "first@example.com" },
+      providers: [{ id: "codex", state: "available", version: "0.155.0", message: null, ...codex }],
+      capabilities: { chat: "ready", browser: "ready", computerUse: "ready" },
+      message: null,
+      fullAccess: true,
+    };
+  }
+
+  it.each([false, true])("keeps account-switch results correct when failure is %s", async (failed) => {
+    render(() => (
+      <AppProviders>
+        <CodeLoginProbe />
+      </AppProviders>
+    ));
+    emitAgentEvent?.({ type: "status", status: codexStatus({ email: "first@example.com" }) });
+    await waitFor(() =>
+      expect(screen.getByLabelText("ChatGPT row")).toHaveTextContent("available idle first@example.com"),
+    );
+
+    await fireEvent.click(screen.getByRole("button", { name: "Log in with code" }));
+    await waitFor(() => expect(screen.getByLabelText("Code sign-in")).toHaveTextContent("waiting KTQ4-B62MX"));
+
+    // The provider is working on the login, and the account the user already has is still on the
+    // row. Reading that account as the answer would end the dialog before anyone typed the code.
+    emitAgentEvent?.({
+      type: "status",
+      status: codexStatus({ connectionState: "connecting", email: "first@example.com" }),
+    });
+    await waitFor(() =>
+      expect(screen.getByLabelText("ChatGPT row")).toHaveTextContent("available connecting first@example.com"),
+    );
+    expect(screen.getByLabelText("Code sign-in")).toHaveTextContent("waiting KTQ4-B62MX");
+
+    // The second account arrives, and only now is the sign-in over: the dialog closes, and what
+    // says which account was signed in to is a notification.
+    emitAgentEvent?.({
+      type: "status",
+      status: codexStatus(
+        failed
+          ? { email: "first@example.com", message: "OpenBot could not connect ChatGPT. Try again." }
+          : { email: "second@example.com" },
+      ),
+    });
+    await waitFor(() => expect(screen.getByLabelText("Code sign-in")).toHaveTextContent("closed"));
+    if (failed) {
+      expect(await screen.findByText("Could not connect ChatGPT")).toBeVisible();
+      expect(screen.getByRole("button", { name: "Try again" })).toBeVisible();
+      expect(screen.queryByText("ChatGPT connected")).not.toBeInTheDocument();
+    } else {
+      expect(await screen.findByText("ChatGPT connected")).toBeVisible();
+      expect(screen.getByText("Signed in as second@example.com.")).toBeVisible();
+    }
+  });
+  it.each([false, true])("ignores a cancelled attempt when its reply fails: %s", async (failed) => {
+    const oldReply = Promise.withResolvers<Awaited<ReturnType<typeof window.openbot.startProviderCodeLogin>>>();
+    const cancellation = Promise.withResolvers<AgentStatus>();
+    vi.mocked(window.openbot.startProviderCodeLogin).mockImplementationOnce(() => oldReply.promise);
+    vi.mocked(window.openbot.cancelProviderCodeLogin).mockImplementationOnce(() => cancellation.promise);
+    render(() => (
+      <AppProviders>
+        <CodeLoginProbe />
+      </AppProviders>
+    ));
+    await fireEvent.click(screen.getByRole("button", { name: "Log in with code" }));
+    await waitFor(() => expect(window.openbot.startProviderCodeLogin).toHaveBeenCalledTimes(1));
+    await fireEvent.click(screen.getByRole("button", { name: "Cancel code login" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Log in with code" }));
+    if (failed) oldReply.reject(new Error("Old login failed"));
+    else
+      oldReply.resolve({
+        kind: "code",
+        userCode: "OLD-CODE",
+        verificationUrl: "https://auth.openai.com/codex/device",
+        expiresAt: Date.now() + 600_000,
+      });
+    await oldReply.promise.catch(() => undefined);
+    expect(screen.getByLabelText("Code sign-in")).toHaveTextContent("starting");
+    expect(window.openbot.startProviderCodeLogin).toHaveBeenCalledTimes(1);
+    emitAgentEvent?.({ type: "status", status: codexStatus({ email: "first@example.com" }) });
+    cancellation.resolve(codexStatus({ email: "first@example.com" }));
+    await waitFor(() => expect(window.openbot.startProviderCodeLogin).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByLabelText("Code sign-in")).toHaveTextContent("waiting KTQ4-B62MX"));
+    expect(screen.queryByText("Could not connect ChatGPT")).not.toBeInTheDocument();
+    emitAgentEvent?.({
+      type: "status",
+      status: codexStatus({ connectionState: "connecting", email: "first@example.com" }),
+    });
+    await waitFor(() => expect(screen.getByLabelText("ChatGPT row")).toHaveTextContent("connecting"));
+    emitAgentEvent?.({ type: "status", status: codexStatus({ email: "second@example.com" }) });
+    expect(await screen.findByText("Signed in as second@example.com.")).toBeVisible();
   });
 });

@@ -1,9 +1,10 @@
 // Signing in to a provider, storing the optional provider API keys, and downloading the CLI
 // runtimes the providers need.
 
-import { isManagedRuntimeProvider } from "@openbot/contracts/agent-providers";
-import type { AgentProviderId } from "@openbot/contracts/ipc";
+import { isManagedRuntimeProvider, type ManagedProviderId } from "@openbot/contracts/agent-providers";
+import type { SetProviderApiKeyInput } from "@openbot/contracts/ipc";
 import { isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
+import { sourceText } from "@openbot/i18n/source";
 import { shell } from "electron";
 import type { AgentService } from "../../backend/agent-service";
 import type { ProviderCredentialStore } from "../provider-credential-store";
@@ -39,6 +40,9 @@ export function providerIpcHandlers({
         return service.getStatus();
       }),
       refreshAgentProviders: handler(() => service.refreshProviders()),
+      // The code and the page it is typed on come back; nothing the code is later traded for does.
+      startProviderCodeLogin: payloadHandler(parseProviderId, (provider) => service.startProviderCodeLogin(provider)),
+      cancelProviderCodeLogin: payloadHandler(parseProviderId, (provider) => service.cancelProviderCodeLogin(provider)),
       // The key and the process that uses it change as one step, because the catalog the CLI
       // advertises is decided at spawn time: the service writes the key only when it can restart
       // the provider on it, and reports success only once the new process is up.
@@ -58,6 +62,7 @@ export function providerIpcHandlers({
       getStatus: handler(() => providerRuntimes.getStatus()),
       download: payloadHandler(parseManagedProviderId, (parsed) => providerRuntimes.download(parsed)),
       cancel: payloadHandler(parseManagedProviderId, (parsed) => providerRuntimes.cancel(parsed)),
+      checkForUpdates: handler(() => providerRuntimes.checkForUpdates()),
     },
   };
 }
@@ -68,15 +73,15 @@ export function providerIpcHandlers({
  * Exported for the test that holds it to its limits: this is the one place a renderer-supplied
  * secret enters the main process, and each rule here decides what `safeStorage` is asked to keep.
  */
-export function parseProviderApiKeyInput(value: unknown): { provider: AgentProviderId; key: string } {
-  if (!isDynamicRecord(value)) throw new Error("A provider key is required.");
+export function parseProviderApiKeyInput(value: unknown): SetProviderApiKeyInput {
+  if (!isDynamicRecord(value)) throw new Error(sourceText("error.provider.keyRequired"));
   const provider = parseProviderId(value.provider);
-  if (!isString(value.key) || !value.key.trim()) throw new Error("A provider key is required.");
-  if (value.key.length > MAX_API_KEY_LENGTH) throw new Error("The provider key is too long.");
+  if (!isString(value.key) || !value.key.trim()) throw new Error(sourceText("error.provider.keyRequired"));
+  if (value.key.length > MAX_API_KEY_LENGTH) throw new Error(sourceText("error.provider.keyTooLong"));
   return { provider, key: value.key.trim() };
 }
 
-function parseManagedProviderId(value: unknown) {
+export function parseManagedProviderId(value: unknown): ManagedProviderId {
   const provider = parseProviderId(value);
   if (!isManagedRuntimeProvider(provider)) throw new Error("OpenBot does not manage this provider's CLI.");
   return provider;

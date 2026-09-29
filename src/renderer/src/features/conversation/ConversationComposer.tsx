@@ -1,10 +1,9 @@
 import { IMAGE_ATTACHMENT_ACCEPT, supportedAttachmentExtensions } from "@openbot/contracts/attachment-files";
-import { canPreviewAttachment } from "@openbot/contracts/ipc";
+import { accountUsageCoversModel, canPreviewAttachment } from "@openbot/contracts/ipc";
 import {
   TEAM_EML_ATTACHMENTS_CAPABILITY,
   TEAM_MEDIA_ATTACHMENTS_CAPABILITY,
 } from "@openbot/contracts/team-protocol/current";
-import { createEffect, createMemo, createSignal, For, Loading, lazy, onCleanup, Show } from "solid-js";
 import {
   ArrowUp,
   Button,
@@ -17,16 +16,18 @@ import {
   Mic,
   Plus,
   Puzzle,
-} from "../../components/ui";
-import { usePlatform } from "../../platform";
-import { fileBadge, formatFileSize } from "./AttachmentCards";
-import { attachmentReferenceTone } from "./AttachmentReference";
-import { ComposerEditor } from "./ComposerEditor";
-import { ComposerErrorBanner } from "./ComposerErrorBanner";
-import { ComposerSignInNotice, ComposerUsageLimitNotice } from "./ComposerNotice";
-import { CloseIcon, MoreIcon, StopIcon } from "./ConversationIcons";
+} from "@openbot/ui";
+import { fileBadge } from "@openbot/ui/features/conversation/AttachmentCards";
+import { attachmentReferenceTone } from "@openbot/ui/features/conversation/AttachmentReference";
+import { AwaitingReplies } from "@openbot/ui/features/conversation/AwaitingReplies";
+import { ComposerEditor } from "@openbot/ui/features/conversation/ComposerEditor";
+import { ComposerErrorBanner } from "@openbot/ui/features/conversation/ComposerErrorBanner";
+import { ComposerSignInNotice, ComposerUsageLimitNotice } from "@openbot/ui/features/conversation/ComposerNotice";
+import { CloseIcon, MoreIcon, StopIcon } from "@openbot/ui/features/conversation/ConversationIcons";
+import { RichMessageText } from "@openbot/ui/features/conversation/RichMessageText";
+import { useText } from "@openbot/ui/text";
+import { createEffect, createMemo, createSignal, For, Loading, lazy, onCleanup, Show } from "solid-js";
 import { useConversationViewScope } from "./conversation-scope";
-import { RichMessageText } from "./RichMessageText";
 import { formatVoiceDuration, voiceButtonLabel, voiceSupported } from "./voice-status";
 
 /** @internal Stable HMR boundary for conversation composer. */
@@ -35,6 +36,8 @@ export function ConversationComposer() {
     agentReady,
     attachmentAction,
     attachmentBusy,
+    awaitingReplies,
+    dismissAwaitingReplies,
     composerFocusRequest,
     composerHasContent,
     currentChatConversationKey,
@@ -42,6 +45,7 @@ export function ConversationComposer() {
     currentDraft,
     dismissCurrentChatErrors,
     installedSkills,
+    mcpServers,
     editQueuedMessage,
     editingDeliveryId,
     editingPendingSave,
@@ -72,13 +76,19 @@ export function ConversationComposer() {
     voicePhase,
     voiceModelProgress,
   } = useConversationViewScope();
-  const platform = usePlatform();
+  const { t, format } = useText();
+  const messageLabel = () =>
+    props.agent?.name
+      ? t("composer.placeholder.message", { name: props.agent.name })
+      : t("composer.placeholder.messageAgent");
   const [pickerOpen, setPickerOpen] = createSignal(false);
   // A pending Save keeps its exact request for retry. Block changes until retry or cancel.
   const savePending = () => Boolean(editingDeliveryId() && editingPendingSave());
   // The mention picker grows out of the same edge as the queue, so only one of them holds it.
   const queueVisible = () => queuePanelVisible() && !pickerOpen();
-  const voiceAvailable = () => voiceSupported(platform.appInfo()?.platform);
+  const awaitingVisible = () => awaitingReplies().length > 0 && !pickerOpen();
+  const slotOpen = () => queueVisible() || awaitingVisible();
+  const voiceAvailable = () => !props.runtime && voiceSupported(props.platform);
   /**
    * The provider status is the only source of truth for a signed-out provider, so the notice and the
    * model picker's "Sign in required" label can never disagree, and the notice is shown before the
@@ -87,6 +97,9 @@ export function ConversationComposer() {
   const signInRequired = createMemo(() => {
     const provider = props.agent?.provider;
     if (!provider || !props.onSignInProvider) return null;
+    // OpenCode is signed in by pasting a key in settings, not by a login this button can start, so
+    // its notice would carry a button that does nothing. Every other provider opens its own OAuth.
+    if (provider === "opencode") return null;
     const status = props.agentStatus.providers?.find((item) => item.id === provider);
     return status?.state === "sign-in-required" ? status : null;
   });
@@ -101,7 +114,7 @@ export function ConversationComposer() {
    */
   const usageExhausted = createMemo(() => {
     const provider = props.agent?.provider;
-    if (!provider || signInRequired()) return null;
+    if (!provider || signInRequired() || !accountUsageCoversModel(provider, props.agent?.model)) return null;
     for (const limit of props.accountUsage?.limits ?? []) {
       if (limit.id !== provider) continue;
       for (const plan of [limit.primary, limit.secondary]) {
@@ -138,11 +151,14 @@ export function ConversationComposer() {
       <div class="composer-wrap">
         <div
           class="agent-queue-slot"
-          data-open={queueVisible() ? "true" : "false"}
-          aria-hidden={queueVisible() ? undefined : "true"}
-          inert={queueVisible() ? undefined : true}
+          data-open={slotOpen() ? "true" : "false"}
+          aria-hidden={slotOpen() ? undefined : "true"}
+          inert={slotOpen() ? undefined : true}
         >
           <div class="agent-queue-slot-inner">
+            <Show when={awaitingVisible()}>
+              <AwaitingReplies items={awaitingReplies()} onDismiss={dismissAwaitingReplies} />
+            </Show>
             <Show when={queueVisible()}>
               <Loading>
                 <QueuePanel
@@ -168,10 +184,10 @@ export function ConversationComposer() {
           {(message) => (
             <div class="composer-reply-preview">
               <div>
-                <span>Replying to {message().author === "you" ? "your message" : "Agent"}</span>
+                <span>{t(message().author === "you" ? "composer.reply.toYou" : "composer.reply.toAgent")}</span>
                 <p>
                   <RichMessageText
-                    body={message().body || "Attachment"}
+                    body={message().body || t("composer.reply.attachment")}
                     agents={props.agents}
                     skills={installedSkills()}
                     attachments={message().attachments}
@@ -184,7 +200,7 @@ export function ConversationComposer() {
               <Button
                 variant="ghost"
                 type="button"
-                aria-label="Cancel reply"
+                aria-label={t("composer.reply.cancel")}
                 disabled={voicePhase() === "transcribing"}
                 onClick={() => updateCurrentDraft({ replyToMessageId: null })}
               >
@@ -233,29 +249,33 @@ export function ConversationComposer() {
           <Show when={unreferencedDraftAttachments().length > 0}>
             <div class="composer-attachments">
               <For each={unreferencedDraftAttachments()}>
-                {(attachment) => (
-                  <div class="composer-attachment ui-removable-image" data-kind={attachment.kind}>
-                    <span
-                      class="composer-attachment-preview"
-                      data-file-tone={attachment.kind === "file" ? attachmentReferenceTone(attachment.name) : undefined}
-                    >
-                      <Show when={attachment.kind === "image"} fallback={fileBadge(attachment)}>
-                        <img src={attachment.previewUrl ?? ""} alt="" />
-                      </Show>
-                    </span>
-                    <Show when={attachment.kind === "file"}>
-                      <span class="composer-attachment-copy">
-                        <strong title={attachment.name}>{attachment.name}</strong>
-                        <small>{formatFileSize(attachment.size)}</small>
+                {(attachment) => {
+                  // An image with no preview (the web client) shows as a file, with its name.
+                  const chip = () => (attachment.kind === "image" && attachment.previewUrl ? "image" : "file");
+                  return (
+                    <div class="composer-attachment ui-removable-image" data-kind={chip()}>
+                      <span
+                        class="composer-attachment-preview"
+                        data-file-tone={chip() === "file" ? attachmentReferenceTone(attachment.name) : undefined}
+                      >
+                        <Show when={chip() === "image"} fallback={fileBadge(attachment)}>
+                          <img src={attachment.previewUrl ?? ""} alt="" />
+                        </Show>
                       </span>
-                    </Show>
-                    <ImageRemoveButton
-                      label={`Remove ${attachment.name}`}
-                      disabled={voicePhase() === "transcribing" || savePending()}
-                      onClick={() => removeAttachment(attachment.id)}
-                    />
-                  </div>
-                )}
+                      <Show when={chip() === "file"}>
+                        <span class="composer-attachment-copy">
+                          <strong title={attachment.name}>{attachment.name}</strong>
+                          <small>{format.fileSize(attachment.size)}</small>
+                        </span>
+                      </Show>
+                      <ImageRemoveButton
+                        label={t("composer.attachment.remove", { name: attachment.name })}
+                        disabled={voicePhase() === "transcribing" || savePending()}
+                        onClick={() => removeAttachment(attachment.id)}
+                      />
+                    </div>
+                  );
+                }}
               </For>
             </div>
           </Show>
@@ -264,6 +284,7 @@ export function ConversationComposer() {
               agentId={props.agent?.id}
               agents={props.agents}
               skills={installedSkills()}
+              mcpServers={mcpServers()}
               attachments={currentDraft().attachments}
               value={currentDraft().text}
               disabled={
@@ -271,12 +292,16 @@ export function ConversationComposer() {
               }
               placeholder={
                 !agentReady()
-                  ? "Complete agent CLI setup to start"
+                  ? props.runtime
+                    ? props.server?.state === "online"
+                      ? t("composer.placeholder.hostSetup")
+                      : t("composer.placeholder.connectHost")
+                    : t("composer.placeholder.cliSetup")
                   : replyTarget()
-                    ? "Reply…"
-                    : `Message ${props.agent?.name ?? "agent"}`
+                    ? t("composer.placeholder.reply")
+                    : messageLabel()
               }
-              ariaLabel={`Message ${props.agent?.name ?? "agent"}`}
+              ariaLabel={messageLabel()}
               focusRequest={composerFocusRequest()}
               onValueChange={(text) => {
                 updateCurrentDraft({ text });
@@ -284,6 +309,9 @@ export function ConversationComposer() {
               }}
               onSubmit={submitComposer}
               onPickerOpenChange={setPickerOpen}
+              onPasteFiles={(files) => {
+                if (props.runtime?.importFiles) void props.runtime.importFiles(files);
+              }}
               onOpenAttachment={(attachment) =>
                 canPreviewAttachment(attachment)
                   ? void previewAttachment(attachment)
@@ -299,7 +327,11 @@ export function ConversationComposer() {
               multiple
               hidden
               tabindex={-1}
-              data-openbot-attachment-picker="true"
+              data-openbot-attachment-picker={props.runtime ? undefined : "true"}
+              onChange={(event) => {
+                if (props.runtime?.importFiles)
+                  void props.runtime.importFiles(Array.from(event.currentTarget.files ?? []));
+              }}
             />
             <Input
               ref={setContextAttachmentPickerElement}
@@ -308,7 +340,11 @@ export function ConversationComposer() {
               multiple
               hidden
               tabindex={-1}
-              data-openbot-attachment-picker="true"
+              data-openbot-attachment-picker={props.runtime ? undefined : "true"}
+              onChange={(event) => {
+                if (props.runtime?.importFiles)
+                  void props.runtime.importFiles(Array.from(event.currentTarget.files ?? []));
+              }}
             />
             <DropdownMenu.Root
               open={showComposerActions()}
@@ -319,7 +355,7 @@ export function ConversationComposer() {
             >
               <DropdownMenu.Trigger
                 class="composer-button"
-                aria-label="Add to prompt"
+                aria-label={t("composer.add.label")}
                 disabled={
                   attachmentBusy() ||
                   submitting() ||
@@ -332,7 +368,7 @@ export function ConversationComposer() {
                 <Plus aria-hidden="true" />
               </DropdownMenu.Trigger>
               <DropdownMenu.Portal>
-                <DropdownMenu.Content aria-label="Add to prompt">
+                <DropdownMenu.Content aria-label={t("composer.add.label")}>
                   <DropdownMenu.Item
                     disabled={attachmentBusy()}
                     onPointerDown={(event) => {
@@ -341,11 +377,11 @@ export function ConversationComposer() {
                     onKeyDown={(event) => openAttachmentPickerFromKey(event, "images")}
                   >
                     <Image aria-hidden="true" />
-                    <span>Attach image</span>
+                    <span>{t("composer.add.image")}</span>
                   </DropdownMenu.Item>
-                  <DropdownMenu.Item disabled title="Skill selection is not available yet.">
+                  <DropdownMenu.Item disabled title={t("composer.add.skillUnavailable")}>
                     <Puzzle aria-hidden="true" />
-                    <span>Use a skill</span>
+                    <span>{t("composer.add.skill")}</span>
                   </DropdownMenu.Item>
                   <DropdownMenu.Item
                     disabled={attachmentBusy()}
@@ -355,16 +391,23 @@ export function ConversationComposer() {
                     onKeyDown={(event) => openAttachmentPickerFromKey(event, "all")}
                   >
                     <File aria-hidden="true" />
-                    <span>Add context</span>
+                    <span>{t("composer.add.context")}</span>
                   </DropdownMenu.Item>
                 </DropdownMenu.Content>
               </DropdownMenu.Portal>
             </DropdownMenu.Root>
             <div class="composer-primary-actions">
+              <Show when={attachmentBusy() && props.runtime?.cancelImportFiles} keyed>
+                {(cancelImportFiles) => (
+                  <Button variant="ghost" type="button" onClick={() => void cancelImportFiles()}>
+                    {t("composer.upload.cancel")}
+                  </Button>
+                )}
+              </Show>
               <Show when={voiceAvailable()}>
                 <Show when={voicePhase() === "preparing"}>
                   <span class="voice-model-progress" role="status">
-                    Downloading voice model {voiceModelProgress() ?? 0}%
+                    {t("composer.voice.progress", { progress: voiceModelProgress() ?? 0 })}
                   </span>
                 </Show>
                 <Show
@@ -374,7 +417,7 @@ export function ConversationComposer() {
                       variant="ghost"
                       type="button"
                       class="dictation-button"
-                      aria-label={voiceButtonLabel(voicePhase())}
+                      aria-label={t(voiceButtonLabel(voicePhase()))}
                       disabled={
                         voicePhase() === "requesting" ||
                         voicePhase() === "preparing" ||
@@ -396,12 +439,12 @@ export function ConversationComposer() {
                     </Button>
                   }
                 >
-                  <fieldset class="voice-recording-status" aria-label="Voice recording">
+                  <fieldset class="voice-recording-status" aria-label={t("composer.voice.recording")}>
                     <Button
                       variant="ghost"
                       type="button"
                       class="voice-recording-stop"
-                      aria-label="Stop voice recording"
+                      aria-label={t("composer.voice.stop")}
                       onClick={stopVoiceRecording}
                     >
                       <StopIcon />
@@ -424,10 +467,10 @@ export function ConversationComposer() {
                     class="voice-button"
                     aria-label={
                       editingDeliveryId()
-                        ? "Save queued message"
+                        ? t("composer.send.saveQueued")
                         : voicePhase() === "recording"
-                          ? "Send voice message"
-                          : "Send message"
+                          ? t("composer.send.voice")
+                          : t("composer.send.message")
                     }
                     disabled={
                       attachmentBusy() ||
@@ -450,7 +493,7 @@ export function ConversationComposer() {
                   variant="ghost"
                   type="button"
                   class="voice-button voice-button-active"
-                  aria-label="Stop agent"
+                  aria-label={t("composer.send.stop")}
                   onClick={props.onStop}
                 >
                   <StopIcon />
@@ -464,4 +507,6 @@ export function ConversationComposer() {
   );
 }
 
-const QueuePanel = lazy(() => import("./QueuePanel").then((module) => ({ default: module.QueuePanel })));
+const QueuePanel = lazy(() =>
+  import("@openbot/ui/features/conversation/QueuePanel").then((module) => ({ default: module.QueuePanel })),
+);

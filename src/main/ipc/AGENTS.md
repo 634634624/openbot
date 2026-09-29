@@ -6,14 +6,26 @@ here registers anything: `index.ts` spreads them all into `registerIpcGroups`, w
 
 ## Adding an endpoint
 
-1. Add the wire value to `packages/contracts/src/ipc-channels.ts`.
-2. Add it to a group in `packages/contracts/src/ipc-endpoints.ts`, as `request(...)` or `event(...)`.
-3. Run `bun run typecheck`. It now names the file to change and the key to add.
-4. Add the handler here, the `invoke` in `src/preload/index.ts`, and the method in
-   `src/renderer/src/preview/mock-openbot.ts`.
+1. Add the endpoint to a group in `packages/contracts/src/ipc-endpoints.ts`, as
+   `request<Payload, Result>()("group:wire-name")` or `event<Payload>()("group:wire-name")`. All
+   endpoints are typed except `browserInput.sendLiveViewInput`: the renderer sends `BrowserLiveViewInput`
+   and main decodes the different wire `BrowserViewInput`. Do not add another `untypedRequest(...)`.
+2. In a group the preload builds with `bridgeGroup` (the `GroupApi` aliases in
+   `packages/contracts/src/ipc-desktop-apis.ts`), skip this step: the method exists already. In a
+   hand-written group, declare the `OpenBotDesktopApi` method as
+   `Invoke<typeof IPC_ENDPOINTS.group.name>` (or `Subscribe<...>` for an event).
+3. Run `bun run typecheck:node`, then `bun run typecheck:renderer`. The errors name the file to
+   change and the key to add.
+4. Add the handler here and the method in `src/renderer/src/preview/mock-openbot.ts`, or in the
+   `mock-*.ts` module there that owns the group, such as `mock-team.ts`. In the preload,
+   a bridged group needs one decoder in its `bridgeGroup` map (`TS2741` names it). A hand-written group
+   needs the call (`invokeAgentForServer` for a server-scoped payload, `ipcRenderer.invoke` for the
+   untyped endpoint, or `listen` for an event). The decoder comes from a preload decoding
+   module, such as `src/preload/team-decoding.ts`, or is `decodeVoid`.
 
-Step 3 is the point. Every step but the preload announces itself, and the preload is what
-`src/main/ipc-channel-coverage.test.ts` reads.
+Step 3 is the point. In a bridged group every step announces itself. In a hand-written group, a
+hand-written signature in step 2 compiles, so review must check that it uses `Invoke`, and a missing
+preload call is found by `src/main/ipc-channel-coverage.test.ts`, not by the types.
 
 A group is the unit one registrar covers in full, which is why a wire prefix can span several: the
 `agent:` channels are four groups, one per registrar, because the exhaustiveness a group buys is only
@@ -37,7 +49,7 @@ today needs the sender check too. `handleTrustedWithEvent` carries the overload,
 constructor when an endpoint actually wants it rather than before.
 
 `authorizedHandler` exists because every window of the app shares one origin, so the trusted-URL gate
-in `./trusted-ipc.ts` cannot tell the Dynamic Island overlay from the main renderer.
+in `../trusted-ipc.ts` cannot tell the Dynamic Island overlay from the main renderer.
 `dynamic-island-handlers.ts` is the only user today, and the ordering is the point: a caller already
 known to be rejected must not be handed a payload-validation error to read, and must not be what the
 decoder spends its allocations on.
@@ -64,3 +76,8 @@ A handler that takes a `serverId` serves two backends — the local `AgentServic
 server over HTTP — and picks with `routeToServer(serverId, { local, remote })` from
 `./route-to-server.ts`. Write the branch out by hand and you have written the fifty-fifth copy of the
 same ternary.
+
+When the whole handler is that one route, bind it with `scopedHandler(decode, { local, remote })`, or
+`scopedQueryHandler({ local, remote })` for a `scopedQuery` endpoint, from `./scoped-handler.ts`.
+Each branch gets the decoded payload, and `remote` also gets the server. Use `payloadHandler` with
+`agentRequest(decode)` only when the handler does work outside the route.

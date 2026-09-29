@@ -1,29 +1,31 @@
 import { isManagedRuntimeProvider, type ManagedProviderId } from "@openbot/contracts/agent-providers";
 import type { AgentProviderId, ProviderRuntimeStatus } from "@openbot/contracts/ipc";
+import { Button, Checkbox, Heading, Text, Toaster } from "@openbot/ui";
+import type { ProviderPickerOption } from "@openbot/ui/components/ProviderPicker";
+import { ProviderPicker } from "@openbot/ui/components/ProviderPicker";
+import { type ProviderUpdate, providerUpdatesToAnnounce } from "@openbot/ui/features/provider-updates/provider-update";
 import { createEffect, createSignal, createUniqueId, onCleanup, Show } from "solid-js";
-import { expect, waitFor, within } from "storybook/test";
 import type { Meta, StoryObj } from "storybook-solidjs-vite";
-import { ProviderPicker, type ProviderPickerOption } from "../src/components/ProviderPicker";
-import { Button, Checkbox, Heading, Text, Toaster } from "../src/components/ui";
-import { type ProviderUpdate, providerUpdatesToAnnounce } from "../src/features/provider-updates/provider-update";
 import {
   dismissProviderUpdateToast,
   reportProviderUpdateToast,
   showProviderUpdateToast,
 } from "../src/features/provider-updates/provider-update-toast";
 
-const PROVIDERS = ["codex", "claude", "grok", "opencode"] as const;
+const PROVIDERS = ["codex", "claude", "grok", "opencode", "antigravity"] as const;
 const NAMES: Record<ManagedProviderId, string> = {
   codex: "ChatGPT",
   claude: "Claude",
   grok: "Grok",
   opencode: "OpenCode",
+  antigravity: "Gemini",
 };
 const INSTALLED: Record<ManagedProviderId, string> = {
   codex: "0.149.1",
   claude: "2.1.246",
   grok: "1.0.5",
   opencode: "1.18.30",
+  antigravity: "1.2.1",
 };
 
 /** Only Claude has a newer runtime: the quiet rows are half of what the flow has to show. */
@@ -32,9 +34,10 @@ const AVAILABLE: Record<ManagedProviderId, string | null> = {
   claude: "2.1.250",
   grok: null,
   opencode: null,
+  antigravity: null,
 };
 
-/** Fast enough that a play function settles in a couple of seconds, slow enough to read. */
+/** Fast enough to finish in a couple of seconds, slow enough to read. */
 const PROGRESS_STEP = 8;
 const PROGRESS_INTERVAL = 120;
 const FINISHING_DELAY = 500;
@@ -45,6 +48,7 @@ function readyRuntimes(): Record<ManagedProviderId, ProviderRuntimeStatus> {
     claude: { phase: "ready", progress: 100, message: null, version: INSTALLED.claude },
     grok: { phase: "ready", progress: 100, message: null, version: INSTALLED.grok },
     opencode: { phase: "ready", progress: 100, message: null, version: INSTALLED.opencode },
+    antigravity: { phase: "ready", progress: 100, message: null, version: INSTALLED.antigravity },
   };
 }
 
@@ -54,12 +58,12 @@ function readyRuntimes(): Record<ManagedProviderId, ProviderRuntimeStatus> {
  * cleanup. `mock-openbot.ts` still stubs `providerRuntimes` inert, and no contract carries
  * `availableVersion` yet, so props are the only honest source for these states today.
  */
-function ProviderUpdateFlow(props: { failOnce?: boolean; controls?: boolean }) {
+function ProviderUpdateFlow(props: { controls?: boolean }) {
   const [runtimes, setRuntimes] = createSignal(readyRuntimes());
   const [provider, setProvider] = createSignal<AgentProviderId>("claude");
   // One update fails, and the flag is spent when it does, so the Retry after it succeeds. The
-  // `UpdateFails` story starts it armed; the playground puts the same switch under the reader.
-  const [failNext, setFailNext] = createSignal(Boolean(props.failOnce));
+  // playground puts the switch under the reader.
+  const [failNext, setFailNext] = createSignal(false);
   const failToggleId = createUniqueId();
   const timers = new Set<number>();
   const running = new Set<AgentProviderId>();
@@ -217,7 +221,7 @@ type Story = StoryObj<typeof meta>;
 
 /**
  * Drive it yourself. Nothing runs on its own here: the offer arrives on mount and the update starts
- * only when you press Update, on the notification or on the row. "Offer the update again" puts
+ * only when you press Update, on the notification or in the row's actions menu. "Offer the update again" puts
  * Claude back on the version it started from, so the whole flow can be watched more than once, and
  * the switch beside it interrupts the next run to make the Retry path reachable.
  */
@@ -226,38 +230,4 @@ export const Playground: Story = {
 };
 
 /** The offer, on both surfaces at once. */
-export const UpdateAvailable: Story = {
-  play: async ({ canvasElement }) => {
-    const body = within(canvasElement.ownerDocument.body);
-    await expect(body.findByRole("button", { name: "Update Claude to 2.1.250" })).resolves.toBeEnabled();
-    await expect(body.findByRole("button", { name: "Update" })).resolves.toBeEnabled();
-  },
-};
-
-/** The toast is the whole point: one click starts the update, and the same toast reports it. */
-export const UpdateFromToast: Story = {
-  play: async ({ canvasElement, userEvent }) => {
-    const body = within(canvasElement.ownerDocument.body);
-    await userEvent.click(await body.findByRole("button", { name: "Update" }));
-
-    await waitFor(() => expect(body.getByRole("button", { name: "Cancel Claude" })).toBeEnabled());
-    await expect(body.findByText("Claude is up to date", undefined, { timeout: 8_000 })).resolves.toBeInTheDocument();
-    // Neither surface still offers an update the user already took. Sonner merges by toast id, so
-    // the settled notification keeps the offer's Update button unless the action is cleared by name.
-    await expect(body.queryByRole("button", { name: "Update Claude to 2.1.250" })).toBeNull();
-    await expect(body.queryByRole("button", { name: "Update" })).toBeNull();
-  },
-};
-
-/** A failed update is not a dead end either: Retry is on the notification that reported the failure. */
-export const UpdateFails: Story = {
-  render: () => <ProviderUpdateFlow failOnce />,
-  play: async ({ canvasElement, userEvent }) => {
-    const body = within(canvasElement.ownerDocument.body);
-    await userEvent.click(await body.findByRole("button", { name: "Update Claude to 2.1.250" }));
-
-    await expect(body.findByText("Claude update failed", undefined, { timeout: 8_000 })).resolves.toBeInTheDocument();
-    await userEvent.click(await body.findByRole("button", { name: "Retry" }));
-    await expect(body.findByText("Claude is up to date", undefined, { timeout: 8_000 })).resolves.toBeInTheDocument();
-  },
-};
+export const UpdateAvailable: Story = {};

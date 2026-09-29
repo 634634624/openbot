@@ -10,7 +10,13 @@
  */
 
 import { join } from "node:path";
-import { type AgentEvent, IPC_CHANNELS, LOCAL_SERVER_ID, type MacPermissionId } from "@openbot/contracts/ipc";
+import {
+  type AgentEvent,
+  type ComputerUseHighlightPlacement,
+  IPC_ENDPOINTS,
+  LOCAL_SERVER_ID,
+  type MacPermissionId,
+} from "@openbot/contracts/ipc";
 import type { AppTranslate } from "@openbot/i18n";
 import { app, BrowserWindow, clipboard, type Display, Menu, type Rectangle, screen } from "electron";
 import type { AgentService } from "../backend/agent-service";
@@ -21,7 +27,7 @@ import {
   isSelectAllShortcut,
   isToggleDevToolsShortcut,
 } from "../backend/browser-shortcuts";
-import type { ComputerUseMacSetupWindowController } from "./computer-use-mac-setup-window";
+import type { HighlightDisplay } from "./computer-use-highlight-window";
 import { shouldShowDevelopmentWindow } from "./development-profile";
 import { dynamicIslandNotchSizeForDisplay } from "./dynamic-island-window";
 import {
@@ -41,11 +47,10 @@ import type { UpdateService } from "./update-service";
  * `ApplicationServices`: keeping it structural is what lets the composition root import this
  * module without this module importing it back.
  */
-export interface MainWindowApplicationServices {
+interface MainWindowApplicationServices {
   service: AgentService;
   browser: BrowserHost;
   remoteServers: RemoteServerManager;
-  computerUseMacSetup: ComputerUseMacSetupWindowController;
 }
 
 /** The two handles that outlive any one window, so `activate` can rebuild into the same slot. */
@@ -69,6 +74,8 @@ export interface MainWindowContext {
   isQuitting: () => boolean;
   /** A function, not a value: nothing exists yet when the first window is created. */
   getServices: () => MainWindowApplicationServices | null;
+  /** A function, not a value: the saved language is read after the first window opens. */
+  getTranslate: () => AppTranslate;
   forwardAgentEvent: (serverId: string, event: AgentEvent) => void;
   /** The renderer is about to be replaced, so a queued invitation has nobody to receive it. */
   onRendererLoadStarted: () => void;
@@ -82,7 +89,6 @@ export interface MainWindowController {
   openMainWindow: () => BrowserWindow;
   ensureMainWindow: () => Promise<BrowserWindow>;
   loadRenderer: (window: BrowserWindow) => Promise<void>;
-  createComputerUseMacSetupWindow: () => BrowserWindow;
   restoreMainWindowBounds: () => Promise<void>;
   flushMainWindowBounds: () => Promise<void>;
 }
@@ -96,6 +102,7 @@ export function createMainWindowController({
   developmentTestClientEnabled,
   isQuitting,
   getServices,
+  getTranslate,
   forwardAgentEvent,
   onRendererLoadStarted,
   onMainWindowCreated,
@@ -125,7 +132,10 @@ export function createMainWindowController({
       minHeight: 640,
       show: false,
       backgroundColor: "#0b0d0e",
-      title: developmentProfile === "test-client" ? "OpenBot Local Client" : "OpenBot Local Host",
+      title:
+        developmentProfile === "test-client"
+          ? getTranslate()("window.localClientTitle")
+          : getTranslate()("window.localHostTitle"),
       icon: appIconPath,
       // The dots are drawn over the renderer, so this position is a layout value, not a chrome
       // detail. macOS spaces the three 13px dots 23px apart, so the group is 59px wide: x 12 leaves
@@ -169,7 +179,6 @@ export function createMainWindowController({
     });
     window.on("move", () => rememberMainWindowBounds(window.getNormalBounds()));
     window.on("resize", () => rememberMainWindowBounds(window.getNormalBounds()));
-    window.on("hide", () => getServices()?.computerUseMacSetup.close());
 
     window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
     window.webContents.on("before-input-event", (event, input) => {
@@ -235,7 +244,7 @@ export function createMainWindowController({
           if (item === "separator") return { type: "separator" } as const;
           if (item === "copy-link")
             return {
-              label: "Copy Link",
+              label: getTranslate()("menu.copyLink"),
               click: () => clipboard.writeText(params.linkURL),
             };
           if (item === "copy") return { role: "copy" } as const;
@@ -257,49 +266,6 @@ export function createMainWindowController({
       }
     });
 
-    return window;
-  }
-
-  function createComputerUseMacSetupWindow(): BrowserWindow {
-    const anchor = holder.current;
-    const workArea =
-      anchor && !anchor.isDestroyed()
-        ? screen.getDisplayMatching(anchor.getBounds()).workArea
-        : screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea;
-    const width = 360;
-    const height = 300;
-    const window = new BrowserWindow({
-      width,
-      height,
-      x: workArea.x + workArea.width - width - 16,
-      y: workArea.y + 52,
-      show: false,
-      resizable: false,
-      minimizable: false,
-      maximizable: false,
-      fullscreenable: false,
-      skipTaskbar: true,
-      alwaysOnTop: true,
-      backgroundColor: "#0b0d0e",
-      title: "Set up Computer Use",
-      icon: appIconPath,
-      ...(process.platform === "darwin"
-        ? { titleBarStyle: "hiddenInset" as const, trafficLightPosition: { x: 12, y: 13 } }
-        : {}),
-      webPreferences: {
-        preload: join(__dirname, "../preload/index.cjs"),
-        contextIsolation: true,
-        devTools: true,
-        sandbox: true,
-        nodeIntegration: false,
-        webSecurity: true,
-      },
-    });
-    window.setAlwaysOnTop(true, "floating");
-    window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
-    window.webContents.on("will-navigate", (event, targetUrl) => {
-      if (!isTrustedRendererUrl(targetUrl)) event.preventDefault();
-    });
     return window;
   }
 
@@ -338,7 +304,6 @@ export function createMainWindowController({
     openMainWindow,
     ensureMainWindow,
     loadRenderer,
-    createComputerUseMacSetupWindow,
     restoreMainWindowBounds,
     flushMainWindowBounds,
   };
@@ -379,6 +344,157 @@ export function createDynamicIslandWindow(bounds: Rectangle, _display: Display):
   return window;
 }
 
+/**
+ * The overlay that carries the Computer Use rim over the window an agent works in.
+ *
+ * It covers the whole desktop and then stays still: the rim moves inside it, so a window the user
+ * drags is followed by a repaint rather than by a window move on every frame.
+ *
+ * It is a panel that is never focusable and never in Mission Control, so it does not enter the
+ * user's window order. It floats over the desktop, because macOS gives no way to hold one
+ * application's window between two of another's, and a rim the user cannot see says nothing about
+ * where the agent works. It is created hidden and click-through.
+ */
+export function createComputerUseHighlightWindow(bounds: Rectangle): BrowserWindow {
+  const window = new BrowserWindow({
+    ...bounds,
+    show: false,
+    transparent: true,
+    frame: false,
+    focusable: false,
+    hiddenInMissionControl: true,
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    enableLargerThanScreen: true,
+    hasShadow: false,
+    skipTaskbar: true,
+    acceptFirstMouse: false,
+    type: "panel",
+    backgroundColor: "#00000000",
+    webPreferences: {
+      preload: join(__dirname, "../preload/index.cjs"),
+      contextIsolation: true,
+      devTools: true,
+      sandbox: true,
+      nodeIntegration: false,
+      webSecurity: true,
+    },
+  });
+  // A floating level, which is the only thing that holds this window in front on macOS: both
+  // `moveAbove` and `moveTop` return without an error and leave a transparent panel where it was.
+  // The level stays below the menu bar, and the rim is a thin edge around one window, so being in
+  // front costs the user almost none of what is behind it.
+  window.setAlwaysOnTop(true, "floating");
+  // The agent works wherever the user left the window, which can be another Space or another
+  // application's full screen. One overlay on every Space is what lets the rim follow it there
+  // without a second window and without pulling the user out of the Space they are on.
+  window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  // Nothing on this surface may be pressed, and it covers another application's whole window, so
+  // every event is handed straight on to the window below it.
+  window.setIgnoreMouseEvents(true, { forward: true });
+  window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  window.webContents.on("will-navigate", (event, targetUrl) => {
+    if (!isTrustedRendererUrl(targetUrl)) event.preventDefault();
+  });
+  return window;
+}
+
+/**
+ * The small window that stands beside the System Settings pane a permission is granted in.
+ *
+ * System Settings opens in front of everything and covers OpenBot, so the panel that asked for the
+ * grant is no longer on screen at the moment the user has to act. This window carries the steps
+ * there: it floats, it is small enough to leave the pane readable, and it reports the grant landing
+ * so the user knows they are done without going back to look.
+ *
+ * It holds no secret and asks for nothing. Every hardening the other surfaces carry is kept:
+ * sandboxed, context-isolated, no window may be opened from it, and no navigation away from the
+ * renderer's own origin.
+ */
+export function createComputerUsePermissionHelpWindow(translate: AppTranslate): BrowserWindow {
+  const workArea = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea;
+  const width = 340;
+  // The card the user drags out of it, the two steps, and nothing else: a window taller than its
+  // own contents would put empty space over the pane it stands beside.
+  const height = 322;
+  const window = new BrowserWindow({
+    width,
+    height,
+    x: workArea.x + workArea.width - width - 16,
+    y: workArea.y + 52,
+    show: false,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    backgroundColor: "#0b0d0e",
+    title: translate("window.computerUsePermissionTitle"),
+    ...(process.platform === "darwin"
+      ? { titleBarStyle: "hiddenInset" as const, trafficLightPosition: { x: 12, y: 13 } }
+      : {}),
+    webPreferences: {
+      preload: join(__dirname, "../preload/index.cjs"),
+      contextIsolation: true,
+      devTools: true,
+      sandbox: true,
+      nodeIntegration: false,
+      webSecurity: true,
+    },
+  });
+  // Over System Settings, which opens in front of everything: a window the pane covers would carry
+  // the steps to nobody.
+  window.setAlwaysOnTop(true, "floating");
+  window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  window.webContents.on("will-navigate", (event, targetUrl) => {
+    if (!isTrustedRendererUrl(targetUrl)) event.preventDefault();
+  });
+  return window;
+}
+
+export function loadComputerUsePermissionHelpRenderer(
+  window: BrowserWindow,
+  permission: MacPermissionId,
+  sunshine = false,
+): Promise<void> {
+  const developmentUrl = process.env.ELECTRON_RENDERER_URL;
+  const url = new URL(developmentUrl ?? "openbot-app://app/index.html");
+  url.searchParams.set("surface", "computer-use-permission-help");
+  url.searchParams.set("permission", permission);
+  if (sunshine) url.searchParams.set("application", "sunshine");
+  return window.loadURL(url.toString());
+}
+
+export function loadComputerUseHighlightRenderer(window: BrowserWindow): Promise<void> {
+  const developmentUrl = process.env.ELECTRON_RENDERER_URL;
+  const url = new URL(developmentUrl ?? "openbot-app://app/index.html");
+  url.searchParams.set("surface", "computer-use-highlight");
+  return window.loadURL(url.toString());
+}
+
+/**
+ * Every display the Computer Use overlay is built over, one overlay for each.
+ *
+ * Not one window over all of them: macOS gives every display its own Space, so a window the size of
+ * the desktop is drawn on one display and clipped away on all the others. An agent working on the
+ * second display would then be marked by a rim nobody can see.
+ */
+export function computerUseDisplays(): HighlightDisplay[] {
+  return screen.getAllDisplays().map((display) => ({ id: display.id, bounds: display.bounds }));
+}
+
+/** Where the overlay draws the rim. Sent on every placement, and read by that surface only. */
+export function sendComputerUseHighlightPlacement(
+  window: BrowserWindow,
+  placement: ComputerUseHighlightPlacement,
+): void {
+  sendToRenderer(window, IPC_ENDPOINTS.computerUse.highlightPlacement, placement);
+}
+
 export function showMainWindow(window: BrowserWindow): void {
   presentMainWindow(window, process.platform, () => app.show());
 }
@@ -394,14 +510,6 @@ export function loadDynamicIslandRenderer(window: BrowserWindow, display: Displa
     url.searchParams.set("notch-width", String(notch.width));
     url.searchParams.set("notch-height", String(notch.height));
   }
-  return window.loadURL(url.toString());
-}
-
-export function loadComputerUseMacSetupRenderer(window: BrowserWindow, permission: MacPermissionId): Promise<void> {
-  const developmentUrl = process.env.ELECTRON_RENDERER_URL;
-  const url = new URL(developmentUrl ?? "openbot-app://app/index.html");
-  url.searchParams.set("surface", "computer-use-setup");
-  url.searchParams.set("permission", permission);
   return window.loadURL(url.toString());
 }
 
@@ -438,7 +546,7 @@ export function configureApplicationMenu(service: AgentService, updater: UpdateS
             click: (_item, focusedWindow) => {
               const candidate = focusedWindow ?? BrowserWindow.getFocusedWindow();
               if (!(candidate instanceof BrowserWindow)) return;
-              sendToRenderer(candidate, IPC_CHANNELS.openSettings);
+              sendToRenderer(candidate, IPC_ENDPOINTS.app.openSettings);
             },
           },
           { type: "separator" },

@@ -5,7 +5,7 @@ import { EventEmitter } from "node:events";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentEvent, BrowserControlState, BrowserTab } from "@openbot/contracts/ipc";
+import type { AgentEvent, BrowserControlState, BrowserTab, QueueSnapshot } from "@openbot/contracts/ipc";
 import { type DynamicRecord, isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
 import { expect, vi } from "vitest";
 import type { BrowserUploadHooks } from "./agent/browser-uploads";
@@ -52,6 +52,7 @@ const FAKE_RUNTIME_ENV_VARS = [
   "OPENBOT_FAKE_TURN_START_RESPONSE_DELAY",
   "OPENBOT_FAKE_WARNING",
   "OPENBOT_FAKE_CLAUDE_LOGIN_LOG",
+  "OPENBOT_FAKE_CODEX_CONFIG",
 ] as const;
 
 const PROVIDER_PATH_ENV_VARS = [
@@ -102,17 +103,25 @@ export class FakeAgentClient extends EventEmitter implements AgentClient {
   readonly errors: Array<{ id: RequestId; error: RpcError }> = [];
   readonly releasedThreads: string[] = [];
   #threadCounter = 0;
+  /** Starts each session id. A second client of the same provider needs another, as real ids never repeat. */
+  sessionIdPrefix: string | null = null;
   running = false;
   responseError: Error | null = null;
   modelList: ((params: unknown) => unknown) | undefined;
   threadRead: ((params: unknown) => unknown) | undefined;
   accountRateLimits: unknown = { rateLimits: null, rateLimitsByLimitId: null };
+  /**
+   * What `config/read` answers, for the Codex sweep that turns off the servers of
+   * `~/.codex/config.toml`. Left unset it answers nothing, which is the failed read the sweep
+   * treats as "no entry of its own".
+   */
+  configRead: unknown;
 
   constructor(
     readonly provider: AgentProvider,
     readonly output = provider === "codex" ? "CODEX_DONE" : provider === "grok" ? "GROK_DONE" : "CLAUDE_DONE",
     readonly autoComplete = true,
-    private accountSignedIn = true,
+    public accountSignedIn = true,
     private readonly requestDelays: Readonly<Record<string, number>> = {},
     private readonly requestHook?: (method: string, provider: AgentProvider) => Promise<void>,
   ) {
@@ -150,7 +159,17 @@ export class FakeAgentClient extends EventEmitter implements AgentClient {
       };
     }
     if (method === "account/login/start") {
-      result = { type: "chatgpt", loginId: "login-1", authUrl: "https://auth.openai.test/connect" };
+      // The two shapes the real app server answers with: a URL this computer opens, or a code the
+      // user types elsewhere. Which one comes back is decided by what the caller asked for.
+      result =
+        isDynamicRecord(params) && params.type === "chatgptDeviceCode"
+          ? {
+              type: "chatgptDeviceCode",
+              loginId: "login-1",
+              verificationUrl: "https://auth.openai.test/device",
+              userCode: "TEST-CODE",
+            }
+          : { type: "chatgpt", loginId: "login-1", authUrl: "https://auth.openai.test/connect" };
     }
     if (method === "account/login/cancel") result = { status: "cancelled" };
     if (method === "account/rateLimits/read") {
@@ -162,6 +181,7 @@ export class FakeAgentClient extends EventEmitter implements AgentClient {
           this.provider === "codex"
             ? [
                 "gpt-reserve",
+                "gpt-6-luna",
                 "gpt-5.6-luna",
                 "gpt-5.6-terra",
                 "gpt-5.6-sol",
@@ -175,14 +195,15 @@ export class FakeAgentClient extends EventEmitter implements AgentClient {
               ? [{ model: "opencode/example-model" }]
               : this.provider === "grok"
                 ? ["grok-4.5", "grok-fast"].map((model) => ({ model }))
-                : ["claude-fable-5", "claude-opus-5", "claude-sonnet-5"].map((model) => ({ model })),
+                : ["claude-fable-5", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5"].map((model) => ({ model })),
       };
     }
     if (method === "model/list" && this.modelList) result = this.modelList(params);
     if (method === "plugin/list") result = { marketplaces: [] };
+    if (method === "config/read") result = this.configRead;
     if (method === "thread/start") {
       this.#threadCounter += 1;
-      result = { thread: { id: `${this.provider}-session-${this.#threadCounter}` } };
+      result = { thread: { id: `${this.sessionIdPrefix ?? this.provider}-session-${this.#threadCounter}` } };
     }
     if (method === "thread/resume") {
       result = { thread: { id: stringParam(params, "threadId") } };
@@ -306,11 +327,25 @@ export async function expectOpenBotToolError(
   expect(result.error?.message).toContain(message);
 }
 
+/** A tool that refuses with `openBotToolFailure`: the model reads the reason, no JSON-RPC fault. */
+export async function expectOpenBotToolFailure(
+  client: FakeAgentClient,
+  threadId: string,
+  tool: string,
+  args: unknown,
+  message: string,
+): Promise<void> {
+  const result = await callOpenBotTool(client, threadId, tool, args);
+  expect(result.error).toBeUndefined();
+  expect(paramsRecord(result.result)?.success).toBe(false);
+  expect(openBotToolPayload(result.result).error).toContain(message);
+}
+
 export function notification(method: string, params: unknown): AppServerNotification {
   return { method, params };
 }
 
-export function stringParam(value: unknown, key: string): string {
+function stringParam(value: unknown, key: string): string {
   if (!isDynamicRecord(value)) throw new Error(`${key} is missing.`);
   const result = value[key];
   if (!isString(result)) throw new Error(`${key} is missing.`);
@@ -354,6 +389,7 @@ export function fakeBrowser(tabs: BrowserTab[] = [], uploadTarget = { inputId: "
     // block-bodied replacement can satisfy, and replacing one is the whole point of the plain property.
     beginTakeover: async (_tabId: string): Promise<void> => undefined,
     endTakeover: (_tabId: string): void => undefined,
+    close: async (_tabId: string): Promise<void> => undefined,
     resolveUploadTarget: async (_params: DynamicToolCallParams) => uploadTarget,
     handleDynamicTool: async (_params: DynamicToolCallParams, hooks?: BrowserUploadHooks) => {
       hooks?.onUploadTargetResolved?.(uploadTarget.inputId, uploadTarget.documentId);
@@ -374,6 +410,77 @@ export function createTestService(
   return new AgentService({ browser: fakeBrowser(), requestTimeoutMs: 30_000, ...options });
 }
 
+/**
+ * The service every test here starts from: stores under `root`, and `initialize()` already awaited.
+ *
+ * Whether the agents get a fake client or the real spawned CLI is the caller's choice, and the two
+ * are not interchangeable - a `clientFactory` is what keeps a case from starting a child process.
+ * Passing any of `provider`, `output`, `autoComplete` or `client` installs the fake; passing none of
+ * them leaves `clientFactory` unset, so the service spawns the fake CLI that `startAgentTestFixture`
+ * wrote. `provider` names the client's provider only: which provider the service prefers stays
+ * `preferredProvider`, passed through, because the two are not the same choice.
+ *
+ * `client` is built eagerly, so a case can arm it before the first turn reaches it - which is what
+ * the hand-written preamble did by constructing the client above `createTestService`. `clients`
+ * collects every client handed out, in order, and `clientFor` answers with the most recent one for a
+ * provider, which is the question the per-provider `Map` in these files was built to answer.
+ */
+export interface StartServiceOptions extends Partial<Omit<AgentServiceOptions, "store" | "mailbox">> {
+  /** Installs the fake client, and names the provider it answers as. */
+  provider?: AgentProvider;
+  /** The fake client's completion marker. Left unset, each provider uses its own default. */
+  output?: string;
+  autoComplete?: boolean;
+  /** Builds the client for a provider, for the cases that vary it per provider. */
+  client?: (provider: AgentProvider) => FakeAgentClient;
+}
+
+export interface StartedService {
+  service: AgentService;
+  /** The client for the preferred provider. Meaningless when no fake was installed. */
+  client: FakeAgentClient;
+  clients: FakeAgentClient[];
+  clientFor: (provider: AgentProvider) => FakeAgentClient | undefined;
+  store: AgentStore;
+  mailbox: MailboxStore;
+}
+
+export async function startService(root: string, options: StartServiceOptions = {}): Promise<StartedService> {
+  const { provider, output, autoComplete, client: build, ...serviceOptions } = options;
+  const fake = provider !== undefined || output !== undefined || autoComplete !== undefined || build !== undefined;
+  const preferred = provider ?? serviceOptions.preferredProvider ?? "codex";
+  const { store, mailbox } = stores(root);
+  const client = new FakeAgentClient(preferred, output, autoComplete);
+  const clients: FakeAgentClient[] = [];
+  const service = createTestService({
+    store,
+    mailbox,
+    ...(fake
+      ? {
+          clientFactory: (requested: AgentProvider) => {
+            const made = build
+              ? build(requested)
+              : requested === preferred
+                ? client
+                : new FakeAgentClient(requested, output, autoComplete);
+            clients.push(made);
+            return made;
+          },
+        }
+      : {}),
+    ...serviceOptions,
+  });
+  await service.initialize();
+  return {
+    service,
+    client,
+    clients,
+    clientFor: (wanted) => clients.findLast((made) => made.provider === wanted),
+    store,
+    mailbox,
+  };
+}
+
 export function nextRoutinesChanged(agentService: AgentService, agentId: string): Promise<void> {
   return new Promise((resolve) => {
     const listener = (event: AgentEvent) => {
@@ -381,6 +488,40 @@ export function nextRoutinesChanged(agentService: AgentService, agentId: string)
       agentService.off("event", listener);
       resolve();
     };
+    agentService.on("event", listener);
+  });
+}
+
+/**
+ * Waits for a queue of one agent to pass `check`, without polling. It checks the queue now and then
+ * on each `queue-changed` event. A change after the call that the service writes without an event
+ * times out here. A change before the call passes the first check and needs no event.
+ */
+export function waitForQueue(
+  agentService: AgentService,
+  agentId: string,
+  check: (queue: QueueSnapshot) => boolean,
+): Promise<void> {
+  if (check(agentService.listQueue(agentId))) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const listener = (event: AgentEvent) => {
+      if (event.type !== "queue-changed" || event.snapshot.agentId !== agentId || !check(event.snapshot)) return;
+      clearTimeout(timeout);
+      agentService.off("event", listener);
+      resolve();
+    };
+    const timeout = setTimeout(() => {
+      agentService.off("event", listener);
+      const statuses = agentService
+        .listQueue(agentId)
+        .deliveries.map((delivery) => delivery.status)
+        .join(", ");
+      reject(
+        new Error(
+          `Timed out after ${HARNESS_WAIT_TIMEOUT_MS}ms waiting for the queue of ${agentId}: ${check.toString()}. Statuses: ${statuses || "none"}.`,
+        ),
+      );
+    }, HARNESS_WAIT_TIMEOUT_MS);
     agentService.on("event", listener);
   });
 }
@@ -447,6 +588,7 @@ process.stdin.on("data", (chunk) => {
       if (message.method === "account/read") write({ id: message.id, result: { account: { type: "chatgpt", email: "codex@example.com" } } });
       if (message.method === "account/rateLimits/read") write({ id: message.id, result: { rateLimits: { limitId: "codex", primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 1786563600 }, secondary: { usedPercent: 40, windowDurationMins: 10080, resetsAt: 1787040000 } }, rateLimitsByLimitId: null } });
       if (message.method === "model/list") write({ id: message.id, result: { data: [
+        { model: "gpt-6-luna", displayName: "GPT-6 Luna", defaultReasoningEffort: "medium", supportedReasoningEfforts: [{ reasoningEffort: "low" }, { reasoningEffort: "medium" }, { reasoningEffort: "high" }] },
         { model: "gpt-5.6-luna", displayName: "GPT-5.6 Luna", defaultReasoningEffort: "medium", supportedReasoningEfforts: [{ reasoningEffort: "low" }, { reasoningEffort: "medium" }, { reasoningEffort: "high" }] },
         { model: "gpt-5.6-terra", displayName: "GPT-5.6 Terra", defaultReasoningEffort: "medium", supportedReasoningEfforts: [{ reasoningEffort: "medium" }, { reasoningEffort: "high" }] },
         { model: "gpt-5.6-sol", displayName: "GPT-5.6 Sol", defaultReasoningEffort: "high", supportedReasoningEfforts: [{ reasoningEffort: "medium" }, { reasoningEffort: "high" }, { reasoningEffort: "xhigh" }] },
@@ -456,6 +598,10 @@ process.stdin.on("data", (chunk) => {
         { model: "gpt-5.3-codex-spark", displayName: "GPT-5.3-Codex-Spark" }
       ] } });
       if (message.method === "plugin/list") write({ id: message.id, result: { marketplaces: [{ plugins: [{ id: "computer-use@openai-bundled", name: "computer-use", installed: true, enabled: true }] }] } });
+      // The sweep that turns off the servers of the user's own Codex file reads this before every
+      // thread starts. An unanswered request holds that start open until the request times out,
+      // which is the failure this fake exists to make visible rather than hide.
+      if (message.method === "config/read") write({ id: message.id, result: JSON.parse(process.env.OPENBOT_FAKE_CODEX_CONFIG || '{"config":{}}') });
       if (message.method === "thread/start") {
         const threadId = "thread-" + (++threadCounter);
         write({ id: message.id, result: { thread: { id: threadId, turns: [] } } });

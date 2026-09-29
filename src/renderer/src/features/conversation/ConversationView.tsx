@@ -1,29 +1,27 @@
+import { MessageSelectionActions } from "@openbot/ui/features/conversation/SelectionActions";
+import { useText } from "@openbot/ui/text";
 import { createEffect, Show } from "solid-js";
-import { useServers } from "../servers/servers-context";
-import { useUsage } from "../usage/usage-context";
 import { ConversationComposer } from "./ConversationComposer";
 import { ConversationHeader } from "./ConversationHeader";
 import { ConversationPanels } from "./ConversationPanels";
 import { ConversationTimeline } from "./ConversationTimeline";
 import { ConversationViewScopeContext, createConversationViewScope } from "./conversation-scope";
 import type { ConversationProps } from "./conversation-types";
-import { MessageSelectionActions } from "./SelectionActions";
 
 /** @internal Keeps file-drag state active while the pointer moves between conversation descendants. */
-export function isDragLeavingConversation(currentTarget: HTMLElement, relatedTarget: EventTarget | null): boolean {
+function isDragLeavingConversation(currentTarget: HTMLElement, relatedTarget: EventTarget | null): boolean {
   return !(relatedTarget instanceof Node && currentTarget.contains(relatedTarget));
 }
 
 export function ConversationView(props: ConversationProps) {
   const scope = createConversationViewScope(props);
-  const servers = useServers();
-  const usage = useUsage();
   const {
     agentReady,
     browserPanelWidth,
     browserSidebarOpen,
     dropActive,
     filePreviewOpen,
+    filesOpen,
     handleChatSearchShortcut,
     sendSelectionInstruction,
     setConversationPanelElement,
@@ -31,6 +29,7 @@ export function ConversationView(props: ConversationProps) {
     settingsPanelWidth,
     submitting,
   } = scope;
+  const { t } = useText();
   createEffect(
     () => props.globalOverlayOpen,
     (open) => {
@@ -41,13 +40,13 @@ export function ConversationView(props: ConversationProps) {
     <ConversationViewScopeContext value={scope}>
       <main
         ref={setConversationPanelElement}
-        aria-label="Conversation"
+        aria-label={t("conversation.view.label")}
         onKeyDown={handleChatSearchShortcut}
         class={[
           "conversation-panel",
           {
             "conversation-drop-active": dropActive(),
-            "browser-panel-active": browserSidebarOpen() || filePreviewOpen(),
+            "browser-panel-active": browserSidebarOpen() || filePreviewOpen() || filesOpen(),
           },
         ]}
         style={`--settings-panel-width: ${settingsPanelWidth()}px; --browser-panel-width: ${browserPanelWidth()}px`}
@@ -63,6 +62,8 @@ export function ConversationView(props: ConversationProps) {
         onDrop={(event) => {
           event.preventDefault();
           setDropActive(false);
+          // The desktop preload imports a dropped file; a client with its own runtime imports it here.
+          if (props.runtime?.importFiles) void props.runtime.importFiles([...(event.dataTransfer?.files ?? [])]);
         }}
       >
         <MessageSelectionActions
@@ -71,19 +72,16 @@ export function ConversationView(props: ConversationProps) {
           onSend={sendSelectionInstruction}
         />
         <Show when={dropActive()}>
-          <div class="attachment-drop-overlay">Drop files to attach</div>
+          <div class="attachment-drop-overlay">{t("conversation.view.drop")}</div>
         </Show>
         <ConversationHeader />
+        {props.notice}
 
         <ConversationTimeline />
 
         <ConversationComposer />
 
-        <ConversationPanels
-          onOpenUsage={(trigger) => {
-            usage.openUsage(servers.activeServerId(), trigger, props.agent?.id);
-          }}
-        />
+        <ConversationPanels onOpenUsage={props.onOpenUsage} />
       </main>
     </ConversationViewScopeContext>
   );

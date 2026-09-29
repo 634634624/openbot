@@ -1,4 +1,12 @@
 import type { ChannelService } from "../../backend/channel-service";
+import type { AgentAdminSettingsService } from "../agent-admin-settings";
+import type { AgentMarketplaceService } from "../agent-marketplace-service";
+import type { AgentTemplateService } from "../agent-template-service";
+import type { PeerCustomProviderChanges } from "../custom-provider-changes";
+import type { ProviderCredentialStore } from "../provider-credential-store";
+import type { ProviderRuntimeManager } from "../provider-runtime-manager";
+import type { RequestedUpdate } from "../requested-update";
+import type { SkillMarketplaceService } from "../skill-marketplace-service";
 // What `TeamApiServer` needs from the rest of the main process, and nothing else.
 //
 // Every service arrives as a `Pick<>` of the real class. The point is not brevity: the Team API is
@@ -17,13 +25,17 @@ import type {
   InviteSummary,
   SidebarLayoutSnapshot,
   TeamPresenceSnapshot,
+  UpdateHostIdentityInput,
 } from "@openbot/contracts/ipc";
 import type { Logger } from "@openbot/logging";
 import type { AgentService } from "../../backend/agent-service";
 import type { BrowserHost } from "../../backend/browser-host";
 import type { MailboxStore } from "../../backend/mailbox-store";
 import type { SidebarLayoutStore } from "../../backend/sidebar-layout-store";
+import type { StorageUsageService } from "../../backend/storage-usage";
 import type { TeamChatStore } from "../../backend/team-chat-store";
+import type { BrowserViewGateway } from "../browser-view-gateway";
+import type { McpToolRuntimePreparation } from "../ipc/mcp-server-handlers";
 import type { RemoteScreenGateway } from "../remote-screen-gateway";
 import type { TeamStore } from "../team-store";
 
@@ -90,8 +102,10 @@ type TeamApiAgentMethods = Pick<
   | "editQueuedMessage"
   | "reorderQueue"
   | "interrupt"
+  | "clearAgentContext"
   | "respondToPrompt"
   | "respondToApproval"
+  | "respondToBrowserSecret"
   | "respondToBrowserTakeover"
 >;
 
@@ -108,6 +122,45 @@ export type TeamApiMcpServers = Pick<
   AgentService,
   "listMcpServers" | "saveMcpServer" | "removeMcpServer" | "setMcpServerEnabled" | "testMcpServer"
 >;
+
+/** Its presence is what `#protocolSupport` advertises `storage-v1` on. */
+export type TeamApiStorage = Pick<StorageUsageService, "usage" | "deleteFile" | "clear">;
+
+/**
+ * The admin routes, one member per optional capability. A member's presence is what
+ * `#protocolSupport` advertises its capability on; every route behind it requires an owner or admin.
+ */
+export interface TeamApiAdmin {
+  /** `agent-admin-v1`: access and auto-approve of one agent. */
+  agents?: AgentAdminSettingsService;
+  /** `skills-admin-v1`: list, install, remove and enable the skills of one agent. */
+  skills?: Pick<SkillMarketplaceService, "listInstalled" | "install" | "uninstall" | "setEnabled">;
+  /** `shared-tables-v1`: list and delete the tables the agents share. */
+  sharedTables?: Pick<AgentService, "listTables" | "deleteTable">;
+  /**
+   * `agent-install-v1`: add an agent from a marketplace listing or a shared template. Both must be set.
+   * `agent-update-v1`: update an agent from a listing; needs only `marketplaceAgents`.
+   */
+  marketplaceAgents?: Pick<AgentMarketplaceService, "install">;
+  agentTemplates?: Pick<AgentTemplateService, "install">;
+  /** `providers-v1`: code sign-in, provider API keys, managed CLI runtimes and custom endpoints. */
+  providers?: TeamApiProviders;
+  /** `host-admin-v1`: the server name and logo. */
+  identity?: TeamApiHostIdentity;
+  /** `host-update-v1`: the app update of this computer. Advertised also when the host user turned it off. */
+  update?: Pick<RequestedUpdate, "snapshot" | "check" | "start" | "cancel" | "changeSettings">;
+}
+
+interface TeamApiHostIdentity {
+  updateIdentity(input: UpdateHostIdentityInput): Promise<unknown>;
+}
+
+interface TeamApiProviders {
+  service: Pick<AgentService, "startProviderCodeLogin" | "cancelProviderCodeLogin" | "changeProviderCredential">;
+  credentials: Pick<ProviderCredentialStore, "status" | "set" | "clear">;
+  runtimes: Pick<ProviderRuntimeManager, "getStatus" | "download" | "cancel" | "checkForUpdates">;
+  customProviders: PeerCustomProviderChanges;
+}
 
 export type TeamApiMailbox = Pick<MailboxStore, "resolveAttachment">;
 export type TeamApiSidebarLayout = Pick<
@@ -128,6 +181,16 @@ export type TeamApiBrowser = Pick<
   | "close"
   | "capturePreview"
   | "setVisible"
+  | "getDisplayState"
+  | "loadUrl"
+  // The live view, behind `browser-view`. `browser-view-gateway.ts` is what reaches these; a route
+  // cannot, because frames outlive the request that asked for them.
+  | "startView"
+  | "dispatchViewInput"
+>;
+export type TeamApiBrowserView = Pick<
+  BrowserViewGateway,
+  "handlesUpgrade" | "handleUpgrade" | "stop" | "createSession" | "closeMemberSession" | "revokeTeamSession"
 >;
 export type TeamApiRemoteScreen = Pick<
   RemoteScreenGateway,
@@ -142,11 +205,16 @@ export type TeamApiRemoteScreen = Pick<
   | "closeMemberSession"
   | "revokeTeamSession"
   | "revokeMember"
->;
+> &
+  Partial<Pick<RemoteScreenGateway, "checkSetup" | "test">>;
 
 export interface TeamApiOptions {
   channels?: ChannelService;
   mcpServers?: TeamApiMcpServers;
+  /** Starts and waits for the managed tool runtimes behind the MCP save, enable, and test routes. */
+  mcpToolRuntimePreparation?: McpToolRuntimePreparation;
+  storage?: TeamApiStorage;
+  admin?: TeamApiAdmin;
   appVersion?: string;
   store: TeamStore;
   agents: TeamApiAgents;
@@ -154,6 +222,7 @@ export interface TeamApiOptions {
   sidebarLayout?: TeamApiSidebarLayout;
   mailbox: TeamApiMailbox;
   browser: TeamApiBrowser;
+  browserView?: TeamApiBrowserView;
   remoteScreen?: TeamApiRemoteScreen;
   redeemCentralTicket?: (ticket: string, serverId: string) => Promise<CentralAuthUser | null>;
   onPresence?: (snapshot: TeamPresenceSnapshot) => void;

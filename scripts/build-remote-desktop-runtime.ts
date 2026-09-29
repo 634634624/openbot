@@ -10,11 +10,7 @@ import { createRemoteDesktopSourceManifest, loadNativeRuntimeLock } from "./nati
 const platform = process.platform === "darwin" ? "darwin" : process.platform === "win32" ? "win32" : null;
 if (!platform) throw new Error("The remote desktop runtime supports macOS and Windows only.");
 const architecture = process.arch === "arm64" ? "arm64" : process.arch === "x64" ? "x64" : null;
-if (
-  !architecture ||
-  (platform === "darwin" && architecture !== "arm64") ||
-  (platform === "win32" && architecture !== "x64")
-) {
+if (!architecture || (platform === "win32" && architecture !== "x64")) {
   throw new Error(`Unsupported remote desktop target: ${process.platform}-${process.arch}.`);
 }
 const tarExecutable =
@@ -199,6 +195,7 @@ function requiredSunshineSubmodules(targetPlatform: "darwin" | "win32"): string[
   const common = [
     "third-party/Simple-Web-Server",
     "third-party/build-deps",
+    "third-party/googletest",
     "third-party/libdisplaydevice",
     "third-party/moonlight-common-c",
     "third-party/moonlight-common-c/enet",
@@ -233,7 +230,8 @@ function buildSunshine(source: string, version: string, commit: string): void {
       generator,
       "-DCMAKE_BUILD_TYPE=Release",
       "-DBUILD_DOCS=OFF",
-      "-DBUILD_TESTS=OFF",
+      "-DBUILD_TESTS=ON",
+      "-DOPENBOT_SECURITY_TESTS=ON",
       "-DBUILD_WERROR=OFF",
     ],
     { env: buildEnvironment, stdio: "inherit" },
@@ -244,12 +242,52 @@ function buildSunshine(source: string, version: string, commit: string): void {
   execFileSync("cmake", ["--build", build, "--config", "Release", "--parallel", "--target", "sunshine"], {
     stdio: "inherit",
   });
+  execFileSync("cmake", ["--build", build, "--config", "Release", "--parallel", "--target", "test_sunshine"], {
+    stdio: "inherit",
+  });
+  const securityTests = join(build, "tests", platform === "win32" ? "test_sunshine.exe" : "test_sunshine");
+  execFileSync(
+    securityTests,
+    [
+      "--gtest_filter=InputPacketValidationTest.*:ControlPacketTests.*:CryptoTest.*:ClientAuthorizationTest.*:PairingSessionRegistryTest.*:ConfigHttpTest.Pairing*:PairingTest.*",
+    ],
+    {
+      cwd: join(build, "tests"),
+      stdio: "inherit",
+    },
+  );
+  if (platform === "darwin") {
+    execFileSync("cmake", ["--build", build, "--config", "Release", "--target", "openbot-setup-test"], {
+      stdio: "inherit",
+    });
+    execFileSync(join(build, "openbot-setup-test"), [], { stdio: "inherit" });
+  }
 }
 
 function buildMoonlight(source: string): void {
   execFileSync("npm", ["ci"], { cwd: source, stdio: "inherit" });
   execFileSync("npm", ["run", "build"], { cwd: source, stdio: "inherit" });
-  execFileSync("cargo", ["build", "--locked", "--release"], { cwd: source, stdio: "inherit" });
+  execFileSync("cargo", ["build", "--locked", "--release"], {
+    cwd: source,
+    env: moonlightCargoEnvironment(),
+    stdio: "inherit",
+  });
+}
+
+/**
+ * On an Intel Mac, moonlight-common-c's Reed-Solomon code picks its SIMD path with
+ * `__builtin_cpu_supports`, which reads `__cpu_model` from the compiler runtime. rustc links with
+ * `-nodefaultlibs`, so `libclang_rt.osx.a` is not on the link line and `streamer` fails with an
+ * undefined `___cpu_model`. The ARM64 build never calls the x86 check.
+ */
+function moonlightCargoEnvironment(): NodeJS.ProcessEnv {
+  if (platform !== "darwin" || architecture !== "x64") return process.env;
+  const resourceDirectory = execFileSync("xcrun", ["clang", "-print-resource-dir"], { encoding: "utf8" }).trim();
+  const runtimeLibrary = join(resourceDirectory, "lib", "darwin", "libclang_rt.osx.a");
+  accessSync(runtimeLibrary);
+  const variable = "CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS";
+  const flags = [process.env[variable], `-C link-arg=${runtimeLibrary}`].filter(Boolean).join(" ");
+  return { ...process.env, [variable]: flags };
 }
 
 async function applyOpenBotPatch(source: string, entry: { path: string; sha256: string }): Promise<void> {

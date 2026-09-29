@@ -1,5 +1,5 @@
 import type { AgentEvent, ConversationMessage, ConversationPage } from "@openbot/contracts/ipc";
-import { describe, expect, it, vi } from "vitest";
+import { assert, describe, expect, it, vi } from "vitest";
 import { indexChatMessages, projectChatMessages } from "../../chat/model/chat-messages";
 import { reduceAgentActivity } from "./agent-activity";
 import { decodeConversationPage } from "./conversation";
@@ -45,6 +45,26 @@ function setup() {
   };
 }
 
+describe("generated images in mobile history", () => {
+  it("keeps a generation that has no text or image yet, so its placeholder shows in its message", () => {
+    const imageGeneration = { prompt: "A lighthouse", resolution: "1024×1024", aspectRatio: "square" as const };
+    const generating: ConversationMessage = { ...message("image", ""), status: "streaming", imageGeneration };
+    expect(projectChatMessages([message("before"), generating])).toEqual([
+      expect.objectContaining({ id: "before" }),
+      expect.objectContaining({ id: "image", streaming: true, imageGeneration }),
+    ]);
+  });
+
+  it("keeps the transcript order while a reply streams and sorts again when the order can change", () => {
+    const later = { ...message("later"), createdAt: "2026-09-10T10:05:00Z" };
+    const earlier = { ...message("earlier"), createdAt: "2026-09-10T10:01:00Z" };
+    const ids = (messages: ConversationMessage[]) => projectChatMessages(messages).map((item) => item.id);
+    expect(ids([later, earlier])).toEqual(["earlier", "later"]);
+    expect(ids([{ ...later, text: "later, streamed" }, earlier])).toEqual(["earlier", "later"]);
+    expect(ids([later, { ...earlier, createdAt: "2026-09-10T10:09:00Z" }])).toEqual(["later", "earlier"]);
+  });
+});
+
 describe("mobile conversation windows", () => {
   it("does not rebuild or notify an unchanged history on refresh", () => {
     const { store } = setup();
@@ -56,10 +76,12 @@ describe("mobile conversation windows", () => {
     expect(store.get("agent")).toBe(current);
     expect(notify).not.toHaveBeenCalled();
     const updated = page(["recent", "reply"], 2);
-    updated.messages[1].text = "Updated reply";
+    const reply = updated.messages[1];
+    assert(reply);
+    reply.text = "Updated reply";
     store.applyPage(updated);
     expect(store.get("agent")?.messages[0]).toBe(current?.messages[0]);
-    expect(store.get("agent")?.messages[1].text).toBe("Updated reply");
+    expect(store.get("agent")?.messages[1]?.text).toBe("Updated reply");
     expect(notify).toHaveBeenCalledTimes(1);
     close();
   });
@@ -116,6 +138,7 @@ describe("mobile conversation windows", () => {
         author: "agent",
         body: "Referenced outside the window",
         streaming: false,
+        status: "completed",
       },
     });
   });
@@ -160,7 +183,14 @@ describe("mobile conversation windows", () => {
       updates: 1,
       unrelatedUpdates: 0,
       oldRetained: true,
-      reply: { id: "reply", kind: "message", author: "agent", body: "reply one two", streaming: true },
+      reply: {
+        id: "reply",
+        kind: "message",
+        author: "agent",
+        body: "reply one two",
+        streaming: true,
+        status: "streaming",
+      },
     });
   });
 
@@ -292,11 +322,13 @@ describe("mobile conversation windows", () => {
       references: {},
       pageInfo: { hasOlder: true, olderCursor: "older" },
     };
+    const answer = messages[2];
+    assert(answer);
     store.applyPage(page);
     store.applyPage({
       ...page,
       revision: 2,
-      messages: [messages[2]],
+      messages: [answer],
       pageInfo: { hasOlder: true, olderCursor: "at-r1" },
     });
     expect(store.get("agent")?.messages.map((item) => item.id)).toEqual(["q1", "q2", "r1"]);
@@ -434,5 +466,33 @@ describe("mobile conversation windows", () => {
   it("does not update workspace activity for each token of the same response", () => {
     const current = reduceAgentActivity({}, delta(1, "first"));
     expect(reduceAgentActivity(current, delta(2, "second"))).toBe(current);
+  });
+
+  it("does not update workspace activity for events that change no activity", () => {
+    const progress: AgentEvent = {
+      type: "turn-progress",
+      agentId: "agent",
+      threadId: "thread",
+      turnId: "turn",
+      detail: "Reading",
+    };
+    const working = reduceAgentActivity({}, progress);
+    expect(reduceAgentActivity(working, { ...progress })).toBe(working);
+    expect(
+      reduceAgentActivity(working, {
+        type: "runtime-snapshot",
+        snapshot: {
+          agents: [],
+          activeTurns: [{ agentId: "agent", threadId: "thread", turnId: "turn" }],
+          work: [],
+          latestMessages: [],
+          attentionComplete: true,
+          pendingPrompts: [],
+          pendingApprovals: [],
+          pendingBrowserTakeovers: [],
+          failedTurns: [],
+        },
+      }),
+    ).toBe(working);
   });
 });

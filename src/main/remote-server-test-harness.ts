@@ -27,7 +27,7 @@ import { join } from "node:path";
 import type { ServerSummary } from "@openbot/contracts/ipc";
 import { type DynamicRecord, isDynamicRecord } from "@openbot/contracts/runtime-values";
 import { expect, vi } from "vitest";
-import type { RemoteHostSummary } from "./central-auth-manager";
+import type { RemoteHostSummary } from "./central-auth-records";
 import { RemoteServerManager } from "./remote-server-manager";
 import type { StoredRemoteServer } from "./remote-server-stored-shape";
 import { TeamWebRtcBridge } from "./team-webrtc-bridge";
@@ -35,7 +35,7 @@ import { TeamWebRtcClientTransport } from "./team-webrtc-client-transport";
 
 // A socket the event stream can drive: `readyState` tracks `close()`, and `close` is a spy so a test
 // can name the code the stream chose to close with.
-export class FakeEventSocket extends EventTarget {
+class FakeEventSocket extends EventTarget {
   static readonly OPEN = 1;
   static readonly CLOSED = 3;
 
@@ -130,7 +130,13 @@ export function fakeWebRtcTransport(hosts: readonly RemoteHostSummary[] = []): T
       signalUrl: "wss://signal.example.test/v1/signal",
     }),
     endSession: async () => undefined,
-    createInvite: async () => ({ inviteId: "invite", token: "token", expiresAt: Date.now() + 60_000 }),
+    createInvite: async () => ({
+      inviteId: "invite",
+      token: "token",
+      expiresAt: Date.now() + 60_000,
+      permanent: false,
+      useCount: 0,
+    }),
     listInvites: async () => [],
     previewInvite: async () => ({
       inviteId: "invite",
@@ -139,6 +145,7 @@ export function fakeWebRtcTransport(hosts: readonly RemoteHostSummary[] = []): T
       role: "member",
       expiresAt: Date.now() + 60_000,
       emailBound: false,
+      permanent: false,
       devicePublicKey: null,
     }),
     acceptInvite: async () => ({ hostId: "host-1", membershipId: "member-1", role: "member" }),
@@ -232,7 +239,7 @@ export async function waitForServer(
   });
 }
 
-export interface TeamFetchCall {
+interface TeamFetchCall {
   readonly url: URL;
   readonly path: string;
   readonly headers: Headers;
@@ -240,9 +247,9 @@ export interface TeamFetchCall {
   readonly body: DynamicRecord | undefined;
 }
 
-export type TeamFetchHandler = (call: TeamFetchCall) => Response | Promise<Response>;
+type TeamFetchHandler = (call: TeamFetchCall) => Response | Promise<Response>;
 
-export interface HostHandshake {
+interface HostHandshake {
   readonly appVersion?: string;
   readonly protocol?: { minimum: number; maximum: number };
   readonly capabilities?: readonly string[];

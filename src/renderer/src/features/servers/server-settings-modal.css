@@ -158,6 +158,12 @@
   background: var(--openbot-bg-control);
 }
 
+.server-settings-members-title {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--openbot-space-2);
+}
+
 .server-settings-search {
   position: relative;
   width: 188px;
@@ -194,6 +200,18 @@
   gap: var(--openbot-space-2);
 }
 
+/* The hidden tab panels stay mounted for the slide animation, so without this the
+   slot sizes to the widest panel and the active one inherits its width as dead space. */
+.server-settings-invite-composer .ui-sliding-tabs-content-slot {
+  position: relative;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.server-settings-invite-composer .ui-sliding-tabs-content:not([data-selected]) {
+  position: absolute;
+  inset: 0;
+}
+
 .server-settings-invite-mode-panel,
 .server-settings-invite-email-field,
 .server-settings-invite-email-field .ui-input {
@@ -203,6 +221,8 @@
 
 .server-settings-invite-email-field {
   position: relative;
+  width: 22rem;
+  max-width: 100%;
 }
 
 .server-settings-invite-email-field > .ui-label {
@@ -234,6 +254,18 @@
   height: var(--openbot-icon-sm);
   flex: 0 0 auto;
   stroke-width: var(--openbot-icon-stroke);
+}
+
+.server-settings-invite-new-link > svg {
+  width: var(--openbot-icon-sm);
+  height: var(--openbot-icon-sm);
+  flex: 0 0 auto;
+  stroke-width: var(--openbot-icon-stroke);
+}
+
+.server-settings-invite-hint {
+  display: block;
+  margin-top: var(--openbot-space-2);
 }
 
 .server-settings-role-select {
@@ -324,82 +356,6 @@
   margin-top: var(--openbot-space-1);
 }
 
-.server-settings-confirm-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: calc(var(--openbot-layer-dialog) + 2);
-  display: grid;
-  place-items: center;
-  padding: var(--openbot-space-6);
-  animation: server-settings-confirm-backdrop-in var(--openbot-duration-normal) var(--openbot-ease-out) both;
-}
-
-.server-settings-confirm-dialog {
-  width: min(400px, calc(100vw - 40px));
-  display: grid;
-  justify-items: center;
-  outline: 0;
-  background: var(--openbot-bg-surface-raised);
-  padding: var(--openbot-space-6);
-  text-align: center;
-  transform-origin: center;
-  animation: server-settings-confirm-in var(--openbot-duration-overlay) var(--openbot-ease-out) both;
-}
-
-.server-settings-confirm-icon {
-  width: 44px;
-  height: 44px;
-  display: grid;
-  place-items: center;
-  margin-bottom: var(--openbot-space-4);
-  border-radius: var(--openbot-radius-lg);
-  background: var(--openbot-danger-soft);
-  color: var(--openbot-danger);
-}
-
-.server-settings-confirm-icon svg {
-  width: var(--openbot-icon-lg);
-  height: var(--openbot-icon-lg);
-}
-
-.server-settings-confirm-dialog h2 {
-  margin: 0;
-  color: var(--openbot-text-primary);
-  font-size: var(--openbot-text-2xl);
-  font-weight: var(--openbot-weight-semibold);
-  line-height: var(--openbot-leading-2xl);
-  letter-spacing: var(--openbot-tracking-tight);
-}
-
-.server-settings-confirm-dialog > p {
-  max-width: 320px;
-  margin: var(--openbot-space-2) 0 0;
-  color: var(--openbot-text-muted);
-  font-size: var(--openbot-text-md);
-  line-height: var(--openbot-leading-md);
-}
-
-.server-settings-confirm-actions {
-  width: 100%;
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: var(--openbot-space-2);
-  margin-top: var(--openbot-space-6);
-}
-
-@keyframes server-settings-confirm-backdrop-in {
-  from {
-    opacity: 0;
-  }
-}
-
-@keyframes server-settings-confirm-in {
-  from {
-    opacity: 0;
-    transform: translateY(8px) scale(0.97);
-  }
-}
-
 @media (max-width: 720px) {
   .server-settings-address-setting,
   .server-settings-readonly-name {
@@ -431,6 +387,10 @@
 
   .server-settings-invite-composer {
     grid-template-columns: minmax(0, 1fr) 118px;
+  }
+
+  .server-settings-invite-email-field {
+    max-width: none;
   }
 
   .server-settings-invite-composer > .ui-button,
@@ -483,13 +443,6 @@
   .server-settings-invite-share {
     width: 100%;
     grid-column: 1;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .server-settings-confirm-backdrop,
-  .server-settings-confirm-dialog {
-    animation: none;
   }
 }
 

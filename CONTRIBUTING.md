@@ -21,7 +21,9 @@ bun run check
 bun run dev
 ```
 
-The supported toolchain is pinned in `package.json`. Use stable Bun 1.4.0, TypeScript 5.9, Vite 7, and the
+Coding agents skip `bun run check`: see [AGENTS.md, Checks](AGENTS.md#checks).
+
+The supported toolchain is pinned in `package.json`. Use stable Bun 1.4.0, TypeScript 7, Vite 7, and the
 existing Biome configuration. Biome is the only lint and format tool. Do not add a second linter,
 Prettier, a second state library, or a UI kit without first discussing the architectural cost.
 The Biome configuration also loads the repository-owned GritQL rules in
@@ -38,7 +40,7 @@ Type-only imports (`import type`) are erased by the compiler and stay allowed in
 ## Pull requests
 
 1. Create a branch from `main`.
-2. Add or update tests for behavior changes and reproduced bugs.
+2. Test behavior changes and reproduced bugs as [AGENTS.md, Tests](AGENTS.md#tests) describes.
 3. Run `bun run check`. Coding agents do not: see [AGENTS.md, Checks](AGENTS.md#checks).
 4. Describe user-visible changes, risks, and manual verification in the pull request.
 
@@ -87,6 +89,70 @@ the recheck whatever its timestamp says. That one is passed to the reviewer whol
 responses share a size budget and are dropped from the oldest end. A label carries no argument of
 its own, so write the rebuttal as a comment first and label afterwards.
 
+### Choosing the reviewer for one pull request
+
+The reviewer runs on a default model and reasoning effort set in
+[`.github/workflows/norbiai-review.yml`](.github/workflows/norbiai-review.yml). A pull request that
+needs a closer read, or one small enough not to need the slowest one, can pick its own with two
+directives, each on a line of its own in the pull request description:
+
+```
+NorbiAI-Model: chatgpt-web/pro
+NorbiAI-Effort: high
+```
+
+Wrap a directive in `<!-- -->` to keep it out of the rendered description. A directive inside a
+fenced code block is an example and is not read, so a pull request may show one without changing its
+own review. Each is optional: leave one out and that half keeps the default. The choice applies to this pull request only — nothing is
+written back, so the next one starts from the defaults again — and the review comment records under
+`Review details` which reviewer actually ran.
+
+Pick the level from the highest-risk file in the diff, not from its size. A one-line migration
+needs a closer read than a large copy change.
+
+| Diff touches | Directive |
+| --- | --- |
+| Only documentation, comments, localization strings, Storybook stories, or tests with no production change | none (the workflow picks `chatgpt-web/medium` itself) |
+| Product code, including a [non-negotiable](AGENTS.md#non-negotiable) area: migrations, a released Team API wire protocol, the renderer-to-main trust boundary, secret redaction, or licensing | none (the default, `gpt-6-astra` at `low`) |
+
+When unsure between two rows, take the higher one. Do not lower the level to get a faster result on
+a risky change. A slower model on a very large diff can reach the job's time limit: split the pull
+request rather than drop the level.
+
+The workflow picks `chatgpt-web/medium` without a directive when every changed file is Markdown,
+under `docs/`, a Storybook story, a test, or a localization message file. `AGENTS.md`, `CLAUDE.md`,
+`.github/` and `.agents/` files are instructions, not documentation, and keep the default. A
+directive always wins over this choice.
+
+A review after a push reads only the commits since the last successful review, and rechecks the
+earlier findings against the full current code. A rebuttal on an unchanged commit reads no new code.
+The first review, a review after a rebase or a merge of the base branch, and a review asked for with
+the `norbiai` label read the whole pull request. Add the label when a change since the last review
+needs the whole pull request read again.
+
+`NorbiAI-Effort` reaches `gpt-6-astra` and `claude-opus-5-5` only. A `chatgpt-web/*` slug carries
+its own level — the `high` in `chatgpt-web/high` is the reasoning level, already chosen — so pair
+the effort with another model or it changes nothing. `gpt-6-astra` itself is capped at `low`: asking
+for more is answered with a warning and the run goes ahead at `low`.
+
+The default, `gpt-6-astra` at `low`, runs on Codex. Name `chatgpt-web/pro` for a closer read, or
+`claude-opus-5-5` to review on Claude
+Code with the Claude login on the runner mac. It runs at `high` without `NorbiAI-Effort`. Every
+other model runs on Codex. Both use the same prompt, merge block and
+findings list. Claude Code can only read: it gets the Read, Grep and Glob tools and the `git diff`,
+`git show`, `git log` and `git ls-files` commands. It does not load the pull request's own settings,
+hooks, `CLAUDE.md` or MCP servers.
+
+The same two directives work in a `/norbiai review` comment, where they override the description for
+that one run. On a pull request from a fork only the comment is read: the description belongs to
+whoever opened the pull request, and choosing your own reviewer is not theirs to do.
+
+`ALLOWED_MODELS` and `ALLOWED_EFFORTS` in the workflow file are the accepted values. Anything else
+is refused with a warning and the default runs instead, so a typo reviews at the default rather
+than at none. The value is the whole rest of the line, so keep the directive on its own: a trailing
+note makes the line unrecognised rather than being trimmed off it. The review still has to finish
+inside the job's own time limit, whichever model runs.
+
 ## Security-sensitive changes
 
 Preserve the following boundaries and their tests:
@@ -100,11 +166,22 @@ Preserve the following boundaries and their tests:
 Full agent access is intentional today, but new privileges or network surfaces still require an
 explicit threat-model note in the pull request.
 
+## Translations
+
+English is the source text. A French or Japanese catalog can be partial: a key it does not have
+shows in English. To add a key, a translation or a language, follow [docs/i18n.md](docs/i18n.md) and
+run `bun run i18n:check`.
+
 ## Dependencies
 
 Prefer the platform and existing dependencies. A new runtime dependency should remove more
 complexity than it adds, have a compatible open-source license, and be justified in the pull request.
-Keep tool versions pinned; compatibility upgrades should be isolated and verified by the full check.
+
+Bun does not resolve a version that is less than 3 days old (`minimumReleaseAge` in `bunfig.toml`),
+and Dependabot waits the same time. Only `@norbert_bodziony/bloub`, which the maintainer publishes,
+is excluded. Only the packages in `trustedDependencies` in `package.json` can
+run install scripts. If a new dependency needs its install script, add it to that list and give the
+reason in the `bunfig.toml` comment. `bun pm untrusted` shows the blocked scripts.
 
 ## Licensing
 

@@ -1,6 +1,10 @@
 import type { BrowserControlSession, BrowserPreview, BrowserTab } from "@openbot/contracts/ipc";
+import { TEAM_BROWSER_NAVIGATION_CAPABILITY } from "@openbot/contracts/team-protocol/current";
+import { currentText } from "@openbot/ui/text";
 import { createEffect, createMemo, createSignal, untrack } from "solid-js";
 import { desktopAnalytics } from "../../../analytics";
+import { serverSupportsCapability } from "../../servers/server-capabilities";
+import { conversationRuntime } from "../conversation-runtime";
 import type { ConversationProps, ConversationTarget, RightPanelMode } from "../conversation-types";
 
 export interface BrowserTakeoverPreviewState {
@@ -16,7 +20,7 @@ export interface BrowserTakeoverResolutionState {
   messageMarker: string | null;
 }
 
-export function canonicalBrowserUrl(url: string): string {
+function canonicalBrowserUrl(url: string): string {
   try {
     return new URL(url).toString();
   } catch {
@@ -42,9 +46,9 @@ function browserAddressUrl(value: string): string {
   return `https://www.google.com/search?q=${encodeURIComponent(query)}`;
 }
 
-export interface BrowserPanels {
+interface BrowserPanels {
+  activeRightPanel: () => RightPanelMode;
   setActiveRightPanel: (mode: RightPanelMode) => void;
-  screenOpen: () => boolean;
 }
 
 export interface BrowserStoreDeps {
@@ -69,6 +73,11 @@ export interface BrowserStoreDeps {
 export function createBrowserStore(deps: BrowserStoreDeps) {
   const browserInteractionAvailable = () =>
     deps.props.browserEnabled !== false && !deps.props.browserVisibilitySuspended;
+  const browserSidebarOpen = () => browserInteractionAvailable() && deps.panels.activeRightPanel() === "browser";
+  const browserExpandedOpen = () =>
+    browserInteractionAvailable() && deps.panels.activeRightPanel() === "browser-expanded";
+  const browserPipOpen = () => browserInteractionAvailable() && deps.panels.activeRightPanel() === "browser-pip";
+  const screenOpen = () => browserSidebarOpen() || browserExpandedOpen() || browserPipOpen();
   const browserTabs = createMemo(() => {
     if (deps.props.browserEnabled === false) return [];
     const agent = deps.props.agent;
@@ -91,8 +100,8 @@ export function createBrowserStore(deps: BrowserStoreDeps) {
   createEffect(
     () => browserTabs().map((tab) => ({ id: tab.id, url: tab.url })),
     (tabs) => {
-      const serverId = deps.props.server?.id ?? "local";
-      const agentId = deps.props.agent?.id ?? null;
+      const serverId = untrack(() => deps.props.server?.id ?? "local");
+      const agentId = untrack(() => deps.props.agent?.id ?? null);
       for (const [requestKey, request] of deps.browserOpenRequests) {
         if (request.serverId !== serverId || request.agentId !== agentId) continue;
         const tabAppeared = tabs.some(
@@ -122,7 +131,7 @@ export function createBrowserStore(deps: BrowserStoreDeps) {
       suspended: deps.props.browserVisibilitySuspended,
     }),
     ({ request, tab, suspended }) => {
-      if (!request || suspended) {
+      if (!request || request.secret || suspended) {
         browserTakeoverPreviewKey = null;
         browserTakeoverPreviewGeneration += 1;
         setBrowserTakeoverPreview({ status: "idle", preview: null });
@@ -141,8 +150,8 @@ export function createBrowserStore(deps: BrowserStoreDeps) {
       browserTakeoverPreviewKey = requestKey;
       const generation = ++browserTakeoverPreviewGeneration;
       setBrowserTakeoverPreview({ status: "loading", preview: null });
-      void window.openbot.browser
-        .capturePreview(tab.id)
+      void conversationRuntime(deps.props)
+        .browser.capturePreview(tab.id)
         .then((preview) => {
           if (browserTakeoverPreviewGeneration !== generation) return;
           setBrowserTakeoverPreview({ status: "ready", preview });
@@ -188,9 +197,9 @@ export function createBrowserStore(deps: BrowserStoreDeps) {
   };
   let previousBrowserTabCount = 0;
   createEffect(
-    () => ({ count: browserTabs().length, open: deps.panels.screenOpen() }),
-    ({ count, open }) => {
-      if (deps.props.browserEnabled === false) return;
+    () => ({ count: browserTabs().length, open: screenOpen(), enabled: deps.props.browserEnabled !== false }),
+    ({ count, open, enabled }) => {
+      if (!enabled) return;
       const browserWasClosed = open && previousBrowserTabCount > 0 && count === 0;
       previousBrowserTabCount = count;
       if (browserWasClosed) deps.panels.setActiveRightPanel("browser");
@@ -266,13 +275,16 @@ export function createBrowserStore(deps: BrowserStoreDeps) {
     const target = targetAgentId ? { agentId: targetAgentId, serverId: deps.props.server?.id ?? "local" } : undefined;
     const analytics = desktopAnalytics.scope();
     const url = browserAddressUrl(value);
-    const currentTab = newTab || deps.props.server?.kind === "remote" ? undefined : activeBrowserTab();
+    // A host that cannot move an existing tab to an address gets a new tab for it instead: the
+    // released navigate route carries a direction only.
+    const canNavigateCurrentTab = serverSupportsCapability(deps.props.server, TEAM_BROWSER_NAVIGATION_CAPABILITY);
+    const currentTab = newTab || !canNavigateCurrentTab ? undefined : activeBrowserTab();
     if (currentTab) {
       if (closingBrowserTabIds.has(currentTab.id)) return;
       try {
-        await window.openbot.browser.navigate({ tabId: currentTab.id, url });
+        await conversationRuntime(deps.props).browser.navigate({ tabId: currentTab.id, url });
       } catch {
-        deps.setComposerError("Could not open the address in this tab.", target);
+        deps.setComposerError(currentText().t("browser.error.openAddress"), target);
       }
       return;
     }
@@ -284,7 +296,7 @@ export function createBrowserStore(deps: BrowserStoreDeps) {
     if (pendingRequest) return pendingRequest.promise;
     const request = (async () => {
       try {
-        const tab = await window.openbot.browser.open({
+        const tab = await conversationRuntime(deps.props).browser.open({
           url,
           ownerThreadId: deps.props.agent?.threadId ?? null,
           ownerAgentId: deps.props.agent?.id ?? null,
@@ -332,7 +344,7 @@ export function createBrowserStore(deps: BrowserStoreDeps) {
     try {
       await deps.props.onCloseBrowserTab(tabId);
     } catch {
-      deps.setComposerError("Could not close the browser tab.", target);
+      deps.setComposerError(currentText().t("browser.error.closeTab"), target);
     } finally {
       closingBrowserTabIds.delete(tabId);
     }
@@ -361,10 +373,10 @@ export function createBrowserStore(deps: BrowserStoreDeps) {
     const target = agentId ? { agentId, serverId: deps.props.server?.id ?? "local" } : undefined;
     const analytics = desktopAnalytics.scope();
     try {
-      await window.openbot.browser.reload(tabId);
+      await conversationRuntime(deps.props).browser.reload(tabId);
       analytics.track("browser_action", { action: "reload", result: "succeeded" });
     } catch {
-      deps.setComposerError("Could not reload the browser tab.", target);
+      deps.setComposerError(currentText().t("browser.error.reloadTab"), target);
       analytics.track("browser_action", {
         action: "reload",
         result: "failed",
@@ -384,14 +396,21 @@ export function createBrowserStore(deps: BrowserStoreDeps) {
     const agentId = deps.props.agent?.id;
     const target = agentId ? { agentId, serverId: deps.props.server?.id ?? "local" } : undefined;
     try {
-      await window.openbot.browser.navigate({ tabId, direction });
+      await conversationRuntime(deps.props).browser.navigate({ tabId, direction });
     } catch {
-      deps.setComposerError(`Could not navigate ${direction}.`, target);
+      deps.setComposerError(
+        currentText().t(direction === "back" ? "browser.error.navigateBack" : "browser.error.navigateForward"),
+        target,
+      );
     }
   }
 
   return {
     browserInteractionAvailable,
+    browserSidebarOpen,
+    browserExpandedOpen,
+    browserPipOpen,
+    screenOpen,
     browserTabs,
     activeBrowserTab,
     browserTakeoverTab,
@@ -411,5 +430,3 @@ export function createBrowserStore(deps: BrowserStoreDeps) {
     navigateBrowserTab,
   };
 }
-
-export type BrowserStore = ReturnType<typeof createBrowserStore>;

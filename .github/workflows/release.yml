@@ -4,16 +4,39 @@ on:
   push:
     tags:
       - "v*.*.*"
+  # A manual run publishes nothing. `host-signing` exercises the Host signing keychain on its own,
+  # so a credential or keychain problem is found without pushing a tag; it builds nothing, and it
+  # must run on a tag ref because the `release` environment admits only tags. `dry-run` runs the
+  # release path on any ref, without the macOS job and the publish job: they need the tag-only
+  # `release` secrets. It also makes no provenance attestation, because an attestation of a public
+  # repository is a public Sigstore record.
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: What the manual run checks
+        type: choice
+        options:
+          - host-signing
+          - dry-run
+        default: host-signing
 
 permissions: {}
 
+# All tag pushes share one queue and run in push order. With one group per tag, two tags pushed
+# close together publish in parallel: if the older one publishes last, `--latest` and the updater
+# manifests point users back to it. `queue: max` keeps every pending run; the default keeps only the
+# newest pending run and cancels the others. Manual signing checks use their own queue.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   validate:
     name: Validate release tag
+    # Gating the one job every build and the publish depend on keeps a host signing run off the
+    # release path entirely, rather than relying on each of them to opt out.
+    if: github.event_name == 'push' || inputs.mode == 'dry-run'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -29,6 +52,7 @@ jobs:
           persist-credentials: false
 
       - name: Require release commit on main
+        if: github.event_name == 'push'
         shell: bash
         run: |
           git fetch origin main --no-tags
@@ -49,11 +73,11 @@ jobs:
         run: |
           package_version="$(bun -p 'require("./package.json").version')"
           tag_version="${GITHUB_REF_NAME#v}"
-          if [[ "$package_version" != "$tag_version" ]]; then
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$package_version" != "$tag_version" ]]; then
             echo "Tag $GITHUB_REF_NAME does not match package.json version $package_version." >&2
             exit 1
           fi
-          grep -F "## [$package_version]" CHANGELOG.md
+          bun scripts/check-release-notes.ts
           echo "version=$package_version" >> "$GITHUB_OUTPUT"
           echo "tag=v$package_version" >> "$GITHUB_OUTPUT"
 
@@ -74,14 +98,96 @@ jobs:
             https://openbot.run/.well-known/apple-app-site-association)"
           test "$association_status" = "200"
           tr -d '\r' < "$verification_dir/association.headers" | grep -Eiq '^content-type: application/json'
-          jq -e '.applinks.details == [{"appID":"ZTRDTUL87R.app.openbot.desktop","paths":["/join"]}]' \
+          jq -e '.applinks.details == [{"appID":"ZTRDTUL87R.app.openbot.desktop","paths":["/join"]},{"appID":"ZTRDTUL87R.run.openbot.mobile","paths":["/join","/agents/*"]}]' \
             "$verification_dir/association.json" >/dev/null
 
-  macos:
-    name: Build signed macOS ARM64 release
-    needs: validate
+  host-signing:
+    name: Check Host signing keychain
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'host-signing'
     runs-on: macos-14
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: ./.github/actions/setup-bun
+        with:
+          install: ignore-scripts
+
+      - name: Build the Host signing keychain and sign a throwaway package
+        shell: bash
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_INSTALLER_KEY_PASSWORD: ${{ secrets.CSC_INSTALLER_KEY_PASSWORD }}
+          CSC_INSTALLER_LINK: ${{ secrets.CSC_INSTALLER_LINK }}
+        run: |
+          set -euo pipefail
+          source scripts/host-signing-keychain.sh
+          echo "Application identity: $HOST_APPLICATION_IDENTITY"
+          echo "Installer identity: $HOST_INSTALLER_IDENTITY"
+          # Signs a throwaway package with the installer identity and holds the real
+          # `verifyHostInstaller` wording against it. Apple writes that status text and a runner can
+          # word it differently from a developer's own Mac, so the release path must not be the first
+          # place the comparison runs: it gets there with the package already built and notarized.
+          probe="$host_signing_dir/pkg-probe"
+          mkdir -p "$probe/root/usr/local/bin"
+          cp /usr/bin/true "$probe/root/usr/local/bin/openbot-signing-probe"
+          /usr/bin/pkgbuild --root "$probe/root" --identifier app.openbot.host.signing-probe \
+            --version 0.0.0 --install-location / --ownership recommended \
+            --sign "$HOST_INSTALLER_IDENTITY" --keychain "$HOST_SIGNING_KEYCHAIN" "$probe/probe.pkg"
+          HOST_PROBE_PKG="$probe/probe.pkg" bun -e '
+            import { execFileSync } from "node:child_process";
+            import { verifyHostSignature } from "./scripts/verify-host-installer";
+            const pkg = process.env.HOST_PROBE_PKG;
+            if (!pkg) throw new Error("Missing HOST_PROBE_PKG.");
+            const status = execFileSync("/usr/sbin/pkgutil", ["--check-signature", pkg]).toString();
+            process.stdout.write(status);
+            verifyHostSignature(status);
+            process.stdout.write("This runner reports a wording verifyHostSignature accepts.\n");
+          '
+          # `verifyHostBom` allows only the fixed host paths. A macOS that stamps every new file with
+          # `com.apple.provenance` makes `pkgbuild` record an AppleDouble entry beside each one, which
+          # that allowlist rejects, so print the payload listing rather than infer it from one OS.
+          /usr/sbin/pkgutil --expand-full "$probe/probe.pkg" "$probe/expanded"
+          /usr/bin/lsbom -p fmug "$probe/expanded/Bom"
+          if /usr/bin/lsbom -p f "$probe/expanded/Bom" | grep -q '/\._'; then
+            echo "This runner records AppleDouble metadata entries, which verifyHostBom rejects." >&2
+            exit 1
+          fi
+          echo "This runner records no AppleDouble metadata entries."
+
+  # Each architecture builds on a runner of its own kind. The install scripts run every provider
+  # runtime they download, and Whisper and the remote desktop runtime are built or verified for the
+  # runner's architecture, so one runner cannot produce both. The ARM64 job keeps the asset names
+  # every earlier release used, and it alone builds the Host PKG, which is Apple silicon only.
+  macos:
+    name: Build signed macOS ${{ matrix.label }} release
+    needs: validate
+    if: github.event_name == 'push'
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            label: ARM64
+            os: macos-14
+            app_dir: mac-arm64
+            suffix: macos
+          - arch: x64
+            label: x64
+            os: macos-15-intel
+            app_dir: mac
+            suffix: macos-x64
     environment: release
     permissions:
       attestations: write
@@ -109,10 +215,12 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
           CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_INSTALLER_LINK: ${{ secrets.CSC_INSTALLER_LINK }}
+          CSC_INSTALLER_KEY_PASSWORD: ${{ secrets.CSC_INSTALLER_KEY_PASSWORD }}
           MAC_PROVISIONING_PROFILE: ${{ secrets.MAC_PROVISIONING_PROFILE }}
         run: |
           missing=()
-          for name in CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID MAC_PROVISIONING_PROFILE; do
+          for name in CSC_LINK CSC_KEY_PASSWORD CSC_INSTALLER_LINK CSC_INSTALLER_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID MAC_PROVISIONING_PROFILE; do
             if [[ -z "${!name}" ]]; then missing+=("$name"); fi
           done
           if (( ${#missing[@]} > 0 )); then
@@ -124,7 +232,9 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      # The code is the same for both architectures, so the check runs once.
       - name: Run repository check
+        if: matrix.arch == 'arm64'
         run: |
           bun run check:desktop
           bun run test:desktop -- --maxWorkers=2
@@ -138,6 +248,7 @@ jobs:
           bun run install:grok-runtime
           bun run install:remote-desktop-runtime
           bun run verify:remote-desktop-runtime
+          bun run prepare:cua-driver
 
       - name: Install Developer ID provisioning profile
         shell: bash
@@ -149,18 +260,33 @@ jobs:
           security cms -D -i "$profile_path" >/dev/null
           echo "OPENBOT_PROVISIONING_PROFILE=$profile_path" >> "$GITHUB_ENV"
 
-      - name: Build, sign, and notarize ARM64 update artifacts
+      - name: Build, sign, and notarize ${{ matrix.label }} update artifacts
         env:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
           CSC_LINK: ${{ secrets.CSC_LINK }}
+        # On a hosted macOS runner, `hdiutil create` can fail with "Device not configured" or
+        # "Resource busy" when nothing is wrong with the app; v0.21.1 failed this way. Only that
+        # error gets another attempt. Each attempt signs and notarizes again, about 6 minutes.
+        shell: bash
         run: |
           bun run voice:prepare-runtime
           bun run build
-          bun x electron-builder --mac --arm64 --publish never \
-            --config.mac.provisioningProfile="$OPENBOT_PROVISIONING_PROFILE"
+          log="$RUNNER_TEMP/electron-builder-mac.log"
+          for attempt in 1 2 3; do
+            if bun x electron-builder --mac --${{ matrix.arch }} --publish never \
+              --config.mac.provisioningProfile="$OPENBOT_PROVISIONING_PROFILE" 2>&1 | tee "$log"; then
+              exit 0
+            fi
+            if ! grep -Eq 'hdiutil: create failed - (Device not configured|Resource busy)' "$log"; then
+              exit 1
+            fi
+            echo "::warning::hdiutil could not create the DMG (attempt $attempt of 3)."
+            hdiutil info || true
+          done
+          exit 1
 
       - name: Verify packaged application metadata and launch
         run: bun run verify:package
@@ -168,10 +294,10 @@ jobs:
       - name: Verify application signature and notarization
         shell: bash
         run: |
-          app_path="dist/mac-arm64/OpenBot.app"
+          app_path="dist/${{ matrix.app_dir }}/OpenBot.app"
           test -d "$app_path"
           codesign --verify --deep --strict --verbose=2 "$app_path"
-          runtime_path="$app_path/Contents/Resources/remote-desktop-runtime/darwin/arm64"
+          runtime_path="$app_path/Contents/Resources/remote-desktop-runtime/darwin/${{ matrix.arch }}"
           codesign --verify --deep --strict --verbose=2 "$runtime_path/Sunshine.app"
           codesign --verify --strict --verbose=2 "$runtime_path/web-server"
           codesign --verify --strict --verbose=2 "$runtime_path/streamer"
@@ -181,9 +307,9 @@ jobs:
             codesign --verify --strict --verbose=2 "$executable"
             codesign -d --verbose=4 "$executable" 2>&1 | grep -Fx "TeamIdentifier=$team_id"
           }
-          verify_provider_signature build/codex/mac/arm64/bin/codex 2DC432GLL2
-          verify_provider_signature build/claude/mac/arm64/bin/claude Q6L2SF6YDW
-          verify_provider_signature build/grok/mac/arm64/bin/grok 5Y6N3AJ54S
+          verify_provider_signature build/codex/mac/${{ matrix.arch }}/bin/codex 2DC432GLL2
+          verify_provider_signature build/claude/mac/${{ matrix.arch }}/bin/claude Q6L2SF6YDW
+          verify_provider_signature build/grok/mac/${{ matrix.arch }}/bin/grok 5Y6N3AJ54S
           test -f "$app_path/Contents/embedded.provisionprofile"
           codesign -d --entitlements :- "$app_path" > "$RUNNER_TEMP/openbot-entitlements.plist"
           test -s "$RUNNER_TEMP/openbot-entitlements.plist"
@@ -222,6 +348,8 @@ jobs:
             echo "The macOS ZIP is ${current_size} bytes. The limit is 800000000 bytes." >&2
             exit 1
           fi
+          # v0.1.21 shipped only an ARM64 ZIP, so only that one has a size to stay under.
+          if [[ "${{ matrix.arch }}" != "arm64" ]]; then exit 0; fi
           mkdir -p "$RUNNER_TEMP/openbot-0.1.21"
           gh release download v0.1.21 --repo "$GITHUB_REPOSITORY" --pattern '*.zip' \
             --dir "$RUNNER_TEMP/openbot-0.1.21"
@@ -236,40 +364,92 @@ jobs:
             exit 1
           fi
 
+      - name: Test native tenant setup
+        if: matrix.arch == 'arm64'
+        run: |
+          xcrun swiftc -parse-as-library -D TENANT_SETUP_TESTS scripts/macos-tenant-setup.swift scripts/macos-tenant-setup-tests.swift -o "$RUNNER_TEMP/openbot-tenant-setup-tests"
+          "$RUNNER_TEMP/openbot-tenant-setup-tests"
+
+      - name: Build, sign, notarize, and verify Host installer
+        if: matrix.arch == 'arm64'
+        shell: bash
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          CSC_INSTALLER_LINK: ${{ secrets.CSC_INSTALLER_LINK }}
+          CSC_INSTALLER_KEY_PASSWORD: ${{ secrets.CSC_INSTALLER_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          source scripts/host-signing-keychain.sh
+          bun scripts/build-host-installer.ts
+          host_pkg="dist/OpenBot-Host-$RELEASE_VERSION-arm64.pkg"
+          xcrun notarytool store-credentials openbot-host-release --keychain "$HOST_SIGNING_KEYCHAIN" \
+            --apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --team-id "$APPLE_TEAM_ID"
+          xcrun notarytool submit "$host_pkg" --keychain "$HOST_SIGNING_KEYCHAIN" \
+            --keychain-profile openbot-host-release --wait --timeout 20m --output-format json > "$host_signing_dir/notarization.json"
+          jq -e '.status == "Accepted"' "$host_signing_dir/notarization.json" >/dev/null
+          xcrun stapler staple "$host_pkg"
+          bun scripts/verify-host-installer.ts "$host_pkg" "$RELEASE_VERSION"
+          # Host infrastructure is never an Electron auto-update target.
+          if grep -F '.pkg' dist/latest-mac.yml; then exit 1; fi
+
       - name: Generate checksums
         shell: bash
         run: |
           cd dist
           shopt -s nullglob
-          artifacts=(*.dmg *.zip)
-          shasum -a 256 "${artifacts[@]}" > SHA256SUMS-macos.txt
+          artifacts=("OpenBot-$RELEASE_VERSION-${{ matrix.arch }}.dmg" "OpenBot-$RELEASE_VERSION-${{ matrix.arch }}.zip")
+          if [[ "${{ matrix.arch }}" == "arm64" ]]; then artifacts+=("OpenBot-Host-$RELEASE_VERSION-arm64.pkg"); fi
+          shasum -a 256 "${artifacts[@]}" > "SHA256SUMS-${{ matrix.suffix }}.txt"
 
       - name: Generate macOS release SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
-          path: dist/mac-arm64/OpenBot.app
+          path: dist/${{ matrix.app_dir }}/OpenBot.app
           format: spdx-json
-          output-file: dist/OpenBot-${{ env.RELEASE_VERSION }}-macos.spdx.json
-          artifact-name: OpenBot-${{ env.RELEASE_VERSION }}-macOS-SBOM
+          output-file: dist/OpenBot-${{ env.RELEASE_VERSION }}-${{ matrix.suffix }}.spdx.json
+          artifact-name: OpenBot-${{ env.RELEASE_VERSION }}-${{ matrix.suffix }}-SBOM
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Generate Host package SBOM
+        if: matrix.arch == 'arm64'
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: dist/host-sbom
+          format: spdx-json
+          output-file: dist/OpenBot-Host-${{ env.RELEASE_VERSION }}-macos.spdx.json
+          artifact-name: OpenBot-Host-${{ env.RELEASE_VERSION }}-macOS-SBOM
           upload-artifact: false
           upload-release-assets: false
 
       - name: Attest macOS release provenance
+        id: macos-provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-checksums: dist/SHA256SUMS-macos.txt
+          subject-checksums: dist/SHA256SUMS-${{ matrix.suffix }}.txt
+
+      - name: Include macOS provenance bundle
+        env:
+          BUNDLE_PATH: ${{ steps.macos-provenance.outputs.bundle-path }}
+        run: cp "$BUNDLE_PATH" "dist/OpenBot-$RELEASE_VERSION-${{ matrix.suffix }}.sigstore.json"
 
       - name: Upload macOS release assets
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-macos
+          name: release-${{ matrix.suffix }}
           path: |
             dist/*.dmg
             dist/*.zip
+            dist/OpenBot-Host-*-arm64.pkg
             dist/latest-mac.yml
             dist/*.blockmap
             dist/*.spdx.json
-            dist/SHA256SUMS-macos.txt
+            dist/*-${{ matrix.suffix }}.sigstore.json
+            dist/SHA256SUMS-${{ matrix.suffix }}.txt
           if-no-files-found: error
           retention-days: 7
 
@@ -278,7 +458,8 @@ jobs:
     needs: validate
     runs-on: windows-2025
     timeout-minutes: 35
-    environment: release
+    # These jobs read no secrets. The environment limits a tag build to tags; a dry run has none.
+    environment: ${{ github.event_name == 'push' && 'release' || '' }}
     permissions:
       attestations: write
       contents: read
@@ -298,7 +479,11 @@ jobs:
       - name: Run Windows checks
         run: bun run lint && bun run typecheck && bunx vitest run src/backend/cli.test.ts
 
+      # Without a token, the GitHub API rate limit for the runner's address can refuse the release
+      # lookup with HTTP 403.
       - name: Install and verify remote desktop runtime
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: bun scripts/install-remote-desktop-runtime.ts win32 x64 && bun run verify:remote-desktop-runtime --windows
 
       - name: Install and verify provider control artifacts
@@ -386,6 +571,7 @@ jobs:
           upload-release-assets: false
 
       - name: Attest Windows release provenance
+        if: github.event_name == 'push'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-checksums: dist/SHA256SUMS-windows.txt
@@ -404,11 +590,27 @@ jobs:
           retention-days: 7
 
   linux:
-    name: Build unsigned Linux x64 release
+    name: Build unsigned Linux ${{ matrix.arch }} release
     needs: validate
-    runs-on: ubuntu-24.04
+    # Each architecture builds on a native runner: the launch check runs the packaged binary, and
+    # the provider checks run each pinned CLI's `--version`, so neither can cross-build.
+    # `suffix` is electron-builder's own name for the target: it names the unpacked directory
+    # (`linux-unpacked`, `linux-arm64-unpacked`) and the updater manifest (`latest-linux.yml`,
+    # `latest-linux-arm64.yml`) that electron-updater looks for on that architecture.
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+            suffix: linux
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            suffix: linux-arm64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 35
-    environment: release
+    # These jobs read no secrets. The environment limits a tag build to tags; a dry run has none.
+    environment: ${{ github.event_name == 'push' && 'release' || '' }}
     permissions:
       attestations: write
       contents: read
@@ -429,17 +631,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes xvfb
 
+      # Lint and typecheck do not depend on the architecture, so one runner is enough.
       - name: Run Linux checks
-        run: bun run lint && bun run typecheck && bunx vitest run src/backend/cli.test.ts
+        if: matrix.arch == 'x64'
+        run: bun run lint && bun run typecheck
+
+      - name: Run Linux CLI tests
+        run: bunx vitest run src/backend/cli.test.ts
 
       - name: Install and verify provider control artifacts
         run: |
-          bun scripts/install-codex-runtime.ts linux x64
-          bun scripts/install-claude-runtime.ts linux x64
-          bun scripts/install-grok-runtime.ts linux x64
+          bun scripts/install-codex-runtime.ts linux ${{ matrix.arch }}
+          bun scripts/install-claude-runtime.ts linux ${{ matrix.arch }}
+          bun scripts/install-grok-runtime.ts linux ${{ matrix.arch }}
 
       - name: Build AppImage
-        run: bun run dist:linux
+        run: bun run ${{ matrix.arch == 'arm64' && 'dist:linux:arm64' || 'dist:linux' }}
 
       # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor, which is the same
       # restriction the shipped profile answers for an installed AppImage. The verifier starts the
@@ -449,28 +656,30 @@ jobs:
       - name: Permit the Electron sandbox for the verification build
         run: |
           set -euo pipefail
-          sudo chown root:root dist/linux-unpacked/chrome-sandbox
-          sudo chmod 4755 dist/linux-unpacked/chrome-sandbox
+          sudo chown root:root "dist/$SUFFIX-unpacked/chrome-sandbox"
+          sudo chmod 4755 "dist/$SUFFIX-unpacked/chrome-sandbox"
           sudo tee /etc/apparmor.d/openbot-verify >/dev/null <<PROFILE
           abi <abi/4.0>,
           include <tunables/global>
 
-          profile openbot-verify "$GITHUB_WORKSPACE/dist/linux-unpacked/openbot" flags=(unconfined) {
+          profile openbot-verify "$GITHUB_WORKSPACE/dist/$SUFFIX-unpacked/openbot" flags=(unconfined) {
             userns,
           }
           PROFILE
           sudo apparmor_parser -r /etc/apparmor.d/openbot-verify
+        env:
+          SUFFIX: ${{ matrix.suffix }}
 
       - name: Verify packaged application metadata and launch
-        run: xvfb-run -a bun run verify:package:linux --require-update-metadata
+        run: xvfb-run -a bun run verify:package:linux "dist/${{ matrix.suffix }}-unpacked" --require-update-metadata
 
       - name: Verify AppImage and updater metadata
         run: |
           set -euo pipefail
           shopt -s nullglob
           appImages=(dist/*.AppImage)
-          if [ "${#appImages[@]}" -ne 1 ] || [ ! -f dist/latest-linux.yml ]; then
-            echo "Expected one AppImage and latest-linux.yml." >&2
+          if [ "${#appImages[@]}" -ne 1 ] || [ ! -f "dist/latest-$SUFFIX.yml" ]; then
+            echo "Expected one AppImage and latest-$SUFFIX.yml." >&2
             exit 1
           fi
           # The AppImage has to stay executable, or the download is unusable without a chmod.
@@ -478,61 +687,93 @@ jobs:
             echo "The AppImage is not executable." >&2
             exit 1
           fi
-          grep -Fq "version: $RELEASE_VERSION" dist/latest-linux.yml
-          grep -Fq ".AppImage" dist/latest-linux.yml
-          bun run verify:update-artifacts linux
+          grep -Fq "version: $RELEASE_VERSION" "dist/latest-$SUFFIX.yml"
+          grep -Fq ".AppImage" "dist/latest-$SUFFIX.yml"
+          bun run verify:update-artifacts "$SUFFIX"
+        env:
+          SUFFIX: ${{ matrix.suffix }}
 
       - name: Generate checksums
         run: |
           set -euo pipefail
           cd dist
-          shasum -a 256 ./*.AppImage | sed 's| \./| |' > SHA256SUMS-linux.txt
-          cat SHA256SUMS-linux.txt
+          shasum -a 256 ./*.AppImage | sed 's| \./| |' > "SHA256SUMS-$SUFFIX.txt"
+          cat "SHA256SUMS-$SUFFIX.txt"
+        env:
+          SUFFIX: ${{ matrix.suffix }}
 
       - name: Generate Linux release SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
-          path: dist/linux-unpacked
+          path: dist/${{ matrix.suffix }}-unpacked
           format: spdx-json
-          output-file: dist/OpenBot-${{ env.RELEASE_VERSION }}-linux.spdx.json
-          artifact-name: OpenBot-${{ env.RELEASE_VERSION }}-Linux-SBOM
+          output-file: dist/OpenBot-${{ env.RELEASE_VERSION }}-${{ matrix.suffix }}.spdx.json
+          artifact-name: OpenBot-${{ env.RELEASE_VERSION }}-${{ matrix.suffix }}-SBOM
           upload-artifact: false
           upload-release-assets: false
 
       - name: Attest Linux release provenance
+        if: github.event_name == 'push'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-checksums: dist/SHA256SUMS-linux.txt
+          subject-checksums: dist/SHA256SUMS-${{ matrix.suffix }}.txt
 
       - name: Upload Linux release assets
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-linux
+          name: release-${{ matrix.suffix }}
           # An AppImage embeds its block map, so there is no sidecar file to upload beside it.
           path: |
             dist/*.AppImage
-            dist/latest-linux.yml
+            dist/latest-${{ matrix.suffix }}.yml
             dist/*.spdx.json
-            dist/SHA256SUMS-linux.txt
+            dist/SHA256SUMS-${{ matrix.suffix }}.txt
           if-no-files-found: error
           retention-days: 7
 
   publish:
     name: Publish GitHub Release
     needs: [validate, macos, windows, linux]
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
     env:
-      GH_TOKEN: ${{ github.token }}
       RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
     steps:
-      - name: Download macOS release assets
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: ./.github/actions/setup-bun
+        with:
+          install: ignore-scripts
+
+      - name: Download macOS ARM64 release assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-macos
           path: release-assets/macos
+
+      - name: Download macOS x64 release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-macos-x64
+          path: release-assets/macos-x64
+
+      # Both macOS jobs write a `latest-mac.yml`, and a release holds one asset of that name. The
+      # merged file lists both ZIPs; electron-updater picks the one for the Mac's architecture.
+      - name: Merge macOS update manifests
+        shell: bash
+        run: |
+          bun scripts/merge-mac-update-manifests.ts \
+            release-assets/macos/latest-mac.yml \
+            release-assets/macos-x64/latest-mac.yml \
+            release-assets/latest-mac.yml
+          rm release-assets/macos/latest-mac.yml release-assets/macos-x64/latest-mac.yml
 
       - name: Download Windows release assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -540,25 +781,36 @@ jobs:
           name: release-windows
           path: release-assets/windows
 
-      - name: Download Linux release assets
+      - name: Download Linux x64 release assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-linux
           path: release-assets/linux
 
+      - name: Download Linux arm64 release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-linux-arm64
+          path: release-assets/linux-arm64
+
       - name: Generate combined checksums
         shell: bash
         run: |
           cat release-assets/macos/SHA256SUMS-macos.txt \
+            release-assets/macos-x64/SHA256SUMS-macos-x64.txt \
             release-assets/windows/SHA256SUMS-windows.txt \
             release-assets/linux/SHA256SUMS-linux.txt \
+            release-assets/linux-arm64/SHA256SUMS-linux-arm64.txt \
             > release-assets/SHA256SUMS.txt
 
+      # Only this step gets the write token: the steps before it run dependency code.
       - name: Publish GitHub Release
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           shopt -s nullglob
-          artifacts=(release-assets/macos/* release-assets/windows/* release-assets/linux/* release-assets/SHA256SUMS.txt)
+          artifacts=(release-assets/macos/* release-assets/macos-x64/* release-assets/latest-mac.yml release-assets/windows/* release-assets/linux/* release-assets/linux-arm64/* release-assets/SHA256SUMS.txt)
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" "${artifacts[@]}" --clobber --repo "$GITHUB_REPOSITORY"
             gh release edit "$RELEASE_TAG" --draft=false --latest --repo "$GITHUB_REPOSITORY"

@@ -26,6 +26,7 @@ import {
 } from "@openbot/contracts/ipc";
 import { type DynamicRecord, isNumber, isString } from "@openbot/contracts/runtime-values";
 import { QueueEditRejectedError } from "@openbot/contracts/team-protocol/queue-edit-v1";
+import { sourceText } from "@openbot/i18n/source";
 import { redactText } from "@openbot/logging";
 import {
   AttachmentFiles,
@@ -42,6 +43,7 @@ export type { ExportedAttachmentFile, GeneratedAttachmentSource } from "./attach
 import { MailboxDeliveryGate } from "./mailbox-delivery-gate";
 import { OpenBotDatabase } from "./openbot-database";
 import { isRecord } from "./protocol";
+import { recordRestartActivity } from "./restart-activity";
 
 const MAX_ATTACHMENTS = INPUT_LIMITS.attachments;
 interface StoredMessage {
@@ -114,6 +116,19 @@ interface EnqueueInput {
   idempotencyKey?: string;
 }
 
+/** A file a chat message carries or an agent made, as the Storage view lists it. */
+export interface MailboxStoredFile {
+  attachment: AttachmentSummary;
+  path: string;
+  source: "attachment" | "generated";
+  /** The mailbox message that carries an attachment. Null for a generated file. */
+  messageId: string | null;
+  /** The agent that sent the message or made the file, else the first recipient. */
+  agentId: string | null;
+  /** Null for a generated file: its record has no time. */
+  createdAt: string | null;
+}
+
 export interface DeliveryContext {
   delivery: QueueDelivery;
   managedAttachments: Array<AttachmentSummary & { path: string }>;
@@ -181,10 +196,10 @@ export class MailboxStore {
   async prepareImportedAttachments(paths: string[], data: AttachmentDataInput[]): Promise<DraftAttachment[]> {
     if (paths.length + data.length === 0) return [];
     if (paths.length + data.length > MAX_ATTACHMENTS) {
-      throw new Error(`Choose at most ${MAX_ATTACHMENTS} files.`);
+      throw new Error(sourceText("error.attachment.tooMany", { limit: MAX_ATTACHMENTS }));
     }
     if (this.#state.drafts.length + paths.length + data.length > INPUT_LIMITS.draftAttachments) {
-      throw new Error(`Keep at most ${INPUT_LIMITS.draftAttachments} draft attachments.`);
+      throw new Error(sourceText("error.backend.draftAttachmentLimit", { limit: INPUT_LIMITS.draftAttachments }));
     }
     const prepared = await this.#files.prepareDrafts(paths, data);
     this.#state.drafts.push(...prepared);
@@ -203,6 +218,7 @@ export class MailboxStore {
     const index = this.#state.drafts.findIndex((draft) => draft.id === id);
     if (index < 0) return;
     const [draft] = this.#state.drafts.splice(index, 1);
+    if (!draft) return;
     try {
       await this.#persist("attachment-draft.discarded");
     } catch (error) {
@@ -234,9 +250,9 @@ export class MailboxStore {
 
     const recipients = [...new Set(input.recipientAgentIds)];
     const validateRecipients = this.prepareDelivery(recipients);
-    if (recipients.length === 0) throw new Error("At least one recipient is required.");
+    if (recipients.length === 0) throw new Error(sourceText("error.backend.recipientRequired"));
     if (recipients.length > INPUT_LIMITS.messageRecipients) {
-      throw new Error(`A message can have at most ${INPUT_LIMITS.messageRecipients} recipients.`);
+      throw new Error(sourceText("error.backend.recipientLimit", { limit: INPUT_LIMITS.messageRecipients }));
     }
     if (recipients.some((id) => !id || id.length > INPUT_LIMITS.identifier)) {
       throw new Error("A message recipient is invalid.");
@@ -246,21 +262,21 @@ export class MailboxStore {
     }
 
     const text = input.text.trim();
-    if (text.length > INPUT_LIMITS.messageText) throw new Error("Message is too long.");
+    if (text.length > INPUT_LIMITS.messageText) throw new Error(sourceText("error.agent.messageTooLong"));
 
     const drafts = (input.draftIds ?? []).map((id) => {
       const draft = this.#state.drafts.find((candidate) => candidate.id === id);
-      if (!draft) throw new Error(`Attachment draft no longer exists: ${id}`);
-      if (draft.ownerEditId) throw new Error("An attachment belongs to a queue edit.");
+      if (!draft) throw new Error(sourceText("error.backend.attachmentDraftGone", { id }));
+      if (draft.ownerEditId) throw new Error(sourceText("error.backend.attachmentInQueueEdit"));
       return draft;
     });
     if (drafts.length !== new Set(input.draftIds ?? []).size) {
       throw new Error("Duplicate attachment draft.");
     }
     const sourcePaths = [...drafts.map((draft) => draft.path), ...(input.sourcePaths ?? [])];
-    if (!text && sourcePaths.length === 0) throw new Error("Message cannot be empty.");
+    if (!text && sourcePaths.length === 0) throw new Error(sourceText("error.backend.messageEmpty"));
     if (sourcePaths.length > MAX_ATTACHMENTS) {
-      throw new Error(`Attach at most ${MAX_ATTACHMENTS} files.`);
+      throw new Error(sourceText("error.backend.attachLimit", { limit: MAX_ATTACHMENTS }));
     }
 
     const createdAt = new Date().toISOString();
@@ -305,6 +321,7 @@ export class MailboxStore {
     }));
 
     this.#state.messages.push(message);
+    recordRestartActivity();
     this.#state.deliveries.push(...deliveries);
     if (input.idempotencyKey) this.#state.idempotency[input.idempotencyKey] = messageId;
     this.#state.drafts = this.#state.drafts.filter((draft) => !(input.draftIds ?? []).includes(draft.id));
@@ -346,11 +363,12 @@ export class MailboxStore {
     if (ids.size !== input.draftIds.length) throw new Error("Duplicate attachment drafts.");
     const drafts = input.draftIds.map((id) => {
       const draft = this.#state.drafts.find((candidate) => candidate.id === id);
-      if (!draft) throw new Error(`Attachment draft no longer exists: ${id}`);
-      if (draft.ownerEditId) throw new Error("An attachment belongs to a queue edit.");
+      if (!draft) throw new Error(sourceText("error.backend.attachmentDraftGone", { id }));
+      if (draft.ownerEditId) throw new Error(sourceText("error.backend.attachmentInQueueEdit"));
       return draft;
     });
-    if (drafts.length > MAX_ATTACHMENTS) throw new Error(`Attach at most ${MAX_ATTACHMENTS} files.`);
+    if (drafts.length > MAX_ATTACHMENTS)
+      throw new Error(sourceText("error.backend.attachLimit", { limit: MAX_ATTACHMENTS }));
     const sender: StoredMessage["sender"] = { kind: "user" };
     const createdAt = new Date().toISOString();
     const attachments = await this.#files.commitMessageTransfer(
@@ -666,10 +684,81 @@ export class MailboxStore {
     ) {
       return null;
     }
-    const delivery = this.#state.deliveries
+    const delivery = this.#queuedFor(agentId).find((candidate) => !this.#isHeldReply(candidate));
+    return delivery && this.#mayStart(delivery) ? this.#context(delivery) : null;
+  }
+
+  /**
+   * The teammate answers that start in the same turn as this delivery. For an answer, these are the
+   * other answers to the same request. For a message from the person, these are the answers that
+   * wait for a slow teammate: the person writes before all answers are in, so they are read now.
+   */
+  repliesToStartWith(deliveryId: string): DeliveryContext[] {
+    const next = this.#state.deliveries.find((candidate) => candidate.id === deliveryId);
+    if (!next) return [];
+    const message = this.#requireMessage(next.messageId);
+    const requestId = isAnswer(message) ? message.replyToMessageId : null;
+    if (message.sender.kind !== "user" && !requestId) return [];
+    return this.#queuedFor(next.recipientAgentId)
+      .filter((candidate) => {
+        if (candidate.id === next.id || !this.#mayStart(candidate)) return false;
+        if (!requestId) return this.#isHeldReply(candidate);
+        const reply = this.#requireMessage(candidate.messageId);
+        return isAnswer(reply) && reply.replyToMessageId === requestId;
+      })
+      .map((delivery) => this.#context(delivery));
+  }
+
+  /** The agents that were sent a request and whose delivery ended with no answer. */
+  unansweredRecipients(requestId: string): string[] {
+    return this.#state.deliveries
+      .filter(
+        (delivery) =>
+          delivery.messageId === requestId &&
+          (delivery.status === "failed" || delivery.status === "interrupted" || delivery.status === "cancelled") &&
+          // A linked question from this agent is not an answer.
+          !this.#state.messages.some(
+            (message) =>
+              isAnswer(message) &&
+              message.sender.agentId === delivery.recipientAgentId &&
+              message.replyToMessageId === requestId,
+          ),
+      )
+      .map((delivery) => delivery.recipientAgentId);
+  }
+
+  #queuedFor(agentId: string): StoredDelivery[] {
+    return this.#state.deliveries
       .filter((candidate) => candidate.recipientAgentId === agentId && candidate.status === "queued")
-      .sort(compareQueueOrder)[0];
-    return delivery && !delivery.editId && !this.#queueUpdates.has(delivery.id) ? this.#context(delivery) : null;
+      .sort(compareQueueOrder);
+  }
+
+  #mayStart(delivery: StoredDelivery): boolean {
+    return !delivery.editId && !this.#queueUpdates.has(delivery.id);
+  }
+
+  /**
+   * An answer to a request that its recipient sent to several teammates waits while another of them
+   * has the request still queued or running. So the requester reads all the answers in one turn,
+   * not one turn for each answer.
+   */
+  #isHeldReply(delivery: StoredDelivery): boolean {
+    const reply = this.#requireMessage(delivery.messageId);
+    if (!isAnswer(reply)) return false;
+    const request = this.#state.messages.find((message) => message.id === reply.replyToMessageId);
+    if (
+      request?.sender.kind !== "agent" ||
+      request.sender.agentId !== delivery.recipientAgentId ||
+      request.expectsReply === false
+    )
+      return false;
+    const answeredBy = reply.sender.agentId;
+    return this.#state.deliveries.some(
+      (candidate) =>
+        candidate.messageId === request.id &&
+        candidate.recipientAgentId !== answeredBy &&
+        (candidate.status === "queued" || candidate.status === "starting" || candidate.status === "running"),
+    );
   }
 
   queuedDeliveryIds(agentId: string): string[] {
@@ -706,6 +795,16 @@ export class MailboxStore {
         candidate.recipientAgentId === agentId && candidate.status === "starting" && candidate.turnId === null,
     );
     return delivery ? this.#context(delivery) : null;
+  }
+
+  /** Every delivery that starts the next turn of this agent: one, or several teammate answers. */
+  startingDeliveriesForAgent(agentId: string): DeliveryContext[] {
+    return this.#state.deliveries
+      .filter(
+        (candidate) =>
+          candidate.recipientAgentId === agentId && candidate.status === "starting" && candidate.turnId === null,
+      )
+      .map((delivery) => this.#context(delivery));
   }
 
   /**
@@ -889,8 +988,8 @@ export class MailboxStore {
     const delivery = this.#state.deliveries.find(
       (candidate) => candidate.id === deliveryId && candidate.recipientAgentId === agentId,
     );
-    if (!delivery) throw new Error("Queued message was not found.");
-    if (delivery.status !== "queued") throw new Error("Only queued messages can be cancelled.");
+    if (!delivery) throw new Error(sourceText("error.backend.queuedMessageNotFound"));
+    if (delivery.status !== "queued") throw new Error(sourceText("error.backend.cancelQueuedOnly"));
     this.#finishCancellation(delivery, true);
   }
 
@@ -903,15 +1002,16 @@ export class MailboxStore {
   #assertQueueNotEditing(deliveryId: string): void {
     this.#assertQueueNotUpdating(deliveryId);
     if (this.#state.deliveries.find((item) => item.id === deliveryId)?.editId)
-      throw new Error("This message is being edited. Save or cancel the edit first.");
+      throw new Error(sourceText("error.backend.messageBeingEdited"));
   }
 
   beginQueueEdit(agentId: string, deliveryId: string, editId: string): void {
     this.#assertQueueNotUpdating(deliveryId);
     const delivery = this.#state.deliveries.find((item) => item.id === deliveryId && item.recipientAgentId === agentId);
-    if (delivery?.status !== "queued") throw new QueueEditRejectedError("This queued message is no longer available.");
+    if (delivery?.status !== "queued")
+      throw new QueueEditRejectedError(sourceText("error.backend.queuedMessageUnavailable"));
     if (delivery.editId && delivery.editId !== editId)
-      throw new QueueEditRejectedError("This message is being edited on another device.");
+      throw new QueueEditRejectedError(sourceText("error.backend.editedOnOtherDevice"));
     const previous = delivery.editId;
     delivery.editId = editId;
     try {
@@ -926,16 +1026,16 @@ export class MailboxStore {
     this.#assertQueueNotUpdating(deliveryId);
     const delivery = this.#state.deliveries.find((item) => item.id === deliveryId && item.recipientAgentId === agentId);
     if (delivery?.status !== "queued" || delivery.editId !== editId)
-      throw new QueueEditRejectedError("This edit is no longer available.");
+      throw new QueueEditRejectedError(sourceText("error.backend.editUnavailable"));
     if (draftIds.length > MAX_ATTACHMENTS || new Set(draftIds).size !== draftIds.length)
       throw new Error("Invalid edit attachment count.");
     const drafts = draftIds.map((id) => {
       const draft = this.#state.drafts.find((item) => item.id === id);
-      if (!draft) throw new Error(`Attachment draft no longer exists: ${id}`);
+      if (!draft) throw new Error(sourceText("error.backend.attachmentDraftGone", { id }));
       return draft;
     });
     if (drafts.some((draft) => draft.ownerEditId && draft.ownerEditId !== editId))
-      throw new Error("An attachment belongs to another edit.");
+      throw new Error(sourceText("error.backend.attachmentInOtherEdit"));
     const previous = drafts.map((draft) => draft.ownerEditId);
     for (const draft of drafts) draft.ownerEditId = editId;
     try {
@@ -978,7 +1078,8 @@ export class MailboxStore {
   finishQueueEdit(agentId: string, deliveryId: string, editId: string): void {
     this.#assertQueueNotUpdating(deliveryId);
     const delivery = this.#state.deliveries.find((item) => item.id === deliveryId && item.recipientAgentId === agentId);
-    if (!delivery || delivery.editId !== editId) throw new QueueEditRejectedError("This edit is no longer available.");
+    if (!delivery || delivery.editId !== editId)
+      throw new QueueEditRejectedError(sourceText("error.backend.editUnavailable"));
     this.#finishCancellation(delivery, false);
   }
 
@@ -1012,8 +1113,7 @@ export class MailboxStore {
   }
 
   #assertQueueNotUpdating(deliveryId: string): void {
-    if (this.#queueUpdates.has(deliveryId))
-      throw new Error("This message is being saved. Try again after it finishes.");
+    if (this.#queueUpdates.has(deliveryId)) throw new Error(sourceText("error.backend.messageBeingSaved"));
   }
 
   async updateQueuedMessage(
@@ -1044,32 +1144,33 @@ export class MailboxStore {
     const delivery = this.#state.deliveries.find(
       (candidate) => candidate.id === deliveryId && candidate.recipientAgentId === agentId,
     );
-    if (!delivery) throw new Error("Queued message was not found.");
-    if (delivery.status !== "queued") throw new Error("Only queued messages can be edited.");
-    if (delivery.editId !== editId) throw new Error("This message is being edited on another device.");
+    if (!delivery) throw new Error(sourceText("error.backend.queuedMessageNotFound"));
+    if (delivery.status !== "queued") throw new Error(sourceText("error.backend.editQueuedOnly"));
+    if (delivery.editId !== editId) throw new Error(sourceText("error.backend.editedOnOtherDevice"));
 
     const message = this.#requireMessage(delivery.messageId);
     const keepIds = new Set(keepAttachmentIds);
     if (keepIds.size !== keepAttachmentIds.length) throw new Error("Duplicate attachments.");
     if (keepAttachmentIds.some((id) => !message.attachments.some((item) => item.id === id))) {
-      throw new Error("An attachment does not belong to the queued message.");
+      throw new Error(sourceText("error.backend.attachmentNotInMessage"));
     }
 
     const draftIds = new Set(attachmentDraftIds);
     if (draftIds.size !== attachmentDraftIds.length) throw new Error("Duplicate attachment drafts.");
     const drafts = attachmentDraftIds.map((id) => {
       const draft = this.#state.drafts.find((candidate) => candidate.id === id);
-      if (!draft) throw new Error(`Attachment draft no longer exists: ${id}`);
-      if (draft.ownerEditId && draft.ownerEditId !== editId) throw new Error("An attachment belongs to another edit.");
+      if (!draft) throw new Error(sourceText("error.backend.attachmentDraftGone", { id }));
+      if (draft.ownerEditId && draft.ownerEditId !== editId)
+        throw new Error(sourceText("error.backend.attachmentInOtherEdit"));
       return draft;
     });
     if (keepAttachmentIds.length + drafts.length > MAX_ATTACHMENTS) {
-      throw new Error(`Attach at most ${MAX_ATTACHMENTS} files.`);
+      throw new Error(sourceText("error.backend.attachLimit", { limit: MAX_ATTACHMENTS }));
     }
 
     const normalizedText = text.trim();
     if (!normalizedText && keepAttachmentIds.length === 0 && drafts.length === 0) {
-      throw new Error("Message cannot be empty.");
+      throw new Error(sourceText("error.backend.messageEmpty"));
     }
 
     const previous = structuredClone(message);
@@ -1167,7 +1268,7 @@ export class MailboxStore {
       new Set(requested).size !== requested.length ||
       requested.some((deliveryId) => !expected.has(deliveryId))
     ) {
-      throw new Error("Queue order is stale. Refresh the queue and try again.");
+      throw new Error(sourceText("error.backend.queueOrderStale"));
     }
     let nextVisible = 0;
     const orderedIds = [...allQueued]
@@ -1230,11 +1331,89 @@ export class MailboxStore {
     if (draft) return this.#files.resolveDraft(draft);
     for (const message of this.#state.messages) {
       const attachment = message.attachments.find((candidate) => candidate.id === id);
-      if (attachment) return this.#files.resolveTransfer(attachment);
+      if (attachment) return attachment.deletedAt ? null : this.#files.resolveTransfer(attachment);
     }
     const generated = this.#state.generatedAttachments.find((candidate) => candidate.id === id);
-    if (generated) return this.#files.resolveTransfer(generated);
+    if (generated) return generated.deletedAt ? null : this.#files.resolveTransfer(generated);
     return null;
+  }
+
+  /** Every sent and generated file that the user has not deleted, from the in-memory state. */
+  listStoredFiles(): MailboxStoredFile[] {
+    const firstRecipient = new Map<string, string>();
+    for (const delivery of this.#state.deliveries)
+      if (!firstRecipient.has(delivery.messageId)) firstRecipient.set(delivery.messageId, delivery.recipientAgentId);
+    const files: MailboxStoredFile[] = [];
+    for (const message of this.#state.messages) {
+      const agentId =
+        message.sender.kind === "agent" ? message.sender.agentId : (firstRecipient.get(message.id) ?? null);
+      for (const attachment of message.attachments) {
+        if (attachment.deletedAt) continue;
+        files.push({
+          attachment: toAttachmentSummary(attachment),
+          path: attachment.path,
+          source: "attachment",
+          messageId: message.id,
+          agentId,
+          createdAt: message.createdAt,
+        });
+      }
+    }
+    for (const attachment of this.#state.generatedAttachments) {
+      if (attachment.deletedAt) continue;
+      files.push({
+        attachment: toAttachmentSummary(attachment),
+        path: attachment.path,
+        source: "generated",
+        messageId: null,
+        agentId: attachment.ownerAgentId ?? null,
+        createdAt: null,
+      });
+    }
+    return files;
+  }
+
+  /**
+   * Deletes one sent or generated file from the disk and keeps its record with a `deletedAt`
+   * marker, so the chat still shows where the file was. A file that is already gone gets only the
+   * marker. The file is removed through the deletion outbox, and only when it resolves inside the
+   * Transfers folder and no other record that is not deleted uses the same path.
+   */
+  async deleteStoredFile(fileId: string): Promise<void> {
+    // The path checks wait, so they run before the state changes. Then no other write can save the
+    // markers without their outbox entry, and a failed save restores a copy that has all other changes.
+    const managedPaths = new Map<string, string | null>();
+    for (const path of new Set(this.#undeletedFileRecords(fileId).map((target) => target.path))) {
+      managedPaths.set(path, await this.#files.managedTransferFile(path));
+    }
+    const records = this.#fileRecords();
+    const targets = this.#undeletedFileRecords(fileId);
+    const previous = structuredClone(this.#state);
+    const deletedAt = new Date().toISOString();
+    for (const target of targets) target.deletedAt = deletedAt;
+    const inUse = new Set(records.filter((record) => !record.deletedAt).map((record) => record.path));
+    const deletions: string[] = [];
+    for (const path of new Set(targets.map((target) => target.path))) {
+      const managed = inUse.has(path) ? null : managedPaths.get(path);
+      if (managed) deletions.push(managed);
+    }
+    try {
+      this.#persist("mailbox.file-deleted", `mailbox:file-deleted:${randomUUID()}`, deletions);
+    } catch (error) {
+      this.#state = previous;
+      throw error;
+    }
+    await this.#drainFileDeletionOutbox();
+  }
+
+  #fileRecords(): StoredAttachment[] {
+    return [...this.#state.messages.flatMap((message) => message.attachments), ...this.#state.generatedAttachments];
+  }
+
+  #undeletedFileRecords(fileId: string): StoredAttachment[] {
+    const targets = this.#fileRecords().filter((record) => record.id === fileId && !record.deletedAt);
+    if (targets.length === 0) throw new Error(sourceText("error.backend.fileGone"));
+    return targets;
   }
 
   async verifyDeliveryAttachments(deliveryId: string): Promise<void> {
@@ -1243,7 +1422,7 @@ export class MailboxStore {
     const message = this.#requireMessage(delivery.messageId);
     for (const attachment of message.attachments) {
       const resolved = await this.#files.resolveTransfer(attachment);
-      if (!resolved) throw new Error(`Managed attachment is missing or has changed: ${attachment.name}`);
+      if (!resolved) throw new Error(sourceText("error.backend.managedAttachmentChanged", { name: attachment.name }));
     }
   }
 
@@ -1322,11 +1501,13 @@ export class MailboxStore {
     const files: ExportedAttachmentFile[] = [];
     for (const [index, message] of this.#state.messages.entries()) {
       for (const attachment of message.attachments) {
+        if (attachment.deletedAt) continue;
         const file = await this.#files.exportAttachment(attachment, { id: message.id, index });
         if (file) files.push(file);
       }
     }
     for (const attachment of this.#state.generatedAttachments) {
+      if (attachment.deletedAt) continue;
       const file = await this.#files.exportAttachment(attachment);
       if (file) files.push(file);
     }
@@ -1420,7 +1601,7 @@ export class MailboxStore {
     try {
       const value = toCurrentMailboxState(JSON.parse(await readFile(this.#statePath, "utf8")));
       if (!value || !isStoredState(value)) {
-        throw new Error("Mailbox state is corrupt or from a newer OpenBot version; refusing to overwrite it.");
+        throw new Error(sourceText("error.backend.mailboxStateCorrupt"));
       }
       return value;
     } catch (error) {
@@ -1575,7 +1756,8 @@ function isStoredAttachment(value: unknown): value is StoredAttachment {
       value.previewKind === "none") &&
     (isString(value.previewUrl) || value.previewUrl === undefined) &&
     isString(value.path) &&
-    isString(value.sha256)
+    isString(value.sha256) &&
+    (value.deletedAt === undefined || isString(value.deletedAt))
   );
 }
 
@@ -1701,4 +1883,11 @@ function queueSaveHash(text: string, keepAttachmentIds: string[], attachmentDraf
  */
 function recordFinishedQueueEdit(delivery: StoredDelivery, editId: string, outcome: StoredFinishedEdit): void {
   delivery.finishedEditOutcomes = { ...(delivery.finishedEditOutcomes ?? {}), [editId]: outcome };
+}
+
+/** An agent's answer to a request. A linked message that asks for a reply is a new request. */
+function isAnswer(
+  message: StoredMessage,
+): message is StoredMessage & { sender: { kind: "agent"; agentId: string }; replyToMessageId: string } {
+  return message.sender.kind === "agent" && message.replyToMessageId !== null && message.expectsReply === false;
 }

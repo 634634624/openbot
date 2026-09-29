@@ -2,8 +2,25 @@
 
 ## Communication
 
-Use ASD-STE100 Simplified Technical English for questions, updates, explanations, and final answers.
-Keep quotations, code, commands, paths, identifiers, and required technical terms unchanged.
+Use ASD-STE100 Simplified Technical English for all text you write: questions, updates,
+explanations, final answers, commit messages, PR descriptions, and review comments. Be as concise as
+possible. Keep quotations, code, commands, paths, identifiers, and required technical terms unchanged.
+
+Do not add an agent or model as author or co-author. Do not add `Co-Authored-By:` trailers or
+"Generated with" lines to commits or PRs.
+
+When a step doesn't need the developer's input, keep going. Put status notes in the same message as
+your next action. Stop and ask only when you can't continue without the developer, or before
+anything destructive: deleting data, force-pushing, or changing anything outside this repository.
+
+For work with more than a few steps, keep a checklist in `TASKS.md` at the worktree root (git
+ignores it). Tick each item when it is done, and add new items that you find. The file stays
+available after the context is summarized.
+
+For an audit or migration that divides into independent areas, give each area to its own subagent.
+Check the evidence in each subagent's report before you accept it. Finish with one table.
+
+Mark each claim that you could not confirm, and say where you looked.
 
 **Non-negotiable** rules protect user data, released contracts, and security. Change them only on
 an explicit developer decision. All other rules are defaults: follow the developer's preference
@@ -34,27 +51,50 @@ adding a module or moving ownership between workspaces.
 - Agents keep their workspace, thread, and identity across provider switches and restarts.
   Do not reset an agent to simplify state.
 
+## Shared UI
+
+`packages/ui` (`@openbot/ui`) owns shared SolidJS controls and feature components used by
+desktop, public web, and Storybook. Reuse these components before adding UI. Import primitives
+from `@openbot/ui` and feature components from explicit subpaths such as
+`@openbot/ui/features/sidebar/Sidebar`. Do not copy them back into an app.
+
+Keep shared components independent of application contexts, desktop storage, host connections,
+and `window.openbot`. Pass data and actions through typed props. Platform adapters and the main
+conversation controller stay in the renderer. Component extraction must preserve the existing
+UI, styles, and behavior unless the user requests a design change. Native mobile shares brand
+tokens and contracts; it does not render SolidJS DOM components.
+
+Read [packages/ui/AGENTS.md](packages/ui/AGENTS.md) before changing shared UI.
+
+## Interface text
+
+Text that a user reads comes from `@openbot/i18n` catalog keys, on desktop, web and mobile. Do not
+write a literal. Errors that the main process, backend or team client send use `sourceText(key)`.
+Read [docs/i18n.md](docs/i18n.md) before adding a key or a language.
+
 ## Checks
 
-`bun run lint`, `bun run typecheck`, `bun run check:ui` and a single test file are the default
-checks. They read the worktree, touch no user profile and no network. Run them, fix what the
-requested change broke, and rerun them without asking at each step.
+Do not run broad checks locally. They overload the user's computer. This explicit user preference
+replaces the previous full lint and typecheck defaults. Leave repository-wide lint, aggregate
+`bun run typecheck`, full UI checks, builds, and full test suites to CI. Do not request these checks
+as a routine completion or PR step.
 
-1. In a fresh worktree, run `bun install --frozen-lockfile` first. Alternatively, run
-   `bun scripts/prepare-dev-environment.ts` to also check Bun, migrate local D1, and create the
-   untracked `apps/auth-api/.env.dev`. Only `.env.production` needs the encrypted setup.
-2. Before completion, run the narrowest relevant test, then `bun run lint` and `bun run typecheck`.
-   Also run `bun run check:ui` for changes in `src/renderer`. Keep the full lint and typecheck scope;
-   `typecheck:*` includes mobile, Signal, and `remote/scripts`. Each TypeScript project has a
-   separate incremental cache in this worktree. The first run creates it; later runs reuse it.
-   Run these checks locally even when cache state or machine load makes them slower.
-3. Run one desktop test file with `bun run test:desktop -- <path>`. Ask for a specific command
-   before a wider test, build, or packaged-app check. Approval covers only that command.
-4. Leave `bun run check`, `bun run check:desktop`, `bun run test`, and `bun run build-storybook`
-   to CI unless authorized. These suites take minutes and desktop tests can fail under load.
-5. Do not run `bun run format`: it rewrites the whole repository. Use
-   `biome check --write <paths>` for changed files, or the pre-commit `bun run check:staged` hook.
-   Keep `--max-diagnostics=none` for full Biome reports.
+1. In a fresh worktree, run `bun install --frozen-lockfile` first.
+2. Run only the narrowest relevant test file and lint the changed files. Run checks one at a time, with one test worker where supported.
+   Use `bun run test:desktop -- <path>` for one desktop or mobile test file.
+3. To check types, run one project for the code you changed, one at a time:
+   `bun run typecheck:node` (`src/main`, `src/backend`, `src/preload`, `scripts`),
+   `bun run typecheck:renderer` (`src/renderer`, `packages/ui`), or the `typecheck` script of the
+   one package or app you changed. Each takes under 10 seconds. Do not run `bun run typecheck`, the
+   mobile typecheck, or parallel checks. Leave broad type validation to CI and state what remains
+   unverified.
+4. Do not run `bun run format`: it rewrites the whole repository. Use
+   `biome check --write --max-diagnostics=none <paths>` for changed files.
+5. The pre-commit hook (`.githooks/pre-commit`) runs `check:staged`, `check:ui`, and
+   `bun run typecheck` when the commit stages code. This is the only exception to rule 3. Do not run
+   these checks by hand, and do not bypass the hook with `--no-verify`. The hook also runs the schema
+   parity test when a database schema file in `src/backend` is staged. It stops the commit if Biome
+   fixes a file that also has unstaged changes; stage the fixes you want and commit again.
 
 [Check design notes](docs/development-checks.md#check-coverage) explain CI coverage, command aliases,
 and the separate Node and Bun type environments. Read them when changing checks or dependencies.
@@ -113,7 +153,15 @@ Read the instruction file for each directory you change. Use the
 | [src/backend/AGENTS.md](src/backend/AGENTS.md) | SQLite migrations and database creation |
 | [packages/contracts/AGENTS.md](packages/contracts/AGENTS.md) | Frozen Team API protocols and IPC mirrors |
 | [apps/auth-api/AGENTS.md](apps/auth-api/AGENTS.md) | Account Worker and D1 deployment races |
+| [src/preload/AGENTS.md](src/preload/AGENTS.md) | Preload bridge and payload decoding |
+| [packages/ui/AGENTS.md](packages/ui/AGENTS.md) | Shared SolidJS controls and feature components |
+| [packages/team-client/AGENTS.md](packages/team-client/AGENTS.md) | Team WebRTC client and framing |
 | [apps/mobile/AGENTS.md](apps/mobile/AGENTS.md) | Expo and build/simulator permissions |
+| [remote/api/AGENTS.md](remote/api/AGENTS.md) | Signal and TURN credentials |
+
+Write release notes in a new `changelog.d/<branch>.md` file, not in `CHANGELOG.md`, as
+[docs/RELEASING.md](docs/RELEASING.md#release-notes) says. CI fails a PR with no notes unless it
+has the `no-changelog` label. A version bump with no notes fails.
 
 Before a version bump or tag, use
 [release-upgrade-safety](.agents/skills/release-upgrade-safety/SKILL.md) to audit upgrade and data-loss
@@ -121,20 +169,27 @@ risks since the last release.
 
 ## Tests
 
-- Prefer an existing test. Add a test only for a user or caller consequence; add a file only for a
-  new boundary. Skip assertions already enforced by TypeScript, Biome, or `check:ui`.
-- Tests are mandatory for changes to the renderer-to-main boundary, IPC contracts, database schema
-  and migrations, persisted state, secrets, provider processes, Team API wire protocols, and the
-  updater. Test once at the lowest stable boundary.
+- Keep tests minimal. Do not add a regression test by default. Add a test only when a bug can lose
+  user data, break a released protocol, weaken the trust boundary, or leak a secret, or when the
+  same bug came back.
+- A database migration always needs tests: data-preservation fixtures for every affected released
+  schema, plus the failure and rollback cases that [src/backend/AGENTS.md](src/backend/AGENTS.md)
+  lists.
+- Highly prefer E2E tests as the sole testing mechanism. Use them to verify complex features work.
+  At the end of E2E tests, produce a verifiable and repeatable artifact, such as a JSON report or a
+  screenshot under `.openbot-build/`.
+- If you must test a system in isolation, first write down all the ways it could fail, then write
+  the code. Put the list in the PR body under "Failure modes": one line per failure, with the test
+  that covers it.
+- Do not assert what TypeScript, Biome, or `check:ui` already enforce.
 - Wait for state, an event, or a promise, not elapsed time. A spy can provide the wait condition,
   such as `await waitFor(() => expect(send).toHaveBeenCalled())`; assert the user consequence after
   that wait. Do not remove synchronization because it uses a spy.
 - Assert behavior and data. Query accessible roles and names; use `toHaveFocus()` for focus.
   Do not assert markup, classes, layout, animation timing, or snapshots. Use exact text only for
   product contracts, error/security messages, serialized output, or localization keys.
-- Use Storybook for visual details. Do not add test IDs to avoid missing accessibility.
-  Story play functions can use them; renderer `data-testid` use must stay within the existing
-  `check:ui` budget of five. A new hook must replace an existing one.
+- Use Storybook for visual details only. Do not add story `play` functions: CI does not run them.
+  Do not add `data-testid` hooks; `check:ui` allows none.
 - `*.test.ts` uses Node; `*.test.tsx` uses JSX and jsdom; `*.dom.test.ts` uses DOM without a
   component. Keep pure logic in Node tests.
 
@@ -157,7 +212,11 @@ They describe the enforced syntax, fixture behavior, and reasons for removed rul
 - Open a PR only when asked.
 - For UI changes, show before and after. State the model and harness in the PR body.
   Do not commit screenshots or other PR review image assets to the repository.
-- Get approval for a specific wider check and run it before opening the PR.
+- Choose the NorbiAI reviewer level from the riskiest file in the diff with the
+  [reviewer table](CONTRIBUTING.md#choosing-the-reviewer-for-one-pull-request). Put the
+  `NorbiAI-Model:` line in the PR body as an HTML comment; omit it for the default. Do not add
+  `NorbiAI-Effort:` with a `chatgpt-web/*` model: it has no effect.
+- Do not run wider checks locally before a PR. Report focused checks and leave broad checks to CI.
 - A PR needs a named reason and is not auto-approvable if it adds `biome-ignore`, `@ts-expect-error`,
   or `@ts-ignore`; disables rules through `biome.json` overrides or removes a GritQL plugin; widens
   a boundary to `any` or `unknown`; or uses an assertion to bypass a checker. Fix the domain issue,

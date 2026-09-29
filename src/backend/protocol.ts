@@ -3,13 +3,13 @@ import { type DynamicRecord, isBoolean, isDynamicRecord, isNumber, isString } fr
 
 export type RequestId = string | number;
 
-export interface RpcRequest {
+interface RpcRequest {
   method: string;
   id: RequestId;
   params?: unknown;
 }
 
-export interface RpcNotification {
+interface RpcNotification {
   method: string;
   params?: unknown;
 }
@@ -20,7 +20,7 @@ export interface RpcError {
   data?: unknown;
 }
 
-export interface RpcResponse {
+interface RpcResponse {
   id: RequestId;
   result?: unknown;
   error?: RpcError;
@@ -52,6 +52,11 @@ export interface AppServerRequest {
   method: string;
   id: RequestId;
   params: unknown;
+  /**
+   * In process only, never on the wire. Aborts when the provider stops waiting for the answer, such
+   * as an MCP client whose tool call timed out. An answer after that reaches nobody.
+   */
+  signal?: AbortSignal;
 }
 
 export interface AccountReadResult {
@@ -67,6 +72,20 @@ export interface AccountLoginStartResult {
   type: "chatgpt";
   loginId: string;
   authUrl: string;
+}
+
+/**
+ * The device-code form of the same login.
+ *
+ * The user types the code on a phone or another browser, so the reply carries a code and the page
+ * to type it on instead of a URL this computer is expected to open. The code authorises nothing on
+ * its own and is meant to be read out; the token it is later traded for never appears here.
+ */
+export interface AccountDeviceCodeLoginStartResult {
+  type: "chatgptDeviceCode";
+  loginId: string;
+  verificationUrl: string;
+  userCode: string;
 }
 
 export interface AccountLoginCompletedResult {
@@ -104,14 +123,14 @@ export interface ThreadItem {
   [key: string]: unknown;
 }
 
-export interface TurnRecord {
+interface TurnRecord {
   id: string;
   status?: string;
   startedAt?: number;
   items?: ThreadItem[];
 }
 
-export interface ThreadRecord {
+interface ThreadRecord {
   id: string;
   turns?: TurnRecord[];
 }
@@ -195,6 +214,21 @@ export function decodeAccountLoginStartResult(value: unknown): AccountLoginStart
   const url = new URL(authUrl);
   if (url.protocol !== "https:") throw new Error("Codex returned an unsafe login URL.");
   return { type: "chatgpt", loginId: requiredString(record, "loginId"), authUrl: url.toString() };
+}
+
+export function decodeAccountDeviceCodeLoginStartResult(value: unknown): AccountDeviceCodeLoginStartResult {
+  const record = decodeRecord(value, "account device login response");
+  if (requiredString(record, "type") !== "chatgptDeviceCode") throw new Error("Unexpected Codex login type.");
+  // Held to the same rule as the browser login's URL: this is the address OpenBot shows the user
+  // and offers to open, so a downgrade to plain HTTP is refused before it reaches the screen.
+  const url = new URL(requiredString(record, "verificationUrl"));
+  if (url.protocol !== "https:") throw new Error("Codex returned an unsafe login URL.");
+  return {
+    type: "chatgptDeviceCode",
+    loginId: requiredString(record, "loginId"),
+    verificationUrl: url.toString(),
+    userCode: requiredString(record, "userCode"),
+  };
 }
 
 export function decodeAccountLoginCompletedResult(value: unknown): AccountLoginCompletedResult {

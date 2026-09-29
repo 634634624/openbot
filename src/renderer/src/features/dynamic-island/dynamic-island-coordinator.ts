@@ -426,7 +426,7 @@ function latestAgentMessage(messages: readonly DynamicIslandMessageSource[]): Dy
   return undefined;
 }
 
-export function queueSnapshotsFromRuntimeWork(work: readonly AgentRuntimeWorkItem[]): Record<string, QueueSnapshot> {
+function queueSnapshotsFromRuntimeWork(work: readonly AgentRuntimeWorkItem[]): Record<string, QueueSnapshot> {
   const queues: Record<string, QueueSnapshot> = {};
   for (const item of work) {
     const queue = queues[item.agentId] ?? { agentId: item.agentId, deliveries: [] };
@@ -461,10 +461,17 @@ export function reconcileQueuesWithRuntimeWork(
     if (!existing) continue;
     const active = runtime[agentId]?.deliveries ?? [];
     const activeIds = new Set(active.map((delivery) => delivery.id));
+    const previous = new Map(existing.deliveries.map((delivery) => [delivery.id, delivery]));
     queues[agentId] = {
       ...existing,
       deliveries: [
-        ...active,
+        ...active.map((delivery) => {
+          const prior = previous.get(delivery.id);
+          // A runtime work item has no sender. Keep the queue's sender, or a reload reports a
+          // routine run as a user message and the sidebar mark disappears.
+          if (!prior) return delivery;
+          return { ...prior, status: delivery.status, turnId: delivery.turnId, error: delivery.error };
+        }),
         ...existing.deliveries.filter(
           (delivery) =>
             ((delivery.status !== "starting" && delivery.status !== "running") ||
@@ -484,7 +491,8 @@ function toDynamicIslandMessage(
     (message.author !== "assistant" && message.author !== "agent") ||
     message.itemType === "commentary" ||
     message.itemType === "question_prompt" ||
-    message.itemType === "agent_attachment"
+    message.itemType === "agent_attachment" ||
+    message.itemType === "plan"
   ) {
     return [];
   }

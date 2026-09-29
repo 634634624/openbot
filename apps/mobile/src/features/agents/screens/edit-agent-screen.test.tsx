@@ -1,4 +1,5 @@
 import {
+  type AgentAdminSettings,
   type AgentAnalytics,
   type AgentMemory,
   analyticsRange,
@@ -8,28 +9,41 @@ import {
   type ChannelTask,
   type CreateAgentInput,
   emptyAnalyticsTotals,
+  type InstalledSkill,
   parseChannelCommand,
   type Routine,
+  type SetEnabledSkillInput,
+  type SidebarLayoutAction,
+  type SidebarLayoutSnapshot,
+  SKILL_CREATION_REQUEST,
+  type StorageUsage,
+  type UninstallSkillInput,
+  type UpdateAgentAdminSettingsInput,
   type UpdateAgentInput,
 } from "@openbot/contracts/ipc";
 import { CHANNEL_ROUTES } from "@openbot/contracts/team-protocol/channels-v1";
 import type { TeamProtocolV2Json } from "@openbot/contracts/team-protocol/v2";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, screen, waitFor } from "@testing-library/dom";
-import { act, type PropsWithChildren, useState } from "react";
+import { act, isValidElement, type PropsWithChildren, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, assert, beforeEach, expect, it, vi } from "vitest";
 import type { ChatTarget } from "@/features/chat/model/chat-target";
+import { takeComposerFocus, takeComposerRequest, useComposerRequest } from "@/features/chat/model/composer-requests";
 import { useHapticsPreference } from "@/features/settings/model/haptics";
 import { SheetSaveAction } from "@/shared/components/sheet-save-action";
 import { ChannelHistoryRefreshError, MobileChannelStore } from "../../channels/model/channel-store";
 import { ChannelActionsScreen } from "../../channels/screens/channel-actions-screen";
 import { ChannelFormScreen } from "../../channels/screens/channel-form-screen";
 import { ChatHeader } from "../../chat/components/chat-header";
+import { LiveWorkspaceStore } from "../../workspace/model/live-workspace-store";
 import { saveAgentRecord } from "../../workspace/model/save-agent-record";
+import { mobileSidebarItems } from "../../workspace/model/sidebar-layout";
 import type { MobileAgent, MobileServer } from "../../workspace/model/workspace-types";
 import { useAgentContextMenu } from "../components/agent-context-menu";
 import { AgentPhoto } from "../components/agent-photo";
+import { SidebarSectionHeader } from "../components/sidebar-section-header";
+import { useChatSectionMenu } from "../components/use-chat-section-menu";
 import { AddAgentScreen } from "./add-agent-screen";
 import { EditAgentScreen } from "./edit-agent-screen";
 import { HiddenChatsScreen } from "./hidden-chats-screen";
@@ -48,10 +62,17 @@ vi.mock("react-native-svg", () => ({
   Image: () => null,
 }));
 vi.mock("expo-image-picker", () => ({ launchImageLibraryAsync: (...args: unknown[]) => mocks.choosePhoto(...args) }));
+vi.mock("expo-image-manipulator", () => {
+  const image = { width: 1200, height: 800, saveAsync: async () => ({ uri: "file:///avatar.jpg" }) };
+  const context = { crop: () => context, resize: () => context, renderAsync: async () => image };
+  return { ImageManipulator: { manipulate: () => context }, SaveFormat: { JPEG: "jpeg" } };
+});
+vi.mock("@/shared/lib/avatar-crop-request", () => ({
+  requestAvatarCrop: async () => ({ originX: 200, originY: 0, width: 800, height: 800 }),
+}));
 vi.mock("expo-file-system", () => ({
   File: class {
-    name = "photo.png";
-    type = "image/png";
+    name = "avatar.jpg";
     get size() {
       return mocks.fileSize;
     }
@@ -60,14 +81,31 @@ vi.mock("expo-file-system", () => ({
   },
 }));
 
+const { sheetRoutes } = vi.hoisted(() => ({
+  sheetRoutes: (...routes: { name: string; params?: object }[]) => [
+    { name: "connected" },
+    ...routes,
+    { name: "agent-info/[agentId]" },
+  ],
+}));
 const mocks = vi.hoisted(() => ({
   choosePhoto: vi.fn(),
   fileSize: 8,
   uuid: vi.fn(() => "new-agent-seed"),
   push: vi.fn(),
   replace: vi.fn(),
+  dismissTo: vi.fn(),
   dispatch: vi.fn(),
+  sheetStack: {
+    routes: sheetRoutes(),
+    getState() {
+      return { index: this.routes.length - 1, routes: this.routes };
+    },
+    goBack: vi.fn(),
+    dispatch: vi.fn(),
+  },
   alert: vi.fn(),
+  shareFile: vi.fn(),
   back: vi.fn(),
   recordId: "",
   blocked: false,
@@ -94,6 +132,7 @@ const host: MobileServer = {
   address: null,
   accent: "",
   publicKey: "key",
+  logoKey: null,
   membershipId: "member",
   role: "member",
 };
@@ -138,21 +177,25 @@ function createChannelStore() {
 }
 const hiddenChannelIds: string[] = [];
 const hiddenAgents: MobileAgent[] = [];
+const sidebarByServer: Record<string, { layout: SidebarLayoutSnapshot | null; error: string | null }> = {};
 const workspace = {
+  sidebarByServer,
+  mutateSidebarLayout: vi.fn(async (_serverId: string, _action: SidebarLayoutAction) => {}),
   channelStore: createChannelStore(),
   agents: [original],
   servers: [host],
   activeServer: host,
-  activityByServer: {},
+  liveState: new LiveWorkspaceStore(),
   pinnedAgentIds: [],
   pinnedChannelIds: [],
   hiddenAgents,
   hiddenChannelIds,
   unhideChannel: vi.fn((_id: string, _serverId: string) => true),
-  unreadAgentIds: [],
   createAgent: vi.fn(async (_input: CreateAgentInput) => {}),
   updateAgent: vi.fn(async (input: UpdateAgentInput, _serverId?: string) => {
-    workspace.agents = [{ ...workspace.agents[0], ...input }];
+    const [agent] = workspace.agents;
+    assert(agent);
+    workspace.agents = [{ ...agent, ...input }];
   }),
   loadAgentAvatar: vi.fn(async (_id: string, _url: string, _serverId: string) => "data:image/png;base64,iVBORw0KGgo="),
   setAgentAvatar: vi.fn(
@@ -172,6 +215,7 @@ const workspace = {
   createAgentRoutine: vi.fn(async () => {}),
   updateAgentRoutine: vi.fn(async () => {}),
   deleteAgentRoutine: vi.fn(async () => {}),
+  testAgentRoutine: vi.fn(async () => {}),
   loadAgentModels: vi.fn(async () => [
     {
       provider: "codex",
@@ -185,6 +229,24 @@ const workspace = {
   loadAgentMemories: vi.fn<() => Promise<AgentMemory[]>>(async () => []),
   loadAgentRoutines: vi.fn<() => Promise<Routine[]>>(async () => []),
   loadAgentAnalytics: vi.fn<() => Promise<AgentAnalytics | null>>(async () => null),
+  loadAgentSkills: vi.fn<(agentId: string, serverId: string, manage?: boolean) => Promise<InstalledSkill[] | null>>(
+    async () => [],
+  ),
+  canManageAgentSkills: vi.fn((_serverId: string) => false),
+  setAgentSkillEnabled: vi.fn<(input: SetEnabledSkillInput, serverId: string) => Promise<InstalledSkill>>(),
+  uninstallAgentSkill: vi.fn<(input: UninstallSkillInput, serverId: string) => Promise<void>>(),
+  loadAgentStorage: vi.fn<(agentId: string, serverId: string, force?: boolean) => Promise<StorageUsage | null>>(
+    async () => null,
+  ),
+  deleteStoredFile: vi.fn(async () => {}),
+  loadAgentAdminSettings: vi.fn<(agentId: string, serverId: string) => Promise<AgentAdminSettings | null>>(
+    async () => null,
+  ),
+  updateAgentAdminSettings: vi.fn<
+    (input: UpdateAgentAdminSettingsInput, serverId: string) => Promise<AgentAdminSettings>
+  >(async () => {
+    throw new Error("unexpected");
+  }),
 };
 vi.mock("@/features/workspace/context/mobile-workspace-context", () => ({ useMobileWorkspace: () => workspace }));
 vi.mock("@/features/auth/context/mobile-session-context", () => ({
@@ -207,26 +269,39 @@ vi.mock("expo-router", () => ({
         ),
     }),
   },
-  router: { push: mocks.push, back: mocks.back, replace: mocks.replace },
+  router: { push: mocks.push, back: mocks.back, replace: mocks.replace, dismissTo: mocks.dismissTo },
   useLocalSearchParams: () => ({
     agentId: "agent-one",
     channelId: "channel-one",
     serverId: "host-one",
     recordId: mocks.recordId,
   }),
-  useNavigation: () => ({ dispatch: mocks.dispatch }),
+  useNavigation: () => ({ dispatch: mocks.dispatch, getParent: () => mocks.sheetStack }),
   Link: Object.assign(({ children }: PropsWithChildren) => <>{children}</>, {
     Trigger: ({ children }: PropsWithChildren) => children,
     AppleZoomTarget: ({ children }: PropsWithChildren) => children,
-    Menu: ({ children }: PropsWithChildren) => <div>{children}</div>,
-    MenuAction: ({ children, onPress }: PropsWithChildren<{ onPress: () => void }>) => (
-      <button type="button" onClick={onPress}>
+    Menu: ({ children, title }: PropsWithChildren<{ title?: string }>) => {
+      const [open, setOpen] = useState(!title);
+      return (
+        <div>
+          {title ? (
+            <button type="button" onClick={() => setOpen(!open)}>
+              {title}
+            </button>
+          ) : null}
+          {open ? children : null}
+        </div>
+      );
+    },
+    MenuAction: ({ children, onPress, disabled }: PropsWithChildren<{ onPress: () => void; disabled?: boolean }>) => (
+      <button type="button" disabled={disabled} onClick={onPress}>
         {children}
       </button>
     ),
   }),
 }));
 vi.mock("expo-router/react-navigation", () => ({
+  StackActions: { replace: (name: string, params: object) => ({ type: "REPLACE", payload: { name, params } }) },
   usePreventRemove: (blocked: boolean, callback: (value: { data: { action: { type: string } } }) => void) => {
     mocks.blocked = blocked;
     mocks.leave = () => {
@@ -252,7 +327,7 @@ vi.mock("react-native", () => ({
     onPress: () => void;
     accessibilityLabel: string;
     accessibilityRole?: "button" | "checkbox";
-    accessibilityState?: { checked?: boolean };
+    accessibilityState?: { checked?: boolean; expanded?: boolean };
     disabled?: boolean;
   }>) =>
     accessibilityRole === "checkbox" ? (
@@ -264,7 +339,13 @@ vi.mock("react-native", () => ({
         onChange={onPress}
       />
     ) : (
-      <button type="button" disabled={disabled} aria-label={accessibilityLabel} onClick={onPress}>
+      <button
+        type="button"
+        disabled={disabled}
+        aria-label={accessibilityLabel}
+        aria-expanded={accessibilityState?.expanded}
+        onClick={onPress}
+      >
         {children}
       </button>
     ),
@@ -284,7 +365,7 @@ vi.mock("heroui-native", () => {
     isDisabled?: boolean;
     accessibilityLabel?: string;
     accessibilityRole?: "radio";
-    accessibilityState?: { checked?: boolean };
+    accessibilityState?: { checked?: boolean; expanded?: boolean };
   }>) =>
     accessibilityRole === "radio" ? (
       <input
@@ -328,6 +409,7 @@ vi.mock("@/shared/components/sheet-scroll-view", () => ({
   SheetScrollView: ({ children }: PropsWithChildren) => <div>{children}</div>,
 }));
 vi.mock("@/features/settings/components/settings-content", () => ({
+  SettingsNote: ({ children }: PropsWithChildren) => <p>{children}</p>,
   SettingsSection: ({ title, children }: PropsWithChildren<{ title: string }>) => (
     <section aria-label={title}>{children}</section>
   ),
@@ -335,11 +417,21 @@ vi.mock("@/features/settings/components/settings-content", () => ({
     children,
     onPress,
     trailing,
-  }: PropsWithChildren<{ onPress?: () => void; trailing?: import("react").ReactNode }>) =>
+    disabled,
+    accessibilityLabel,
+  }: PropsWithChildren<{
+    onPress?: () => void;
+    trailing?: import("react").ReactNode;
+    disabled?: boolean;
+    accessibilityLabel?: string;
+  }>) =>
     onPress ? (
-      <button type="button" onClick={onPress}>
-        {children}
-      </button>
+      <div>
+        <button type="button" aria-label={accessibilityLabel} disabled={disabled} onClick={onPress}>
+          {children}
+        </button>
+        {trailing}
+      </div>
     ) : (
       <div>
         {children}
@@ -351,6 +443,7 @@ vi.mock("@/features/agents/components/bloub-avatar", () => ({
   BloubAvatar: () => null,
   BloubAvatarPreview: () => null,
   BloubAvatarThumbnail: () => null,
+  AvatarThumbnail: () => null,
 }));
 vi.mock("@/features/agents/components/agent-pin-avatar", () => ({
   AgentPinAvatar: ({ children }: PropsWithChildren) => children,
@@ -447,15 +540,41 @@ vi.mock("@expo/ui", () => {
   };
 });
 vi.mock("expo-clipboard", () => ({ setStringAsync: vi.fn() }));
-vi.mock("@/shared/lib/haptics", () => ({ haptics: { impact: async () => {}, notification: async () => {} } }));
-vi.mock("lucide-react-native", () => ({ ArrowLeft: () => null, Eye: () => null, TriangleAlert: () => null }));
+vi.mock("@/shared/lib/haptics", () => ({
+  haptics: { impact: async () => {}, notification: async () => {}, selection: async () => {} },
+}));
+vi.mock("lucide-react-native", () => ({
+  ChevronRight: () => null,
+  Ellipsis: () => null,
+  ArrowLeft: () => null,
+  Eye: () => null,
+  TriangleAlert: () => null,
+  Trash2: () => null,
+  Shuffle: () => null,
+  ImagePlus: () => null,
+  Pencil: () => null,
+}));
+vi.mock("@/features/chat/components/attachment-preview", () => ({
+  AttachmentThumbnail: () => null,
+  useAttachmentFile: () => ({ uri: null, busy: false, share: mocks.shareFile }),
+}));
 
 const container = document.createElement("div");
 document.body.append(container);
 let root = createRoot(container);
 let client = new QueryClient();
 async function renderSheet(
-  page: "info" | "appearance" | "usage" | "memories" | "routines" | "runtime" | "memory" | "routine" = "info",
+  page:
+    | "info"
+    | "appearance"
+    | "usage"
+    | "memories"
+    | "skills"
+    | "files"
+    | "routines"
+    | "runtime"
+    | "memory"
+    | "routine" = "info",
 ) {
   await act(() =>
     root.render(
@@ -472,6 +591,8 @@ async function edit(name: string, value: string) {
   await act(() => fireEvent.change(screen.getByRole("textbox", { name }), { target: { value } }));
 }
 beforeEach(() => {
+  delete sidebarByServer[host.id];
+  workspace.mutateSidebarLayout.mockReset().mockResolvedValue();
   mocks.choosePhoto
     .mockReset()
     .mockResolvedValue({ canceled: false, assets: [{ uri: "file:///photo.png", mimeType: "image/png" }] });
@@ -495,12 +616,25 @@ beforeEach(() => {
   workspace.loadAgentMemories.mockReset().mockResolvedValue([]);
   workspace.loadAgentRoutines.mockReset().mockResolvedValue([]);
   workspace.loadAgentAnalytics.mockReset().mockResolvedValue(null);
+  workspace.loadAgentSkills.mockReset().mockResolvedValue([]);
+  workspace.canManageAgentSkills.mockReset().mockReturnValue(false);
+  workspace.setAgentSkillEnabled.mockReset();
+  workspace.uninstallAgentSkill.mockReset();
+  workspace.loadAgentStorage.mockReset().mockResolvedValue(null);
+  workspace.deleteStoredFile.mockReset().mockResolvedValue();
+  workspace.loadAgentAdminSettings.mockReset().mockResolvedValue(null);
+  workspace.updateAgentAdminSettings.mockReset();
+  mocks.shareFile.mockClear();
   channelRows = [channel];
   actionTasks = [];
   failChannelSave = false;
   workspace.channelStore = createChannelStore();
   channelRequests.mockClear();
   mocks.replace.mockClear();
+  mocks.dismissTo.mockClear();
+  mocks.sheetStack.routes = sheetRoutes();
+  mocks.sheetStack.goBack.mockClear();
+  mocks.sheetStack.dispatch.mockClear();
   mocks.recordId = "";
   mocks.blocked = false;
   mocks.leave = () => {};
@@ -613,6 +747,14 @@ it("validates input, retains failed edits, and confirms cancellation", async () 
   expect(mocks.dispatch).toHaveBeenCalledWith({ type: "GO_BACK" });
 });
 
+it("saves an agent without instructions, as the host and desktop allow", async () => {
+  workspace.agents = [{ ...original, description: "" }];
+  await renderSheet();
+  await edit("Title", "Planner");
+  await click("Save changes");
+  expect(workspace.updateAgent).toHaveBeenCalledWith({ agentId: original.id, title: "Planner" }, original.serverId);
+});
+
 it("keeps edits through host loss and accepts desktop changes in untouched fields", async () => {
   await renderSheet();
   await edit("Name", "My draft");
@@ -676,6 +818,230 @@ it("prevents duplicate saves and dismissal while a save is pending", async () =>
   expect(workspace.updateAgent).toHaveBeenCalledTimes(1);
   await act(async () => finish());
   expect(screen.queryByRole("button", { name: "Save changes" })).toBeNull();
+});
+
+it("lists the host skills read-only and hides built-in skills", async () => {
+  const skill = { installedVersion: 1, availableVersion: 1, state: "installed" as const };
+  workspace.loadAgentSkills.mockResolvedValue([
+    { ...skill, skillId: "writer", slug: "writer", name: "Writer", description: "Drafts posts" },
+    { ...skill, skillId: "managed", slug: "managed", name: "Built in", origin: "managed" },
+    { ...skill, skillId: "notes", slug: "notes", name: "Notes", enabled: false },
+  ]);
+  await renderSheet("skills");
+  await screen.findByText("Writer");
+  expect(workspace.loadAgentSkills).toHaveBeenCalledWith(original.id, original.serverId, false);
+  expect(screen.getByText("Drafts posts")).toBeTruthy();
+  expect(screen.getByText("Notes")).toBeTruthy();
+  expect(screen.queryByText("Built in")).toBeNull();
+  // A member cannot change skills.
+  expect(screen.queryByRole("switch")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Uninstall Writer" })).toBeNull();
+  expect(screen.getByText("Skills for this agent are managed on the host.")).toBeTruthy();
+
+  await act(() => root.unmount());
+  root = createRoot(container);
+  client.clear();
+  workspace.loadAgentSkills.mockResolvedValue(null);
+  await renderSheet("skills");
+  await screen.findByText("This host does not support skills. Update OpenBot on the host.");
+});
+
+it("lets an admin turn a skill off and on, and puts the old state back when the host refuses", async () => {
+  const writer: InstalledSkill = {
+    skillId: "writer",
+    slug: "writer",
+    name: "Writer",
+    installedVersion: 1,
+    availableVersion: 1,
+    state: "installed",
+    enabled: true,
+  };
+  const folder: InstalledSkill = { ...writer, skillId: "folder", slug: "folder", name: "Folder", origin: "workspace" };
+  workspace.servers = [{ ...host, role: "admin" }];
+  workspace.canManageAgentSkills.mockReturnValue(true);
+  workspace.loadAgentSkills.mockResolvedValue([writer, folder]);
+  let answer: (skill: InstalledSkill) => void = () => {};
+  workspace.setAgentSkillEnabled.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        answer = resolve;
+      }),
+  );
+  await renderSheet("skills");
+  const toggle = await screen.findByRole("switch", { name: "Writer" });
+  expect(workspace.loadAgentSkills).toHaveBeenCalledWith(original.id, original.serverId, true);
+  // A skill in a folder that OpenBot does not manage stays read-only.
+  expect(screen.queryByRole("switch", { name: "Folder" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Uninstall Folder" })).toBeNull();
+
+  await act(() => fireEvent.click(toggle));
+  expect(workspace.setAgentSkillEnabled).toHaveBeenCalledWith(
+    { agentId: original.id, skillId: "writer", enabled: false },
+    original.serverId,
+  );
+  // The switch moves before the host answers, and waits for the answer.
+  await waitFor(() => expect(screen.getByRole("switch", { name: "Writer" })).toHaveProperty("checked", false));
+  expect(screen.getByRole("switch", { name: "Writer" })).toHaveProperty("disabled", true);
+  await act(async () => answer({ ...writer, enabled: false }));
+  await waitFor(() => expect(screen.getByRole("switch", { name: "Writer" })).toHaveProperty("disabled", false));
+  expect(screen.getByRole("switch", { name: "Writer" })).toHaveProperty("checked", false);
+
+  workspace.setAgentSkillEnabled.mockRejectedValue(new Error("Sign in to the marketplace on the host."));
+  await act(() => fireEvent.click(screen.getByRole("switch", { name: "Writer" })));
+  await screen.findByText("Sign in to the marketplace on the host.");
+  expect(screen.getByRole("switch", { name: "Writer" })).toHaveProperty("checked", false);
+});
+
+it("lets an admin start a new skill in the agent chat, as on desktop", async () => {
+  await renderSheet("skills");
+  expect(screen.queryByRole("button", { name: "Create skill" })).toBeNull();
+
+  await act(() => root.unmount());
+  root = createRoot(container);
+  client.clear();
+  workspace.servers = [{ ...host, role: "admin" }];
+  workspace.canManageAgentSkills.mockReturnValue(true);
+  await renderSheet("skills");
+  await click("Create skill");
+  expect(useComposerRequest.getState().request).toEqual({
+    serverId: original.serverId,
+    agentId: original.id,
+    text: SKILL_CREATION_REQUEST,
+  });
+  // Opened from the agent list: the agent chat takes the place of the sheet.
+  expect(mocks.sheetStack.dispatch).toHaveBeenCalledWith({
+    type: "REPLACE",
+    payload: { name: "chat/[agentId]", params: { agentId: original.id } },
+  });
+  expect(mocks.sheetStack.goBack).not.toHaveBeenCalled();
+  expect(takeComposerRequest("other-host", original.id)).toBeNull();
+  expect(takeComposerRequest(original.serverId, original.id)).toBe(SKILL_CREATION_REQUEST);
+  expect(useComposerRequest.getState().request).toBeNull();
+
+  // Opened from the agent chat: the sheet closes and that chat, not a new one, gets the request.
+  mocks.sheetStack.routes = sheetRoutes({ name: "chat/[agentId]", params: { agentId: original.id } });
+  mocks.sheetStack.dispatch.mockClear();
+  await click("Create skill");
+  expect(mocks.sheetStack.goBack).toHaveBeenCalledOnce();
+  expect(mocks.sheetStack.dispatch).not.toHaveBeenCalled();
+  // The keyboard is asked for only when the sheet is gone; during the dismissal iOS would drop it.
+  expect(useComposerRequest.getState().focus).toBeNull();
+  await act(() => root.unmount());
+  root = createRoot(container);
+  expect(takeComposerFocus("other-host", original.id)).toBe(false);
+  expect(takeComposerFocus(original.serverId, original.id)).toBe(true);
+  expect(useComposerRequest.getState().focus).toBeNull();
+});
+
+it("uninstalls a skill after confirmation and keeps it when the host refuses", async () => {
+  const skill = { installedVersion: 1, availableVersion: 1, enabled: true };
+  workspace.servers = [{ ...host, role: "owner" }];
+  workspace.canManageAgentSkills.mockReturnValue(true);
+  workspace.loadAgentSkills.mockResolvedValue([
+    { ...skill, skillId: "writer", slug: "writer", name: "Writer", state: "installed" },
+    { ...skill, skillId: "notes", slug: "notes", name: "Notes", state: "modified" },
+  ]);
+  await renderSheet("skills");
+  await screen.findByRole("button", { name: "Uninstall Writer" });
+  await click("Uninstall Writer");
+  expect(mocks.alert).toHaveBeenLastCalledWith(
+    "Uninstall Writer?",
+    "OpenBot will remove this skill from the agent. Chat history stays.",
+    expect.any(Array),
+  );
+  expect(workspace.uninstallAgentSkill).not.toHaveBeenCalled();
+
+  workspace.uninstallAgentSkill.mockRejectedValueOnce(new Error("The host is busy."));
+  await act(async () => mocks.alert.mock.calls.at(-1)?.[2][1].onPress());
+  await screen.findByText("The host is busy.");
+  expect(screen.getByRole("switch", { name: "Writer" })).toBeTruthy();
+
+  workspace.uninstallAgentSkill.mockResolvedValue();
+  await click("Uninstall Writer");
+  await act(async () => mocks.alert.mock.calls.at(-1)?.[2][1].onPress());
+  await waitFor(() => expect(screen.queryByRole("switch", { name: "Writer" })).toBeNull());
+  expect(workspace.uninstallAgentSkill).toHaveBeenLastCalledWith(
+    { agentId: original.id, skillId: "writer" },
+    original.serverId,
+  );
+  expect(screen.queryByText("The host is busy.")).toBeNull();
+
+  // A skill with local changes says that its files go, and the host is told to delete them.
+  await click("Uninstall Notes");
+  expect(mocks.alert.mock.calls.at(-1)?.[1]).toBe(
+    "This skill has local changes in the agent workspace. Uninstall deletes those files. Chat history stays.",
+  );
+  await act(async () => mocks.alert.mock.calls.at(-1)?.[2][1].onPress());
+  await waitFor(() => expect(screen.queryByRole("switch", { name: "Notes" })).toBeNull());
+  expect(workspace.uninstallAgentSkill).toHaveBeenLastCalledWith(
+    { agentId: original.id, skillId: "notes", removeModified: true },
+    original.serverId,
+  );
+
+  // Offline, the list and its controls wait for a new connection.
+  await act(() => root.unmount());
+  root = createRoot(container);
+  client.clear();
+  workspace.servers = [{ ...host, role: "owner", state: "offline" }];
+  workspace.canManageAgentSkills.mockReturnValue(false);
+  await renderSheet("skills");
+  expect(screen.getByText("Reconnect to load skills.")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Uninstall Notes" })).toBeNull();
+});
+
+it("shows the agent files and lets an admin delete one, then measures again", async () => {
+  const usage: StorageUsage = {
+    scope: "agent",
+    agentId: original.id,
+    conversationId: null,
+    scannedAt: "2026-09-14T00:00:00Z",
+    freeBytes: null,
+    breakdown: [{ category: "attachments", bytes: 12, removable: false }],
+    agents: [],
+    conversations: [],
+    files: [
+      {
+        id: "file-one",
+        name: "plan.pdf",
+        size: 12,
+        kind: "file",
+        mimeType: "application/pdf",
+        previewKind: "pdf",
+        previewUrl: null,
+        source: "attachment",
+        agentId: original.id,
+        conversation: null,
+        messageId: "message-one",
+        createdAt: "2026-09-14T00:00:00Z",
+        status: "available",
+        deletable: true,
+      },
+    ],
+    truncated: false,
+  };
+  workspace.loadAgentStorage.mockResolvedValue(usage);
+  await renderSheet("files");
+  await screen.findByText("plan.pdf");
+  expect(workspace.loadAgentStorage).toHaveBeenLastCalledWith(original.id, original.serverId, false);
+  // A member reads the files but cannot delete them.
+  expect(screen.queryByRole("button", { name: "Delete plan.pdf" })).toBeNull();
+  await click("plan.pdf");
+  expect(mocks.shareFile).toHaveBeenCalledOnce();
+
+  await act(() => root.unmount());
+  root = createRoot(container);
+  client.clear();
+  workspace.servers = [{ ...host, role: "admin" }];
+  await renderSheet("files");
+  await screen.findByRole("button", { name: "Delete plan.pdf" });
+  await click("Delete plan.pdf");
+  workspace.loadAgentStorage.mockResolvedValue({ ...usage, files: [] });
+  await act(async () => mocks.alert.mock.calls.at(-1)?.[2][1].onPress());
+  await waitFor(() => expect(workspace.deleteStoredFile).toHaveBeenCalledWith("file-one", original.serverId));
+  await waitFor(() =>
+    expect(workspace.loadAgentStorage).toHaveBeenLastCalledWith(original.id, original.serverId, true),
+  );
+  await waitFor(() => expect(screen.queryByText("plan.pdf")).toBeNull());
 });
 
 it("shows host memories, routine status, and usage on separate pages", async () => {
@@ -828,6 +1194,81 @@ it("saves a supported model and reasoning level on the original host", async () 
     { agentId: original.id, model: "model-one", reasoningEffort: "high" },
     host.id,
   );
+});
+
+it.each([
+  ["a member", "member", { access: "workspace", autoApprove: false, autoApproveLocked: false }],
+  ["a host without agent-admin-v1", "admin", null],
+] as const)("hides access controls for %s", async (_case, role, settings) => {
+  workspace.servers = [{ ...host, role }];
+  workspace.loadAgentAdminSettings.mockResolvedValue(settings);
+  workspace.loadAgentModels.mockClear();
+  await renderSheet("runtime");
+  await waitFor(() => expect(workspace.loadAgentModels).toHaveBeenCalled());
+  if (role === "member") expect(workspace.loadAgentAdminSettings).not.toHaveBeenCalled();
+  else await waitFor(() => expect(workspace.loadAgentAdminSettings).toHaveBeenCalledWith(original.id, host.id));
+  await act(async () => {});
+  expect(screen.queryByRole("switch", { name: "Auto approve" })).toBeNull();
+  expect(screen.queryByDisplayValue("Workspace only")).toBeNull();
+});
+
+it("saves access and auto-approve on the host for an admin", async () => {
+  workspace.servers = [{ ...host, role: "admin" }];
+  let saved: AgentAdminSettings = { access: "workspace", autoApprove: false, autoApproveLocked: false };
+  workspace.loadAgentAdminSettings.mockImplementation(async () => saved);
+  workspace.updateAgentAdminSettings.mockImplementation(async ({ agentId: _agentId, ...input }) => {
+    saved = { ...saved, ...input };
+    return saved;
+  });
+  await renderSheet("runtime");
+  await waitFor(() => expect(screen.getByRole("switch", { name: "Auto approve" })).toHaveProperty("disabled", false));
+  await click("Auto approve", "switch");
+  await waitFor(() => expect(screen.getByRole("switch", { name: "Auto approve" })).toHaveProperty("checked", true));
+  expect(workspace.updateAgentAdminSettings).toHaveBeenLastCalledWith(
+    { agentId: original.id, autoApprove: true },
+    host.id,
+  );
+
+  await act(() => fireEvent.change(screen.getByDisplayValue("Workspace only"), { target: { value: "full" } }));
+  expect(mocks.alert.mock.calls.at(-1)?.[0]).toBe("Give this agent full access?");
+  await act(async () => mocks.alert.mock.calls.at(-1)?.[2][1].onPress());
+  await waitFor(() => expect(screen.getByDisplayValue("Full access")).toBeTruthy());
+  expect(workspace.updateAgentAdminSettings).toHaveBeenLastCalledWith(
+    { agentId: original.id, access: "full" },
+    host.id,
+  );
+
+  // A new sheet reads the host again and shows the saved values.
+  await act(() => root.unmount());
+  root = createRoot(container);
+  client.clear();
+  await renderSheet("runtime");
+  await waitFor(() => expect(screen.getByDisplayValue("Full access")).toBeTruthy());
+  expect(screen.getByRole("switch", { name: "Auto approve" })).toHaveProperty("checked", true);
+});
+
+it("keeps the host value and shows the reason when an access update fails", async () => {
+  workspace.servers = [{ ...host, role: "owner" }];
+  workspace.loadAgentAdminSettings.mockResolvedValue({ access: "full", autoApprove: true, autoApproveLocked: false });
+  workspace.updateAgentAdminSettings.mockRejectedValue(new Error("Host refused the change."));
+  await renderSheet("runtime");
+  await waitFor(() => expect(screen.getByDisplayValue("Full access")).toHaveProperty("disabled", false));
+  await act(() => fireEvent.change(screen.getByDisplayValue("Full access"), { target: { value: "workspace" } }));
+  expect(await screen.findByText("Host refused the change.")).toBeTruthy();
+  expect(screen.getByDisplayValue("Full access")).toBeTruthy();
+  expect(screen.getByRole("switch", { name: "Auto approve" })).toHaveProperty("checked", true);
+});
+
+it("shows auto-approve as read-only when Turbo mode is on", async () => {
+  workspace.servers = [{ ...host, role: "admin" }];
+  workspace.loadAgentAdminSettings.mockResolvedValue({
+    access: "workspace",
+    autoApprove: false,
+    autoApproveLocked: true,
+  });
+  await renderSheet("runtime");
+  await waitFor(() => expect(screen.getByRole("switch", { name: "Auto approve" })).toHaveProperty("checked", true));
+  expect(screen.getByRole("switch", { name: "Auto approve" })).toHaveProperty("disabled", true);
 });
 
 it("hides the header action after saving", async () => {
@@ -1304,7 +1745,9 @@ vi.mock("@expo/ui/community/menu", () => ({
     actions,
     onPressAction,
     shouldOpenOnLongPress,
+    children,
   }: {
+    children?: React.ReactNode;
     actions: { id: string; title: string; attributes?: { disabled?: boolean } }[];
     onPressAction: (event: { nativeEvent: { event: string } }) => void;
     shouldOpenOnLongPress?: boolean;
@@ -1319,7 +1762,9 @@ vi.mock("@expo/ui/community/menu", () => ({
             if (!shouldOpenOnLongPress) setOpen(true);
           }}
         >
-          Reassign
+          {isValidElement<{ accessibilityLabel?: string }>(children)
+            ? (children.props.accessibilityLabel ?? "Reassign")
+            : "Reassign"}
         </button>
         {open
           ? actions.map((action) => (
@@ -1408,7 +1853,10 @@ it("keeps a failed action in the sheet for retry and supports reassign", async (
   await click("Resume");
   const retries = channelRequests.mock.calls.filter(([path]) => path === CHANNEL_ROUTES.command);
   expect(retries).toHaveLength(2);
-  expect(retries[1][1]).toEqual(retries[0][1]);
+  const [firstRetry, secondRetry] = retries;
+  assert(firstRetry);
+  assert(secondRetry);
+  expect(secondRetry[1]).toEqual(firstRetry[1]);
   failChannelSave = false;
   await click("Reassign");
   await click("Travel");
@@ -1442,6 +1890,8 @@ it("retries only history after a task action was accepted", async () => {
 vi.mock("expo-linking", () => ({ openURL: vi.fn() }));
 vi.mock("expo-clipboard", () => ({ setStringAsync: vi.fn() }));
 vi.mock("react-native-reanimated", () => ({
+  default: { View: ({ children }: PropsWithChildren) => <div>{children}</div> },
+  cubicBezier: () => "ease-out",
   useReducedMotion: () => true,
   Easing: { bezier: () => (value: number) => value },
   ReduceMotion: { System: "system" },
@@ -1470,7 +1920,7 @@ it("keeps a selected avatar draft after a failed upload and retries on its origi
   await click("Save changes");
   expect(workspace.setAgentAvatar).toHaveBeenLastCalledWith(
     original.id,
-    expect.objectContaining({ mimeType: "image/png", base64: "iVBORw0KGgo=" }),
+    expect.objectContaining({ mimeType: "image/jpeg", base64: "iVBORw0KGgo=" }),
     host.id,
   );
   expect(workspace.updateAgent).not.toHaveBeenCalled();
@@ -1495,7 +1945,7 @@ it("keeps the form unchanged when photo selection is canceled or the file is too
   expect(screen.queryByRole("button", { name: "Save changes" })).toBeNull();
   mocks.fileSize = 600_000;
   await click("Add photo");
-  expect(screen.getByText("Choose a photo smaller than 512 KB.")).toBeTruthy();
+  expect(screen.getByText("OpenBot could not make this photo small enough. Choose a simpler photo.")).toBeTruthy();
   expect(screen.queryByRole("button", { name: "Save changes" })).toBeNull();
   expect(workspace.setAgentAvatar).not.toHaveBeenCalled();
 });
@@ -1560,4 +2010,79 @@ it("keeps a title after a failed save and permits clearing it", async () => {
   await edit("Title", "");
   await click("Save changes");
   expect(workspace.updateAgent).toHaveBeenLastCalledWith({ agentId: original.id, title: "" }, host.id);
+});
+
+function installSections() {
+  const layout: SidebarLayoutSnapshot = {
+    revision: 1,
+    sections: [{ id: "work", name: "Work" }],
+    order: ["people", "work", "unassigned"],
+    agentAssignments: { [original.id]: "work" },
+    agentOrder: [original.id],
+  };
+  sidebarByServer[host.id] = { layout, error: null };
+  return layout;
+}
+
+it("collapses and expands from the section name while options keep the section visible", async () => {
+  const layout = installSections();
+  function Section() {
+    const [collapsed, setCollapsed] = useState(false);
+    const items = mobileSidebarItems(layout, [original], [], new Set(collapsed ? ["work"] : []));
+    return (
+      <>
+        <SidebarSectionHeader
+          id="work"
+          name="Work"
+          empty={false}
+          visibleSectionIds={["work", "unassigned"]}
+          collapsed={collapsed}
+          onToggle={() => setCollapsed(!collapsed)}
+        />
+        {items.some((item) => item.kind === "agent") ? <button type="button">Open agent</button> : null}
+      </>
+    );
+  }
+  await act(() => root.render(<Section />));
+  await click("Work section options");
+  expect(screen.getByRole("button", { name: "Collapse Work" }).getAttribute("aria-expanded")).toBe("true");
+  expect(screen.getByRole("button", { name: "Open agent" })).toBeTruthy();
+  expect(workspace.mutateSidebarLayout).not.toHaveBeenCalled();
+  await click("Collapse Work");
+  expect(screen.queryByRole("button", { name: "Open agent" })).toBeNull();
+  expect(screen.getByRole("button", { name: "Expand Work" }).getAttribute("aria-expanded")).toBe("false");
+  await click("Expand Work");
+  expect(screen.getByRole("button", { name: "Open agent" })).toBeTruthy();
+});
+
+it("moves a chat from the native submenu without opening a sheet", async () => {
+  installSections();
+  function Menu() {
+    return useChatSectionMenu(host.id, original.id).menu;
+  }
+  await act(() => root.render(<Menu />));
+  expect(screen.queryByRole("button", { name: "Agents" })).toBeNull();
+  await click("Move to section");
+  expect(screen.getByRole("button", { name: "Work" }).hasAttribute("disabled")).toBe(true);
+  await click("Agents");
+  expect(workspace.mutateSidebarLayout).toHaveBeenLastCalledWith(host.id, {
+    type: "assign",
+    agentId: original.id,
+    sectionId: null,
+  });
+  expect(mocks.push).not.toHaveBeenCalled();
+});
+
+it("keeps a failed submenu move available for retry", async () => {
+  installSections();
+  workspace.mutateSidebarLayout.mockRejectedValueOnce(new Error("Move failed"));
+  function Menu() {
+    return useChatSectionMenu(host.id, original.id).menu;
+  }
+  await act(() => root.render(<Menu />));
+  await click("Move to section");
+  await click("Agents");
+  expect(mocks.alert).toHaveBeenCalledWith("Could not move chat", "Move failed");
+  await click("Agents");
+  expect(workspace.mutateSidebarLayout).toHaveBeenCalledTimes(2);
 });

@@ -1,25 +1,31 @@
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import type {
   AgentProviderId,
+  DeleteHostedSiteInput,
   DynamicIslandAction,
   DynamicIslandPreference,
   DynamicIslandPresentation,
   ExternalDestination,
+  HostUpdateSettingsChange,
   InstallMarketplaceAgentInput,
   InstallSkillInput,
   MacPermissionId,
   MarketplaceAgentQuery,
   MarketplaceSkillQuery,
+  NotificationPreference,
   PublishHostedSiteInput,
   ReplaceHostedSiteInput,
   SaveSetupInput,
   SetAnalyticsPreferenceInput,
   SetAppLanguagePreferenceInput,
+  SetApprovalAutomationInput,
+  SetDynamicIslandInteractiveInput,
   SetEnabledSkillInput,
   SubmitMarketplaceAgentInput,
   SubmitSkillInput,
   UninstallSkillInput,
-  UpdatePreference,
+  UpdatePreferenceChange,
+  VerifyEmailCodeInput,
 } from "@openbot/contracts/ipc";
 import {
   isAgentModel,
@@ -29,6 +35,7 @@ import {
   isDynamicIslandInteractive,
   isDynamicIslandPreference,
   isDynamicIslandPresentation,
+  isSetApprovalAutomationInput,
   isSkillCategory,
 } from "@openbot/contracts/ipc";
 import { type DynamicRecord, isBoolean, isDynamicRecord, isNumber, isString } from "@openbot/contracts/runtime-values";
@@ -57,14 +64,54 @@ export function parseAnalyticsPreference(input: unknown): SetAnalyticsPreference
   return { enabled: input.enabled };
 }
 
+export function parseApprovalAutomation(input: unknown): SetApprovalAutomationInput {
+  if (!isSetApprovalAutomationInput(input)) throw new Error("Approval automation preference is required.");
+  const parsed: SetApprovalAutomationInput = {};
+  if (input.turbo !== undefined) parsed.turbo = input.turbo;
+  if (input.agentId !== undefined && input.autoApprove !== undefined) {
+    parsed.agentId = input.agentId;
+    parsed.autoApprove = input.autoApprove;
+  }
+  return parsed;
+}
+
 export function parseAppLanguagePreference(input: unknown): SetAppLanguagePreferenceInput {
   if (!isDynamicRecord(input) || !isAppLanguage(input.language)) throw new Error("Language preference is required.");
   return { language: input.language };
 }
 
-export function parseUpdatePreference(input: unknown): UpdatePreference {
-  if (!isDynamicRecord(input) || !isBoolean(input.autoDownload)) throw new Error("Update preference is required.");
-  return { autoDownload: input.autoDownload };
+export function parseUpdatePreference(input: unknown): UpdatePreferenceChange {
+  return parseSwitches(input, ["autoDownload", "allowRemoteUpdates", "autoInstall"], "Update preference is required.");
+}
+
+/** The switches an admin of a joined server sets on its host. `allowRemoteUpdates` stays with the host user. */
+export function parseHostUpdateSettings(input: unknown): HostUpdateSettingsChange {
+  return parseSwitches(input, ["autoDownload", "autoInstall"], "Update settings are required.");
+}
+
+/** At least one of `keys`, each a boolean. An absent key stays absent. */
+function parseSwitches<Key extends string>(
+  input: unknown,
+  keys: readonly Key[],
+  message: string,
+): Partial<Record<Key, boolean>> {
+  if (!isDynamicRecord(input)) throw new Error(message);
+  const change: Partial<Record<Key, boolean>> = {};
+  for (const key of keys) {
+    const value = input[key];
+    if (value === undefined) continue;
+    if (!isBoolean(value)) throw new Error(message);
+    change[key] = value;
+  }
+  if (Object.keys(change).length === 0) throw new Error(message);
+  return change;
+}
+
+export function parseNotificationPreference(input: unknown): NotificationPreference {
+  if (!isDynamicRecord(input) || !isBoolean(input.desktopNotifications)) {
+    throw new Error("Notification preference is required.");
+  }
+  return { desktopNotifications: input.desktopNotifications };
 }
 
 export function parseDynamicIslandPreference(input: unknown): DynamicIslandPreference {
@@ -74,7 +121,7 @@ export function parseDynamicIslandPreference(input: unknown): DynamicIslandPrefe
   return input;
 }
 
-export function parseDynamicIslandInteractive(input: unknown): { interactive: boolean } {
+export function parseDynamicIslandInteractive(input: unknown): SetDynamicIslandInteractiveInput {
   if (!isDynamicIslandInteractive(input)) {
     throw new Error("Dynamic Island interaction state is required.");
   }
@@ -104,9 +151,9 @@ export function parseExternalDestination(input: unknown): ExternalDestination {
     input !== "claude-install" &&
     input !== "opencode-install" &&
     input !== "opencode-auth" &&
-    input !== "claude-sign-in" &&
     input !== "feedback" &&
     input !== "message" &&
+    input !== "grok-bot-export" &&
     input !== "mac-screen-recording"
   ) {
     throw new Error("Unknown external destination.");
@@ -114,7 +161,7 @@ export function parseExternalDestination(input: unknown): ExternalDestination {
   return input;
 }
 
-export function parseEmailCodeVerification(input: unknown): { challengeId: string; code: string } {
+export function parseEmailCodeVerification(input: unknown): VerifyEmailCodeInput {
   if (!isObject(input)) throw new Error("Sign-in code details are required.");
   return {
     challengeId: requireString(input.challengeId, "challengeId", INPUT_LIMITS.identifier),
@@ -176,6 +223,7 @@ export function parseInstallSkill(input: unknown): InstallSkillInput {
   return {
     agentId: requireString(input.agentId, "agentId"),
     skillId: requireString(input.skillId, "skillId"),
+    ...(input.versionId === undefined ? {} : { versionId: requireString(input.versionId, "versionId") }),
     ...(input.replaceModified === true ? { replaceModified: true } : {}),
   };
 }
@@ -223,9 +271,9 @@ export function parseReplaceHostedSite(input: unknown): ReplaceHostedSiteInput {
   };
 }
 
-export function parseDeleteHostedSite(input: unknown): string {
+export function parseDeleteHostedSite(input: unknown): DeleteHostedSiteInput {
   if (!isObject(input)) throw new Error("Invalid site deletion.");
-  return requireString(input.siteId, "siteId", INPUT_LIMITS.identifier);
+  return { siteId: requireString(input.siteId, "siteId", INPUT_LIMITS.identifier) };
 }
 
 export function parseSubmitMarketplaceAgent(input: unknown): SubmitMarketplaceAgentInput {

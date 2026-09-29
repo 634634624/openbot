@@ -1,4 +1,5 @@
 import type { UpdateAgentInput } from "@openbot/contracts/ipc";
+import { currentText } from "@openbot/ui/text";
 import {
   createContext,
   createEffect,
@@ -12,11 +13,13 @@ import {
 import { createScopeGuard } from "../../scope-lifetime";
 import { useConversationController } from "./conversation-controller-context";
 import { agentConversationKey, composerDraftKey } from "./conversation-keys";
+import { conversationRuntime } from "./conversation-runtime";
 import type { ComposerDraft, ConversationProps, ConversationTarget } from "./conversation-types";
 import { createActivityStore } from "./stores/activity-store";
 import { createBrowserStore } from "./stores/browser-store";
 import { createComposerActions } from "./stores/composer-actions";
 import { createComposerStore, currentConversationTarget } from "./stores/composer-store";
+import { createMcpServersStore } from "./stores/mcp-servers-store";
 import { createMessageActions } from "./stores/message-actions";
 import { createPanelsStore } from "./stores/panels-store";
 import { createQueueStore } from "./stores/queue-store";
@@ -114,6 +117,8 @@ export function createConversationViewScope(props: ConversationProps) {
     setSettingsPanelWidth,
     browserPanelWidth,
     setBrowserPanelWidth,
+    hiddenAwaitingReplyIds,
+    setHiddenAwaitingReplyIds,
     resources,
   } = controller;
   /**
@@ -168,6 +173,9 @@ export function createConversationViewScope(props: ConversationProps) {
     routineSettingsRequest,
     activeRightPanel,
     settingsOpen,
+    profileOpen,
+    filesOpen,
+    toggleFilesPanel,
     filePreviewOpen,
     setActiveRightPanel,
     openRoutineSettings,
@@ -189,6 +197,7 @@ export function createConversationViewScope(props: ConversationProps) {
   } = panels;
   const skills = createSkillsStore({ props, settingsOpen });
   const { installedSkills } = skills;
+  const { mcpServers } = createMcpServersStore({ props });
   const composer = createComposerStore({
     props,
     drafts,
@@ -222,12 +231,18 @@ export function createConversationViewScope(props: ConversationProps) {
     setComposerErrorForTarget,
     clearChatErrors,
   } = composer;
-  const queue = createQueueStore({ props });
-  const { activeDeliveries, orderedQueuedDeliveries, presentedQueueDeliveries, queuePanelVisible } = queue;
+  const queue = createQueueStore({ props, hiddenAwaitingReplyIds });
+  const { activeDeliveries, awaitingReplies, orderedQueuedDeliveries, presentedQueueDeliveries, queuePanelVisible } =
+    queue;
+  const dismissAwaitingReplies = () => {
+    setHiddenAwaitingReplyIds((ids) => new Set([...ids, ...awaitingReplies().map((row) => row.id)]));
+    // The close button leaves with the block, so the focus goes back to the composer.
+    setComposerFocusRequest((value) => value + 1);
+  };
   const activity = createActivityStore({
     props,
     activeDeliveries,
-    agentActivityPresentations: resources.agentActivityPresentations,
+    agentActivityLabels: resources.agentActivityLabels,
   });
   const { renderedAgentActivity, agentActivitySpaceReserved, setAgentActivitySpaceReserved, agentActivity } = activity;
   const browser = createBrowserStore({
@@ -237,10 +252,13 @@ export function createConversationViewScope(props: ConversationProps) {
     setBrowserAddress,
     setBrowserAddressEditing,
     setComposerError: setScopedComposerError,
-    panels: { setActiveRightPanel, screenOpen: () => screenOpen() },
+    panels: { activeRightPanel, setActiveRightPanel },
   });
   const {
-    browserInteractionAvailable,
+    browserSidebarOpen,
+    browserExpandedOpen,
+    browserPipOpen,
+    screenOpen,
     browserTabs,
     activeBrowserTab,
     browserTakeoverTab,
@@ -259,10 +277,6 @@ export function createConversationViewScope(props: ConversationProps) {
     reloadBrowserTab,
     navigateBrowserTab,
   } = browser;
-  const browserSidebarOpen = () => browserInteractionAvailable() && activeRightPanel() === "browser";
-  const browserExpandedOpen = () => browserInteractionAvailable() && activeRightPanel() === "browser-expanded";
-  const browserPipOpen = () => browserInteractionAvailable() && activeRightPanel() === "browser-pip";
-  const screenOpen = () => browserSidebarOpen() || browserExpandedOpen() || browserPipOpen();
   function showBrowserPanel() {
     setActiveRightPanel("browser");
     if (browserTabs().length === 0) void openBrowserAddress();
@@ -503,6 +517,7 @@ export function createConversationViewScope(props: ConversationProps) {
   let lastConversationIdentity: string | undefined;
   let lastPanelAgentId: string | undefined;
   let lastHandledSettingsRequestNonce: number | undefined;
+  let lastHandledProfileRequestNonce: number | undefined;
   let lastHandledMessageFocusNonce: number | undefined;
   let lastRuntimeSettingsSignature: string | undefined;
   async function saveAgentPatch(
@@ -520,7 +535,7 @@ export function createConversationViewScope(props: ConversationProps) {
   }
 
   onSettled(() => {
-    const unsubscribeImport = window.openbot.agent.onAttachmentImport((event) => {
+    const unsubscribeImport = conversationRuntime(props).agent.onAttachmentImport((event) => {
       if (event.type === "started") {
         const target = currentTarget();
         if (target?.serverId === event.serverId) {
@@ -549,13 +564,17 @@ export function createConversationViewScope(props: ConversationProps) {
         } else {
           setAttachmentBusy(resources.importTargetAgents.size > 0);
           for (const attachment of event.attachments) {
-            void window.openbot.agent.discardDraftAttachment(attachment.id, event.serverId);
+            void conversationRuntime(props).agent.discardDraftAttachment(attachment.id, event.serverId);
           }
         }
       }
     });
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || event.defaultPrevented) return;
+      // An open popover, such as a routine chip or the model picker, closes on this key from a
+      // document listener that runs after this one. Closing the panel under it too discards the
+      // edit the person was making.
+      if (event.target instanceof Element && event.target.closest('[role="dialog"]')) return;
       if (browserExpandedOpen() && !props.globalOverlayOpen) {
         event.preventDefault();
         setActiveRightPanel("browser");
@@ -666,7 +685,17 @@ export function createConversationViewScope(props: ConversationProps) {
         if (!target) return;
         lastHandledMessageFocusNonce = request.nonce;
         stickToLatest = false;
+        // A page that loaded just before the request queued a scroll to the latest message. That scroll
+        // must not move the transcript away from the message the user picked, so it is cancelled and
+        // its other updates run here.
+        if (latestScrollFrame !== undefined) cancelAnimationFrame(latestScrollFrame);
+        if (latestScrollSettleFrame !== undefined) cancelAnimationFrame(latestScrollSettleFrame);
+        latestScrollFrame = undefined;
+        latestScrollSettleFrame = undefined;
+        updateVirtualScrollMargin();
         target.scrollIntoView({ behavior: "auto", block: "center", inline: "nearest" });
+        updateScrollFade();
+        updateUnreadDividerVisibility();
       });
     },
   );
@@ -741,7 +770,7 @@ export function createConversationViewScope(props: ConversationProps) {
     (agent) => {
       if (!agent) return;
       const pendingSettings = resources.runtimeSettingsAttempts.get(
-        agentConversationKey(props.server?.id ?? "local", props.agent?.id ?? ""),
+        untrack(() => agentConversationKey(props.server?.id ?? "local", props.agent?.id ?? "")),
       );
       if (
         pendingSettings?.pending &&
@@ -775,12 +804,17 @@ export function createConversationViewScope(props: ConversationProps) {
       lastPanelAgentId = agentId;
       clearRoutineSettingsRequest();
       resources.filePreviewRequestGeneration += 1;
-      const preview = sidebarFilePreview();
+      const preview = untrack(sidebarFilePreview);
       if (preview && preview.ownerAgentId !== agentId) {
         setSidebarFilePreview(null);
         setRightPanels((current) => ({ ...current, [preview.ownerAgentId]: "none" }));
       }
-      if (!previousAgentId || !agentId || (panel !== "settings" && panel !== "file-preview")) return;
+      if (
+        !previousAgentId ||
+        !agentId ||
+        (panel !== "settings" && panel !== "profile" && panel !== "file-preview" && panel !== "files")
+      )
+        return;
       setRightPanels((current) => ({ ...current, [agentId]: "none" }));
     },
   );
@@ -795,6 +829,15 @@ export function createConversationViewScope(props: ConversationProps) {
   );
 
   createEffect(
+    () => ({ request: props.profileRequest, agentId: props.agent?.id }),
+    ({ request, agentId }) => {
+      if (!request || agentId !== request.agentId || request.nonce === lastHandledProfileRequestNonce) return;
+      lastHandledProfileRequestNonce = request.nonce;
+      setActiveRightPanel("profile", agentId);
+    },
+  );
+
+  createEffect(
     () => ({
       agentId: props.agent?.id,
       activeTab: activeBrowserTab(),
@@ -805,7 +848,7 @@ export function createConversationViewScope(props: ConversationProps) {
       suspended: props.browserVisibilitySuspended,
     }),
     ({ activeTab, addressEditing, screenOpen, activeBrowserTabId, onActivateBrowserTab, suspended }) => {
-      if (props.browserEnabled === false || suspended) return;
+      if (untrack(() => props.browserEnabled === false) || suspended) return;
       if (!addressEditing) setBrowserAddress(activeTab?.url ?? "https://www.google.com");
       if (screenOpen && activeTab && activeTab.id !== activeBrowserTabId) {
         onActivateBrowserTab(activeTab.id);
@@ -816,6 +859,8 @@ export function createConversationViewScope(props: ConversationProps) {
   createEffect(
     () => ({
       agentId: props.agent?.id,
+      // Tracked, so a switch to a server with no browser tears down the last view's observers.
+      browserEnabled: props.browserEnabled !== false,
       surface: browserSurface(),
       visible:
         browserExpandedOpen() &&
@@ -824,8 +869,7 @@ export function createConversationViewScope(props: ConversationProps) {
         !props.globalOverlayOpen &&
         !props.remoteDesktopVisible,
     }),
-    ({ agentId, visible, surface }) => {
-      if (props.browserEnabled === false) return;
+    ({ agentId, browserEnabled, visible, surface }) => {
       const generation = ++browserVisibilityGeneration;
       if (browserVisibilityFrame !== undefined) cancelAnimationFrame(browserVisibilityFrame);
       browserResizeObserver?.disconnect();
@@ -834,8 +878,9 @@ export function createConversationViewScope(props: ConversationProps) {
       browserWindowResizeHandler = undefined;
       if (browserBoundsFrame !== undefined) cancelAnimationFrame(browserBoundsFrame);
       browserBoundsFrame = undefined;
+      if (!browserEnabled) return;
       if (!visible) {
-        void window.openbot.browser.setVisible({ visible: false });
+        void conversationRuntime(props).browser.setVisible({ visible: false });
         return;
       }
       browserVisibilityFrame = requestAnimationFrame(() => {
@@ -858,7 +903,7 @@ export function createConversationViewScope(props: ConversationProps) {
             return;
           }
           const bounds = surface.getBoundingClientRect();
-          void window.openbot.browser.setVisible({
+          void conversationRuntime(props).browser.setVisible({
             visible: true,
             target: "main",
             bounds: {
@@ -887,20 +932,20 @@ export function createConversationViewScope(props: ConversationProps) {
   );
 
   createEffect(
-    () => ({ agentId: props.agent?.id, open: browserPipOpen() }),
-    ({ open }) => {
-      if (props.browserEnabled === false) return;
+    () => ({ agentId: props.agent?.id, open: browserPipOpen(), browserEnabled: props.browserEnabled !== false }),
+    ({ open, browserEnabled }) => {
+      if (!browserEnabled) return;
       if (!open) {
-        void window.openbot.browser.closePictureInPicture();
+        void conversationRuntime(props).browser.closePictureInPicture();
         return;
       }
-      void window.openbot.browser
-        .openPictureInPicture(untrack(browserPipBounds) ?? undefined)
+      void conversationRuntime(props)
+        .browser.openPictureInPicture(untrack(browserPipBounds) ?? undefined)
         .then(saveBrowserPipBounds);
     },
   );
 
-  const removeBrowserPictureInPictureListener = window.openbot.browser.onPictureInPictureEvent((event) => {
+  const removeBrowserPictureInPictureListener = conversationRuntime(props).browser.onPictureInPictureEvent((event) => {
     if (event.type === "bounds-changed") {
       saveBrowserPipBounds(event.bounds);
       return;
@@ -916,17 +961,17 @@ export function createConversationViewScope(props: ConversationProps) {
     if (browserWindowResizeHandler) window.removeEventListener("resize", browserWindowResizeHandler);
     removeBrowserPictureInPictureListener();
     if (props.browserEnabled !== false) {
-      void window.openbot.browser.setVisible({ visible: false });
-      void window.openbot.browser.closePictureInPicture();
+      void conversationRuntime(props).browser.setVisible({ visible: false });
+      void conversationRuntime(props).browser.closePictureInPicture();
     }
   });
 
   async function openExternalMessageUrl(url: string) {
     const target = currentTarget();
     try {
-      await window.openbot.openUrl(url);
+      await conversationRuntime(props).openUrl(url);
     } catch {
-      setScopedComposerError("Could not open the link in the external browser.", target);
+      setScopedComposerError(currentText().t("composer.error.openLink"), target);
     }
   }
 
@@ -1035,6 +1080,7 @@ export function createConversationViewScope(props: ConversationProps) {
     currentChatError,
     currentChatConversationKey,
     dismissCurrentChatErrors,
+    dismissAwaitingReplies,
     clearComposerError,
     setComposerErrorForTarget,
     clearChatErrors,
@@ -1045,12 +1091,15 @@ export function createConversationViewScope(props: ConversationProps) {
     currentDraft,
     currentConversationError,
     installedSkills,
+    mcpServers,
     dropActive,
     editQueuedMessage,
     editingDeliveryId: currentEditingDeliveryId,
     editingPendingSave,
     expandedEmojiMessageId,
     scrollFades,
+    filesOpen,
+    toggleFilesPanel,
     filePreviewOpen,
     handleChatSearchShortcut,
     hideBrowserPanel,
@@ -1076,6 +1125,7 @@ export function createConversationViewScope(props: ConversationProps) {
     downloadSidebarFile,
     revealSidebarFile,
     openWorkspaceFile,
+    awaitingReplies,
     presentedQueueDeliveries,
     previewAttachment,
     props,
@@ -1116,6 +1166,7 @@ export function createConversationViewScope(props: ConversationProps) {
     settingsModel,
     settingsProvider,
     settingsOpen,
+    profileOpen,
     settingsPanelWidth,
     settingsReasoning,
     sidebarFilePreview,

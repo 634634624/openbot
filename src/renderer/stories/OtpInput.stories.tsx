@@ -1,6 +1,6 @@
+import { OtpInput } from "@openbot/ui/features/account/OtpInput";
 import { fn } from "storybook/test";
 import type { Meta, StoryObj } from "storybook-solidjs-vite";
-import { OtpInput } from "../src/features/account/OtpInput";
 
 const meta = {
   title: "Auth/OtpInput",

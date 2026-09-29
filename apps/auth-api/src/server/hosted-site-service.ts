@@ -1,79 +1,41 @@
-import { isDynamicRecord, isNumber, isString } from "@openbot/contracts/runtime-values";
-import { hmacSha256, sha256 } from "./crypto";
+import {
+  type HostedSiteRouteManifest,
+  hostedSiteBlockKey,
+  hostedSiteDeploymentPrefix,
+  hostedSiteRouteKey,
+} from "@openbot/contracts/hosted-sites";
+import { sha256 } from "./crypto";
 import {
   expectedFile,
   HOSTED_SITE_LIMITS,
-  type HostedSiteFileManifest,
   HostedSiteInputError,
   type HostedSiteUploadRequest,
 } from "./hosted-site-contract";
-
-interface SiteRow {
-  id: string;
-  user_id: string;
-  hostname: string;
-  title: string;
-  description: string;
-  framework: "vanilla" | "astro";
-  spa_fallback: number;
-  status: "uploading" | "active" | "deleted" | "expired" | "blocked";
-  current_deployment_id: string | null;
-  created_at: number;
-  updated_at: number;
-  expires_at: number | null;
-  route_synced_at: number | null;
-}
-
-interface DeploymentRow {
-  id: string;
-  site_id: string;
-  user_id: string;
-  status: "uploading" | "activating" | "active" | "superseded" | "abandoned";
-  base_deployment_id: string | null;
-  manifest_json: string;
-  file_count: number;
-  total_bytes: number;
-  upload_expires_at: number;
-  site_title: string;
-  site_description: string;
-  site_framework: "vanilla" | "astro";
-  site_spa_fallback: number;
-  request_hash: string;
-  objects_deleted_at: number | null;
-  activation_authorized_at: number | null;
-  in_flight_uploads: number;
-  upload_claims: number;
-  upload_bytes_claimed: number;
-}
-
-export interface HostedSiteSummary {
-  id: string;
-  hostname: string;
-  url: string;
-  title: string;
-  description: string;
-  framework: "vanilla" | "astro";
-  status: SiteRow["status"];
-  fileCount: number;
-  size: number;
-  expiresAt: string | null;
-  updatedAt: string;
-}
+import {
+  assetKey,
+  batchResult,
+  creationCount,
+  type DeploymentRow,
+  deploymentResultIds,
+  descriptiveSlug,
+  type HostedSiteSummary,
+  inactiveSiteError,
+  mapSite,
+  parseManifest,
+  parseStoredSiteSummary,
+  randomBase32,
+  readUploadBody,
+  type SiteRow,
+  siteRouteIdentity,
+  slugWords,
+  sourceIpHash,
+  uploadRequestHash,
+} from "./hosted-site-records";
 
 export interface HostedSiteUploadSession {
   uploadId: string;
   site: HostedSiteSummary;
   expiresAt: string;
-}
-
-interface RouteManifest {
-  version: 1;
-  status: "active" | "deleted" | "expired" | "blocked";
-  siteId: string;
-  deploymentId: string | null;
-  expiresAt: number | null;
-  spaFallback: boolean;
-  files: Record<string, { key: string; size: number; mimeType: string }>;
 }
 
 type OperationClaim = { status: "pending"; token: string } | { status: "completed"; response: string };
@@ -282,10 +244,10 @@ export class HostedSiteService {
     }
     const [siteInsert, deploymentInsert, hostnameReservation, creationEvent] = results;
     if (
-      siteInsert.meta.changes !== 1 ||
-      deploymentInsert.meta.changes !== 1 ||
-      hostnameReservation.meta.changes !== 1 ||
-      creationEvent.meta.changes !== 1
+      batchResult(siteInsert).meta.changes !== 1 ||
+      batchResult(deploymentInsert).meta.changes !== 1 ||
+      batchResult(hostnameReservation).meta.changes !== 1 ||
+      batchResult(creationEvent).meta.changes !== 1
     ) {
       const currentUploads = await this.database
         .prepare(
@@ -297,7 +259,11 @@ export class HostedSiteService {
         throw new HostedSiteInputError(429, "upload_session_limit", "Finish or wait for an existing upload first.");
       }
       await this.enforceCreationRate(userId, now);
-      throw new HostedSiteInputError(409, "site_limit", "This account already has 10 active sites.");
+      throw new HostedSiteInputError(
+        409,
+        "site_limit",
+        `This account already has ${HOSTED_SITE_LIMITS.activeSites} active sites.`,
+      );
     }
     return this.uploadSession(await this.requireDeployment(userId, deploymentId));
   }
@@ -545,7 +511,7 @@ export class HostedSiteService {
           );
         }
         const results = await this.database.batch(statements);
-        const deploymentIds = deploymentResultIds(results[1]);
+        const deploymentIds = deploymentResultIds(batchResult(results[1]));
         await this.publishAuthoritativeRoute(site.id);
         try {
           await this.deleteBlockMarker(site.id, site.hostname);
@@ -592,7 +558,9 @@ export class HostedSiteService {
     if (!site) throw new HostedSiteInputError(409, "site_not_found", "The site was not found.");
     const now = this.now();
     if (blocked) {
-      await this.bucket.put(blockKey(site.hostname), "blocked", { httpMetadata: { contentType: "text/plain" } });
+      await this.bucket.put(hostedSiteBlockKey(site.hostname), "blocked", {
+        httpMetadata: { contentType: "text/plain" },
+      });
     }
     let status: SiteRow["status"];
     let allowedStatuses: string;
@@ -636,18 +604,18 @@ export class HostedSiteService {
           .bind(crypto.randomUUID(), site.id, blocked ? "block" : "unblock", now, site.id, status, now),
       ]);
     } catch (error) {
-      if (blocked) await this.bucket.delete(blockKey(site.hostname)).catch(() => undefined);
+      if (blocked) await this.bucket.delete(hostedSiteBlockKey(site.hostname)).catch(() => undefined);
       throw error;
     }
-    if (results[0].meta.changes !== 1) {
-      if (blocked) await this.bucket.delete(blockKey(site.hostname)).catch(() => undefined);
+    if (batchResult(results[0]).meta.changes !== 1) {
+      if (blocked) await this.bucket.delete(hostedSiteBlockKey(site.hostname)).catch(() => undefined);
       const current = await this.siteById(site.id);
       if (current?.status === "deleted" || current?.status === "expired") throw inactiveSiteError(current.status);
       if (current?.expires_at != null && current.expires_at <= now) throw inactiveSiteError("expired");
       throw new HostedSiteInputError(409, "site_not_active", "This site cannot be blocked or unblocked.");
     }
     await this.reconcileRouteAndMarker(site.id);
-    for (const deploymentId of deploymentResultIds(results[1])) {
+    for (const deploymentId of deploymentResultIds(batchResult(results[1]))) {
       await this.deleteDeployment(site.id, deploymentId);
     }
   }
@@ -749,7 +717,7 @@ export class HostedSiteService {
             )
             .bind(site.id, site.id),
         ]);
-        if (results[0].meta.changes !== 1) continue;
+        if (batchResult(results[0]).meta.changes !== 1) continue;
         expiredSites += 1;
         try {
           await this.publishAuthoritativeRoute(site.id);
@@ -771,7 +739,7 @@ export class HostedSiteService {
       const processedTombstones: { id: string }[] = [];
       for (const site of tombstones.results) {
         if (performance.now() >= deadline) break;
-        await this.bucket.delete([routeKey(site.hostname), blockKey(site.hostname)]);
+        await this.bucket.delete([hostedSiteRouteKey(site.hostname), hostedSiteBlockKey(site.hostname)]);
         processedTombstones.push(site);
       }
       if (processedTombstones.length) {
@@ -889,7 +857,7 @@ export class HostedSiteService {
         )
         .bind(site.id, deployment.id, previousDeployment, site.id, userId, deployment.id),
     ]);
-    if (results[3].meta.changes !== 1) {
+    if (batchResult(results[3]).meta.changes !== 1) {
       const currentSite = await this.requireOwnedSite(userId, site.id, true);
       const currentDeployment = await this.requireDeployment(userId, deployment.id);
       const alreadyActive =
@@ -910,7 +878,11 @@ export class HostedSiteService {
           throw inactiveSiteError("expired");
         }
         if ((await this.activeSiteSlotCount(userId, site.id, now)) >= HOSTED_SITE_LIMITS.activeSites) {
-          throw new HostedSiteInputError(409, "site_limit", "This account already has 10 active sites.");
+          throw new HostedSiteInputError(
+            409,
+            "site_limit",
+            `This account already has ${HOSTED_SITE_LIMITS.activeSites} active sites.`,
+          );
         }
         throw new HostedSiteInputError(409, "activation_superseded", "A newer site deployment is active.");
       }
@@ -920,7 +892,7 @@ export class HostedSiteService {
     if (previousDeployment && previousDeployment !== deployment.id) {
       await this.deleteDeployment(site.id, previousDeployment);
     }
-    for (const abandonedDeploymentId of deploymentResultIds(results[4])) {
+    for (const abandonedDeploymentId of deploymentResultIds(batchResult(results[4]))) {
       await this.deleteDeployment(site.id, abandonedDeploymentId);
     }
     return summary;
@@ -955,7 +927,7 @@ export class HostedSiteService {
       const before = await this.siteById(siteId);
       if (!before) throw new HostedSiteInputError(409, "site_not_found", "The site was not found.");
       const route = await this.routeForSite(before);
-      await this.bucket.put(routeKey(before.hostname), JSON.stringify(route), {
+      await this.bucket.put(hostedSiteRouteKey(before.hostname), JSON.stringify(route), {
         httpMetadata: { contentType: "application/json" },
       });
       const after = await this.siteById(siteId);
@@ -973,7 +945,7 @@ export class HostedSiteService {
     throw new Error("The site route changed too often during publication.");
   }
 
-  private async routeForSite(site: SiteRow): Promise<RouteManifest> {
+  private async routeForSite(site: SiteRow): Promise<HostedSiteRouteManifest> {
     if (site.status !== "active") {
       if (site.status === "uploading") throw new Error("An uploading site does not have a public route.");
       return {
@@ -1084,8 +1056,8 @@ export class HostedSiteService {
         .prepare("SELECT COUNT(*) AS count FROM site_creation_events WHERE user_id = ? AND created_at > ?")
         .bind(userId, now - 86_400_000),
     ]);
-    const hourCount = creationCount(hour.results?.[0]);
-    const dayCount = creationCount(day.results?.[0]);
+    const hourCount = creationCount(batchResult(hour).results?.[0]);
+    const dayCount = creationCount(batchResult(day).results?.[0]);
     if (hourCount >= HOSTED_SITE_LIMITS.creationsPerHour || dayCount >= HOSTED_SITE_LIMITS.creationsPerDay) {
       throw new HostedSiteInputError(
         429,
@@ -1332,7 +1304,7 @@ export class HostedSiteService {
   private async deleteDeployment(siteId: string, deploymentId: string): Promise<void> {
     let cursor: string | undefined;
     do {
-      const listed = await this.bucket.list({ prefix: `sites/${siteId}/deployments/${deploymentId}/`, cursor });
+      const listed = await this.bucket.list({ prefix: hostedSiteDeploymentPrefix(siteId, deploymentId), cursor });
       if (listed.objects.length) await this.bucket.delete(listed.objects.map((object) => object.key));
       cursor = listed.truncated ? listed.cursor : undefined;
     } while (cursor);
@@ -1344,7 +1316,7 @@ export class HostedSiteService {
 
   private async deleteBlockMarker(siteId: string, hostname: string): Promise<void> {
     try {
-      await this.bucket.delete(blockKey(hostname));
+      await this.bucket.delete(hostedSiteBlockKey(hostname));
     } catch (error) {
       await this.markRouteUnsynced(siteId);
       throw error;
@@ -1353,7 +1325,7 @@ export class HostedSiteService {
 
   private async putBlockMarkerForSyncedRoute(siteId: string, hostname: string): Promise<void> {
     try {
-      await this.bucket.put(blockKey(hostname), "blocked", { httpMetadata: { contentType: "text/plain" } });
+      await this.bucket.put(hostedSiteBlockKey(hostname), "blocked", { httpMetadata: { contentType: "text/plain" } });
     } catch (error) {
       await this.markRouteUnsynced(siteId);
       throw error;
@@ -1369,7 +1341,9 @@ export class HostedSiteService {
       const before = await this.siteById(siteId);
       if (!before) return;
       if (before.status === "blocked") {
-        await this.bucket.put(blockKey(before.hostname), "blocked", { httpMetadata: { contentType: "text/plain" } });
+        await this.bucket.put(hostedSiteBlockKey(before.hostname), "blocked", {
+          httpMetadata: { contentType: "text/plain" },
+        });
       }
       await this.publishAuthoritativeRoute(siteId);
       const published = await this.siteById(siteId);
@@ -1395,225 +1369,4 @@ export class HostedSiteService {
     if (prior) return this.uploadSessionForRequest(prior, requestHash);
     throw error;
   }
-}
-
-async function uploadRequestHash(request: HostedSiteUploadRequest): Promise<string> {
-  return sha256(
-    JSON.stringify({
-      siteId: request.siteId,
-      title: request.title,
-      description: request.description,
-      framework: request.framework,
-      spaFallback: request.spaFallback,
-      files: [...request.files].sort((left, right) => {
-        if (left.path === right.path) return 0;
-        return left.path < right.path ? -1 : 1;
-      }),
-    }),
-  );
-}
-
-function parseManifest(value: string): HostedSiteFileManifest[] {
-  const parsed = JSON.parse(value);
-  if (!Array.isArray(parsed) || !parsed.every(isStoredManifestFile)) {
-    throw new Error("The stored site manifest is invalid.");
-  }
-  return parsed.map((file) => ({ path: file.path, size: file.size, mimeType: file.mimeType }));
-}
-
-async function readUploadBody(body: ReadableStream<Uint8Array>, expectedSize: number): Promise<Uint8Array> {
-  const reader = body.getReader();
-  const chunks: Uint8Array[] = [];
-  let totalSize = 0;
-  while (true) {
-    const result = await reader.read();
-    if (result.done) break;
-    totalSize += result.value.byteLength;
-    if (totalSize > expectedSize) {
-      await reader.cancel().catch(() => undefined);
-      throw new HostedSiteInputError(400, "size_mismatch", "The file size does not match the manifest.");
-    }
-    chunks.push(result.value);
-  }
-  if (totalSize !== expectedSize) {
-    throw new HostedSiteInputError(400, "size_mismatch", "The file size does not match the manifest.");
-  }
-  const combined = new Uint8Array(totalSize);
-  let offset = 0;
-  for (const chunk of chunks) {
-    combined.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return combined;
-}
-
-function isStoredManifestFile(value: unknown): value is HostedSiteFileManifest {
-  return isDynamicRecord(value) && isString(value.path) && isNumber(value.size) && isString(value.mimeType);
-}
-
-function creationCount(value: unknown): number {
-  return isDynamicRecord(value) && isNumber(value.count) ? value.count : 0;
-}
-
-function deploymentResultIds(result: D1Result<unknown>): string[] {
-  return result.results.map((deployment) => {
-    if (!isDynamicRecord(deployment) || !isString(deployment.id)) {
-      throw new Error("The deployment result is invalid.");
-    }
-    return deployment.id;
-  });
-}
-
-function inactiveSiteError(status: SiteRow["status"]): HostedSiteInputError {
-  if (status === "blocked") return new HostedSiteInputError(409, "site_blocked", "This site is blocked.");
-  if (status === "deleted") return new HostedSiteInputError(409, "site_deleted", "This site was deleted.");
-  if (status === "expired") return new HostedSiteInputError(409, "site_expired", "This site has expired.");
-  return new HostedSiteInputError(409, "site_not_active", "This site cannot accept this deployment.");
-}
-
-function siteRouteIdentity(site: SiteRow): string {
-  return `${site.status}:${site.current_deployment_id ?? ""}:${site.expires_at ?? ""}`;
-}
-
-function parseStoredSiteSummary(value: string): HostedSiteSummary {
-  const parsed = JSON.parse(value);
-  if (
-    !isDynamicRecord(parsed) ||
-    !isString(parsed.id) ||
-    !isString(parsed.hostname) ||
-    !isString(parsed.url) ||
-    !isString(parsed.title) ||
-    !isString(parsed.description) ||
-    (parsed.framework !== "vanilla" && parsed.framework !== "astro") ||
-    !["uploading", "active", "deleted", "expired", "blocked"].includes(String(parsed.status)) ||
-    !isNumber(parsed.fileCount) ||
-    !isNumber(parsed.size) ||
-    (parsed.expiresAt !== null && !isString(parsed.expiresAt)) ||
-    !isString(parsed.updatedAt)
-  ) {
-    throw new Error("The stored site receipt is invalid.");
-  }
-  return {
-    id: parsed.id,
-    hostname: parsed.hostname,
-    url: parsed.url,
-    title: parsed.title,
-    description: parsed.description,
-    framework: parsed.framework,
-    status: parseSiteStatus(parsed.status),
-    fileCount: parsed.fileCount,
-    size: parsed.size,
-    expiresAt: parsed.expiresAt,
-    updatedAt: parsed.updatedAt,
-  };
-}
-
-function parseSiteStatus(value: unknown): SiteRow["status"] {
-  if (
-    value === "uploading" ||
-    value === "active" ||
-    value === "deleted" ||
-    value === "expired" ||
-    value === "blocked"
-  ) {
-    return value;
-  }
-  throw new Error("The stored site status is invalid.");
-}
-
-function mapSite(
-  row: SiteRow & { file_count: number; total_bytes: number },
-  localSiteOrigin?: string,
-): HostedSiteSummary {
-  return {
-    id: row.id,
-    hostname: row.hostname,
-    url: siteUrl(row.hostname, localSiteOrigin),
-    title: row.title,
-    description: row.description,
-    framework: row.framework,
-    status: row.status,
-    fileCount: row.file_count,
-    size: row.total_bytes,
-    expiresAt: row.expires_at === null ? null : new Date(row.expires_at).toISOString(),
-    updatedAt: new Date(row.updated_at).toISOString(),
-  };
-}
-
-function siteUrl(hostname: string, localSiteOrigin?: string): string {
-  if (!localSiteOrigin) return `https://${hostname}`;
-  const origin = new URL(localSiteOrigin);
-  const label = hostname.slice(0, -".openbot.site".length);
-  origin.hostname = `${label}.${origin.hostname}`;
-  origin.pathname = "/";
-  origin.search = "";
-  origin.hash = "";
-  return origin.toString();
-}
-
-function assetKey(siteId: string, deploymentId: string, path: string): string {
-  return `sites/${siteId}/deployments/${deploymentId}/${path}`;
-}
-
-function routeKey(hostname: string): string {
-  return `routes/${hostname}.json`;
-}
-
-function blockKey(hostname: string): string {
-  return `blocks/${hostname}`;
-}
-
-const RESERVED_PREFIXES = new Set([
-  "admin",
-  "api",
-  "auth",
-  "billing",
-  "login",
-  "support",
-  "security",
-  "status",
-  "mail",
-  "www",
-]);
-
-function slugWords(value: string): string[] {
-  const words = value
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/gu, "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/gu, " ")
-    .trim()
-    .split(/\s+/u)
-    .filter((word) => word.length >= 2 && !RESERVED_PREFIXES.has(word));
-  while (words.length < 3) words.push(["interactive", "static", "website"][words.length] ?? "project");
-  return words;
-}
-
-export function descriptiveSlug(words: string[]): string {
-  const usable = words.map((word) => word.slice(0, 14)).filter(Boolean);
-  while (usable.length < 3) usable.push(["static", "web", "project"][usable.length] ?? "page");
-  let slug = usable.slice(0, 3).join("-");
-  for (const word of usable.slice(3)) {
-    const next = slug ? `${slug}-${word}` : word;
-    if (next.length > 48) break;
-    slug = next;
-  }
-  while (slug.length < 32) {
-    const extra = ["interactive", "web", "project", "page", "experience", "online", "tool"].find(
-      (word) => !slug.split("-").includes(word),
-    );
-    if (!extra || `${slug}-${extra}`.length > 48) break;
-    slug = `${slug}-${extra}`;
-  }
-  return slug.slice(0, 48).replace(/-+$/u, "");
-}
-
-function randomBase32(length: number): string {
-  const alphabet = "23456789abcdefghjkmnpqrstuvwxyz";
-  const bytes = crypto.getRandomValues(new Uint8Array(length));
-  return Array.from(bytes, (byte) => alphabet[byte % alphabet.length]).join("");
-}
-
-export async function sourceIpHash(secret: string, value: string, deduplicationWindow: number): Promise<string> {
-  return hmacSha256(secret, `${deduplicationWindow}\0${value}`);
 }

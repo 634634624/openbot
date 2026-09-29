@@ -19,11 +19,26 @@ import {
 } from "@agentclientprotocol/sdk";
 import { agentProviderName } from "@openbot/contracts/agent-providers";
 import { type DynamicRecord, isBoolean, isString } from "@openbot/contracts/runtime-values";
+import { sourceText } from "@openbot/i18n/source";
 import { redactText } from "@openbot/logging";
-import type { AgentProvider } from "./agent-client";
+import { acpPlanSteps, PLAN_UPDATED_METHOD } from "./agent/plan-updates";
+import { elicitationOptions, elicitationValue, secretElicitationField } from "./agent/prompts";
+import { AgentProcessExitError, type AgentProvider } from "./agent-client";
 import { type AgentCliInfo, cliSpawnTarget } from "./cli";
+import { IdleThreadPool } from "./idle-thread-pool";
 import { type DynamicToolNamespace, LocalMcpBridge, type LocalMcpSession } from "./local-mcp-bridge";
-import { acpMcpServers, type McpServerSource, usableMcpServers } from "./mcp-provider-shapes";
+import {
+  acpMcpServers,
+  agentMcpServers,
+  computerUseParam,
+  type McpAuthorizationSource,
+  type McpDropReporter,
+  type McpServerSource,
+  type McpToolRuntimeSource,
+  usableMcpServers,
+} from "./mcp-provider-shapes";
+import { PendingServerRequests } from "./pending-server-requests";
+import type { SpawnTarget } from "./process-confinement";
 import {
   type AccountRateLimitsReadResult,
   type AppServerNotification,
@@ -39,6 +54,8 @@ import {
   type ThreadItem,
 } from "./protocol";
 import { createDiagnosticStream } from "./stderr-diagnostics";
+import { stopWindowsProcessTree } from "./windows-process-tree";
+import { withTimeout } from "./with-timeout";
 
 /**
  * How long model discovery may spend on asking an agent for each model's reasoning efforts. One
@@ -68,6 +85,12 @@ const MODEL_REASONING_CLEANUP_MS = 1_000;
  */
 const MODEL_DISCOVERY_RETURN_MS = 250;
 
+/**
+ * How long a failed request waits for the process to report its exit. Stdout ends first, and the
+ * exit follows within milliseconds; a CLI that closed stdout and kept running is reported as it was.
+ */
+const EXIT_REPORT_WAIT_MS = 2_000;
+
 interface ClientEvents {
   notification: [notification: AppServerNotification];
   request: [request: AppServerRequest];
@@ -75,9 +98,10 @@ interface ClientEvents {
   diagnostic: [message: string];
 }
 
-interface PendingServerRequest {
-  resolve: (value: unknown) => void;
-  reject: (error: Error) => void;
+interface ProcessEnd {
+  ending: string;
+  /** The last stderr line, after `redactText` only. `AgentProcessExitError` keeps it private. */
+  detail: string | null;
 }
 
 interface AcpTurn {
@@ -88,6 +112,8 @@ interface AcpTurn {
   thought: string;
   thoughtStarted: boolean;
   receivedOutput: boolean;
+  /** The prompt told the model not to answer, so an empty turn is a success. */
+  answerOptional: boolean;
   messages: ThreadItem[];
   toolNames: Map<string, string>;
   task: Promise<void>;
@@ -102,7 +128,34 @@ interface AcpThread {
   mcp: LocalMcpSession;
   activeTurn: AcpTurn | null;
   turns: Array<{ id: string; status: string; items: ThreadItem[] }>;
+  dynamicTools: DynamicToolNamespace[];
+  workspaceRoots: string[];
+  /** Whether the session got the Computer Use server. Its MCP servers are fixed when it opens. */
+  computerUse: boolean;
+  idleRelease: ReturnType<typeof setTimeout> | null;
+  /** Also set when the session was loaded only for a read. */
+  idleSince: number;
 }
+
+/** What a closed idle session needs to be loaded again, and the turns a read answers meanwhile. */
+type ReleasedAcpThread = Pick<
+  AcpThread,
+  "cwd" | "developerInstructions" | "dynamicTools" | "workspaceRoots" | "computerUse" | "turns"
+>;
+
+/**
+ * How long a session with no turn stays open in the agent process. The agent starts the user's MCP
+ * servers for each session and keeps them until the session closes, and the agent loads the same
+ * session again from its own store, so an idle session costs only a slower first message.
+ */
+const ACP_SESSION_IDLE_RELEASE_MS = 10 * 60_000;
+
+/**
+ * How many idle sessions stay open before the timeout. Grok gives each session its own set of the
+ * user's MCP servers (`npx chrome-devtools-mcp` is about 300 MB), so one turn on each of five agents
+ * otherwise holds five sets for ten minutes.
+ */
+export const ACP_IDLE_SESSION_LIMIT = 2;
 
 interface AcpModel {
   id: string;
@@ -114,8 +167,44 @@ interface AcpModel {
   usesModelReasoningEffort: boolean | null;
 }
 
+interface AcpProviderAccount {
+  email: string | null;
+  planType: string | null;
+}
+
+/**
+ * What OpenBot offers every ACP agent in `initialize`. One value, so the trial start that "Check
+ * agent" makes (`acp-agent-check.ts`) and the real client cannot differ.
+ */
+export const OPENBOT_ACP_CLIENT_CAPABILITIES = {
+  fs: { readTextFile: false, writeTextFile: false },
+  terminal: false,
+  elicitation: { form: {} },
+  session: { configOptions: { boolean: {} } },
+} as const;
+
+export const OPENBOT_ACP_CLIENT_INFO = { name: "openbot", title: "OpenBot", version: "0.1.0" } as const;
+
 export interface AcpProviderOptions {
   provider: AgentProvider;
+  /** The name in error text. The provider name when absent; a custom agent gives its own. */
+  label?: string;
+  /**
+   * An agent that lists no model is ready, not signed out. A custom agent can have one model that
+   * it does not name, and it then runs on that model.
+   */
+  allowNoModels?: boolean;
+  /**
+   * The folder of the session that model discovery opens and closes. The app's own working folder
+   * when absent. A custom agent gets an empty folder, because an unknown agent can write where its
+   * session starts.
+   */
+  discoveryCwd?: () => string;
+  /**
+   * Values to mask in every diagnostic and error this client emits, read at each use: the custom
+   * agent's environment values, which have no secret name that `redactText` could know them by.
+   */
+  redactValues?: () => readonly string[];
   profileGeneration?: boolean;
   argv: readonly string[];
   env: Record<string, string>;
@@ -124,19 +213,34 @@ export interface AcpProviderOptions {
    * construction reach the next process without any other plumbing. Spread after `env`.
    */
   extraEnv?: () => Record<string, string>;
+  /**
+   * Wraps the command for a Workspace only agent's own process (`process-confinement.ts`). It throws
+   * when this computer cannot make the sandbox, and then the process does not start.
+   */
+  confine?(target: SpawnTarget): SpawnTarget;
   signInMessage: string;
   /**
    * Whether the model this turn runs on may still be used. Read here, after every wait this client
    * makes for the model configuration and the prompt images, because the endpoint can be removed
    * while those run and this process would still answer on it.
    */
-  servesModel?(modelId: string): boolean;
+  servesModel?: ((modelId: string) => boolean) | undefined;
   /**
    * The user's own MCP servers, read at spawn. OpenBot's bridge servers are appended after these,
    * so a configuration can never displace the tools the agent depends on.
    */
-  mcpServers?: McpServerSource;
+  mcpServers?: McpServerSource | undefined;
+  /** What this provider could not be given. Reported once per spawn, by `AgentService`. */
+  reportMcpDrops?: McpDropReporter | undefined;
+  mcpToolRuntimes?: McpToolRuntimeSource | undefined;
+  mcpAuthorization?: McpAuthorizationSource | undefined;
   authenticate?(connection: ClientSideConnection, initialization: InitializeResponse): Promise<void>;
+  /**
+   * Reads optional identity fields that ACP does not define. A provider extension failing must not
+   * turn a working authenticated process into a signed-out one, so account/read falls back to null
+   * fields when this hook cannot answer.
+   */
+  readAccount?(connection: ClientSideConnection): Promise<Partial<AcpProviderAccount>>;
   readRateLimits?(connection: ClientSideConnection): Promise<AccountRateLimitsReadResult>;
 }
 
@@ -147,11 +251,40 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
   readonly #cli: AgentCliInfo;
   readonly #requestTimeoutMs: number;
   readonly #bridge = new LocalMcpBridge();
-  readonly #threads = new Map<string, AcpThread>();
+  readonly #threads = new IdleThreadPool<AcpThread, ReleasedAcpThread>({
+    releaseAfterMs: ACP_SESSION_IDLE_RELEASE_MS,
+    idleLimit: ACP_IDLE_SESSION_LIMIT,
+    // An agent that cannot close a session and load it again would keep its MCP servers or lose it.
+    canRelease: () =>
+      this.#loadsSessions && Boolean(this.#initialization?.agentCapabilities?.sessionCapabilities?.close),
+    snapshot: ({ cwd, developerInstructions, dynamicTools, workspaceRoots, computerUse, turns }) => ({
+      cwd,
+      developerInstructions,
+      dynamicTools,
+      workspaceRoots,
+      computerUse,
+      turns,
+    }),
+    dispose: (thread) => this.#closeSession(thread),
+    reopen: (threadId, released) =>
+      this.#startThread(
+        {
+          threadId,
+          cwd: released.cwd,
+          developerInstructions: released.developerInstructions,
+          dynamicTools: released.dynamicTools,
+          runtimeWorkspaceRoots: released.workspaceRoots,
+          computerUse: released.computerUse,
+        },
+        true,
+      ),
+  });
   readonly #startingThreads = new Map<string, Promise<{ thread: { id: string } }>>();
-  readonly #pendingServerRequests = new Map<RequestId, PendingServerRequest>();
+  readonly #serverRequests = new PendingServerRequests((request) => this.emit("request", request));
   #process: ChildProcessWithoutNullStreams | null = null;
   #connection: ClientSideConnection | null = null;
+  /** How the current process ended, and its last stderr line, once its output is read to the end. */
+  #ended: Promise<ProcessEnd> | null = null;
   #initialized: Promise<void> | null = null;
   #initialization: InitializeResponse | null = null;
   #models: AcpModel[] = [];
@@ -168,6 +301,20 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     this.#requestTimeoutMs = requestTimeoutMs;
   }
 
+  get #label(): string {
+    return this.options.label ?? agentProviderName(this.provider);
+  }
+
+  /** `redactText`, and then the values this agent was started with. */
+  #redact(text: string): string {
+    let result = redactText(text);
+    for (const value of this.options.redactValues?.() ?? []) {
+      if (value.length < 4) continue;
+      result = result.split(value).join("[redacted]");
+    }
+    return result;
+  }
+
   get running(): boolean {
     return this.#process !== null && this.#process.exitCode === null && !this.#stopping;
   }
@@ -175,7 +322,8 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
   start(): void {
     if (this.running) return;
     this.#stopping = false;
-    const target = cliSpawnTarget(this.#cli.executable, this.options.argv);
+    const direct = cliSpawnTarget(this.#cli.executable, this.options.argv);
+    const target = this.options.confine ? this.options.confine(direct) : direct;
     const child = spawn(target.command, target.args, {
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, ...this.options.env, ...this.options.extraEnv?.() },
@@ -200,12 +348,24 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     );
     // One record at a time, never one chunk at a time: a chunk can end inside a JSON record, and a
     // record read in halves keeps the credential in its second half.
+    let lastDiagnostic: string | null = null;
     const diagnostics = createDiagnosticStream({
-      redact: redactText,
-      emit: (message) => this.emit("diagnostic", message),
+      redact: (text) => this.#redact(text),
+      emit: (message) => {
+        lastDiagnostic = message;
+        this.emit("diagnostic", message);
+      },
     });
     child.stderr.on("data", (chunk: Buffer) => diagnostics.push(chunk.toString("utf8")));
-    child.once("close", () => diagnostics.flush());
+    // Read at `close`, not `exit`: only then is stderr read to its end, and a CLI that fails at start
+    // writes the reason as its last line.
+    this.#ended = new Promise((resolve) => {
+      child.once("error", (error) => resolve({ ending: "it could not start", detail: this.#redact(error.message) }));
+      child.once("close", (code, signal) => {
+        diagnostics.flush();
+        resolve({ ending: signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`, detail: lastDiagnostic });
+      });
+    });
     child.once("error", (error) => this.#fail(error, child));
     child.once("exit", (code, signal) => {
       const suffix = signal ? `signal ${signal}` : `code ${code ?? "unknown"}`;
@@ -219,14 +379,14 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     this.#process = null;
     this.#connection = null;
     this.#initialized = null;
-    for (const thread of this.#threads.values()) thread.mcp.close();
-    this.#threads.clear();
+    for (const thread of this.#threads.clear()) thread.mcp.close();
     this.#startingThreads.clear();
-    for (const pending of this.#pendingServerRequests.values()) pending.reject(new Error("ACP session stopped."));
-    this.#pendingServerRequests.clear();
+    this.#serverRequests.rejectAll("ACP session stopped.");
     await this.#bridge.close();
     if (!child || child.exitCode !== null) return;
     child.stdin.end();
+    // A `.cmd` agent runs under `cmd.exe`; a kill of the wrapper alone leaves the agent running.
+    if (process.platform === "win32") return stopWindowsProcessTree(child);
     await new Promise<void>((resolve) => {
       const forceKill = setTimeout(() => {
         if (child.exitCode === null) child.kill("SIGKILL");
@@ -246,24 +406,63 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
    * ignored: the session is already replaced on this side.
    */
   async releaseThread(sessionId: string): Promise<void> {
+    this.#threads.forget(sessionId);
     const thread = this.#threads.get(sessionId);
     if (!thread) return;
-    this.#threads.delete(sessionId);
+    await this.#threads.close(thread);
+  }
+
+  async #closeSession(thread: AcpThread): Promise<void> {
     thread.mcp.close();
-    await this.#connection?.closeSession({ sessionId }).catch(() => undefined);
+    await this.#connection?.closeSession({ sessionId: thread.id }).catch(() => undefined);
   }
 
   async request<T>(method: string, params: unknown, decoder: ResponseDecoder<T>, timeoutMs?: number): Promise<T> {
+    const ended = this.#ended;
+    try {
+      return await this.#request(method, params, decoder, timeoutMs);
+    } catch (error) {
+      throw await this.#explainEnd(error, ended);
+    }
+  }
+
+  /**
+   * The error to report for a request that failed. The ACP SDK rejects every open request with a
+   * bare "ACP connection closed" as soon as the CLI's stdout ends, before the process reports its
+   * exit, so a CLI that fails at start read to the user as that phrase and nothing else. When the
+   * process ended on its own, this waits for its exit and reports it with the CLI's last stderr line.
+   */
+  async #explainEnd(error: unknown, ended: Promise<ProcessEnd> | null): Promise<unknown> {
+    if (!ended || this.#stopping) return error;
+    const message = error instanceof Error ? error.message : "";
+    if (message !== "ACP connection closed" && message !== "ACP client is not running.") return error;
+    let timer: NodeJS.Timeout | undefined;
+    const ending = await Promise.race([
+      ended,
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), EXIT_REPORT_WAIT_MS);
+      }),
+    ]).finally(() => clearTimeout(timer));
+    if (ending === null) return error;
+    return new AgentProcessExitError(`${this.#label} stopped before it answered (${ending.ending}).`, ending.detail, {
+      cause: error,
+    });
+  }
+
+  async #request<T>(method: string, params: unknown, decoder: ResponseDecoder<T>, timeoutMs?: number): Promise<T> {
     if (!this.running) throw new Error("ACP client is not running.");
     switch (method) {
       case "initialize":
         await this.#ensureInitialized();
         return decoder({});
-      case "account/read":
+      case "account/read": {
+        if (!this.#signedIn) return decoder({ account: null, requiresOpenaiAuth: false });
+        const account = await this.#readProviderAccount(timeoutMs);
         return decoder({
-          account: this.#signedIn ? { type: this.provider, email: null, planType: null } : null,
+          account: { type: this.provider, email: account.email, planType: account.planType },
           requiresOpenaiAuth: false,
         });
+      }
       case "account/rateLimits/read":
         await this.#ensureInitialized();
         if (!this.#signedIn) return decoder({ rateLimits: null, rateLimitsByLimitId: null });
@@ -272,7 +471,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
             ? await withTimeout(
                 this.options.readRateLimits(this.#requireConnection()),
                 timeoutMs ?? this.#requestTimeoutMs,
-                `${agentProviderName(this.provider)} request timed out: account/rateLimits/read`,
+                `${this.#label} request timed out: account/rateLimits/read`,
               )
             : { rateLimits: null, rateLimitsByLimitId: null },
         );
@@ -295,17 +494,22 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
       case "thread/resume":
         return decoder(await this.#startThread(params, true));
       case "thread/read": {
-        const thread = await this.#readableThread(requiredString(params, "threadId"), params);
-        return decoder({
-          thread: { id: thread?.id ?? requiredString(params, "threadId"), turns: thread?.turns ?? [] },
-        });
+        const threadId = requiredString(params, "threadId");
+        // A closed idle session answers from the turns it kept, so a read does not start its MCP
+        // servers again.
+        const released = this.#threads.has(threadId) ? undefined : this.#threads.released(threadId);
+        const thread = released ?? (await this.#readableThread(threadId, params));
+        return decoder({ thread: { id: threadId, turns: thread?.turns ?? [] } });
       }
       case "turn/start":
         return decoder(await this.#startTurn(params, false));
       case "turn/steer":
         return decoder(await this.#startTurn(params, true));
       case "turn/interrupt": {
-        const thread = this.#requireThread(requiredString(params, "threadId"));
+        const threadId = requiredString(params, "threadId");
+        // A closed idle session has no turn to stop.
+        if (this.#threads.isReleased(threadId)) return decoder({});
+        const thread = this.#requireThread(threadId);
         this.#requireConnection().cancel({ sessionId: thread.id });
         return decoder({});
       }
@@ -321,17 +525,11 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
   }
 
   respond(id: RequestId, result: unknown): void {
-    const pending = this.#pendingServerRequests.get(id);
-    if (!pending) return;
-    this.#pendingServerRequests.delete(id);
-    pending.resolve(result);
+    this.#serverRequests.resolve(id, result);
   }
 
   respondError(id: RequestId, error: RpcError): void {
-    const pending = this.#pendingServerRequests.get(id);
-    if (!pending) return;
-    this.#pendingServerRequests.delete(id);
-    pending.reject(new Error(error.message));
+    this.#serverRequests.reject(id, error);
   }
 
   async #ensureInitialized(): Promise<void> {
@@ -340,18 +538,27 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     return this.#initialized;
   }
 
+  async #readProviderAccount(timeoutMs?: number): Promise<AcpProviderAccount> {
+    if (!this.options.readAccount) return { email: null, planType: null };
+    try {
+      const account = await withTimeout(
+        this.options.readAccount(this.#requireConnection()),
+        timeoutMs ?? this.#requestTimeoutMs,
+        `${this.#label} request timed out: account/read`,
+      );
+      return { email: account.email ?? null, planType: account.planType ?? null };
+    } catch {
+      return { email: null, planType: null };
+    }
+  }
+
   async #initialize(): Promise<void> {
     const connection = this.#requireConnection();
     this.#initialization = await withTimeout(
       connection.initialize({
         protocolVersion: 1,
-        clientCapabilities: {
-          fs: { readTextFile: false, writeTextFile: false },
-          terminal: false,
-          elicitation: { form: {} },
-          session: { configOptions: { boolean: {} } },
-        },
-        clientInfo: { name: "openbot", title: "OpenBot", version: "0.1.0" },
+        clientCapabilities: OPENBOT_ACP_CLIENT_CAPABILITIES,
+        clientInfo: OPENBOT_ACP_CLIENT_INFO,
       }),
       this.#requestTimeoutMs,
       "ACP initialization timed out.",
@@ -359,8 +566,8 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     try {
       await this.options.authenticate?.(connection, this.#initialization);
       this.#models = await this.#discoverModels();
-      if (this.#models.length === 0) {
-        throw new Error("ACP CLI did not advertise any ACP models. OpenBot will not guess a fallback model.");
+      if (this.#models.length === 0 && !this.options.allowNoModels) {
+        throw new Error(sourceText("error.provider.acpNoModels"));
       }
       this.#signedIn = true;
     } catch (error) {
@@ -380,7 +587,8 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     const deadline = Date.now() + timeoutMs - MODEL_DISCOVERY_RETURN_MS;
     return withTimeout(
       (async () => {
-        const probe = await connection.newSession({ cwd: process.cwd(), mcpServers: [] });
+        const cwd = this.options.discoveryCwd?.() ?? process.cwd();
+        const probe = await connection.newSession({ cwd, mcpServers: [] });
         try {
           return await this.#modelReasoningEfforts(connection, probe, modelsFromSessionSetup(probe), deadline);
         } finally {
@@ -394,7 +602,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
         }
       })(),
       timeoutMs,
-      `${agentProviderName(this.provider)} request timed out: model/list`,
+      `${this.#label} request timed out: model/list`,
     );
   }
 
@@ -408,9 +616,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
   async #requestBefore<T>(request: () => Promise<T>, until: number, method: string): Promise<T | null> {
     const remaining = until - Date.now();
     if (remaining <= 0) return null;
-    return withTimeout(request(), remaining, `${agentProviderName(this.provider)} request timed out: ${method}`).catch(
-      () => null,
-    );
+    return withTimeout(request(), remaining, `${this.#label} request timed out: ${method}`).catch(() => null);
   }
 
   /**
@@ -490,15 +696,22 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     const held = this.#threads.get(id);
     if (held) return held;
     if (!getString(params, "cwd")) return null;
+    // A resume that is already loading this session opens it for a turn, not for this read.
+    const resuming = this.#startingThreads.has(id);
     try {
       await this.#ensureInitialized();
       if (!this.#loadsSessions) return null;
       await this.#startThread(params, true);
     } catch (error) {
-      this.emit("diagnostic", redactText(`ACP session load for a read failed: ${String(error)}`));
+      this.emit("diagnostic", this.#redact(`ACP session load for a read failed: ${String(error)}`));
       return null;
     }
-    return this.#threads.get(id) ?? null;
+    const thread = this.#threads.get(id) ?? null;
+    // Boot recovery reads every stored session, and each loaded session holds its own set of the
+    // user's MCP servers. A session loaded only for a read is idle from the start, so the idle limit
+    // counts it and keeps only the most recent ones warm for a first turn.
+    if (thread && !resuming && thread.idleSince === 0 && !thread.activeTurn) this.#threads.markIdle(thread);
+    return thread;
   }
 
   /** Whether the agent answers `session/load`, which it advertises in its initialization. */
@@ -512,10 +725,17 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     const requestedThreadId = getString(params, "threadId");
     if (!resume || !requestedThreadId) return this.#openThread(params, false);
     const held = this.#threads.get(requestedThreadId);
+    let turns: AcpThread["turns"] | undefined;
+    // The MCP servers are fixed when a session opens, so a changed Computer Use switch loads the
+    // session again. A session with a turn keeps its servers until a later resume.
+    if (held && !held.activeTurn && held.computerUse !== computerUseParam(params)) {
+      turns = held.turns;
+      await this.#threads.close(held);
+    }
     // A thread this client already holds takes the caller's settings even though no session is
     // opened for them: the loader may have been a `thread/read`, which carries none of its own, and
     // the turn that follows must not run on the settings of whoever loaded the session first.
-    if (held) {
+    else if (held) {
       held.developerInstructions = getString(params, "developerInstructions") ?? held.developerInstructions;
       await this.#applyConfig(held, getString(params, "model"), getString(params, "effort"));
       return { thread: { id: requestedThreadId } };
@@ -525,14 +745,18 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     // bridge sessions under one id, of which only the last is reachable.
     const starting = this.#startingThreads.get(requestedThreadId);
     if (starting) return starting;
-    const start = this.#openThread(params, true).finally(() => {
+    const start = this.#openThread(params, true, turns).finally(() => {
       this.#startingThreads.delete(requestedThreadId);
     });
     this.#startingThreads.set(requestedThreadId, start);
     return start;
   }
 
-  async #openThread(params: unknown, resume: boolean): Promise<{ thread: { id: string } }> {
+  async #openThread(
+    params: unknown,
+    resume: boolean,
+    heldTurns?: AcpThread["turns"],
+  ): Promise<{ thread: { id: string } }> {
     const requestedThreadId = getString(params, "threadId");
     if (resume && requestedThreadId && !this.#loadsSessions) {
       // Reported as a missing session, which is what it is for the caller: the agent cannot give
@@ -542,12 +766,13 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     }
     const cwd = requiredString(params, "cwd");
     const dynamicTools = getArray(params, "dynamicTools").filter(isDynamicToolNamespace);
+    const computerUse = computerUseParam(params);
     let threadRef: AcpThread | null = null;
     const mcp = await this.#bridge.createSession(
       requestedThreadId ?? randomUUID(),
       dynamicTools,
       () => threadRef?.activeTurn?.id ?? null,
-      (call) => this.#callDynamicTool(call),
+      (call, signal) => this.#callDynamicTool(call, signal),
     );
     try {
       const connection = this.#requireConnection();
@@ -557,7 +782,15 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
       let currentModelId: string | null;
       // OpenBot's bridge servers last: all providers key MCP servers by name, so a user
       // configuration that reached one of those names would take the agent's own tools away.
-      const mcpServers = [...acpMcpServers(await usableMcpServers(this.options.mcpServers?.() ?? [])), ...mcp.servers];
+      const handoff = acpMcpServers(
+        await usableMcpServers(
+          agentMcpServers(this.options.mcpServers?.() ?? [], computerUse),
+          this.options.mcpToolRuntimes?.(),
+          this.options.mcpAuthorization,
+        ),
+      );
+      this.options.reportMcpDrops?.(this.provider, handoff.dropped);
+      const mcpServers = [...handoff.servers, ...mcp.servers];
       if (resume && requestedThreadId) {
         const response = await connection.loadSession({
           sessionId: requestedThreadId,
@@ -583,10 +816,15 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
         currentModelId,
         mcp,
         activeTurn: null,
-        turns: [],
+        turns: heldTurns ?? this.#threads.released(id)?.turns ?? [],
+        dynamicTools,
+        workspaceRoots: additionalDirectories,
+        computerUse,
+        idleRelease: null,
+        idleSince: 0,
       };
       threadRef = thread;
-      this.#threads.set(id, thread);
+      this.#threads.add(thread);
       await this.#applyConfig(thread, getString(params, "model"), getString(params, "effort"));
       return { thread: { id } };
     } catch (error) {
@@ -649,7 +887,17 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     params: unknown,
     steer: boolean,
   ): Promise<{ turn: { id: string; status: string }; turnId?: string }> {
-    const thread = this.#requireThread(requiredString(params, "threadId"));
+    const threadId = requiredString(params, "threadId");
+    return this.#threads.startTurn(threadId, () => this.#openTurn(threadId, params, steer));
+  }
+
+  async #openTurn(
+    threadId: string,
+    params: unknown,
+    steer: boolean,
+  ): Promise<{ turn: { id: string; status: string }; turnId?: string }> {
+    await this.#threads.wake(threadId);
+    const thread = this.#requireThread(threadId);
     if (!steer && thread.activeTurn) throw new Error("The ACP thread already has an active turn.");
     if (steer && !thread.activeTurn) throw new Error("The ACP thread has no active turn to steer.");
     await this.#applyConfig(thread, getString(params, "model"), getString(params, "effort"));
@@ -664,10 +912,12 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     }
     this.#requireServedModel(thread);
     if (steer) {
+      // A steered message can want an answer, so an empty turn is again a failure to report.
+      if (activeTurn) activeTurn.answerOptional = false;
       void this.#requireConnection()
         .prompt({ sessionId: thread.id, prompt: blocks })
         .catch((error) => {
-          this.emit("diagnostic", redactText(`ACP steer failed: ${String(error)}`));
+          this.emit("diagnostic", this.#redact(`ACP steer failed: ${String(error)}`));
         });
       return { turn: { id: turnId, status: "inProgress" }, turnId };
     }
@@ -679,11 +929,13 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
       thought: "",
       thoughtStarted: false,
       receivedOutput: false,
+      answerOptional: isRecord(params) && params.answerOptional === true,
       messages: [],
       toolNames: new Map(),
       task: Promise.resolve(),
     };
     thread.activeTurn = turn;
+    this.#threads.holdForTurn(thread);
     this.emit("notification", {
       method: "turn/started",
       params: { threadId: thread.id, turn: { id: turn.id, status: "inProgress" } },
@@ -697,7 +949,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     const model = thread.currentModelId;
     if (!model || !this.options.servesModel) return;
     if (!this.options.servesModel(model)) {
-      throw new Error("The endpoint this agent used was removed. Choose another model for it.");
+      throw new Error(sourceText("error.agent.endpointRemoved"));
     }
   }
 
@@ -710,8 +962,14 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
           params: { threadId: thread.id, turnId: turn.id, usage: response.usage },
         });
       // OpenCode can swallow provider errors and report a successful, empty ACP turn.
-      // Do not invent the upstream cause or report that turn as a successful reply.
-      if (this.provider === "opencode" && response.stopReason === "end_turn" && !turn.receivedOutput) {
+      // Do not invent the upstream cause or report that turn as a successful reply. A turn told not
+      // to answer ends empty on purpose, and an error there costs no answer the user waits for.
+      if (
+        this.provider === "opencode" &&
+        response.stopReason === "end_turn" &&
+        !turn.receivedOutput &&
+        !turn.answerOptional
+      ) {
         this.#completeTurn(
           thread,
           turn,
@@ -790,16 +1048,9 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
       return;
     }
     if (update.sessionUpdate === "plan") {
-      const text = update.entries
-        .map((entry) => `- [${entry.status === "completed" ? "x" : " "}] ${entry.content}`)
-        .join("\n");
       this.emit("notification", {
-        method: "item/completed",
-        params: {
-          threadId: thread.id,
-          turnId: turn.id,
-          item: { id: `${turn.id}:plan`, type: "agentMessage", phase: "analysis", text },
-        },
+        method: PLAN_UPDATED_METHOD,
+        params: { threadId: thread.id, turnId: turn.id, explanation: null, plan: acpPlanSteps(update.entries) },
       });
     }
   }
@@ -835,7 +1086,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     this.#completeThought(thread, turn);
     this.#completeMessage(thread, turn, "final_answer");
     if (status === "failed" && error) {
-      const detail = redactText(String(error));
+      const detail = this.#redact(String(error));
       const message =
         this.provider === "opencode" &&
         /invalid api key|unauthori[sz]ed|token refresh failed|authentication failed/i.test(detail)
@@ -852,6 +1103,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     });
     thread.turns.push({ id: turn.id, status, items: turn.messages });
     thread.activeTurn = null;
+    this.#threads.markIdle(thread);
   }
 
   async #requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
@@ -865,7 +1117,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
           ? "file-change"
           : "permissions";
     const requestedPermissions = kind === "permissions" ? { [params.toolCall.kind ?? "file-system"]: true } : null;
-    const result = await this.#callServerRequest(
+    const result = await this.#serverRequests.call(
       `item/${kind === "command" ? "commandExecution" : kind === "file-change" ? "fileChange" : "permissions"}/requestApproval`,
       {
         threadId: params.sessionId,
@@ -888,9 +1140,9 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
   }
 
   async #requestUserInput(method: string, params: DynamicRecord): Promise<DynamicRecord> {
-    const sessionId = getString(params, "sessionId") ?? [...this.#threads.keys()][0];
+    const sessionId = getString(params, "sessionId") ?? [...this.#threads.ids()][0];
     const thread = sessionId ? this.#threads.get(sessionId) : undefined;
-    const result = await this.#callServerRequest("item/tool/requestUserInput", {
+    const result = await this.#serverRequests.call("item/tool/requestUserInput", {
       ...params,
       threadId: sessionId,
       turnId: thread?.activeTurn?.id ?? randomUUID(),
@@ -910,6 +1162,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
           id,
           header: getString(property, "title") ?? id,
           question: getString(property, "description") ?? getString(params, "message") ?? "ACP needs more information.",
+          isSecret: secretElicitationField(id, property),
           options: elicitationOptions(property),
         },
       ];
@@ -919,6 +1172,7 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
         id: "response",
         header: "ACP",
         question: getString(params, "message") ?? "ACP needs confirmation.",
+        isSecret: false,
         options: null,
       });
     }
@@ -934,25 +1188,20 @@ export class AcpAgentClient extends EventEmitter<ClientEvents> {
     return Object.keys(content).length > 0 ? { action: "accept", content } : { action: "decline" };
   }
 
-  async #callDynamicTool(params: {
-    threadId: string;
-    turnId: string;
-    callId: string;
-    namespace: string;
-    tool: string;
-    arguments: unknown;
-  }): Promise<DynamicToolResult> {
-    const result = await this.#callServerRequest("item/tool/call", params);
+  async #callDynamicTool(
+    params: {
+      threadId: string;
+      turnId: string;
+      callId: string;
+      namespace: string;
+      tool: string;
+      arguments: unknown;
+    },
+    signal: AbortSignal,
+  ): Promise<DynamicToolResult> {
+    const result = await this.#serverRequests.call("item/tool/call", params, signal);
     if (!isDynamicToolResult(result)) throw new Error("OpenBot returned an invalid dynamic tool result.");
     return result;
-  }
-
-  #callServerRequest(method: string, params: unknown): Promise<unknown> {
-    const id = randomUUID();
-    return new Promise((resolve, reject) => {
-      this.#pendingServerRequests.set(id, { resolve, reject });
-      this.emit("request", { id, method, params });
-    });
   }
 
   #requireThread(id: string): AcpThread {
@@ -1190,37 +1439,6 @@ function bestPermissionOption(options: PermissionOption[], accepted: boolean): P
   return kinds.flatMap((kind) => options.filter((option) => option.kind === kind))[0] ?? null;
 }
 
-function elicitationOptions(property: DynamicRecord): Array<{ label: string; description: string }> | null {
-  if (Array.isArray(property.oneOf)) {
-    return property.oneOf.filter(isRecord).flatMap((option) => {
-      const value = getString(option, "const");
-      if (!value) return [];
-      return [{ label: getString(option, "title") ?? value, description: getString(option, "description") ?? "" }];
-    });
-  }
-  if (Array.isArray(property.enum)) {
-    return property.enum.filter(isString).map((value) => ({ label: value, description: "" }));
-  }
-  if (property.type === "boolean") {
-    return [
-      { label: "Yes", description: "" },
-      { label: "No", description: "" },
-    ];
-  }
-  return null;
-}
-
-function elicitationValue(property: DynamicRecord | undefined, answers: string[]): ElicitationContentValue {
-  if (!property) return answers[0] ?? "";
-  if (property.type === "array") return answers;
-  if (property.type === "boolean") return /^(yes|true|1)$/i.test(answers[0] ?? "");
-  if (property.type === "number" || property.type === "integer") {
-    const parsed = Number(answers[0]);
-    return Number.isFinite(parsed) ? parsed : (answers[0] ?? "");
-  }
-  return answers[0] ?? "";
-}
-
 function isDynamicToolResult(value: unknown): value is DynamicToolResult {
   return (
     isRecord(value) &&
@@ -1238,18 +1456,4 @@ function isAuthenticationError(error: unknown): boolean {
   return /auth|login|credential|token|unauthori[sz]ed|api key/i.test(
     error instanceof Error ? error.message : String(error),
   );
-}
-
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-  let timer: NodeJS.Timeout | null = null;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<T>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
 }

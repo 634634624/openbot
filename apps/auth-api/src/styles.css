@@ -2,14 +2,10 @@
 @import "@fontsource-variable/inter/wght-italic.css";
 @import "tailwindcss";
 @import "@openbot/brand/tokens.css";
+@import "@openbot/ui/stagger.css";
 
 :root {
   color-scheme: dark;
-  --stagger-dur: 500ms;
-  --stagger-distance: 12px;
-  --stagger-stagger: 40ms;
-  --stagger-blur: 3px;
-  --stagger-ease: cubic-bezier(0.22, 1, 0.36, 1);
   --pulse-dur: 1000ms;
   --pulse-count: 1;
   --pulse-min: 0.5;
@@ -23,13 +19,10 @@
 }
 
 html {
-  min-width: 320px;
-  scroll-behavior: smooth;
   background: var(--openbot-bg-canvas);
 }
 
 body {
-  min-width: 320px;
   min-height: 100vh;
   margin: 0;
   background: var(--openbot-bg-canvas);
@@ -40,32 +33,19 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* Site pages only: the web client at /app keeps the desktop document styles. */
+html:not(:has(.web-app)) {
+  min-width: 320px;
+  scroll-behavior: smooth;
+}
+
+body:not(:has(.web-app)) {
+  min-width: 320px;
+}
+
 a {
   color: inherit;
   text-decoration: none;
-}
-
-/* Lines start translated down + blurred + invisible; .is-shown
-   on the parent flips them to their resting state. The second
-   line's transition-delay holds it back by --stagger-stagger
-   so the eye lands on the headline first. */
-.t-stagger-line {
-  display: block;
-  opacity: 0;
-  transform: translateY(var(--stagger-distance));
-  filter: blur(var(--stagger-blur));
-  transition:
-    opacity var(--stagger-dur) var(--stagger-ease),
-    transform var(--stagger-dur) var(--stagger-ease),
-    filter var(--stagger-dur) var(--stagger-ease);
-  will-change: transform, opacity, filter;
-}
-.t-stagger-line--2 {
-  transition-delay: var(--stagger-stagger);
-}
-
-.t-stagger-line--3 {
-  transition-delay: calc(var(--stagger-stagger) * 2);
 }
 
 .t-stagger-line--4 {
@@ -75,32 +55,6 @@ a {
 .landing-actions.t-stagger-line--4 {
   transition-duration: 400ms;
   transition-delay: var(--stagger-stagger);
-}
-
-.t-stagger.is-shown .t-stagger-line {
-  opacity: 1;
-  transform: translateY(0);
-  filter: blur(0);
-}
-/* Exit decouples from the stagger: same fade for every line,
-   no Y return, no blur — so the disappearance reads as a
-   single quiet fade instead of a reverse reveal. */
-.t-stagger.is-hiding .t-stagger-line {
-  opacity: 0;
-  transform: translateY(0);
-  filter: blur(0);
-  transition:
-    opacity 200ms ease,
-    transform 0s linear,
-    filter 0s linear;
-  transition-delay: 0s;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .t-stagger .t-stagger-line,
-  .t-stagger.is-hiding .t-stagger-line {
-    transition: none;
-  }
 }
 
 /* The wrap stacks two layers on the same coordinates. The
@@ -189,12 +143,18 @@ a {
   overflow: clip;
 }
 
+/* Three columns with the outer two equal, so the menu sits at the true centre
+   of the page whatever the brand and the buttons measure. The header is its own
+   stacking context: the menu panels and the mobile sheet have to cover whatever
+   the page draws under it. */
 .landing-header {
+  position: relative;
+  z-index: 40;
   width: min(100%, 1280px);
   min-height: 76px;
-  display: flex;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
   align-items: center;
-  justify-content: space-between;
   gap: 24px;
   margin: 0 auto;
   padding: 18px clamp(20px, 4vw, 48px);
@@ -202,6 +162,7 @@ a {
 
 .landing-brand {
   min-width: 0;
+  justify-self: start;
   display: inline-flex;
   align-items: center;
   gap: 10px;
@@ -222,32 +183,696 @@ a {
   flex: 0 0 auto;
 }
 
-.landing-navigation,
+/* Header menu ---------------------------------------------------------------
+   SiteNavigationMenu.tsx says what moves and why. The pill slides behind the
+   trigger under the pointer, and the surface is one frosted card behind every
+   panel that morphs to the size of the one that is open. */
+
+.site-nav {
+  /* A long, soft settle: fast out of the gate, then a slow glide into place. */
+  --site-nav-ease: cubic-bezier(0.32, 0.72, 0, 1);
+  --site-nav-duration: 460ms;
+  --site-nav-quick: 300ms;
+  --site-nav-blur: 8px;
+  --site-nav-offset: 10px;
+  --site-nav-radius: 18px;
+  --site-nav-hairline: rgba(255, 255, 255, 0.07);
+  --site-nav-hover: rgba(255, 255, 255, 0.05);
+  /* The one containing block for the pill, the panels and the surface. The menu
+     places a panel and the surface with the same numbers, so they must share it:
+     a positioned track or list moved the panel 4px off its frame. */
+  position: relative;
+}
+
+.site-nav-track {
+  display: flex;
+  padding: 4px;
+  border-radius: var(--openbot-radius-pill);
+  background: rgba(255, 255, 255, 0.025);
+  box-shadow:
+    0 0 0 1px var(--site-nav-hairline),
+    inset 0 1px 0 rgba(255, 255, 255, 0.03);
+}
+
+.site-nav-list {
+  display: flex;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.site-nav-pill {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  width: var(--site-nav-pill-width, 0);
+  height: calc(100% - 8px);
+  border-radius: var(--openbot-radius-pill);
+  background: rgba(255, 255, 255, 0.08);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    0 1px 2px rgba(0, 0, 0, 0.32);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(var(--site-nav-pill-x, 0));
+  transition:
+    transform var(--site-nav-quick) var(--site-nav-ease),
+    width var(--site-nav-quick) var(--site-nav-ease),
+    opacity var(--openbot-duration-normal) ease;
+}
+
+.site-nav-pill[data-shown] {
+  opacity: 1;
+}
+
+.site-nav-trigger {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 32px;
+  padding: 0 11px 0 14px;
+  border: 0;
+  border-radius: var(--openbot-radius-pill);
+  background: transparent;
+  color: var(--openbot-text-muted);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+  transition: color var(--openbot-duration-normal) ease;
+}
+
+.site-nav-trigger[aria-expanded="true"] {
+  color: var(--openbot-text-primary);
+}
+
+.site-nav-trigger:focus-visible {
+  outline: 0;
+  box-shadow: 0 0 0 2px var(--openbot-accent-strong);
+}
+
+/* A link with no panel: no chevron, so the padding is even on both sides. */
+.site-nav-link {
+  padding: 0 14px;
+  text-decoration: none;
+}
+
+.site-nav-link[aria-current="page"] {
+  color: var(--openbot-text-primary);
+}
+
+.site-nav-chevron {
+  width: 12px;
+  height: 12px;
+  opacity: 0.55;
+  transition:
+    transform var(--site-nav-duration) var(--site-nav-ease),
+    opacity var(--openbot-duration-normal) ease;
+}
+
+.site-nav-trigger[aria-expanded="true"] .site-nav-chevron {
+  opacity: 1;
+  transform: rotate(180deg);
+}
+
+.site-nav-surface {
+  position: absolute;
+  top: calc(100% + var(--site-nav-offset));
+  left: 0;
+  width: var(--site-nav-surface-width, 0);
+  height: var(--site-nav-surface-height, 0);
+  border-radius: var(--site-nav-radius);
+  background: rgba(22, 22, 22, 0.8);
+  box-shadow:
+    0 0 0 1px var(--site-nav-hairline),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 8px 16px -8px rgba(0, 0, 0, 0.5),
+    0 28px 56px -16px rgba(0, 0, 0, 0.64);
+  backdrop-filter: blur(40px) saturate(180%);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(var(--site-nav-surface-x, 0)) translateY(-6px) scale(0.96);
+  transform-origin: var(--site-nav-surface-origin, 50%) top;
+  transition:
+    opacity 200ms ease,
+    transform 240ms var(--site-nav-ease),
+    width var(--site-nav-duration) var(--site-nav-ease),
+    height var(--site-nav-duration) var(--site-nav-ease);
+}
+
+.site-nav[data-state="open"] .site-nav-surface {
+  opacity: 1;
+  transform: translateX(var(--site-nav-surface-x, 0)) translateY(0) scale(1);
+  transition:
+    opacity 240ms ease,
+    transform var(--site-nav-duration) var(--site-nav-ease),
+    width var(--site-nav-duration) var(--site-nav-ease),
+    height var(--site-nav-duration) var(--site-nav-ease);
+}
+
+.site-nav-pill[data-instant],
+.site-nav-surface[data-instant] {
+  transition: none;
+}
+
+/* Every panel is laid out all the time, so the menu can measure one before it
+   opens it; a closed one is only invisible and inert. */
+.site-nav-panel {
+  --site-nav-shift: 0px;
+  --site-nav-rise: 0px;
+  position: absolute;
+  top: calc(100% + var(--site-nav-offset));
+  left: 0;
+  z-index: 1;
+  opacity: 0;
+  visibility: hidden;
+}
+
+.site-nav-panel[data-state="open"] {
+  opacity: 1;
+  visibility: visible;
+}
+
+/* A bridge over the gap under the trigger, so a pointer moving down to the panel
+   never leaves the menu on the way. */
+.site-nav-panel[data-state="open"]::before {
+  content: "";
+  position: absolute;
+  right: 0;
+  bottom: 100%;
+  left: 0;
+  height: calc(var(--site-nav-offset) + 6px);
+}
+
+/* Contents come in and go out through a blur, so a change of section reads as one
+   picture dissolving into the next rather than two sliding past each other. */
+.site-nav-panel[data-motion] {
+  will-change: opacity, transform, filter;
+}
+
+.site-nav-panel[data-motion="from-start"],
+.site-nav-panel[data-motion="to-start"] {
+  --site-nav-shift: -40px;
+}
+
+.site-nav-panel[data-motion="from-end"],
+.site-nav-panel[data-motion="to-end"] {
+  --site-nav-shift: 40px;
+}
+
+.site-nav-panel[data-motion="enter"] {
+  --site-nav-rise: -6px;
+  animation: site-nav-panel-enter 420ms var(--site-nav-ease) 30ms both;
+}
+
+.site-nav-panel[data-motion="exit"] {
+  --site-nav-rise: -4px;
+  animation: site-nav-panel-leave 200ms cubic-bezier(0.4, 0, 1, 1) both;
+}
+
+.site-nav-panel[data-motion="from-start"],
+.site-nav-panel[data-motion="from-end"] {
+  animation: site-nav-panel-enter var(--site-nav-duration) var(--site-nav-ease) both;
+}
+
+.site-nav-panel[data-motion="to-start"],
+.site-nav-panel[data-motion="to-end"] {
+  animation: site-nav-panel-leave var(--site-nav-quick) var(--site-nav-ease) both;
+}
+
+@keyframes site-nav-panel-enter {
+  from {
+    opacity: 0;
+    filter: blur(var(--site-nav-blur));
+    transform: translate(var(--site-nav-shift), var(--site-nav-rise));
+  }
+}
+
+@keyframes site-nav-panel-leave {
+  from {
+    opacity: 1;
+    visibility: visible;
+  }
+
+  to {
+    opacity: 0;
+    visibility: hidden;
+    filter: blur(var(--site-nav-blur));
+    transform: translate(var(--site-nav-shift), var(--site-nav-rise));
+  }
+}
+
+/* Panel contents: the same markup in the desktop panel and the mobile sheet. */
+
+.site-panel {
+  width: 580px;
+  display: flex;
+  flex-direction: column;
+  padding: 8px;
+}
+
+.site-panel[data-kind="plugins"] {
+  width: 540px;
+}
+
+.site-panel a:focus-visible {
+  outline: 0;
+  box-shadow: 0 0 0 2px var(--openbot-accent-strong);
+}
+
+.site-panel-body {
+  display: grid;
+  grid-template-columns: 208px minmax(0, 1fr);
+  gap: 6px;
+}
+
+.site-panel-feature {
+  position: relative;
+  min-height: 204px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  overflow: hidden;
+  padding: 14px;
+  border-radius: 12px;
+  isolation: isolate;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+.site-panel-feature-art {
+  position: absolute;
+  inset: 0;
+  z-index: -2;
+  background: var(--site-panel-art);
+  transition: transform 700ms var(--site-nav-ease, var(--openbot-ease-out));
+  /* Firefox on a GPU drew the live shader canvas with square corners here, past the
+     host's own clip and the card's, and even past a clip-path. Only while the zoom
+     below made the host a layer of its own were the corners round, so it is one
+     at all times. */
+  will-change: transform;
+}
+
+.site-panel-feature::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.62), rgba(0, 0, 0, 0) 70%);
+}
+
+.site-panel-feature-badge {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  padding: 4px 8px;
+  border-radius: var(--openbot-radius-pill);
+  /* Solid, not frosted. Chromium does not paint a backdrop filter while an
+     ancestor fades or blurs on the compositor, so a frosted badge appeared only
+     after the panel had finished coming in. */
+  background: rgba(0, 0, 0, 0.44);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.14);
+  color: var(--openbot-text-primary);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+.site-panel-feature-copy,
+.site-panel-row-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.site-panel-feature-title {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--openbot-text-primary);
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  line-height: 1.25;
+  text-wrap: balance;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.site-panel-meta {
+  overflow: hidden;
+  color: var(--openbot-text-muted);
+  font-size: 12px;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.site-panel-feature .site-panel-meta {
+  color: rgba(255, 255, 255, 0.72);
+}
+
+.site-panel-list,
+.site-panel-plugins {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.site-panel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.site-panel-plugins {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 2px;
+}
+
+.site-panel-row,
+.site-panel-plugin {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px;
+  border-radius: 12px;
+  transition: background-color var(--openbot-duration-normal) ease;
+}
+
+.site-panel-row-art,
+.site-panel-plugin-mark {
+  width: 40px;
+  height: 40px;
+  flex: 0 0 auto;
+  border-radius: 10px;
+  background: var(--site-panel-art);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.1);
+  transition: transform var(--site-nav-duration, 340ms) var(--site-nav-ease, var(--openbot-ease-out));
+}
+
+.site-panel-plugin-mark {
+  display: grid;
+  place-items: center;
+  color: var(--openbot-text-primary);
+}
+
+.site-panel-plugin-logo {
+  width: 20px;
+  height: 20px;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 20px;
+  text-align: center;
+}
+
+.site-panel-plugin-icon {
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+}
+
+.site-panel-row-title {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--openbot-text-primary);
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  line-height: 1.3;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.site-panel-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 8px -8px -8px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--site-nav-hairline, rgba(255, 255, 255, 0.07));
+  border-radius: 0 0 var(--site-nav-radius, 18px) var(--site-nav-radius, 18px);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.site-panel-summary {
+  min-width: 0;
+  color: var(--openbot-text-muted);
+  font-size: 12px;
+}
+
+.site-panel-index {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  margin: -6px -10px;
+  padding: 6px 10px;
+  border-radius: var(--openbot-radius-pill);
+  color: var(--openbot-text-primary);
+  font-size: 12.5px;
+  font-weight: 500;
+  transition: background-color var(--openbot-duration-normal) ease;
+}
+
+.site-panel-index svg {
+  width: 14px;
+  height: 14px;
+  transition: transform var(--openbot-duration-slow) var(--openbot-ease-out);
+}
+
+.site-header-actions {
+  grid-column: 3;
+  justify-self: end;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.site-menu-button,
+.site-sheet {
+  display: none;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .site-nav-trigger:hover {
+    color: var(--openbot-text-primary);
+  }
+
+  .site-panel-row:hover,
+  .site-panel-plugin:hover,
+  .site-panel-index:hover {
+    background: var(--site-nav-hover, rgba(255, 255, 255, 0.05));
+  }
+
+  .site-panel-feature:hover .site-panel-feature-art {
+    transform: scale(1.06);
+  }
+
+  .site-panel-row:hover .site-panel-row-art,
+  .site-panel-plugin:hover .site-panel-plugin-mark {
+    transform: scale(1.06);
+  }
+
+  .site-panel-index:hover svg {
+    transform: translateX(3px);
+  }
+}
+
+/* The header on a narrow screen: the brand, the download button and a menu
+   button that opens the sheet. 900px is MOBILE_HEADER_QUERY in SiteMobileMenu. */
+@media (max-width: 900px) {
+  .landing-header {
+    display: flex;
+    justify-content: space-between;
+  }
+
+  .site-nav,
+  .site-header-actions > .site-header-secondary {
+    display: none;
+  }
+
+  .site-menu-button {
+    position: relative;
+    width: 38px;
+    height: 38px;
+    display: inline-grid;
+    place-items: center;
+    padding: 0;
+    border: 0;
+    border-radius: var(--openbot-radius-pill);
+    background: rgba(255, 255, 255, 0.04);
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08);
+    color: var(--openbot-text-primary);
+    cursor: pointer;
+  }
+
+  .site-menu-button:focus-visible {
+    outline: 0;
+    box-shadow: 0 0 0 3px var(--openbot-accent-strong);
+  }
+
+  .site-menu-button-line {
+    position: absolute;
+    width: 15px;
+    height: 1.5px;
+    border-radius: 1px;
+    background: currentColor;
+    transform: translateY(-3.5px);
+    transition: transform 360ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .site-menu-button-line + .site-menu-button-line {
+    transform: translateY(3.5px);
+  }
+
+  .site-menu-button[aria-expanded="true"] .site-menu-button-line {
+    transform: rotate(45deg);
+  }
+
+  .site-menu-button[aria-expanded="true"] .site-menu-button-line + .site-menu-button-line {
+    transform: rotate(-45deg);
+  }
+
+  /* Fixed to the window, and under the header row inside the header's own
+     stacking context, so the brand and the close button stay on top of it. */
+  .site-sheet {
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    display: block;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 84px 16px 32px;
+    background: rgba(20, 20, 20, 0.88);
+    opacity: 0;
+    visibility: hidden;
+    backdrop-filter: blur(32px) saturate(160%);
+    transition:
+      opacity 220ms ease,
+      visibility 0s linear 220ms;
+  }
+
+  .site-sheet[data-state="open"] {
+    opacity: 1;
+    visibility: visible;
+    transition: opacity 260ms ease;
+  }
+
+  .site-sheet-content {
+    max-width: 560px;
+    display: flex;
+    flex-direction: column;
+    gap: 22px;
+    margin: 0 auto;
+  }
+
+  .site-sheet-section,
+  .site-sheet-actions {
+    opacity: 0;
+    filter: blur(6px);
+    transform: translateY(-12px);
+    transition:
+      opacity 200ms ease,
+      filter 200ms ease,
+      transform 200ms ease;
+  }
+
+  .site-sheet[data-state="open"] .site-sheet-section,
+  .site-sheet[data-state="open"] .site-sheet-actions {
+    opacity: 1;
+    filter: none;
+    transform: none;
+    transition:
+      opacity 380ms ease,
+      filter 460ms cubic-bezier(0.32, 0.72, 0, 1),
+      transform 560ms cubic-bezier(0.32, 0.72, 0, 1);
+    transition-delay: calc(var(--site-sheet-index) * 50ms + 40ms);
+  }
+
+  .site-sheet-heading {
+    margin: 0 0 8px 6px;
+    color: var(--openbot-text-dim);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .site-sheet .site-panel {
+    width: auto;
+    padding: 6px;
+    border-radius: 18px;
+    background: rgba(255, 255, 255, 0.03);
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.07);
+  }
+
+  .site-sheet .site-panel-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .site-sheet .site-panel-feature {
+    min-height: 132px;
+  }
+
+  .site-sheet .site-panel-footer {
+    margin: 6px -6px -6px;
+  }
+
+  /* A page with no panel, drawn as one row in the same frame the panels use. */
+  .site-sheet-link {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 18px;
+    border-radius: 18px;
+    background: color-mix(in srgb, var(--openbot-text-primary) 3%, transparent);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--openbot-text-primary) 7%, transparent);
+    color: var(--openbot-text-primary);
+    font-size: 15px;
+    font-weight: 500;
+    text-decoration: none;
+  }
+
+  .site-sheet-link svg {
+    width: 16px;
+    height: 16px;
+    color: var(--openbot-text-muted);
+  }
+
+  .site-sheet-link:focus-visible {
+    outline: 2px solid var(--openbot-border-focus);
+    outline-offset: 2px;
+  }
+
+  .site-sheet-actions {
+    display: flex;
+    gap: 8px;
+  }
+
+  /* Keep the scrollbar's space, so the header does not jump sideways when the page locks. */
+  html[data-site-sheet-open] {
+    overflow: hidden;
+    scrollbar-gutter: stable;
+  }
+}
+
+@media (max-width: 480px) {
+  .site-sheet .site-panel-plugins {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 .landing-actions {
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 10px;
-}
-
-/* A quiet text link among the buttons. It keeps their height and pill radius so
-   the row stays on one baseline and the focus ring matches theirs. */
-.landing-header-link {
-  display: inline-flex;
-  align-items: center;
-  height: 38px;
-  padding: 0 12px;
-  border-radius: var(--openbot-radius-pill);
-  color: var(--openbot-text-secondary);
-  font-size: 13px;
-  font-weight: 500;
-  letter-spacing: -0.01em;
-  transition: color 160ms ease;
-}
-
-.landing-header-link:focus-visible {
-  outline: 0;
-  box-shadow: 0 0 0 3px var(--openbot-accent-strong);
 }
 
 .landing-button {
@@ -595,6 +1220,11 @@ a {
   line-height: 1;
   white-space: nowrap;
   vertical-align: -0.04em;
+}
+
+/* A provider and the comma after it, so that a line never starts with the comma. */
+.landing-provider-item {
+  white-space: nowrap;
 }
 
 .landing-provider-logo {
@@ -1080,17 +1710,52 @@ a {
   text-wrap: balance;
 }
 
+.landing-pricing-compare {
+  margin: 20px 0 0;
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+.landing-pricing-compare a {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--openbot-text-secondary);
+  text-decoration: none;
+  transition: color 160ms ease;
+}
+
+.landing-pricing-compare a:hover,
+.landing-pricing-compare a:focus-visible {
+  color: var(--openbot-text-primary);
+}
+
+.landing-pricing-compare-arrow {
+  width: 16px;
+  height: 16px;
+  transition: transform 160ms ease;
+}
+
+.landing-pricing-compare a:hover .landing-pricing-compare-arrow {
+  transform: translateX(2px);
+}
+
 .landing-pricing [data-revealed="false"] {
   opacity: 0;
 }
 
 .landing-pricing-eyebrow[data-revealed="true"],
-.landing-pricing-note[data-revealed="true"] {
+.landing-pricing-note[data-revealed="true"],
+.landing-pricing-compare[data-revealed="true"] {
   animation: landing-download-reveal 760ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
 }
 
 .landing-pricing-note[data-revealed="true"] {
   animation-delay: 320ms;
+}
+
+.landing-pricing-compare[data-revealed="true"] {
+  animation-delay: 440ms;
 }
 
 /* The figure does not use the shared card reveal: the light arriving is the
@@ -1209,8 +1874,8 @@ a {
 
 .landing-footer-columns {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: clamp(40px, 6vw, 88px);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: clamp(32px, 4vw, 56px);
   padding-top: 7px;
 }
 
@@ -1411,8 +2076,12 @@ a {
   animation: landing-enter var(--openbot-duration-overlay) var(--openbot-ease-out) both;
 }
 
+/* Backwards, not both: a transform left on the header after it has arrived
+   would make it the containing block of the mobile sheet, which is fixed to the
+   window. */
 [data-enter="header"] {
   animation-name: landing-header-enter;
+  animation-fill-mode: backwards;
 }
 
 [data-enter="preview"] {
@@ -1456,10 +2125,6 @@ a {
 @media (hover: hover) and (pointer: fine) {
   .landing-button {
     cursor: pointer;
-  }
-
-  .landing-header-link:hover {
-    color: var(--openbot-text-primary);
   }
 
   .landing-button-primary:hover {
@@ -1520,6 +2185,46 @@ a {
   }
 }
 
+/* After the button rules, which it resizes. The sheet shows only below the header breakpoint. */
+@media (max-width: 900px) {
+  .site-sheet-actions > .landing-button {
+    flex: 1 1 0;
+    height: 44px;
+  }
+}
+
+/* The header menu still fades, but nothing slides, grows, turns or staggers. */
+@media (prefers-reduced-motion: reduce) {
+  .site-nav-pill,
+  .site-nav-chevron,
+  .site-panel-feature-art,
+  .site-panel-plugin-mark,
+  .site-panel-index svg,
+  .site-menu-button-line {
+    transition: none;
+  }
+
+  .site-nav-surface,
+  .site-nav[data-state="open"] .site-nav-surface {
+    transform: translateX(var(--site-nav-surface-x, 0));
+    transition: opacity 160ms ease;
+  }
+
+  .site-nav-panel[data-motion] {
+    --site-nav-shift: 0px;
+    --site-nav-rise: 0px;
+  }
+
+  .site-sheet .site-sheet-section,
+  .site-sheet .site-sheet-actions,
+  .site-sheet[data-state="open"] .site-sheet-section,
+  .site-sheet[data-state="open"] .site-sheet-actions {
+    filter: none;
+    transform: none;
+    transition: opacity 200ms ease;
+  }
+}
+
 @media (max-width: 959px) {
   .landing-preview {
     aspect-ratio: auto;
@@ -1543,7 +2248,7 @@ a {
   }
 
   .landing-footer-columns {
-    max-width: 520px;
+    max-width: 680px;
   }
 
   .landing-footer-bottom {
@@ -1555,11 +2260,14 @@ a {
 @media (max-width: 640px) {
   .landing-header {
     min-height: 68px;
+    flex-wrap: wrap;
     gap: 12px;
+    row-gap: 10px;
     padding: 15px 16px;
   }
 
   .landing-brand {
+    flex-shrink: 0;
     gap: 8px;
     font-size: 15px;
   }
@@ -1567,22 +2275,6 @@ a {
   .landing-brand-logo {
     width: 25px;
     height: 25px;
-  }
-
-  .landing-navigation {
-    gap: 7px;
-  }
-
-  .landing-navigation .landing-button-sm {
-    height: 36px;
-    padding-inline: 13px;
-    font-size: 12px;
-  }
-
-  .landing-header-link {
-    height: 36px;
-    padding-inline: 9px;
-    font-size: 12px;
   }
 
   .landing-hero {
@@ -1692,6 +2384,7 @@ a {
   }
 
   .landing-footer-columns {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 32px;
   }
 
@@ -1707,12 +2400,6 @@ a {
 
   .landing-glow {
     min-height: 300px;
-  }
-}
-
-@media (max-width: 420px) {
-  .landing-header-contact {
-    display: none;
   }
 }
 
@@ -1834,7 +2521,9 @@ a {
    `place-items` is what centres that title without a second positioned layer. */
 .post-featured-art,
 .post-card-art,
-.post-article-art {
+.post-article-art,
+.plugin-card-art,
+.plugin-prompts-card {
   position: relative;
   display: grid;
   place-items: center;
@@ -1864,6 +2553,13 @@ a {
   border-radius: 14px;
 }
 
+/* Squarer than an article card: what sits in the middle is a mark rather than a
+   line of words, and a wide frame leaves it stranded in empty colour. */
+.plugin-card-art {
+  aspect-ratio: 4 / 3;
+  border-radius: 12px;
+}
+
 /* Layer order inside the frame, bottom to top: the CSS approximation and the
    generated PNG are two backgrounds of this element, and the shader canvas is
    prepended by the library at z-index -1, which paints over a background but
@@ -1871,6 +2567,14 @@ a {
 .post-gradient {
   position: absolute;
   inset: 0;
+  /* Clipped three ways, for the one picture. The canvas is prepended at z-index -1,
+     and Firefox on a GPU gives it a compositing layer of its own: a layer is not cut
+     by an ancestor's rounded corner, so the picture stayed square inside a round card.
+     `isolation` keeps the negative layer in this host rather than in a stacking context
+     further up, `overflow` cuts it here, and the corner on the canvas itself is what
+     rounds the layer when the other two are composited around it. */
+  isolation: isolate;
+  overflow: hidden;
   border-radius: inherit;
   background-position: center;
   background-size: cover;
@@ -1881,6 +2585,7 @@ a {
    a frame, and it arrives as a fade: the picture underneath it is the same first
    frame, so a reader sees the artwork start to move rather than change. */
 .post-gradient > canvas {
+  border-radius: inherit;
   opacity: 0;
   transition: opacity var(--openbot-duration-slow) var(--openbot-ease-out);
 }
@@ -2509,5 +3214,3313 @@ a {
   .post-media-toggle {
     transition: none;
     transform: none;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   Reading progress, on news, guides and comparisons.
+
+   One segment per section, as long as the section. The part the reader has
+   passed is OpenBot's lilac, and the segment they are in glows at the point
+   they have reached. Pointing at the rail brings in the titles through the
+   same blur as the header menu, over a scrim with no edge.
+   ------------------------------------------------------------------------- */
+
+.reading-progress {
+  --reading-accent: var(--openbot-logo-production);
+  --reading-track: rgba(255, 255, 255, 0.1);
+  --reading-glow: color-mix(in srgb, var(--reading-accent) 60%, transparent);
+  /* The header menu's motion. Its tokens live on .site-nav, out of reach here. */
+  --reading-ease: cubic-bezier(0.32, 0.72, 0, 1);
+  --reading-duration: 460ms;
+  --reading-quick: 300ms;
+  --reading-blur: 8px;
+}
+
+/* Narrow screens: a line across the top of the viewport. */
+.reading-progress-line {
+  position: fixed;
+  top: 0;
+  right: 0;
+  left: 0;
+  z-index: 60;
+  height: 2px;
+  background: linear-gradient(90deg, color-mix(in srgb, var(--reading-accent) 25%, transparent), var(--reading-accent));
+  box-shadow: 0 0 12px var(--reading-glow);
+  opacity: 0;
+  pointer-events: none;
+  transform: scaleX(var(--reading-progress, 0));
+  transform-origin: left center;
+  transition: opacity 240ms ease;
+}
+
+.reading-progress[data-visible="true"] .reading-progress-line {
+  opacity: 1;
+}
+
+.reading-progress-rail {
+  display: none;
+}
+
+@media (min-width: 1200px) {
+  .reading-progress-line {
+    display: none;
+  }
+
+  /* Only the bars take the pointer until the rail opens, so the text beside it
+     stays selectable. */
+  .reading-progress-rail {
+    position: fixed;
+    top: 50%;
+    right: 12px;
+    z-index: 30;
+    width: 280px;
+    height: min(64vh, 600px);
+    display: flex;
+    flex-direction: column;
+    padding: 14px 0;
+    opacity: 0;
+    pointer-events: none;
+    transform: translate(8px, -50%);
+    transition:
+      opacity 300ms ease,
+      transform var(--reading-duration) var(--reading-ease);
+  }
+
+  .reading-progress[data-visible="true"] .reading-progress-rail,
+  .reading-progress-rail:focus-within {
+    opacity: 1;
+    transform: translate(0, -50%);
+  }
+
+  .reading-progress-rail:hover,
+  .reading-progress-rail:focus-within {
+    pointer-events: auto;
+  }
+
+  /* A scrim in the page colour, with no edge of its own. It darkens only where
+     the titles are, so they stay legible over wide content such as the
+     comparison cards, and on plain text it does not show at all. */
+  .reading-progress-surface {
+    position: absolute;
+    inset: -64px -12px -64px -64px;
+    background: linear-gradient(
+      to left,
+      var(--openbot-bg-canvas) 0%,
+      color-mix(in srgb, var(--openbot-bg-canvas) 92%, transparent) 55%,
+      transparent 100%
+    );
+    mask-image: linear-gradient(to bottom, transparent, #000 64px, #000 calc(100% - 64px), transparent);
+    opacity: 0;
+    transition: opacity 200ms ease;
+  }
+
+  .reading-progress-eyebrow {
+    position: relative;
+    display: flex;
+    justify-content: space-between;
+    margin: 0 0 12px;
+    padding: 0 20px 0 18px;
+    color: var(--openbot-text-dim);
+    font-family: var(--openbot-font-mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    opacity: 0;
+    transition: opacity 200ms ease;
+  }
+
+  .reading-progress-count {
+    color: var(--reading-accent);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .reading-progress-list {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .reading-progress-item {
+    flex-basis: 0;
+    min-height: 22px;
+    display: flex;
+  }
+
+  .reading-progress-link {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    gap: 14px;
+    padding-left: 18px;
+    color: var(--openbot-text-muted);
+    text-decoration: none;
+    outline: none;
+  }
+
+  .reading-progress-item[data-state="read"] .reading-progress-link {
+    color: var(--openbot-text-secondary);
+  }
+
+  .reading-progress-item[data-state="active"] .reading-progress-link,
+  .reading-progress-link:hover,
+  .reading-progress-link:focus-visible {
+    color: var(--openbot-text-primary);
+  }
+
+  .reading-progress-label {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    margin-top: -3px;
+    font-size: 12.5px;
+    line-height: 18px;
+    text-align: right;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    opacity: 0;
+    filter: blur(var(--reading-blur));
+    transform: translateX(8px);
+    transition:
+      color 200ms ease,
+      opacity 200ms ease,
+      filter 200ms ease,
+      transform 240ms var(--reading-ease);
+  }
+
+  .reading-progress-link:focus-visible .reading-progress-label {
+    text-decoration: underline;
+    text-decoration-color: var(--reading-accent);
+    text-underline-offset: 4px;
+  }
+
+  /* A hit area wider than the 2px bar it holds. */
+  .reading-progress-bar {
+    position: relative;
+    width: 20px;
+    flex: none;
+    padding-bottom: 4px;
+  }
+
+  .reading-progress[data-visible="true"] .reading-progress-bar {
+    pointer-events: auto;
+  }
+
+  .reading-progress-bar::before,
+  .reading-progress-fill {
+    content: "";
+    position: absolute;
+    top: 0;
+    right: 9px;
+    bottom: 4px;
+    width: 2px;
+    border-radius: 2px;
+    transition:
+      width 300ms var(--reading-ease),
+      right 300ms var(--reading-ease),
+      background-color 300ms ease;
+  }
+
+  .reading-progress-bar::before {
+    background: var(--reading-track);
+  }
+
+  .reading-progress-fill {
+    background: var(--reading-accent);
+    transform: scaleY(var(--reading-fill, 0));
+    transform-origin: top center;
+  }
+
+  .reading-progress-item[data-state="active"] .reading-progress-bar::before,
+  .reading-progress-item[data-state="active"] .reading-progress-fill {
+    right: 8.5px;
+    width: 3px;
+  }
+
+  .reading-progress-item[data-state="active"] .reading-progress-fill {
+    box-shadow: 0 0 10px var(--reading-glow);
+  }
+
+  /* The reading head: where the reader is inside the current section. */
+  .reading-progress-item[data-state="active"] .reading-progress-bar::after {
+    content: "";
+    position: absolute;
+    top: calc((100% - 4px) * var(--reading-fill, 0));
+    right: 7px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--reading-accent);
+    box-shadow:
+      0 0 0 3px color-mix(in srgb, var(--reading-accent) 18%, transparent),
+      0 0 12px var(--reading-glow);
+    transform: translateY(-50%);
+  }
+
+  .reading-progress-rail:hover .reading-progress-surface,
+  .reading-progress-rail:focus-within .reading-progress-surface {
+    opacity: 1;
+    transition: opacity 240ms ease;
+  }
+
+  .reading-progress-rail:hover .reading-progress-eyebrow,
+  .reading-progress-rail:focus-within .reading-progress-eyebrow {
+    opacity: 1;
+  }
+
+  .reading-progress-rail:hover .reading-progress-label,
+  .reading-progress-rail:focus-within .reading-progress-label {
+    opacity: 1;
+    filter: blur(0);
+    transform: none;
+    transition:
+      color 200ms ease,
+      opacity var(--reading-quick) ease calc(var(--reading-index, 0) * 18ms),
+      filter var(--reading-quick) ease calc(var(--reading-index, 0) * 18ms),
+      transform var(--reading-duration) var(--reading-ease) calc(var(--reading-index, 0) * 18ms);
+  }
+}
+
+/* The rules above name their own transitions, which outrank the global
+   reduced-motion rule, so the titles would still slide and blur in. */
+@media (prefers-reduced-motion: reduce) {
+  .reading-progress[data-visible] .reading-progress-line,
+  .reading-progress[data-visible] .reading-progress-rail,
+  .reading-progress[data-visible] .reading-progress-rail *,
+  .reading-progress[data-visible] .reading-progress-rail *::before,
+  .reading-progress[data-visible] .reading-progress-rail *::after {
+    transition: none;
+  }
+}
+
+/* A heading that a section link opens sits clear of the top edge. */
+.post-article-body h2,
+.compare-article h2 {
+  scroll-margin-top: 32px;
+}
+
+/* ---------------------------------------------------------------------------
+   /compare and /compare/<slug>.
+
+   A comparison is read as a set of answers, so the page is built from blocks
+   rather than prose: the two marks side by side over the artwork, the short
+   answer, a table, a pair of cards per topic, the questions, and the sources.
+   Each side keeps one accent the whole way down (`--compare-accent`), so a reader
+   can tell which column is which without reading the label again. OpenBot's is
+   its own lilac and the rival's is a quiet grey, so OpenBot is the side the eye
+   goes to. Where one side is better, the page marks it in green
+   (`--openbot-success`), with a check and a word, never with colour alone.
+   ------------------------------------------------------------------------- */
+
+.compare-page [data-side="openbot"] {
+  --compare-accent: var(--openbot-logo-production);
+}
+
+.compare-page [data-side="rival"] {
+  --compare-accent: var(--openbot-text-muted);
+}
+
+/* One centred column for the hero and every section under it. */
+.compare-article {
+  width: min(100%, 1160px);
+}
+
+.compare-hero {
+  display: grid;
+  grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.05fr);
+  align-items: center;
+  gap: clamp(28px, 4vw, 64px);
+  margin-top: clamp(20px, 3vw, 36px);
+}
+
+.compare-hero-copy {
+  min-width: 0;
+}
+
+.compare-eyebrow {
+  margin: 22px 0 0;
+  color: var(--openbot-text-dim);
+  font-family: var(--openbot-font-mono);
+  font-size: 12px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.compare-title {
+  margin: 12px 0 0;
+  font-size: clamp(32px, 4vw, 54px);
+  font-weight: 600;
+  letter-spacing: -0.045em;
+  line-height: 1.04;
+  text-wrap: balance;
+}
+
+.compare-nowrap {
+  white-space: nowrap;
+}
+
+.compare-standfirst {
+  max-width: 48ch;
+  margin: 18px 0 0;
+  color: var(--openbot-text-secondary);
+  font-size: clamp(16px, 1.5vw, 18px);
+  line-height: 1.55;
+}
+
+.compare-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 7px;
+  margin-top: 20px;
+}
+
+.compare-meta a,
+.compare-sources-note a {
+  color: var(--openbot-text-muted);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  transition: color var(--openbot-duration-normal) ease;
+}
+
+/* The artwork frame, the same shape as the featured article on /news. The
+   gradient host inside carries the Firefox corner fix (see `.post-gradient`).
+
+   The frame itself only rises; the artwork and the plate fade on their own. The
+   plate is frosted, and Chromium paints no backdrop filter while an ancestor
+   fades or blurs (see `.site-panel-feature-badge`), so nothing that holds the
+   plate may animate its opacity or a filter. */
+.compare-stage {
+  position: relative;
+  display: grid;
+  place-items: center;
+  aspect-ratio: 19 / 10;
+  overflow: hidden;
+  border: 1px solid var(--openbot-border-strong);
+  border-radius: 16px;
+  pointer-events: none;
+  animation: compare-rise 720ms cubic-bezier(0.22, 1, 0.36, 1) 160ms backwards;
+}
+
+.compare-stage-art {
+  animation: compare-fade 900ms cubic-bezier(0.22, 1, 0.36, 1) 160ms backwards;
+}
+
+/* One frosted plate holds both marks, split by a hairline with "vs" on it: two
+   brands side by side, not a scoreboard. The table below gives the score. */
+.compare-marks {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  padding: clamp(20px, 2.4vw, 32px) clamp(22px, 3vw, 40px);
+  border-radius: 20px;
+  background: rgba(14, 14, 18, 0.26);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.14);
+  -webkit-backdrop-filter: blur(24px) saturate(1.4);
+  backdrop-filter: blur(24px) saturate(1.4);
+  animation: compare-plate-in 800ms cubic-bezier(0.22, 1, 0.36, 1) 320ms backwards;
+}
+
+.compare-mark {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  min-width: clamp(96px, 9vw, 128px);
+  color: var(--openbot-text-primary);
+  animation: compare-mark-in 800ms cubic-bezier(0.22, 1, 0.36, 1) 420ms backwards;
+}
+
+.compare-mark[data-side="rival"] {
+  --compare-from: 10px;
+}
+
+.compare-mark-logo {
+  width: clamp(44px, 5vw, 68px);
+  height: clamp(44px, 5vw, 68px);
+}
+
+.compare-mark-rival {
+  color: var(--openbot-text-primary);
+}
+
+.compare-mark-name {
+  color: rgba(255, 255, 255, 0.86);
+  font-size: clamp(13px, 1.1vw, 15px);
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+
+.compare-vs {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  align-self: stretch;
+  gap: 8px;
+  margin-inline: clamp(14px, 2.2vw, 32px);
+  color: rgba(255, 255, 255, 0.62);
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+}
+
+.compare-vs::before,
+.compare-vs::after {
+  flex: 1;
+  width: 1px;
+  background: rgba(255, 255, 255, 0.2);
+  content: "";
+}
+
+/* Each mark moves in a little from its own side. No blur: a filter under the
+   plate would take its frosted backdrop away. */
+@keyframes compare-plate-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 10px, 0) scale(0.98);
+  }
+}
+
+@keyframes compare-mark-in {
+  from {
+    opacity: 0;
+    transform: translate3d(var(--compare-from, -10px), 0, 0);
+  }
+}
+
+@keyframes compare-rise {
+  from {
+    border-color: var(--openbot-transparent);
+    transform: translate3d(0, 16px, 0);
+  }
+}
+
+@keyframes compare-fade {
+  from {
+    opacity: 0;
+  }
+}
+
+.compare-section {
+  margin-top: clamp(56px, 7vw, 96px);
+}
+
+.compare-heading {
+  margin: 0;
+  font-size: clamp(24px, 2.4vw, 32px);
+  font-weight: 600;
+  letter-spacing: -0.035em;
+  line-height: 1.15;
+  text-wrap: balance;
+}
+
+.compare-answer-text {
+  max-width: 62ch;
+  margin: 16px 0 0;
+  color: var(--openbot-text-secondary);
+  font-size: clamp(17px, 1.6vw, 20px);
+  line-height: 1.55;
+}
+
+.compare-glance-summary {
+  margin: 10px 0 0;
+  color: var(--openbot-text-muted);
+  font-size: 15px;
+}
+
+/* The plans an agent can run on, each with its provider's logo in its own colour
+   (`--openbot-provider-current`, from `data-provider` on the logo). Plain cards:
+   the logos are the colour on this part of the page. */
+.compare-plans-lead {
+  max-width: 62ch;
+  margin: 14px 0 0;
+  color: var(--openbot-text-secondary);
+  font-size: clamp(16px, 1.4vw, 18px);
+  line-height: 1.6;
+}
+
+.compare-plans-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin: 24px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.compare-plan {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-content: start;
+  column-gap: 14px;
+  row-gap: 3px;
+  padding: 16px 18px;
+  border: 1px solid var(--openbot-border);
+  border-radius: 14px;
+  background: var(--openbot-bg-surface);
+}
+
+.compare-plan-logo-frame {
+  display: grid;
+  grid-row: span 2;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.05);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.07);
+}
+
+.compare-plan-logo {
+  width: 20px;
+  height: 20px;
+  overflow: visible;
+  fill: var(--openbot-provider-current);
+}
+
+.compare-plan-logo-custom {
+  fill: none;
+  color: var(--openbot-text-primary);
+}
+
+.compare-plan-name {
+  align-self: end;
+  color: var(--openbot-text-primary);
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.compare-plan-text {
+  color: var(--openbot-text-muted);
+  font-size: 13.5px;
+  line-height: 1.45;
+}
+
+.compare-plans-rival {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 18px 0 0;
+  color: var(--openbot-text-muted);
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+.compare-plans-rival strong {
+  color: var(--openbot-text-secondary);
+  font-weight: 600;
+}
+
+.compare-plans-rival-logo {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin-top: 0.12em;
+}
+
+/* What the two share, set apart between the table and the details. */
+.compare-intro {
+  max-width: 62ch;
+  margin: clamp(56px, 7vw, 96px) auto 0;
+  color: var(--openbot-text-secondary);
+  font-size: clamp(17px, 1.6vw, 19px);
+  line-height: 1.7;
+  text-align: center;
+  text-wrap: pretty;
+}
+
+.compare-pair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: clamp(14px, 1.6vw, 20px);
+  margin-top: 22px;
+}
+
+/* A card per side. The accent is a soft light from the top corner and a short
+   line on the top edge: enough to tell the sides apart, not enough to shout. */
+.compare-card {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+  padding: clamp(20px, 2.2vw, 28px);
+  border: 1px solid var(--openbot-border);
+  border-radius: 16px;
+  background:
+    radial-gradient(
+      120% 80% at 0% 0%,
+      color-mix(in srgb, var(--compare-accent) 9%, var(--openbot-transparent)),
+      var(--openbot-transparent) 60%
+    ),
+    var(--openbot-bg-surface);
+}
+
+.compare-card[data-better] {
+  border-color: color-mix(in srgb, var(--compare-accent) 34%, var(--openbot-border));
+  background:
+    radial-gradient(
+      120% 90% at 0% 0%,
+      color-mix(in srgb, var(--compare-accent) 16%, var(--openbot-transparent)),
+      var(--openbot-transparent) 62%
+    ),
+    var(--openbot-bg-surface);
+}
+
+.compare-card::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: clamp(20px, 2.2vw, 28px);
+  width: 44px;
+  height: 2px;
+  border-radius: 0 0 2px 2px;
+  background: var(--compare-accent);
+  opacity: 0.8;
+}
+
+.compare-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 12px;
+}
+
+.compare-card-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  color: var(--openbot-text-primary);
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.compare-side-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.compare-side-logo {
+  width: 22px;
+  height: 22px;
+}
+
+.compare-card-text {
+  margin: 14px 0 0;
+  color: var(--openbot-text-secondary);
+  font-size: 15px;
+  line-height: 1.65;
+}
+
+.compare-choice-list {
+  display: grid;
+  gap: 10px;
+  margin: 16px 0 0;
+  padding: 0;
+  color: var(--openbot-text-secondary);
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+.compare-choice-list li {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.compare-choice-check {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin-top: 0.15em;
+  color: var(--openbot-success);
+  stroke-width: 2.6;
+}
+
+.compare-choice-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  margin: 0.6em 5px 0;
+  border-radius: 50%;
+  background: var(--openbot-text-dim);
+}
+
+.compare-better-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px 4px 8px;
+  border-radius: var(--openbot-radius-pill);
+  background: color-mix(in srgb, var(--openbot-success) 14%, var(--openbot-transparent));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--openbot-success) 30%, var(--openbot-transparent));
+  color: var(--openbot-success-text);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+.compare-better-badge-icon {
+  width: 13px;
+  height: 13px;
+  stroke-width: 2.8;
+}
+
+.compare-table-frame {
+  margin-top: 22px;
+  overflow-x: auto;
+  border: 1px solid var(--openbot-border);
+  border-radius: 16px;
+  background: var(--openbot-bg-surface);
+}
+
+.compare-table {
+  width: 100%;
+  min-width: 560px;
+  border-collapse: collapse;
+  font-size: 15px;
+  line-height: 1.5;
+  text-align: left;
+}
+
+.compare-table th,
+.compare-table td {
+  padding: 16px clamp(14px, 1.8vw, 22px);
+  vertical-align: top;
+}
+
+.compare-table thead th {
+  border-bottom: 1px solid var(--openbot-border-strong);
+  background: var(--openbot-bg-surface-raised);
+  color: var(--openbot-text-primary);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.compare-table thead th:first-child {
+  width: 24%;
+}
+
+.compare-table-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.compare-table-logo {
+  width: 22px;
+  height: 22px;
+}
+
+/* OpenBot's column is lit the whole way down, the way a pricing table marks the
+   plan it recommends. */
+.compare-table thead th[data-side="openbot"] {
+  box-shadow: inset 0 2px 0 var(--compare-accent);
+}
+
+.compare-table [data-side="openbot"] {
+  background: color-mix(in srgb, var(--compare-accent) 5%, var(--openbot-transparent));
+}
+
+.compare-table td[data-better] {
+  color: var(--openbot-text-primary);
+}
+
+.compare-better-mark {
+  display: grid;
+  float: left;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  margin: 1px 9px 0 0;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--openbot-success) 18%, var(--openbot-transparent));
+  color: var(--openbot-success);
+}
+
+.compare-better-icon {
+  width: 12px;
+  height: 12px;
+  stroke-width: 3;
+}
+
+.compare-table tbody tr + tr {
+  border-top: 1px solid var(--openbot-border);
+}
+
+.compare-table tbody th {
+  color: var(--openbot-text-primary);
+  font-weight: 500;
+}
+
+.compare-table td {
+  color: var(--openbot-text-secondary);
+}
+
+.compare-topic {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.compare-topic-icon {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin-top: 2px;
+  color: var(--openbot-text-muted);
+}
+
+.compare-faq-list {
+  interpolate-size: allow-keywords;
+  margin-top: 18px;
+  border-top: 1px solid var(--openbot-border);
+}
+
+.compare-faq-item {
+  border-bottom: 1px solid var(--openbot-border);
+}
+
+/* The panel grows to its own height where the browser can animate to `auto`;
+   elsewhere it opens at once, which is what a `details` does anyway. */
+.compare-faq-item::details-content {
+  block-size: 0;
+  overflow: clip;
+  transition:
+    block-size var(--openbot-duration-normal) var(--openbot-ease-out),
+    content-visibility var(--openbot-duration-normal) allow-discrete;
+}
+
+.compare-faq-item[open]::details-content {
+  block-size: auto;
+}
+
+.compare-faq-question {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 2px;
+  cursor: pointer;
+  color: var(--openbot-text-primary);
+  font-size: 17px;
+  font-weight: 500;
+  letter-spacing: -0.015em;
+  list-style: none;
+}
+
+.compare-faq-question::-webkit-details-marker {
+  display: none;
+}
+
+.compare-faq-question:focus-visible {
+  border-radius: 8px;
+  outline: 2px solid var(--openbot-border-focus);
+  outline-offset: 2px;
+}
+
+.compare-faq-chevron {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  color: var(--openbot-text-muted);
+  transition: transform var(--openbot-duration-normal) var(--openbot-ease-out);
+}
+
+.compare-faq-item[open] .compare-faq-chevron {
+  transform: rotate(180deg);
+}
+
+.compare-faq-answer {
+  max-width: 70ch;
+  margin: 0;
+  padding: 0 2px 20px;
+  color: var(--openbot-text-secondary);
+  font-size: 15px;
+  line-height: 1.65;
+}
+
+.compare-sources-note {
+  max-width: 68ch;
+  margin: 14px 0 0;
+  color: var(--openbot-text-muted);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.compare-sources-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 24px;
+  margin: 18px 0 0;
+  padding: 0;
+}
+
+.compare-sources-list a {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--openbot-text-secondary);
+  font-size: 14px;
+  transition: color var(--openbot-duration-normal) ease;
+}
+
+.compare-sources-icon {
+  width: 14px;
+  height: 14px;
+  color: var(--openbot-text-dim);
+}
+
+/* Scroll reveals. The heading leads; the parts under it follow in reading order,
+   and the table rows and questions sweep in one by one. */
+.compare-section[data-revealed="false"] > *,
+.compare-section[data-revealed="false"] .compare-table tbody tr,
+.compare-section[data-revealed="false"] .compare-plan,
+.compare-section[data-revealed="false"] .compare-faq-item {
+  opacity: 0;
+}
+
+.compare-section[data-revealed="true"] > * {
+  animation: landing-download-reveal 720ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+}
+
+.compare-section[data-revealed="true"] > :nth-child(2) {
+  animation-delay: 90ms;
+}
+
+.compare-section[data-revealed="true"] > :nth-child(n + 3) {
+  animation-delay: 180ms;
+}
+
+.compare-section[data-revealed="true"] .compare-pair > :nth-child(2) {
+  animation: landing-download-reveal 720ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+  animation-delay: 200ms;
+}
+
+.compare-section[data-revealed="true"] .compare-table tbody tr,
+.compare-section[data-revealed="true"] .compare-plan,
+.compare-section[data-revealed="true"] .compare-faq-item {
+  animation: landing-download-reveal 620ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+  animation-delay: calc(160ms + var(--compare-index, 0) * 70ms);
+}
+
+/* /compare */
+.compare-index-hero {
+  position: relative;
+  isolation: isolate;
+  padding: clamp(28px, 5vw, 72px) 0 clamp(8px, 2vw, 24px);
+  text-align: center;
+}
+
+.compare-index-hero .landing-hero-grid {
+  z-index: -1;
+}
+
+.compare-index-hero .compare-eyebrow {
+  margin-top: 0;
+}
+
+.compare-index-title {
+  margin: 12px 0 0;
+  font-size: clamp(36px, 5vw, 64px);
+  font-weight: 600;
+  letter-spacing: -0.05em;
+  line-height: 1.02;
+}
+
+.compare-index-description {
+  max-width: 56ch;
+  margin: 18px auto 0;
+  color: var(--openbot-text-secondary);
+  font-size: clamp(16px, 1.5vw, 18px);
+  line-height: 1.55;
+}
+
+/* Cards keep one width and the row is centred, so one comparison sits in the
+   middle of the page rather than in the left half of it. */
+.compare-index-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(0, 560px));
+  justify-content: center;
+  gap: clamp(18px, 2vw, 26px);
+  margin-top: clamp(32px, 4vw, 56px);
+}
+
+.compare-index-card {
+  display: block;
+  min-width: 0;
+}
+
+.compare-index-card:focus-visible {
+  border-radius: 20px;
+  outline: 3px solid var(--openbot-border-focus);
+  outline-offset: 4px;
+}
+
+.compare-index-art {
+  position: relative;
+  display: grid;
+  place-items: center;
+  aspect-ratio: 19 / 10;
+  overflow: hidden;
+  border: 1px solid var(--openbot-border-strong);
+  border-radius: 14px;
+  pointer-events: none;
+}
+
+.compare-marks-small {
+  padding: clamp(16px, 1.8vw, 24px) clamp(18px, 2.2vw, 28px);
+  border-radius: 16px;
+}
+
+.compare-marks-small .compare-mark {
+  min-width: clamp(56px, 6vw, 80px);
+}
+
+.compare-marks-small .compare-vs {
+  margin-inline: clamp(10px, 1.6vw, 22px);
+}
+
+.compare-marks-small .compare-mark-logo {
+  width: clamp(32px, 3.4vw, 44px);
+  height: clamp(32px, 3.4vw, 44px);
+}
+
+.compare-index-copy {
+  padding: 16px 2px 0;
+}
+
+.compare-index-card-title {
+  margin: 0;
+  color: var(--openbot-text-primary);
+  font-size: clamp(18px, 1.7vw, 22px);
+  font-weight: 600;
+  letter-spacing: -0.025em;
+  line-height: 1.25;
+}
+
+.compare-index-card-description {
+  margin: 8px 0 0;
+  color: var(--openbot-text-muted);
+  font-size: 15px;
+  line-height: 1.55;
+}
+
+.compare-index-card-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 14px;
+  color: var(--openbot-text-secondary);
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.compare-index-card-arrow {
+  width: 15px;
+  height: 15px;
+  transition: transform var(--openbot-duration-normal) var(--openbot-ease-out);
+}
+
+/* The card only rises, and its parts fade one by one, for the reason given at
+   `.compare-stage`: the card holds a frosted plate. */
+.compare-index-grid[data-revealed="false"] .compare-index-card :is(.post-gradient, .compare-marks),
+.compare-index-grid[data-revealed="false"] .compare-index-copy {
+  opacity: 0;
+}
+
+.compare-index-grid[data-revealed="true"] .compare-index-card {
+  --compare-delay: calc(160ms + var(--compare-index, 0) * 80ms);
+  animation: compare-rise 720ms cubic-bezier(0.22, 1, 0.36, 1) var(--compare-delay) backwards;
+}
+
+.compare-index-grid[data-revealed="true"] .compare-index-card :is(.post-gradient, .compare-marks),
+.compare-index-grid[data-revealed="true"] .compare-index-copy {
+  animation: compare-fade 720ms cubic-bezier(0.22, 1, 0.36, 1) var(--compare-delay) backwards;
+}
+
+@media (max-width: 900px) {
+  .compare-hero {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .compare-plans-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 640px) {
+  /* Two narrow columns: the logo goes over the name. */
+  .compare-plans-grid {
+    gap: 10px;
+  }
+
+  .compare-plan {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 14px;
+  }
+
+  .compare-plan-logo-frame {
+    grid-row: auto;
+    margin-bottom: 10px;
+  }
+
+  .compare-pair,
+  .compare-sources-list,
+  .compare-index-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* Too narrow for three columns: each topic takes its own line, and the two
+     values sit side by side under it, below the two brand headers. The elements
+     stay a table, so a screen reader still reads a topic with its two cells. */
+  .compare-table {
+    display: block;
+    min-width: 0;
+    font-size: 14px;
+  }
+
+  .compare-table thead,
+  .compare-table tbody {
+    display: block;
+  }
+
+  .compare-table tr {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  /* Out of the grid but still in the table, so the brand headers keep their
+     columns: removed, "OpenBot" would head the topic column. */
+  .compare-table thead th:first-child {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    padding: 0;
+  }
+
+  .compare-table th,
+  .compare-table td {
+    padding: 12px 14px;
+  }
+
+  .compare-table tbody th {
+    grid-column: 1 / -1;
+    padding-bottom: 2px;
+  }
+
+  .compare-table td {
+    padding-top: 6px;
+  }
+
+  .compare-mark {
+    min-width: 0;
+    gap: 8px;
+  }
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .compare-meta a:hover,
+  .compare-sources-note a:hover,
+  .compare-sources-list a:hover {
+    color: var(--openbot-text-primary);
+  }
+
+  .compare-faq-question:hover .compare-faq-chevron {
+    color: var(--openbot-text-primary);
+  }
+
+  .compare-index-card:hover .compare-index-card-arrow {
+    transform: translateX(3px);
+  }
+
+  .compare-index-card:hover .compare-index-card-title {
+    color: var(--openbot-text-secondary);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* Named one by one for the reason given in the post block above: an attribute
+     selector outranks the global `*` escape. */
+  .compare-stage,
+  .compare-stage-art,
+  .compare-marks,
+  .compare-mark,
+  .compare-section[data-revealed] > *,
+  .compare-section[data-revealed] .compare-pair > :nth-child(n),
+  .compare-section[data-revealed] .compare-table tbody tr,
+  .compare-section[data-revealed] .compare-plan,
+  .compare-section[data-revealed] .compare-faq-item,
+  .compare-index-grid[data-revealed] .compare-index-card,
+  .compare-index-grid[data-revealed] .compare-index-card :is(.post-gradient, .compare-marks),
+  .compare-index-grid[data-revealed] .compare-index-copy {
+    opacity: 1;
+    animation: none;
+  }
+
+  .compare-faq-item::details-content,
+  .compare-faq-chevron,
+  .compare-index-card-arrow {
+    transition: none;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   /plugins and /plugins/<slug>.
+
+   The index reads as a sibling of /news and /guides, and it is built from the
+   same parts: the article frame, the gradient that runs in it under a pointer,
+   and the per-card reveal. A listing is recognised before it is read, so the
+   mark is the largest thing on a card and the words under it are only the two a
+   reader needs to choose. Nothing about a card's shape moves.
+
+   The listing page is built from the same parts, and from the article page's
+   column as well: it opens on the picture the card a reader pressed was already
+   carrying, under the back link, the title and the standfirst that /news and
+   /guides set. Only the rules below are its own, and they are the ones that turn
+   the boxed lists it used to draw into text. A later change to an article page's
+   type scale moves this page with it, which is the point of borrowing the
+   classes rather than copying them. */
+
+.plugin-intro {
+  margin-top: clamp(28px, 3.5vw, 50px);
+}
+
+.plugin-intro-title {
+  margin: 0;
+  color: var(--openbot-text-primary);
+  font-size: clamp(30px, 3.4vw, 40px);
+  font-weight: 600;
+  letter-spacing: -0.03em;
+  line-height: 1.1;
+}
+
+.plugin-grid-section {
+  margin-top: clamp(32px, 4vw, 48px);
+}
+
+.plugin-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: clamp(18px, 2vw, 26px);
+}
+
+.plugin-card {
+  display: block;
+  min-width: 0;
+  text-decoration: none;
+}
+
+.plugin-card:focus-visible {
+  border-radius: 24px;
+  outline: 3px solid var(--openbot-border-focus);
+  outline-offset: 4px;
+}
+
+/* One colour on a gradient that is a different colour on every card. The shadow
+   is what keeps it readable where the picture behind it is pale: the mark has no
+   plate under it, so the frame stays a picture rather than a tile. */
+.plugin-logo {
+  position: relative;
+  /* The gradient host listens for pointerenter, and it is this mark's sibling
+     rather than its ancestor. Without this, crossing onto the mark counts as
+     leaving the artwork and throws the shader away where the pointer rests. */
+  pointer-events: none;
+  color: var(--openbot-text-primary);
+  filter: drop-shadow(0 1px 6px rgb(0 0 0 / 35%));
+}
+
+/* Sized against the frame rather than the viewport: the card is widest where the
+   grid has folded to one column, which is exactly where a mark set in viewport
+   units would be at its smallest. */
+.plugin-card-logo {
+  width: auto;
+  max-width: 58%;
+  height: 20%;
+}
+
+/* An upright mark takes more of the frame's height than a wide one, so that the
+   two kinds read as the same size on a row of cards: a wide mark spends its size
+   on width, and an upright one has only height to spend it on. */
+.plugin-card-logo.plugin-logo-upright {
+  height: 34%;
+}
+
+/* The listing's own icon on a card, sized against the frame like the drawn mark
+   beside it. It is square art already, so it takes the logo corner and no plate:
+   what is behind it is the gradient, which is the card's picture. */
+.plugin-card-icon {
+  position: relative;
+  height: 40%;
+  border-radius: var(--openbot-radius-logo);
+  box-shadow: 0 2px 12px rgb(0 0 0 / 35%);
+  pointer-events: none;
+}
+
+/* The letter a plugin falls back to when its mark is not drawn yet. Type cannot
+   be sized against the frame the way a mark is, so it takes a clamp; the letter
+   is a stand-in for a path that is on its way, not a listing's resting state. */
+.plugin-logo-letter {
+  display: grid;
+  place-items: center;
+  font-size: clamp(34px, 3.8vw, 48px);
+  font-weight: 600;
+  letter-spacing: -0.03em;
+  line-height: 1;
+}
+
+/* Both text lines under a card share one shape: what a reader asks on the left,
+   what answers it on the right, and the gap between the two ends doing the work a
+   separator would. `baseline` rather than `center`, because the two ends of a line
+   are set at different sizes and centring them would leave neither on the line. */
+.plugin-card-meta,
+.plugin-card-headline {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.plugin-card-meta {
+  margin-top: 14px;
+  color: var(--openbot-text-dim);
+  font-size: 12px;
+}
+
+.plugin-card-version {
+  flex: none;
+  letter-spacing: var(--openbot-tracking-wide);
+}
+
+/* One end of each line gives way first, and it is whichever end a reader can lose:
+   the publisher's own name on the meta line, the sentence about the plugin on the
+   one below. Truncating is what keeps a card the height of the two beside it. */
+.plugin-card-publisher,
+.plugin-card-tagline {
+  overflow: hidden;
+  min-width: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plugin-card-tagline {
+  text-align: right;
+}
+
+/* The switches over the grid and the tags under a card carry the same words, but
+   they are not the same object: one is pressed and one is read. So the switch
+   takes the size and the shape of every other button on the site, and the card
+   tag stays a label. The words are what ties them together. */
+.plugin-filters {
+  /* A fieldset draws a border and reserves room for a legend the page hides. */
+  margin-inline: 0;
+  border: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: clamp(20px, 2.4vw, 30px);
+}
+
+.plugin-card-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.plugin-tag {
+  border: 1px solid var(--openbot-border-strong);
+  border-radius: var(--openbot-radius-pill);
+  background: var(--openbot-bg-surface);
+  padding: 5px 11px;
+  color: var(--openbot-text-dim);
+  font-size: 12px;
+  letter-spacing: var(--openbot-tracking-wide);
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+/* The metrics of `.landing-button-sm`, written out rather than borrowed: the
+   shared class paints an icon box on every button that wears it, and a filter has
+   no icon to put in it. Everything a reader can compare - the height, the padding,
+   the pill, the weight, the rest and pressed colours - is the button family's. */
+.plugin-tag-button {
+  height: 38px;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--openbot-border-strong);
+  border-radius: var(--openbot-radius-pill);
+  background: transparent;
+  padding: 0 17px;
+  color: var(--openbot-text-secondary);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: var(--openbot-tracking-wide);
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  /* Colour, and a press. A filter row is read before it is used, so the motion
+     that belongs on it is the motion every other button here already has. */
+  transition:
+    border-color var(--openbot-duration-normal) ease,
+    background-color var(--openbot-duration-normal) ease,
+    color var(--openbot-duration-normal) ease,
+    transform var(--openbot-duration-fast) var(--openbot-ease-out);
+}
+
+/* Pressed is the only state that fills a switch in, and it fills it the way a
+   primary button is filled. A switch a reader can turn off has to look different
+   from one that was never on, and the grid behind it has already changed, so the
+   fill confirms what happened rather than announcing it. */
+.plugin-tag-button[aria-pressed="true"] {
+  border-color: var(--openbot-surface-light);
+  background: var(--openbot-surface-light);
+  color: var(--openbot-text-on-light);
+}
+
+.plugin-tag-button:active {
+  transform: scale(0.97);
+}
+
+.plugin-tag-button:focus-visible {
+  outline: 0;
+  box-shadow: 0 0 0 3px var(--openbot-accent-strong);
+}
+
+.plugin-empty {
+  margin: 0;
+  color: var(--openbot-text-dim);
+  font-size: 14px;
+}
+
+.plugin-card-headline {
+  margin-top: 5px;
+}
+
+.plugin-card-title {
+  flex: none;
+  color: var(--openbot-text-secondary);
+  font-size: 16px;
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  line-height: 1.35;
+  transition: color var(--openbot-duration-normal) ease;
+}
+
+.plugin-card-tagline {
+  color: var(--openbot-text-dim);
+  font-size: 13px;
+}
+
+/* Per card, ordered by --plugin-card-index, so the grid arrives as a sweep. */
+.plugin-grid-section[data-revealed="false"] .plugin-card {
+  opacity: 0;
+}
+
+.plugin-grid-section[data-revealed="true"] .plugin-card {
+  animation: landing-download-reveal 720ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+  animation-delay: calc(var(--plugin-card-index, 0) * 80ms);
+}
+
+/* Larger against its frame than a card's mark is against its own: this frame is
+   the width of the column and a mark sized for a card would sit lost in it. Both
+   are measured against the frame rather than the viewport, so neither shrinks on
+   the narrow screen where the picture is at its widest. */
+.plugin-hero-logo {
+  width: auto;
+  max-width: 44%;
+  height: 26%;
+}
+
+/* The title and the button share a line, so the space between the two ends of it is
+   what separates them. Below the width that holds both, the button wraps under the
+   title rather than crushing it. The row carries the title's own top margin, so that
+   margin is not inside the item the row centres the button against. */
+.plugin-hero-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px 20px;
+  margin-top: 18px;
+}
+
+/* Smaller than an article's title. This one is read against a tile rather than across a
+   column, and at the article's size the two lines beside the mark stand taller than it. */
+.plugin-hero-row .post-article-title {
+  min-width: 0;
+  margin-top: 0;
+  font-size: clamp(26px, 3vw, 36px);
+  line-height: 1.1;
+}
+
+/* The mark, the name and the line under it are one thing, so they travel together when the
+   button wraps below them. */
+.plugin-hero-heading {
+  display: flex;
+  align-items: center;
+  gap: clamp(14px, 1.6vw, 20px);
+  min-width: 0;
+}
+
+/* What the mark stands beside: the name and the one line that says what the listing does. */
+.plugin-hero-text {
+  min-width: 0;
+}
+
+/* Closer than an article's standfirst sits under its title: here the two lines are one
+   block against the mark, and the article's gap would leave the mark between them. */
+.plugin-hero-standfirst {
+  margin-top: 4px;
+  font-size: clamp(14px, 1.3vw, 16px);
+  line-height: 1.4;
+}
+
+/* The listing's mark as an icon rather than as artwork: the frame further down is
+   21/9 and reads as a picture, and a reader deciding whether to install something
+   looks for a square. Same gradient as that frame, at the size of an app icon. */
+.plugin-hero-mark {
+  position: relative;
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: clamp(56px, 6vw, 76px);
+  aspect-ratio: 1;
+  overflow: hidden;
+  border: 1px solid var(--openbot-glass-border);
+  border-radius: var(--openbot-radius-logo);
+  background: var(--openbot-glass-surface);
+  /* Decoration, like every other frame on this page: it takes no pointer. */
+  pointer-events: none;
+}
+
+/* The listing's own icon, filling the tile: an icon a developer publishes is already
+   drawn as a square, so it is given the whole square rather than inset in it. The plate
+   and its hairline go with the same reasoning as the row's. */
+.plugin-hero-mark-icon {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.plugin-hero-mark:has(.plugin-hero-mark-icon) {
+  border-color: transparent;
+  background: none;
+}
+
+/* Sized against the tile rather than the viewport, the way a card's mark is. */
+.plugin-hero-mark-logo {
+  width: auto;
+  max-width: 64%;
+  height: 32%;
+}
+
+/* Against the right edge of the column, opposite the tags: the block above is
+   read from the left, and the one thing on it a reader acts on is the one thing
+   that is not. It wraps back under the tags before the column gets too narrow
+   to hold both. */
+.plugin-actions-row {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+/* The download offer, as the small modal it is: the visitor has just asked for the app and
+   nothing happened, so this is the only thing on the page worth reading. Same panel the
+   download menu is built from - sidebar surface, strong hairline, overlay shadow - because
+   it is the same kind of surface, lifted off the page rather than drawn into it. */
+.plugin-dialog {
+  width: min(380px, calc(100vw - 32px));
+  margin: auto;
+  padding: 22px;
+  border: 1px solid var(--openbot-border-strong);
+  border-radius: var(--openbot-radius-lg);
+  background: var(--openbot-bg-sidebar);
+  box-shadow: var(--openbot-shadow-overlay);
+  color: var(--openbot-text-primary);
+  animation: plugin-dialog-enter var(--openbot-duration-overlay) var(--openbot-ease-out) both;
+}
+
+@keyframes plugin-dialog-enter {
+  from {
+    opacity: 0;
+    transform: scale(0.97) translateY(6px);
+  }
+
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* The page stays visible behind it, because the visitor is deciding whether to leave it. */
+.plugin-dialog::backdrop {
+  background: var(--openbot-dialog-overlay);
+  backdrop-filter: blur(6px);
+}
+
+.plugin-dialog-title {
+  margin: 0;
+  font-size: 18px;
+  line-height: 1.3;
+}
+
+.plugin-dialog-copy {
+  margin: 8px 0 0;
+  color: var(--openbot-text-dim);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+/* The way out on the left and the way on to the right, which is the order the rest of the
+   site puts a pair of actions in. */
+.plugin-dialog-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 20px;
+}
+
+.plugin-dialog-dismiss {
+  margin: 0;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: var(--openbot-radius-pill);
+  background: none;
+  color: var(--openbot-text-dim);
+  font: inherit;
+  font-size: 13px;
+  transition: color var(--openbot-duration-fast) ease;
+}
+
+/* The ring the site's buttons take, rather than the browser's own box. */
+.plugin-dialog-dismiss:focus-visible {
+  outline: 0;
+  box-shadow: 0 0 0 3px var(--openbot-accent-strong);
+}
+
+.plugin-body {
+  margin-top: clamp(32px, 4vw, 48px);
+}
+
+.plugin-description {
+  margin: 0;
+  color: var(--openbot-text-readable);
+  font-size: 17px;
+  line-height: 1.7;
+}
+
+.plugin-section {
+  margin-top: clamp(32px, 4vw, 48px);
+}
+
+/* A shared agent, as one card: the page a link on X opens. `--agent-share-accent` is the agent's
+   avatar colour, set on the page, so every shared agent is tinted as itself. */
+/* Registered, so the tint fades in when the avatar colour arrives after hydration. */
+@property --agent-share-accent {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: #8a8f98;
+}
+
+.agent-share-page {
+  transition: --agent-share-accent 600ms ease;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  background: var(--openbot-bg-canvas);
+}
+
+.agent-share-main {
+  position: relative;
+  isolation: isolate;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  width: 100%;
+  padding: clamp(12px, 3vh, 40px) 16px 24px;
+}
+
+.agent-share-card {
+  position: relative;
+  z-index: 1;
+  width: min(100%, 520px);
+  overflow: hidden;
+  border: 1px solid var(--openbot-glass-border);
+  border-radius: 28px;
+  background: var(--openbot-bg-surface);
+  box-shadow: 0 40px 120px -40px color-mix(in srgb, var(--agent-share-accent) 45%, transparent);
+}
+
+/* The agent's colour as light on a dark field, with a soft grain, the way a product shot sits on a
+   coloured backdrop. It shrinks with the window's height, so the whole card fits a 13-inch laptop. */
+.agent-share-hero {
+  position: relative;
+  display: grid;
+  place-items: center;
+  height: clamp(160px, 26vh, 236px);
+  overflow: hidden;
+  background:
+    radial-gradient(70% 90% at 18% 0%, color-mix(in srgb, var(--agent-share-accent) 30%, transparent), transparent 70%),
+    radial-gradient(
+      60% 80% at 85% 100%,
+      color-mix(in srgb, var(--agent-share-accent) 55%, transparent),
+      transparent 70%
+    ),
+    radial-gradient(45% 60% at 50% 55%, color-mix(in srgb, var(--agent-share-accent) 40%, transparent), transparent 75%),
+    linear-gradient(
+      160deg,
+      color-mix(in srgb, var(--agent-share-accent) 18%, #101012),
+      color-mix(in srgb, var(--agent-share-accent) 34%, #141416)
+    );
+}
+
+.agent-share-hero::after {
+  position: absolute;
+  inset: 0;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.35'/%3E%3C/svg%3E");
+  content: "";
+  mix-blend-mode: overlay;
+  opacity: 0.35;
+  pointer-events: none;
+}
+
+/* The agent's own avatar from `@openbot/ui`. The hero in the selector outranks the generic
+   `.agent-avatar` size rule, which loads with the avatar's own code after this stylesheet. */
+.agent-share-hero .agent-share-avatar {
+  --agent-share-avatar-size: clamp(100px, 16vh, 140px);
+  position: relative;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: var(--agent-share-avatar-size);
+  height: var(--agent-share-avatar-size);
+  border-radius: var(--openbot-radius-pill);
+  filter: drop-shadow(0 18px 30px rgba(0, 0, 0, 0.35));
+}
+
+/* The Bloub sits low in its drawing, so it is lifted by the share of its size the app uses. */
+.agent-share-hero .agent-share-avatar > svg {
+  display: block;
+  width: 128%;
+  height: 128%;
+  overflow: visible;
+  translate: 0 calc(var(--agent-share-avatar-size) * -0.14);
+}
+
+.agent-share-hero .agent-share-avatar.agent-avatar-custom {
+  overflow: hidden;
+  box-shadow: 0 0 0 4px color-mix(in srgb, #ffffff 12%, transparent);
+}
+
+.agent-share-hero .agent-share-avatar.agent-avatar-custom img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.agent-share-body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 22px clamp(20px, 5vw, 40px) 26px;
+  text-align: center;
+}
+
+.agent-share-name {
+  margin: 0;
+  color: var(--openbot-text-primary);
+  font-size: clamp(26px, 4vw, 30px);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+}
+
+.agent-share-creator {
+  margin: 4px 0 0;
+  color: var(--openbot-text-secondary);
+  font-size: 15px;
+}
+
+/* What the agent brings, as one row of small tags. */
+.agent-share-tags {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agent-share-tags > li {
+  padding: 3px 10px;
+  border: 1px solid var(--openbot-border-grouped);
+  border-radius: var(--openbot-radius-pill);
+  background: var(--openbot-bg-control-active);
+  color: var(--openbot-text-secondary);
+  font-size: 12px;
+}
+
+/* Clamped, the instructions read as one paragraph, so the ellipsis never lands on a blank line.
+   Opened, they keep their line breaks: they are what the agent will do. */
+.agent-share-description {
+  display: -webkit-box;
+  margin: 14px 0 0;
+  overflow: hidden;
+  color: var(--openbot-text-secondary);
+  font-size: 16px;
+  line-height: 1.55;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+}
+
+.agent-share-description[data-expanded] {
+  display: block;
+  white-space: pre-wrap;
+  -webkit-line-clamp: unset;
+  line-clamp: unset;
+}
+
+.agent-share-more {
+  margin-top: 4px;
+  padding: 2px 8px;
+  border: 0;
+  border-radius: var(--openbot-radius-sm);
+  background: none;
+  color: var(--openbot-text-muted);
+  font: inherit;
+  font-size: 13px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+.agent-share-more:hover {
+  color: var(--openbot-text-primary);
+}
+
+.agent-share-divider {
+  width: 100%;
+  height: 1px;
+  margin: 18px 0 0;
+  border: 0;
+  background: var(--openbot-border-grouped);
+}
+
+.agent-share-notice {
+  margin: 12px 0 0;
+  color: var(--openbot-text-dim);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.agent-share-action {
+  margin-top: 14px;
+}
+
+.agent-share-action .plugin-actions-row {
+  justify-content: center;
+}
+
+.agent-share-fallback {
+  position: relative;
+  z-index: 1;
+  margin: 0;
+  color: var(--openbot-text-muted);
+  font-size: 14px;
+  text-align: center;
+}
+
+.agent-share-fallback a {
+  color: var(--openbot-text-primary);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+/* The heading the app's plugin detail sets, rather than the uppercase eyebrow this
+   page used: the section's name at reading size, with its count in a box beside it. */
+.plugin-section-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 12px;
+  color: var(--openbot-text-primary);
+  font-size: 15px;
+  font-weight: 500;
+}
+
+/* A count is one or two digits. A box that is square at one digit holds every count
+   at one width, so a section with 2 rows and one with 12 draw the same shape. */
+.plugin-section-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 22px;
+  padding-inline: 6px;
+  border-radius: var(--openbot-radius-sm);
+  background: var(--openbot-glass-surface);
+  color: var(--openbot-text-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The app draws its prompts on the plugin's own artwork, so this card is that screen:
+   the gradient fills it and the requests sit on plates over it. It is one of the
+   artwork frames above rather than a card that copies them - the same rule, the same
+   corner as the picture further up this column, and the same clipping of the shader,
+   which is the whole reason it is declared there and not here. */
+.plugin-prompts-card {
+  border-radius: 14px;
+  padding: clamp(16px, 2.4vw, 24px);
+}
+
+.plugin-prompts {
+  /* Over the canvas, which the shader library prepends at z-index -1: that paints
+     above a background but below anything in the card that is positioned. */
+  position: relative;
+  /* Given back what the frame rule turns off for artwork. These are sentences a
+     reader copies, so the list takes the pointer even though the frame does not. */
+  pointer-events: auto;
+  width: min(100%, 520px);
+  margin: 0 auto;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 8px;
+}
+
+/* One frame around the whole list, like the app's item group: the rows share a
+   border and a surface, and a single hairline separates each pair. No gap - a gap
+   would leave that hairline floating between two rows rather than between them. */
+.plugin-rows {
+  overflow: hidden;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0;
+  border: 1px solid var(--openbot-border-strong);
+  border-radius: var(--openbot-radius-card);
+  background: var(--openbot-bg-surface);
+}
+
+/* One request as the app draws it: the plugin's chip, then the line a reader would
+   type. The plate is opaque because the colour behind it is a different colour on
+   every listing, and no transparent surface is legible on all of them. */
+.plugin-prompt {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+  border-radius: var(--openbot-radius-card);
+  background: var(--openbot-bg-canvas);
+  padding: 12px;
+  color: var(--openbot-text-secondary);
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+/* The chip the app puts in front of a prompt: this is the plugin the request would
+   be sent to, said once per line rather than in a heading above the list. */
+.plugin-prompt-chip {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  border-radius: var(--openbot-radius-pill);
+  background: var(--openbot-glass-surface);
+  padding: 3px 10px 3px 6px;
+  color: var(--openbot-text-primary);
+  font-size: 13px;
+}
+
+/* Set by height alone, so a wide wordmark stays a wordmark instead of being letterboxed
+   into a square. The shadow the marks carry over artwork is dropped here: the plate under
+   this one is opaque, so it has nothing to lift off. */
+.plugin-prompt-mark {
+  width: auto;
+  max-width: 56px;
+  height: 14px;
+  font-size: 12px;
+  filter: none;
+}
+
+.plugin-prompt-text {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.plugin-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 12px 14px;
+  color: var(--openbot-text-secondary);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.plugin-rows > .plugin-row + .plugin-row {
+  border-top: 1px solid var(--openbot-border-strong);
+}
+
+/* What kind of thing the row is, in a tile the height of its two lines of type. The
+   app draws the thing's own icon here; this page draws a glyph, because that icon
+   lives on a developer's own servers and the site fetches nothing from one. */
+/* The square is this plate, not the picture on it. A listing's icon is usually a mark on
+   a transparent ground - Canva's is a circle - so an icon left to draw its own shape reads
+   as whatever shape its developer chose. A lighter plate under it, inset far enough to be
+   seen at every edge, is what makes every row open on the same square. */
+.plugin-row-icon {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  overflow: hidden;
+  border: 1px solid var(--openbot-glass-border);
+  border-radius: var(--openbot-radius-md);
+  background: var(--openbot-glass-surface);
+  padding: 5px;
+  color: var(--openbot-accent-text);
+}
+
+.plugin-row-icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+/* A listing's own icon is a picture of any proportion - one of them is a favicon - and it
+   is drawn here as the rounded square an icon is everywhere else in the product. `cover`
+   is what makes the square: a wide picture is trimmed to it rather than left floating in
+   a frame at the height its proportion allows. */
+.plugin-icon {
+  display: block;
+  aspect-ratio: 1;
+  object-fit: cover;
+}
+
+/* The icon is the tile. An icon a developer publishes is drawn as a square already - both
+   in the catalog are - so it takes the whole plate rather than sitting inset in one, and a
+   picture that is not square is trimmed to it. */
+.plugin-row-icon .plugin-icon {
+  width: 100%;
+  height: 100%;
+}
+
+/* The plate is for the glyph. A row that draws a real icon drops the inset and the hairline
+   with it, which would otherwise read as a frame around a picture that has its own edge. */
+.plugin-row-icon:has(.plugin-icon) {
+  border-color: transparent;
+  background: none;
+  padding: 0;
+}
+
+/* On the chip the icon sits on a line of type, so it takes the height of one. */
+.plugin-prompt-icon {
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+}
+
+.plugin-row-text {
+  min-width: 0;
+}
+
+.plugin-row-title {
+  margin: 0;
+  color: var(--openbot-text-primary);
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.plugin-row-copy {
+  margin: 2px 0 0;
+  color: var(--openbot-text-dim);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.plugin-facts {
+  margin: 0;
+  display: grid;
+  gap: 0;
+}
+
+.plugin-fact {
+  display: grid;
+  grid-template-columns: 160px minmax(0, 1fr);
+  gap: 16px;
+  padding: 11px 0;
+  border-top: 1px solid var(--openbot-glass-surface);
+  font-size: 14px;
+}
+
+.plugin-fact dt {
+  color: var(--openbot-text-dim);
+}
+
+.plugin-fact dd {
+  margin: 0;
+  min-width: 0;
+  color: var(--openbot-text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.plugin-fact-link {
+  color: var(--openbot-text-secondary);
+  text-decoration: none;
+  transition: color var(--openbot-duration-normal) ease;
+}
+
+@media (max-width: 900px) {
+  .plugin-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 640px) {
+  .plugin-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .plugin-fact {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 3px;
+  }
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .plugin-card,
+  .plugin-dialog-dismiss {
+    cursor: pointer;
+  }
+
+  /* An explicit scale rather than `none`, for the reason the article titles give:
+     the resting element and the moving layer otherwise rasterise on different
+     pixels, and the mark looks like it jumps as the growth ends. */
+  .plugin-card-logo,
+  .plugin-card-icon {
+    transform: scale(1);
+    transition: transform var(--openbot-duration-normal) var(--openbot-ease-out);
+    will-change: transform;
+  }
+
+  .plugin-tag-button:hover:not([aria-pressed="true"]) {
+    border-color: var(--openbot-text-dim);
+    background: var(--openbot-bg-control-hover);
+    color: var(--openbot-text-primary);
+  }
+
+  .plugin-tag-button[aria-pressed="true"]:hover {
+    background: var(--openbot-text-primary);
+  }
+
+  .plugin-card:hover .plugin-card-logo,
+  .plugin-card:hover .plugin-card-icon {
+    transform: scale(1.06);
+  }
+
+  .plugin-card:hover .plugin-card-title,
+  .plugin-dialog-dismiss:hover,
+  .plugin-fact-link:hover {
+    color: var(--openbot-text-primary);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .plugin-grid-section[data-revealed] .plugin-card {
+    opacity: 1;
+    animation: none;
+  }
+
+  .plugin-card,
+  .plugin-card-title,
+  .plugin-card-art,
+  .plugin-fact-link {
+    transition: none;
+  }
+
+  .plugin-card-logo,
+  .plugin-card-icon,
+  .plugin-tag-button {
+    transition: none;
+    transform: none;
+  }
+
+  .plugin-dialog {
+    animation: none;
+  }
+}
+
+/* 404. The "0" is the OpenBot logo: it looks around while the page is idle,
+   and follows the pointer while it moves. A search log types out below. */
+.not-found-main {
+  position: relative;
+  isolation: isolate;
+  width: min(100%, 1280px);
+  display: grid;
+  justify-items: center;
+  margin: 0 auto;
+  padding: clamp(40px, 7vw, 88px) clamp(20px, 4vw, 48px) 96px;
+  text-align: center;
+}
+
+.not-found-grid {
+  mask-image: radial-gradient(60% 55% at 50% 30%, var(--openbot-mask-solid) 30%, var(--openbot-transparent) 100%);
+}
+
+.not-found-searchlight {
+  position: absolute;
+  z-index: -1;
+  top: -80px;
+  left: 50%;
+  width: min(760px, 120vw);
+  aspect-ratio: 1;
+  margin-left: calc(min(760px, 120vw) / -2);
+  pointer-events: none;
+  background: radial-gradient(
+    closest-side,
+    color-mix(in srgb, var(--openbot-logo-production) 22%, var(--openbot-transparent)),
+    var(--openbot-transparent)
+  );
+  animation: not-found-sweep 9s ease-in-out infinite alternate;
+}
+
+.not-found-stage {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.08em;
+  font-size: clamp(112px, 24vw, 248px);
+  font-weight: 800;
+  line-height: 1;
+  letter-spacing: -0.06em;
+  user-select: none;
+}
+
+.not-found-digit,
+.not-found-bot {
+  animation:
+    not-found-drop 900ms var(--openbot-ease-out) both,
+    not-found-float 6s ease-in-out 900ms infinite;
+}
+
+/* `background-image`, not the `background` shorthand: the build copies this
+   declaration into an `@supports` block for `color-mix()`, and a shorthand there
+   resets `background-clip` to the border box. */
+.not-found-digit {
+  background-image: linear-gradient(
+    180deg,
+    var(--openbot-text-primary) 25%,
+    color-mix(in srgb, var(--openbot-logo-production) 70%, var(--openbot-transparent))
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: var(--openbot-transparent);
+}
+
+.not-found-bot {
+  position: relative;
+  width: 0.74em;
+  height: 0.74em;
+  margin: 0 0.06em;
+  animation-delay: 120ms, 120ms;
+}
+
+.not-found-digit:last-child {
+  animation:
+    not-found-drop 900ms var(--openbot-ease-out) 240ms both,
+    not-found-float 6s ease-in-out -3s infinite,
+    not-found-flicker 7s linear 2s infinite;
+}
+
+/* The tilt has the same length as the logo's look-around, and both restart
+   when the pointer stops, so the head turns with the eyes. */
+.not-found-bot-logo {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: 24%;
+  pointer-events: none;
+  filter: drop-shadow(0 0 48px color-mix(in srgb, var(--openbot-logo-production) 45%, var(--openbot-transparent)));
+  animation: not-found-tilt 6s cubic-bezier(0.77, 0, 0.175, 1) infinite;
+}
+
+.not-found-stage[data-tracking="true"] .not-found-bot-logo {
+  animation: none;
+}
+
+.not-found-bot-shadow {
+  position: absolute;
+  left: 12%;
+  bottom: -0.2em;
+  width: 76%;
+  height: 0.07em;
+  border-radius: 50%;
+  background: radial-gradient(closest-side, var(--openbot-scroll-edge-overlay), var(--openbot-transparent));
+  animation: not-found-shadow 6s ease-in-out 900ms infinite;
+}
+
+.not-found-copy {
+  display: grid;
+  justify-items: center;
+  margin-top: clamp(28px, 5vw, 48px);
+  animation: landing-enter 700ms var(--openbot-ease-out) 420ms both;
+}
+
+.not-found-eyebrow {
+  margin: 0 0 12px;
+  color: var(--openbot-logo-production);
+  font-family: var(--openbot-font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.not-found-title {
+  margin: 0;
+  font-size: clamp(32px, 5vw, 52px);
+  line-height: 1.05;
+  letter-spacing: -0.04em;
+}
+
+.not-found-description {
+  max-width: 460px;
+  margin: 16px 0 0;
+  color: var(--openbot-text-secondary);
+  font-size: 16px;
+  line-height: 1.55;
+}
+
+.not-found-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 28px;
+}
+
+.not-found-terminal {
+  width: min(100%, 540px);
+  margin-top: 48px;
+  overflow: hidden;
+  border: 1px solid var(--openbot-glass-border);
+  border-radius: 14px;
+  background: var(--openbot-bg-glass);
+  box-shadow: 0 24px 80px var(--openbot-glass-shadow);
+  backdrop-filter: blur(12px);
+  text-align: left;
+  animation: landing-enter 700ms var(--openbot-ease-out) 560ms both;
+}
+
+.not-found-terminal-bar {
+  display: flex;
+  gap: 6px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--openbot-glass-surface);
+}
+
+.not-found-terminal-bar i {
+  width: 9px;
+  height: 9px;
+  border-radius: var(--openbot-radius-pill);
+  background: var(--openbot-glass-surface-hover);
+}
+
+.not-found-terminal-lines {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 16px 18px 18px;
+  list-style: none;
+  color: var(--openbot-text-secondary);
+  font-family: var(--openbot-font-mono);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* Each line types in from the left, one after the other. */
+.not-found-line {
+  overflow-wrap: anywhere;
+  animation: not-found-type 480ms steps(24, end) calc(1100ms + var(--line) * 560ms) both;
+}
+
+.not-found-prompt,
+.not-found-arrow {
+  color: var(--openbot-logo-production);
+}
+
+.not-found-path {
+  color: var(--openbot-text-primary);
+}
+
+.not-found-result {
+  color: var(--openbot-text-dim);
+}
+
+.not-found-line-error {
+  color: var(--openbot-danger-text);
+}
+
+.not-found-caret {
+  display: inline-block;
+  width: 0.55em;
+  height: 1.1em;
+  margin-left: 4px;
+  vertical-align: text-bottom;
+  background: var(--openbot-text-secondary);
+  animation: not-found-caret 1s steps(1, end) infinite;
+}
+
+.not-found-links {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 28px;
+}
+
+.not-found-link {
+  padding: 7px 14px;
+  border: 1px solid var(--openbot-glass-border);
+  border-radius: var(--openbot-radius-pill);
+  color: var(--openbot-text-muted);
+  font-size: 13px;
+  transition:
+    color var(--openbot-duration-normal) ease,
+    background-color var(--openbot-duration-normal) ease,
+    border-color var(--openbot-duration-normal) ease;
+  animation: landing-enter 500ms var(--openbot-ease-out) calc(3900ms + var(--link) * 70ms) both;
+}
+
+.not-found-link:hover {
+  border-color: var(--openbot-glass-highlight);
+  background: var(--openbot-glass-surface);
+  color: var(--openbot-text-primary);
+}
+
+.not-found-link:focus-visible {
+  outline: 2px solid var(--openbot-border-focus);
+  outline-offset: 2px;
+}
+
+@keyframes not-found-drop {
+  from {
+    opacity: 0;
+    transform: translateY(-0.4em) scale(0.9);
+  }
+
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes not-found-float {
+  0%,
+  100% {
+    translate: 0 0;
+  }
+
+  50% {
+    translate: 0 -0.05em;
+  }
+}
+
+@keyframes not-found-shadow {
+  0%,
+  100% {
+    opacity: 1;
+    scale: 1;
+  }
+
+  50% {
+    opacity: 0.5;
+    scale: 0.8;
+  }
+}
+
+@keyframes not-found-tilt {
+  0%,
+  30%,
+  47%,
+  64%,
+  100% {
+    rotate: 0deg;
+  }
+
+  35%,
+  42% {
+    rotate: -7deg;
+  }
+
+  52%,
+  59% {
+    rotate: 7deg;
+  }
+}
+
+/* A sign with a loose wire: a short stutter, then a long rest. */
+@keyframes not-found-flicker {
+  0%,
+  70%,
+  73%,
+  76%,
+  100% {
+    opacity: 1;
+  }
+
+  71%,
+  74.5% {
+    opacity: 0.25;
+  }
+}
+
+@keyframes not-found-sweep {
+  from {
+    translate: -34% 0;
+  }
+
+  to {
+    translate: 34% 8%;
+  }
+}
+
+@keyframes not-found-type {
+  from {
+    clip-path: inset(0 100% 0 0);
+  }
+
+  to {
+    clip-path: inset(0);
+  }
+}
+
+@keyframes not-found-caret {
+  50% {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .not-found-searchlight,
+  .not-found-digit,
+  .not-found-digit:last-child,
+  .not-found-bot,
+  .not-found-bot-logo,
+  .not-found-bot-shadow,
+  .not-found-copy,
+  .not-found-terminal,
+  .not-found-line,
+  .not-found-caret,
+  .not-found-link {
+    animation: none;
+  }
+
+  .not-found-link {
+    transition: none;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   /changelog.
+
+   The release notes from CHANGELOG.md, one block per release under a hero that
+   dissolves into the page. On a wide screen the index of releases stays beside
+   the notes and marks the one being read; on a narrow one it becomes a strip of
+   versions that stays at the top. Colour belongs to the kind of change, so a
+   reader scanning for fixes finds the green groups without reading headings. */
+
+.changelog-page {
+  --changelog-hairline: color-mix(in srgb, var(--openbot-text-primary) 8%, transparent);
+  --changelog-scroll-offset: 24px;
+}
+
+.changelog-hero {
+  position: relative;
+  isolation: isolate;
+  display: grid;
+  align-items: end;
+  min-height: clamp(320px, 38vw, 460px);
+  margin-top: clamp(4px, 1vw, 12px);
+}
+
+/* The picture fades out at the bottom rather than ending on an edge, so the
+   title reads as standing in the page and the notes start where the colour stops. */
+.changelog-hero-art {
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  overflow: hidden;
+  border-radius: 24px;
+  pointer-events: none;
+  -webkit-mask-image: linear-gradient(to bottom, var(--openbot-mask-solid) 40%, transparent 100%);
+  mask-image: linear-gradient(to bottom, var(--openbot-mask-solid) 40%, transparent 100%);
+}
+
+/* A shade on the reading side, so white type keeps its contrast over the lightest
+   colours the shader draws. */
+.changelog-hero-art::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image: linear-gradient(
+    100deg,
+    color-mix(in srgb, var(--openbot-bg-canvas) 62%, transparent) 0%,
+    color-mix(in srgb, var(--openbot-bg-canvas) 18%, transparent) 55%,
+    transparent 80%
+  );
+}
+
+.changelog-hero-copy {
+  max-width: 760px;
+  padding: clamp(40px, 6vw, 72px) clamp(24px, 4vw, 56px) clamp(40px, 5vw, 64px);
+}
+
+.changelog-eyebrow {
+  margin: 0;
+  color: color-mix(in srgb, var(--openbot-text-primary) 76%, transparent);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.changelog-title {
+  margin: 12px 0 0;
+  color: var(--openbot-text-primary);
+  font-size: clamp(38px, 5.6vw, 72px);
+  font-weight: 600;
+  letter-spacing: -0.05em;
+  line-height: 1;
+  text-wrap: balance;
+}
+
+.changelog-lede {
+  max-width: 54ch;
+  margin: 18px 0 0;
+  color: color-mix(in srgb, var(--openbot-text-primary) 80%, transparent);
+  font-size: clamp(15px, 1.4vw, 18px);
+  line-height: 1.55;
+  text-wrap: pretty;
+}
+
+.changelog-latest {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 24px;
+  padding: 0 clamp(24px, 4vw, 56px) 20px;
+  border-bottom: 1px solid var(--changelog-hairline);
+}
+
+.changelog-latest-text {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  color: var(--openbot-text-muted);
+  font-size: 14px;
+}
+
+.changelog-latest-dot {
+  position: relative;
+  width: 8px;
+  height: 8px;
+  margin-right: 4px;
+  border-radius: var(--openbot-radius-pill);
+  background: var(--openbot-success);
+}
+
+/* A ring that grows out of the dot and fades: the release is live, and the dot says so
+   without blinking. */
+.changelog-latest-dot::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--openbot-success);
+  animation: changelog-pulse 2.4s cubic-bezier(0.22, 1, 0.36, 1) infinite;
+}
+
+@keyframes changelog-pulse {
+  from {
+    opacity: 0.6;
+    transform: scale(1);
+  }
+
+  to {
+    opacity: 0;
+    transform: scale(3.2);
+  }
+}
+
+.changelog-latest-version {
+  border-radius: var(--openbot-radius-xs);
+  color: var(--openbot-text-primary);
+  font-family: var(--openbot-font-mono);
+  font-weight: 500;
+  text-decoration: none;
+}
+
+.changelog-latest-version:focus-visible {
+  outline: 2px solid var(--openbot-border-focus);
+  outline-offset: 2px;
+}
+
+.changelog-latest-date {
+  color: var(--openbot-text-dim);
+}
+
+.changelog-layout {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  align-items: start;
+  gap: clamp(40px, 6vw, 96px);
+  margin-top: clamp(36px, 4.5vw, 64px);
+}
+
+/* The index -------------------------------------------------------------- */
+
+.changelog-index {
+  position: sticky;
+  top: var(--changelog-scroll-offset);
+}
+
+.changelog-index-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 0 14px;
+  color: var(--openbot-text-dim);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.changelog-index-count {
+  color: var(--openbot-text-muted);
+  font-family: var(--openbot-font-mono);
+  font-weight: 500;
+  letter-spacing: 0;
+}
+
+/* Scrolls on its own, inside the window, and fades at both ends so a row cut by the
+   edge reads as more to come rather than as a clipped line. */
+.changelog-index-scroll {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  max-height: calc(100dvh - var(--changelog-scroll-offset) * 2 - 32px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 4px 0 24px;
+  scrollbar-width: none;
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent,
+    var(--openbot-mask-solid) 12px,
+    var(--openbot-mask-solid) calc(100% - 32px),
+    transparent
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    transparent,
+    var(--openbot-mask-solid) 12px,
+    var(--openbot-mask-solid) calc(100% - 32px),
+    transparent
+  );
+}
+
+.changelog-index-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+.changelog-index-month-label {
+  margin: 0 0 6px 14px;
+  color: var(--openbot-text-dim);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.changelog-index-list {
+  margin: 0;
+  padding: 0;
+  border-left: 1px solid var(--changelog-hairline);
+  list-style: none;
+}
+
+.changelog-index-link {
+  position: relative;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 10px 6px 14px;
+  border-radius: 0 var(--openbot-radius-sm) var(--openbot-radius-sm) 0;
+  color: var(--openbot-text-dim);
+  font-size: 13px;
+  text-decoration: none;
+  transition: color var(--openbot-duration-normal) ease;
+}
+
+/* The current row's mark sits on the rail, so the rail reads as a track the reader
+   moves along. */
+.changelog-index-link::before {
+  content: "";
+  position: absolute;
+  top: 5px;
+  bottom: 5px;
+  left: -1px;
+  width: 2px;
+  border-radius: var(--openbot-radius-pill);
+  background: var(--openbot-text-primary);
+  opacity: 0;
+  transform: scaleY(0.3);
+  transition:
+    opacity var(--openbot-duration-normal) ease,
+    transform 320ms var(--openbot-ease-out);
+}
+
+.changelog-index-link[aria-current="true"] {
+  color: var(--openbot-text-primary);
+}
+
+.changelog-index-link[aria-current="true"]::before {
+  opacity: 1;
+  transform: none;
+}
+
+.changelog-index-link:focus-visible {
+  outline: 2px solid var(--openbot-border-focus);
+  outline-offset: -2px;
+}
+
+.changelog-index-version {
+  font-family: var(--openbot-font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.changelog-index-date {
+  color: var(--openbot-text-dim);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* A release ---------------------------------------------------------------- */
+
+.changelog-releases {
+  min-width: 0;
+  max-width: 780px;
+}
+
+.changelog-release {
+  padding: clamp(36px, 4.5vw, 56px) 0;
+  border-top: 1px solid var(--changelog-hairline);
+  scroll-margin-top: var(--changelog-scroll-offset);
+}
+
+.changelog-release:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.changelog-release[data-revealed="false"] {
+  opacity: 0;
+}
+
+.changelog-release[data-revealed="true"] {
+  animation: landing-download-reveal 720ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+}
+
+.changelog-release-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--openbot-text-dim);
+  font-size: 13px;
+}
+
+.changelog-release-badge {
+  padding: 2px 8px;
+  border-radius: var(--openbot-radius-pill);
+  background: var(--openbot-success-soft);
+  color: var(--openbot-success-text);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.changelog-release-title {
+  margin: 8px 0 0;
+  font-size: clamp(24px, 2.4vw, 32px);
+  font-weight: 600;
+  letter-spacing: -0.035em;
+  line-height: 1.15;
+}
+
+.changelog-release-anchor {
+  border-radius: var(--openbot-radius-sm);
+  color: var(--openbot-text-primary);
+  text-decoration: none;
+}
+
+/* The link to this release, shown under a pointer so a reader knows the title can
+   be copied as one. */
+.changelog-release-anchor::after {
+  content: "#";
+  margin-left: 10px;
+  color: var(--openbot-text-dim);
+  font-weight: 400;
+  opacity: 0;
+  transition: opacity var(--openbot-duration-normal) ease;
+}
+
+.changelog-release-anchor:focus-visible {
+  outline: 2px solid var(--openbot-border-focus);
+  outline-offset: 4px;
+}
+
+.changelog-release-version {
+  color: var(--openbot-text-muted);
+  font-weight: 500;
+  transition: color var(--openbot-duration-normal) ease;
+}
+
+.changelog-release-intro {
+  max-width: 68ch;
+  margin: 16px 0 0;
+  color: var(--openbot-text-secondary);
+  font-size: 15px;
+  line-height: 1.65;
+}
+
+.changelog-code {
+  padding: 1px 6px;
+  border-radius: var(--openbot-radius-sm);
+  background: var(--openbot-bg-surface);
+  box-shadow: inset 0 0 0 1px var(--changelog-hairline);
+  color: var(--openbot-text-primary);
+  font-family: var(--openbot-font-mono);
+  font-size: 0.86em;
+  overflow-wrap: anywhere;
+}
+
+.changelog-strong {
+  color: var(--openbot-text-primary);
+  font-weight: 600;
+}
+
+.changelog-link {
+  border-radius: var(--openbot-radius-xs);
+  color: var(--openbot-accent-text);
+  text-decoration: none;
+}
+
+.changelog-link:focus-visible {
+  outline: 2px solid var(--openbot-border-focus);
+  outline-offset: 2px;
+}
+
+.changelog-notice {
+  margin-top: 24px;
+  padding: 16px 18px 18px;
+  border-radius: var(--openbot-radius-card);
+  background-image: linear-gradient(
+    180deg,
+    var(--openbot-warning-soft),
+    color-mix(in srgb, var(--openbot-warning) 3%, transparent)
+  );
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--openbot-warning) 26%, transparent);
+}
+
+.changelog-notice-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  color: var(--openbot-warning-text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.changelog-notice-mark {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border-radius: var(--openbot-radius-pill);
+  background: var(--openbot-warning);
+  color: var(--openbot-text-on-light);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.changelog-notice-list {
+  display: grid;
+  gap: 10px;
+  margin: 10px 0 0;
+  padding: 0 0 0 28px;
+  list-style: none;
+}
+
+.changelog-notice-item {
+  color: var(--openbot-text-secondary);
+  font-size: 15px;
+  line-height: 1.6;
+}
+
+/* Most notices are bold from end to end in the file. Inside a box that already says
+   "act on this", full weight on every word is only harder to read. */
+.changelog-notice .changelog-strong {
+  color: var(--openbot-text-primary);
+  font-weight: 500;
+}
+
+.changelog-group {
+  --changelog-tone: var(--openbot-text-muted);
+  margin-top: 28px;
+}
+
+.changelog-group[data-type="added"] {
+  --changelog-tone: var(--openbot-logo-production);
+}
+
+.changelog-group[data-type="changed"] {
+  --changelog-tone: var(--openbot-accent-text);
+}
+
+.changelog-group[data-type="fixed"] {
+  --changelog-tone: var(--openbot-success-text);
+}
+
+.changelog-group[data-type="removed"],
+.changelog-group[data-type="security"],
+.changelog-group[data-type="deprecated"] {
+  --changelog-tone: var(--openbot-warning-text);
+}
+
+.changelog-group-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 12px;
+  color: var(--changelog-tone);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.changelog-group-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--openbot-radius-pill);
+  background: var(--changelog-tone);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--changelog-tone) 70%, transparent);
+}
+
+.changelog-group-count {
+  padding: 1px 7px;
+  border-radius: var(--openbot-radius-pill);
+  background: color-mix(in srgb, var(--changelog-tone) 12%, transparent);
+  font-family: var(--openbot-font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+
+.changelog-list {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* A hanging mark in the group's colour, so a long item wraps under its own text and
+   not under the mark. */
+.changelog-item {
+  position: relative;
+  padding-left: 22px;
+  color: var(--openbot-text-secondary);
+  font-size: 15px;
+  line-height: 1.6;
+  text-wrap: pretty;
+}
+
+.changelog-item::before {
+  content: "";
+  position: absolute;
+  top: 0.8em;
+  left: 4px;
+  width: 8px;
+  height: 1px;
+  background: color-mix(in srgb, var(--changelog-tone) 70%, transparent);
+}
+
+/* Narrow screens: the index becomes a strip of versions that stays at the top of the
+   window, over the notes, and scrolls sideways to keep the current one in sight. */
+@media (max-width: 959px) {
+  .changelog-page {
+    --changelog-scroll-offset: 72px;
+  }
+
+  .changelog-layout {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 28px;
+    margin-top: 0;
+  }
+
+  .changelog-index {
+    z-index: 5;
+    top: 0;
+    margin: 0 calc(clamp(20px, 4vw, 48px) * -1);
+    padding: 12px 0;
+    border-bottom: 1px solid var(--changelog-hairline);
+    background: color-mix(in srgb, var(--openbot-bg-canvas) 86%, transparent);
+    -webkit-backdrop-filter: blur(14px) saturate(1.4);
+    backdrop-filter: blur(14px) saturate(1.4);
+  }
+
+  .changelog-index-title,
+  .changelog-index-month-label {
+    display: none;
+  }
+
+  .changelog-index-scroll {
+    flex-direction: row;
+    gap: 6px;
+    max-height: none;
+    overflow: auto hidden;
+    padding: 0 clamp(20px, 4vw, 48px);
+    -webkit-mask-image: linear-gradient(
+      to right,
+      transparent,
+      var(--openbot-mask-solid) 16px,
+      var(--openbot-mask-solid) calc(100% - 32px),
+      transparent
+    );
+    mask-image: linear-gradient(
+      to right,
+      transparent,
+      var(--openbot-mask-solid) 16px,
+      var(--openbot-mask-solid) calc(100% - 32px),
+      transparent
+    );
+  }
+
+  .changelog-index-month,
+  .changelog-index-list {
+    display: contents;
+  }
+
+  .changelog-index-item {
+    flex: 0 0 auto;
+  }
+
+  .changelog-index-link {
+    padding: 6px 12px;
+    border-radius: var(--openbot-radius-pill);
+    box-shadow: inset 0 0 0 1px var(--changelog-hairline);
+    transition:
+      color var(--openbot-duration-normal) ease,
+      background-color var(--openbot-duration-normal) ease;
+  }
+
+  .changelog-index-link::before,
+  .changelog-index-date {
+    display: none;
+  }
+
+  .changelog-index-link[aria-current="true"] {
+    background: var(--openbot-action);
+    color: var(--openbot-action-foreground);
+  }
+
+  .changelog-latest {
+    padding-right: 0;
+    padding-left: 0;
+  }
+
+  .changelog-hero-copy {
+    padding-right: clamp(20px, 4vw, 32px);
+    padding-left: clamp(20px, 4vw, 32px);
+  }
+
+  .changelog-hero-art {
+    border-radius: 18px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .changelog-latest-dot::after {
+    animation: none;
+    opacity: 0;
+  }
+
+  .changelog-release[data-revealed="true"] {
+    animation: none;
+  }
+
+  .changelog-index-link,
+  .changelog-index-link::before,
+  .changelog-release-anchor::after,
+  .changelog-release-version {
+    transition: none;
+  }
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .changelog-index-link:hover {
+    color: var(--openbot-text-secondary);
+  }
+
+  .changelog-release-anchor:hover .changelog-release-version {
+    color: var(--openbot-text-secondary);
+  }
+
+  .changelog-release-anchor:hover::after {
+    opacity: 1;
+  }
+
+  .changelog-latest-version:hover,
+  .changelog-link:hover {
+    text-decoration: underline;
+    text-underline-offset: 3px;
   }
 }

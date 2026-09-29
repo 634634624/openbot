@@ -7,11 +7,12 @@
 //
 // Electron-free, with the cipher injected, so its tests need neither a keychain nor a display.
 
-import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
-import type { CustomProviderSummary, SaveCustomProviderInput } from "@openbot/contracts/ipc";
+import { readFile } from "node:fs/promises";
+import type { CustomProviderSummary, SaveCustomProviderInput, UpdateCustomProviderInput } from "@openbot/contracts/ipc";
+import { sameCustomProviderOrigin } from "@openbot/contracts/ipc";
+import { sourceText } from "@openbot/i18n/source";
 import { z } from "zod";
+import { writeJsonFileAtomically } from "../backend/atomic-json-file";
 import type { CustomProviderConfig } from "../backend/opencode-config";
 
 export interface CustomProviderCipher {
@@ -58,11 +59,12 @@ interface Entry {
   readonly secret: ProviderSecret | null;
 }
 
-const READ_ONLY_MESSAGE =
-  "The saved endpoints were written by a newer version of OpenBot, or the file cannot be read. Update OpenBot to change them.";
-const NO_SECURE_STORAGE_MESSAGE =
-  "This computer has no secure storage, so an API key or a header cannot be saved. Remove them, or use an endpoint that needs no credentials.";
-const DUPLICATE_MESSAGE = "An endpoint with this provider ID is already saved. Remove it first, or use another ID.";
+const READ_ONLY_MESSAGE = sourceText("error.provider.endpointsReadOnly");
+const NO_SECURE_STORAGE_MESSAGE = sourceText("error.provider.endpointNoSecureStorage");
+const DUPLICATE_MESSAGE = sourceText("error.provider.endpointDuplicate");
+const NOT_SAVED_MESSAGE = sourceText("error.provider.endpointNotSaved");
+const KEY_FOR_NEW_ADDRESS_MESSAGE = sourceText("error.provider.endpointKeyForNewAddress");
+const SECRET_UNREADABLE_MESSAGE = sourceText("error.provider.endpointSecretUnreadable");
 
 export class CustomProviderStore {
   readonly #path: string;
@@ -154,6 +156,78 @@ export class CustomProviderStore {
     });
   }
 
+  /**
+   * Changes one saved endpoint. An absent `apiKey` or `headers` keeps the stored part.
+   *
+   * A kept part may not follow the endpoint to another origin: the user typed the key for one server,
+   * and an edit of the address alone must not send it to another one. When nothing secret changes,
+   * the stored ciphertext is kept byte for byte, so an edit on a computer whose keychain is gone does
+   * not lose a key that a later keychain could still open.
+   */
+  async update(input: UpdateCustomProviderInput): Promise<CustomProviderSummary[]> {
+    return this.#mutate(() => {
+      const { index, current } = this.#checkUpdate(input);
+      const keepKey = input.apiKey === undefined;
+      const keepHeaders = input.headers === undefined;
+      let sealed = current.stored.secret ?? null;
+      let secret = current.secret;
+      if (!keepKey || !keepHeaders) {
+        const apiKey = keepKey ? (current.secret?.apiKey ?? null) : input.apiKey || null;
+        const headers = keepHeaders ? (current.secret?.headers ?? []) : (input.headers ?? []);
+        secret = apiKey || headers.length > 0 ? { apiKey, headers } : null;
+        if (secret && !this.#cipher.canPersist()) throw new Error(NO_SECURE_STORAGE_MESSAGE);
+        sealed = secret ? this.#cipher.encrypt(JSON.stringify(secret)).toString("base64") : null;
+      }
+      const next: Entry = {
+        stored: {
+          id: current.stored.id,
+          name: input.name,
+          baseUrl: input.baseUrl,
+          models: input.models.map((model) => ({ id: model.id, name: model.name })),
+          secret: sealed,
+        },
+        secret,
+      };
+      return this.#entries.map((entry, position) => (position === index ? next : entry));
+    });
+  }
+
+  /**
+   * Throws what `update` would refuse for this input, and writes nothing. The caller moves agents
+   * off removed models before the write, so a refused edit must fail before that.
+   */
+  checkUpdate(input: UpdateCustomProviderInput): void {
+    if (this.#readOnly) throw new Error(READ_ONLY_MESSAGE);
+    const { current } = this.#checkUpdate(input);
+    const replacesSecret = input.apiKey !== undefined || input.headers !== undefined;
+    if (replacesSecret && !this.#cipher.canPersist()) {
+      const apiKey = input.apiKey ?? current.secret?.apiKey ?? null;
+      const headers = input.headers ?? current.secret?.headers ?? [];
+      if (apiKey || headers.length > 0) throw new Error(NO_SECURE_STORAGE_MESSAGE);
+    }
+  }
+
+  #checkUpdate(input: UpdateCustomProviderInput): { index: number; current: Entry } {
+    const index = this.#entries.findIndex((entry) => entry.stored.id === input.id);
+    const current = this.#entries[index];
+    if (!current) throw new Error(NOT_SAVED_MESSAGE);
+    const keepKey = input.apiKey === undefined;
+    const keepHeaders = input.headers === undefined;
+    // A ciphertext this computer cannot open cannot be merged: replacing one part would drop the other.
+    if (keepKey !== keepHeaders && current.stored.secret && !current.secret) {
+      throw new Error(SECRET_UNREADABLE_MESSAGE);
+    }
+    const keptSecret =
+      (keepKey && Boolean(current.secret?.apiKey)) ||
+      (keepHeaders && (current.secret?.headers.length ?? 0) > 0) ||
+      // A ciphertext that this computer cannot open still holds something the user saved.
+      (keepKey && keepHeaders && Boolean(current.stored.secret) && !current.secret);
+    if (keptSecret && !sameCustomProviderOrigin(current.stored.baseUrl, input.baseUrl)) {
+      throw new Error(KEY_FOR_NEW_ADDRESS_MESSAGE);
+    }
+    return { index, current };
+  }
+
   /** Removes one endpoint and its credentials. An id that is not saved writes nothing. */
   async remove(id: string): Promise<CustomProviderSummary[]> {
     return this.#mutate(() => {
@@ -206,17 +280,7 @@ export class CustomProviderStore {
     // The stored half only: every entry keeps the ciphertext it arrived with, so an untouched
     // endpoint is never decrypted and encrypted again.
     const providers = entries.map((entry) => entry.stored);
-    await mkdir(dirname(this.#path), { recursive: true, mode: 0o700 });
-    const temporary = `${this.#path}.${randomUUID()}.tmp`;
-    try {
-      await writeFile(temporary, `${JSON.stringify({ version: 1, providers })}\n`, {
-        encoding: "utf8",
-        mode: 0o600,
-      });
-      await rename(temporary, this.#path);
-    } finally {
-      await rm(temporary, { force: true });
-    }
+    await writeJsonFileAtomically(this.#path, { version: 1, providers }, { createDirectory: true });
   }
 }
 

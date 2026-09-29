@@ -14,8 +14,10 @@ import {
   type DeleteChannelRoutineInput,
   type DeleteRoutineInput,
   type DownloadAttachmentsInput,
+  type EditQueuedMessageInput,
   type ImportAttachmentsInput,
   type InterruptTurnInput,
+  isAgentAccess,
   isAgentModel,
   isAgentProvider,
   isAvatarHue,
@@ -51,6 +53,8 @@ import {
 } from "@openbot/contracts/ipc";
 import { isBoolean, isNumber, isString } from "@openbot/contracts/runtime-values";
 import { decodeQueueEditRequest } from "@openbot/contracts/team-protocol/queue-edit-v1";
+import { sourceText } from "@openbot/i18n/source";
+import type { PayloadDecoder } from "../trusted-ipc";
 import { parseAvatarImage } from "./avatar-inputs";
 import { isObject, requireString } from "./validation";
 
@@ -62,8 +66,29 @@ export function parseAgentRequest(value: unknown): AgentIpcRequest {
   };
 }
 
+/** Checks the server scope first, then decodes the payload inside it. */
+export function agentRequest<Payload>(decode: PayloadDecoder<Payload>): PayloadDecoder<AgentIpcRequest<Payload>> {
+  return (value) => {
+    const scoped = parseAgentRequest(value);
+    return { serverId: scoped.serverId, payload: decode(scoped.payload) };
+  };
+}
+
+/** Checks the server scope of a request that carries nothing else. The preload sends `null`. */
+export function agentScope(value: unknown): AgentIpcRequest<null> {
+  return { serverId: parseAgentRequest(value).serverId, payload: null };
+}
+
 export function parseAgentId(value: unknown): string {
   return requireString(value, "agentId", INPUT_LIMITS.identifier);
+}
+
+export function parseChannelId(value: unknown): string {
+  return requireString(value, "channelId", INPUT_LIMITS.identifier);
+}
+
+export function parseAttachmentId(value: unknown): string {
+  return requireString(value, "attachmentId", INPUT_LIMITS.identifier);
 }
 
 export function parseOptionalAgentId(value: unknown): string | undefined {
@@ -344,7 +369,7 @@ export function parseReadConversationPage(value: unknown): ReadConversationPageI
 export function parseSearchConversationMessages(value: unknown): SearchConversationMessagesInput {
   if (!isObject(value)) throw new Error("Invalid conversation search request.");
   const query = requireString(value.query, "query", INPUT_LIMITS.messageText);
-  if (!query.trim()) throw new Error("A search query is required.");
+  if (!query.trim()) throw new Error(sourceText("error.agent.searchQueryRequired"));
   const limit = parsePageLimit(value.limit ?? 100);
   return {
     query,
@@ -386,9 +411,9 @@ export function parseSendMessage(value: unknown): SendMessageInput {
     throw new Error("Invalid attachment drafts.");
   }
   if (!isString(value.text)) throw new Error("text is required.");
-  if (value.text.length > INPUT_LIMITS.messageText) throw new Error("Message is too long.");
+  if (value.text.length > INPUT_LIMITS.messageText) throw new Error(sourceText("error.agent.messageTooLong"));
   if (!value.text.trim() && attachmentDraftIds.length === 0) {
-    throw new Error("A message or attachment is required.");
+    throw new Error(sourceText("error.agent.messageOrAttachmentRequired"));
   }
   const replyToMessageId = value.replyToMessageId ?? null;
   if (replyToMessageId !== null && (!isString(replyToMessageId) || replyToMessageId.length > INPUT_LIMITS.identifier)) {
@@ -464,6 +489,14 @@ export function parseUpdateAgent(value: unknown): UpdateAgentInput {
     if (!isReasoningEffort(value.reasoningEffort)) throw new Error("Invalid reasoning effort.");
     result.reasoningEffort = value.reasoningEffort;
   }
+  if (value.access !== undefined) {
+    if (!isAgentAccess(value.access)) throw new Error("Invalid agent access.");
+    result.access = value.access;
+  }
+  if (value.computerUse !== undefined) {
+    if (!isBoolean(value.computerUse)) throw new Error("Invalid Computer Use value.");
+    result.computerUse = value.computerUse;
+  }
   if (value.avatarSeed !== undefined) {
     if (!isAvatarSeed(value.avatarSeed)) throw new Error("Invalid avatar seed.");
     result.avatarSeed = value.avatarSeed;
@@ -490,7 +523,7 @@ export function parseImportAttachments(value: unknown): ImportAttachmentsInput {
     throw new Error("Invalid attachment import.");
   }
   if (value.paths.length + value.data.length > INPUT_LIMITS.attachments) {
-    throw new Error(`Choose at most ${INPUT_LIMITS.attachments} files.`);
+    throw new Error(sourceText("error.attachment.tooMany", { limit: INPUT_LIMITS.attachments }));
   }
   if (!value.paths.every((path) => isString(path) && path.length > 0 && path.length <= INPUT_LIMITS.path)) {
     throw new Error("Invalid attachment path.");
@@ -591,11 +624,11 @@ export function parseUpdateQueuedMessage(value: unknown): UpdateQueuedMessageInp
   if (!isObject(value) || !isString(value.text)) {
     throw new Error("Invalid queued message update request.");
   }
-  if (value.text.length > INPUT_LIMITS.messageText) throw new Error("Message is too long.");
+  if (value.text.length > INPUT_LIMITS.messageText) throw new Error(sourceText("error.agent.messageTooLong"));
   const keepAttachmentIds = parseIdentifierList(value.keepAttachmentIds, "attachment ids");
   const attachmentDraftIds = parseIdentifierList(value.attachmentDraftIds, "attachment drafts");
   if (!value.text.trim() && keepAttachmentIds.length === 0 && attachmentDraftIds.length === 0) {
-    throw new Error("A message or attachment is required.");
+    throw new Error(sourceText("error.agent.messageOrAttachmentRequired"));
   }
   return {
     agentId: requireString(value.agentId, "agentId"),
@@ -660,7 +693,7 @@ export function parsePromptResponse(value: unknown): RespondToPromptInput {
     }
     totalTextLength += answer.reduce((length, item) => length + item.length, 0);
     if (totalTextLength > INPUT_LIMITS.promptAnswersTotalText) {
-      throw new Error("Prompt answers are too long.");
+      throw new Error(sourceText("error.agent.promptAnswersTooLong"));
     }
     answers[key] = answer;
   }
@@ -697,7 +730,7 @@ export function parseBrowserTakeoverResponse(value: unknown): RespondToBrowserTa
   return { requestId: value.requestId, decision: value.decision };
 }
 
-export function parseQueueEdit(value: unknown) {
+export function parseQueueEdit(value: unknown): EditQueuedMessageInput {
   if (!isObject(value)) throw new Error("Invalid queue edit request.");
   return { agentId: parseAgentId(value.agentId), ...decodeQueueEditRequest(value) };
 }

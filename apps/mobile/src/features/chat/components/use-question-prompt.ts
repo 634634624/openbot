@@ -2,6 +2,7 @@ import type { AgentPromptResolution, RespondToPromptInput } from "@openbot/contr
 import { useRef, useState } from "react";
 import type { ChatMessage } from "@/features/chat/model/chat-messages";
 import { answeredPromptResolution, nextUnansweredQuestion } from "@/features/chat/model/question-prompt";
+import { haptics } from "@/shared/lib/haptics";
 
 interface PromptState {
   scope: string;
@@ -11,10 +12,21 @@ interface PromptState {
   pending: boolean;
   failedAnswers: Record<string, string[]> | null;
   resolution: AgentPromptResolution | null;
+  /** The person chose to answer the current question with the chat composer. */
+  replyInChat: boolean;
 }
 
 function initialState(scope: string): PromptState {
-  return { scope, index: 0, answers: {}, drafts: {}, pending: false, failedAnswers: null, resolution: null };
+  return {
+    scope,
+    index: 0,
+    answers: {},
+    drafts: {},
+    pending: false,
+    failedAnswers: null,
+    resolution: null,
+    replyInChat: false,
+  };
 }
 
 export function useQuestionPrompt(
@@ -45,7 +57,9 @@ export function useQuestionPrompt(
     try {
       await respond(agentId, { requestId: prompt.requestId, answers });
       update({ resolution: answeredPromptResolution(prompt.questions, answers), answers: {}, drafts: {} });
+      void haptics.notification("success");
     } catch {
+      void haptics.notification("error");
       update({ failedAnswers: answers });
     } finally {
       submitting.current.delete(scope);
@@ -62,6 +76,9 @@ export function useQuestionPrompt(
       drafts: { ...state.drafts, [question.id]: "" },
       failedAnswers: null,
       index: next ?? state.index,
+      // The choice to answer in the chat belongs to one question. The next question asks again,
+      // so a later message does not answer a question the person did not choose to answer.
+      replyInChat: false,
     });
     if (next === null) void submit(answers);
   }
@@ -78,8 +95,16 @@ export function useQuestionPrompt(
     setDraft: (text: string) => {
       if (question && !disabled) update({ drafts: { ...state.drafts, [question.id]: text } });
     },
+    replyInChat: state.replyInChat,
+    setReplyInChat: (replyInChat: boolean) => {
+      if (disabled) return;
+      void haptics.selection();
+      update({ replyInChat });
+    },
     setIndex: (index: number) => {
-      if (!disabled && prompt?.questions[index]) update({ index });
+      if (disabled || !prompt?.questions[index]) return;
+      void haptics.selection();
+      update({ index, replyInChat: false });
     },
     answer,
     submit,

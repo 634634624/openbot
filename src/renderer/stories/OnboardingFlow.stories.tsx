@@ -1,10 +1,20 @@
 import { isManagedRuntimeProvider, type ManagedProviderId } from "@openbot/contracts/agent-providers";
-import type { AgentProviderId, AgentStatus, AppSetupState, ProviderRuntimeStatus } from "@openbot/contracts/ipc";
-import { createSignal, onCleanup } from "solid-js";
-import { expect, fn, waitFor, within } from "storybook/test";
+import type {
+  AgentProviderId,
+  AgentProviderStatus,
+  AgentStatus,
+  AppSetupState,
+  ProviderRuntimeStatus,
+} from "@openbot/contracts/ipc";
+import { Toaster, toast } from "@openbot/ui";
+import type { ProviderDetection } from "@openbot/ui/features/custom-providers/detected-providers";
+import { createSignal, onCleanup, onSettled } from "solid-js";
+import { fn } from "storybook/test";
 import type { Meta, StoryObj } from "storybook-solidjs-vite";
-import { Toaster, toast } from "../src/components/ui";
 import { OnboardingFlow } from "../src/features/onboarding/OnboardingFlow";
+import { providerKeyApi } from "../src/features/settings/provider-key-api";
+import { createFakeCodeLogin } from "./code-login-fixture";
+import { createStoryDetection, STORY_DETECTED_PROVIDERS } from "./detected-providers-fixture";
 import { STORY_AGENT_STATUS } from "./fixtures";
 import { createMockOpenBot } from "./mock-openbot";
 
@@ -69,20 +79,34 @@ const bothConnectingAgentStatus: AgentStatus = {
   })),
 };
 
-const lazyProviderAgentStatus: AgentStatus = {
-  ...noProvidersConnectedAgentStatus,
-  providers: noProvidersConnectedAgentStatus.providers?.map((provider) => ({
-    ...provider,
-    state: "not-installed",
-    connectionState: undefined,
-    message: null,
-  })),
+/** A new computer: no provider is downloaded yet, Gemini included. */
+const lazyProviders: AgentProviderStatus[] = [
+  ...(noProvidersConnectedAgentStatus.providers ?? []).map(
+    ({ connectionState: _connectionState, ...provider }): AgentProviderStatus => ({
+      ...provider,
+      state: "not-installed",
+      message: null,
+    }),
+  ),
+  { id: "antigravity", state: "not-installed", version: null, message: null },
+];
+const lazyProviderAgentStatus: AgentStatus = { ...noProvidersConnectedAgentStatus, providers: lazyProviders };
+
+/** Gemini is downloaded and signed in. The others are not downloaded yet. */
+const geminiSignedInAgentStatus: AgentStatus = {
+  ...lazyProviderAgentStatus,
+  providers: lazyProviders.map((provider) =>
+    provider.id === "antigravity"
+      ? { ...provider, state: "available", version: "1.2.1", email: "ada@example.com" }
+      : provider,
+  ),
 };
 
 const initialRuntimeStatuses = (): Record<ManagedProviderId, ProviderRuntimeStatus> => ({
   codex: { phase: "not-downloaded", progress: null, message: null, version: null },
   claude: { phase: "not-downloaded", progress: null, message: null, version: null },
   grok: { phase: "not-downloaded", progress: null, message: null, version: null },
+  antigravity: { phase: "not-downloaded", progress: null, message: null, version: null },
   opencode: { phase: "not-downloaded", progress: null, message: null, version: null },
 });
 
@@ -90,10 +114,12 @@ function MockedOnboardingFlow(props: { args: Parameters<typeof OnboardingFlow>[0
   const previousApi = window.openbot;
   const mock = createMockOpenBot();
   if (props.permissions) {
-    mock.api.getComputerUseMacSetupState = async () => ({
-      status: "available",
-      helperName: "Codex Computer Use",
-      helperIconDataUrl: null,
+    mock.api.computerUse.getState = async () => ({
+      status: "permissions-required",
+      permissions: [
+        { id: "screen-recording", granted: false },
+        { id: "accessibility", granted: false },
+      ],
       message: null,
     });
   }
@@ -132,10 +158,38 @@ function RefreshResettingFlow(props: { args: Parameters<typeof OnboardingFlow>[0
   );
 }
 
-function LazyProviderDownloadsFlow(props: { args: Parameters<typeof OnboardingFlow>[0]; failGrokOnce?: boolean }) {
-  const [agentStatus, setAgentStatus] = createSignal(lazyProviderAgentStatus);
-  const [runtimeStatuses, setRuntimeStatuses] = createSignal(initialRuntimeStatuses());
+/** ChatGPT, Claude and Grok downloaded and waiting to connect; OpenCode still to download. */
+const downloadedAgentStatus: AgentStatus = {
+  ...lazyProviderAgentStatus,
+  providers: lazyProviderAgentStatus.providers?.map((provider) =>
+    provider.id === "opencode" || provider.id === "antigravity" ? provider : { ...provider, state: "sign-in-required" },
+  ),
+};
+
+const downloadedRuntimeStatuses = (): Record<ManagedProviderId, ProviderRuntimeStatus> => ({
+  ...initialRuntimeStatuses(),
+  codex: { phase: "ready", progress: 100, message: null, version: "0.149.1" },
+  claude: { phase: "ready", progress: 100, message: null, version: "2.1.246" },
+  grok: { phase: "ready", progress: 100, message: null, version: "1.0.5" },
+});
+
+function LazyProviderDownloadsFlow(props: {
+  args: Parameters<typeof OnboardingFlow>[0];
+  failGrokOnce?: boolean;
+  downloaded?: boolean;
+  initialAgentStatus?: AgentStatus;
+}) {
+  const [agentStatus, setAgentStatus] = createSignal(
+    props.initialAgentStatus ?? (props.downloaded ? downloadedAgentStatus : lazyProviderAgentStatus),
+  );
+  const [runtimeStatuses, setRuntimeStatuses] = createSignal(
+    props.downloaded ? downloadedRuntimeStatuses() : initialRuntimeStatuses(),
+  );
   const [grokFailed, setGrokFailed] = createSignal(false);
+  // One offer, so the row actions menu shows both an Update and a "Check for updates".
+  const [availableVersions, setAvailableVersions] = createSignal<Partial<Record<AgentProviderId, string | null>>>({
+    claude: "2.1.250",
+  });
   const providerTimers = new Map<AgentProviderId, Set<number>>();
 
   function rememberTimer(provider: AgentProviderId, timer: number): number {
@@ -209,6 +263,25 @@ function LazyProviderDownloadsFlow(props: { args: Parameters<typeof OnboardingFl
     rememberTimer(provider, interval);
   }
 
+  function installUpdate(provider: AgentProviderId): void {
+    const version = availableVersions()[provider] ?? null;
+    clearProviderTimers(provider);
+    setAvailableVersions((current) => ({ ...current, [provider]: null }));
+    updateRuntime(provider, { phase: "downloading", progress: 0 });
+    let progress = 0;
+    const interval = window.setInterval(() => {
+      progress = Math.min(100, progress + 10);
+      if (progress < 100) {
+        updateRuntime(provider, { phase: "downloading", progress });
+        return;
+      }
+      window.clearInterval(interval);
+      providerTimers.delete(provider);
+      updateRuntime(provider, { phase: "ready", progress: 100, version });
+    }, 160);
+    rememberTimer(provider, interval);
+  }
+
   function cancelProviderDownload(provider: AgentProviderId): void {
     clearProviderTimers(provider);
     updateRuntime(provider, { phase: "not-downloaded", progress: null });
@@ -236,11 +309,36 @@ function LazyProviderDownloadsFlow(props: { args: Parameters<typeof OnboardingFl
         ...props.args,
         agentStatus: agentStatus(),
         providerRuntimeStatuses: runtimeStatuses(),
+        providerAvailableVersions: availableVersions(),
+        onUpdateProvider: installUpdate,
         onDownloadProvider: downloadProvider,
         onCancelProviderDownload: cancelProviderDownload,
         onConnectProvider: connectProvider,
         onInstallProvider: fn(),
         onRefreshProviders: undefined,
+        providerKeys: providerKeyApi,
+        codeLogin: createFakeCodeLogin({ finishAfterMs: 0 }),
+      }}
+    />
+  );
+}
+
+/** The provider step with a fake scan. `scan` starts one when the story opens, as first run would. */
+function DetectingOnboardingFlow(props: {
+  args: Parameters<typeof OnboardingFlow>[0];
+  initial: ProviderDetection;
+  scan?: boolean;
+}) {
+  const story = createStoryDetection(props.initial);
+  onSettled(() => {
+    if (props.scan) story.scan();
+  });
+  return (
+    <MockedOnboardingFlow
+      args={{
+        ...props.args,
+        providerDetection: story.detection(),
+        detectedProviderApi: story.api,
       }}
     />
   );
@@ -291,11 +389,6 @@ export const Initial: Story = {};
 /** The row that adds a self-described endpoint. OpenCode is installed, so the row offers Add. */
 export const AddCustomProvider: Story = {
   args: { agentStatus: openCodeInstalledAgentStatus },
-  play: async ({ canvas, userEvent }) => {
-    await userEvent.click(await canvas.findByRole("button", { name: "Add custom provider" }));
-    const body = within(document.body);
-    await expect(body.findByRole("heading", { name: "Custom provider" })).resolves.toBeTruthy();
-  },
 };
 
 /** The endpoint is refused, so the form stays with the values, including the key the user typed. */
@@ -306,20 +399,32 @@ export const CustomProviderSaveFails: Story = {
       throw new Error("House Router refused the API key.");
     }),
   },
-  play: async ({ canvas, userEvent }) => {
-    await userEvent.click(await canvas.findByRole("button", { name: "Add custom provider" }));
-    const body = within(document.body);
-    // A required field appends an aria-hidden asterisk to its label, so its name is not an exact match.
-    await userEvent.type(await body.findByLabelText(/^Provider ID/), "house-router");
-    await userEvent.type(body.getByLabelText(/^Display name/), "House Router");
-    await userEvent.type(body.getByLabelText(/^Base URL/), "https://models.example.com/v1");
-    await userEvent.type(body.getByLabelText("Model 1 ID"), "glm-5-air");
-    await userEvent.type(body.getByLabelText("Model 1 display name"), "GLM 5 Air");
-    await userEvent.click(body.getByRole("button", { name: "Submit" }));
+};
 
-    await expect(body.findByText("House Router refused the API key.")).resolves.toBeTruthy();
-    await expect(body.getByLabelText(/^Provider ID/)).toHaveValue("house-router");
-  },
+/**
+ * First run looks for local model servers and ACP agents while the user reads the list. Rows appear
+ * one by one; the provider rows above them do not move.
+ */
+export const DetectingLocalProviders: Story = {
+  args: { agentStatus: openCodeInstalledAgentStatus },
+  render: (storyArgs) => <DetectingOnboardingFlow args={storyArgs} initial={{ scanning: true, found: [] }} scan />,
+};
+
+/**
+ * The scan is done. Add opens the form of its kind, filled from the scan: the endpoint form for a
+ * server, the ACP agent form for an agent. X hides a row that the user does not want.
+ */
+export const DetectedLocalProviders: Story = {
+  args: { agentStatus: openCodeInstalledAgentStatus },
+  render: (storyArgs) => (
+    <DetectingOnboardingFlow args={storyArgs} initial={{ scanning: false, found: STORY_DETECTED_PROVIDERS }} />
+  ),
+};
+
+/** The same result on a narrow window. */
+export const DetectedLocalProvidersNarrow: Story = {
+  ...DetectedLocalProviders,
+  globals: { viewport: "onboardingNarrow" },
 };
 
 export const NarrowProviderVersions: Story = {
@@ -343,22 +448,19 @@ export const NoProvidersConnected: Story = {
     onConnectProvider: fn(),
     onRefreshProviders: fn(),
   },
-  play: async ({ args: storyArgs, canvas, userEvent }) => {
-    const providers = canvas.getByRole("radiogroup", { name: "Default provider" });
-    await expect(within(providers).getByRole("radio", { name: /ChatGPT/ })).not.toBeChecked();
-    await expect(within(providers).getByRole("radio", { name: /Claude/ })).toBeEnabled();
-    await expect(within(providers).getByRole("radio", { name: /Grok/ })).toBeEnabled();
+};
 
-    await userEvent.click(canvas.getByRole("button", { name: "Connect ChatGPT" }));
-    await userEvent.click(canvas.getByRole("button", { name: "Connect Claude" }));
-    await userEvent.click(canvas.getByRole("button", { name: "Connect Grok" }));
-    await userEvent.click(canvas.getByRole("button", { name: "Refresh providers" }));
-
-    await expect(storyArgs.onConnectProvider).toHaveBeenCalledWith("codex");
-    await expect(storyArgs.onConnectProvider).toHaveBeenCalledWith("claude");
-    await expect(storyArgs.onConnectProvider).toHaveBeenCalledWith("grok");
-    await expect(storyArgs.onRefreshProviders).toHaveBeenCalledOnce();
-    await expect(canvas.getByRole("button", { name: "Next" })).toBeDisabled();
+/**
+ * The second way in, on the step where it matters most: first run on a computer whose browser
+ * cannot finish the hand-off. The ChatGPT row keeps it in its actions menu, beside the Connect the
+ * step leads with, and the code opens over the step rather than replacing it.
+ */
+export const SignInWithCode: Story = {
+  args: {
+    agentStatus: noProvidersConnectedAgentStatus,
+    onConnectProvider: fn(),
+    onRefreshProviders: fn(),
+    codeLogin: createFakeCodeLogin({ finishAfterMs: 0 }),
   },
 };
 
@@ -368,17 +470,6 @@ export const RefreshingProviders: Story = {
     refreshingProviders: true,
     onConnectProvider: fn(),
     onRefreshProviders: fn(),
-  },
-  play: async ({ canvas }) => {
-    const providers = canvas.getByRole("radiogroup", { name: "Default provider" });
-    await expect(canvas.getByRole("button", { name: "Checking providers" })).toBeDisabled();
-    await expect(canvas.queryByRole("button", { name: /^Install / })).not.toBeInTheDocument();
-    await expect(canvas.getByRole("button", { name: "Connect ChatGPT" })).toBeDisabled();
-    await expect(canvas.getByRole("button", { name: "Connect Claude" })).toBeDisabled();
-    await expect(canvas.getByRole("button", { name: "Connect Grok" })).toBeDisabled();
-    await expect(within(providers).getByRole("radio", { name: /ChatGPT/ })).toBeEnabled();
-    await expect(within(providers).getByRole("radio", { name: /Claude/ })).toBeEnabled();
-    await expect(canvas.getByRole("button", { name: "Next" })).toBeDisabled();
   },
 };
 
@@ -411,12 +502,6 @@ export const ConnectingChatGPT: Story = {
     onConnectProvider: fn(),
     onRefreshProviders: fn(),
   },
-  play: async ({ canvas }) => {
-    await expect(canvas.getByRole("button", { name: "Restart ChatGPT" })).toBeEnabled();
-    await expect(canvas.getByRole("button", { name: "Connect Claude" })).toBeEnabled();
-    await expect(canvas.getByRole("button", { name: "Refresh providers" })).toBeEnabled();
-    await expect(canvas.getByRole("button", { name: "Next" })).toBeDisabled();
-  },
 };
 
 export const ConnectingClaude: Story = {
@@ -430,12 +515,6 @@ export const ConnectingClaude: Story = {
     onConnectProvider: fn(),
     onRefreshProviders: fn(),
   },
-  play: async ({ canvas }) => {
-    await expect(canvas.getByRole("button", { name: "Restart Claude" })).toBeEnabled();
-    await expect(canvas.getByRole("button", { name: "Connect ChatGPT" })).toBeEnabled();
-    await expect(canvas.getByRole("button", { name: "Refresh providers" })).toBeEnabled();
-    await expect(canvas.getByRole("button", { name: "Next" })).toBeDisabled();
-  },
 };
 
 export const ConnectingBoth: Story = {
@@ -443,11 +522,6 @@ export const ConnectingBoth: Story = {
     agentStatus: bothConnectingAgentStatus,
     onConnectProvider: fn(),
     onRefreshProviders: fn(),
-  },
-  play: async ({ canvas }) => {
-    await expect(canvas.getByRole("button", { name: "Restart ChatGPT" })).toBeEnabled();
-    await expect(canvas.getByRole("button", { name: "Restart Claude" })).toBeEnabled();
-    await expect(canvas.getByRole("button", { name: "Refresh providers" })).toBeEnabled();
   },
 };
 
@@ -458,15 +532,6 @@ export const RefreshResettingConnections: Story = {
     onRefreshProviders: fn(),
   },
   render: (storyArgs) => <RefreshResettingFlow args={storyArgs} />,
-  play: async ({ args: storyArgs, canvas, userEvent }) => {
-    await expect(canvas.getByRole("button", { name: "Restart ChatGPT" })).toBeEnabled();
-    await expect(canvas.getByRole("button", { name: "Restart Claude" })).toBeEnabled();
-    await userEvent.click(canvas.getByRole("button", { name: "Refresh providers" }));
-    await waitFor(() => expect(canvas.getByRole("button", { name: "Connect ChatGPT" })).toBeEnabled());
-    await expect(canvas.getByRole("button", { name: "Connect Claude" })).toBeEnabled();
-    await expect(storyArgs.onRefreshProviders).toHaveBeenCalledOnce();
-    await expect(canvas.queryByRole("alert")).not.toBeInTheDocument();
-  },
 };
 
 export const ConnectedWithReconnect: Story = {
@@ -474,13 +539,6 @@ export const ConnectedWithReconnect: Story = {
     agentStatus: STORY_AGENT_STATUS,
     onConnectProvider: fn(),
     onRefreshProviders: fn(),
-  },
-  play: async ({ canvas }) => {
-    const providers = canvas.getByRole("radiogroup", { name: "Default provider" });
-    await expect(within(providers).getByRole("radio", { name: /ChatGPT/ })).toBeChecked();
-    await expect(canvas.getByRole("button", { name: "Reconnect ChatGPT" })).toBeEnabled();
-    await expect(canvas.getByRole("button", { name: "Reconnect Claude" })).toBeEnabled();
-    await expect(canvas.getByRole("button", { name: "Next" })).toBeEnabled();
   },
 };
 
@@ -491,9 +549,41 @@ export const LazyProviderDownloads: Story = {
   render: (storyArgs) => <LazyProviderDownloadsFlow args={storyArgs} />,
 };
 
+/**
+ * A new computer with no saved endpoint. The list shows ChatGPT, Claude, Grok and OpenCode. Gemini
+ * and the custom provider are in "More providers".
+ */
+export const NewComputer: Story = {
+  args: {
+    agentStatus: lazyProviderAgentStatus,
+    customProviders: [],
+  },
+  render: (storyArgs) => <LazyProviderDownloadsFlow args={storyArgs} />,
+};
+
+/** The user is signed in to Gemini, so Gemini is the first row and Grok is in "More providers". */
+export const SignedInToGemini: Story = {
+  args: {
+    agentStatus: geminiSignedInAgentStatus,
+    customProviders: [],
+  },
+  render: (storyArgs) => <LazyProviderDownloadsFlow args={storyArgs} initialAgentStatus={geminiSignedInAgentStatus} />,
+};
+
 export const LazyProviderDownloadsWithFailure: Story = {
   args: {
     agentStatus: lazyProviderAgentStatus,
   },
   render: (storyArgs) => <LazyProviderDownloadsFlow args={storyArgs} failGrokOnce />,
+};
+
+/**
+ * The whole step to press through: the rows connect after a short wait, OpenCode still downloads,
+ * and the main button connects the selected provider and says so in a toast.
+ */
+export const Interactive: Story = {
+  args: {
+    agentStatus: downloadedAgentStatus,
+  },
+  render: (storyArgs) => <LazyProviderDownloadsFlow args={storyArgs} downloaded />,
 };

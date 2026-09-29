@@ -17,7 +17,7 @@ any of them before an upgrade. A renamed constant means the old file is never re
 | `openbot-update-preference-v1.json` | `UPDATE_PREFERENCE_FILE`, `src/main/application-services.ts` | `src/main/update-preference-store.ts` |
 | `openbot-dynamic-island-preference-v1.json` | `DYNAMIC_ISLAND_PREFERENCE_FILE`, `src/main/application-services.ts` | `src/main/dynamic-island-preference-store.ts` reads `version` 1 and 2 forward into 3 |
 | `openbot-main-window-state-v1.json` | `MAIN_WINDOW_STATE_FILE`, `src/main/index.ts` | `src/main/main-window-state.ts` accepts only `version === 1` |
-| `openbot-browser-state-v1.json` | `BROWSER_STATE_FILE`, `src/main/application-services.ts` | `BrowserHost` in `src/backend/browser-host.ts` |
+| `openbot-browser-state-v1.json` | `BROWSER_STATE_FILE`, `src/main/application-services.ts` | `readBrowserState` in `src/backend/browser-state.ts` reads `version` 1 and 2 forward into 2 |
 | `openbot-sidebar-layout-v1.json` | `SIDEBAR_LAYOUT_FILE`, `src/main/application-services.ts` | `src/backend/sidebar-layout-store.ts` |
 | `openbot-team-server-v1.json` | `TEAM_FILE`, `src/main/application-services.ts` | frozen as the last pre-accounts build left it |
 | `openbot-team-server-v2.json` | `TEAM_FILE_V2`, `src/main/application-services.ts` | `src/main/team-store.ts`; both files coexist so a downgrade still finds its host |
@@ -84,7 +84,7 @@ cycle. Keys here are dot-separated, not colon-separated like the renderer's.
 The middle two are built with a template literal, so **no key-literal query returns them** — they are
 the standing reason gate B reads owner files as well as keys.
 
-The paired-phones note under `## [Unreleased]` in `CHANGELOG.md` is what this surface looks like when
+The paired-phones note under `## [0.5.0]` in `CHANGELOG.md` is what this surface looks like when
 it breaks: agent identifiers changed, the phone still held the old ones, and the only remedy was for
 the user to re-pair. Gate B is what should catch the next one before gate G has to apologise for it.
 
@@ -145,7 +145,7 @@ untouched — they already spell the agent `agent` on both sides.
 
 ## IPC channel list and its mirrors
 
-`packages/contracts/src/ipc-channels.ts` declares every channel. Per the table in
+`packages/contracts/src/ipc-endpoints.ts` declares every channel. Per the table in
 `packages/contracts/AGENTS.md`:
 
 | Mirror | What it is |
@@ -173,7 +173,7 @@ untouched — they already spell the agent `agent` on both sides.
 Two deploy paths, both ordered migrations-then-deploy. Neither one covers the other, and the
 deploy-race reasoning in gate E only holds while *both* keep that order.
 
-`auth:*` channels in `packages/contracts/src/ipc-channels.ts` are the desktop side of this contract.
+`auth:*` channels in `packages/contracts/src/ipc-endpoints.ts` are the desktop side of this contract.
 
 ## Updater and packaging
 

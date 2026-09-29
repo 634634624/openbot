@@ -1,5 +1,6 @@
 import type { AppInfo } from "@openbot/contracts/ipc";
-import { createMemo, createSignal, flush, onSettled } from "solid-js";
+import { createSignal, flush, onSettled } from "solid-js";
+import { appPort } from "./app-port";
 import type { AppProps } from "./app-providers";
 import { createSimpleContext } from "./simple-context";
 
@@ -22,8 +23,8 @@ import { createSimpleContext } from "./simple-context";
  */
 const Platform = createSimpleContext({
   name: "Platform",
-  init: (props: AppProps) => {
-    const [appInfo, setAppInfo] = createSignal<AppInfo | null>(null);
+  init: (props: AppProps & { appInfo?: AppInfo }) => {
+    const [appInfo, setAppInfo] = createSignal<AppInfo | null>(props.appInfo ?? null);
     const [appFocused, setAppFocused] = createSignal(document.hasFocus());
     // Whether `appInfo` is what main reported, as opposed to the fallback below.
     // Analytics attribution is only honest about the former.
@@ -35,20 +36,22 @@ const Platform = createSimpleContext({
       const handleFocus = () => flush(() => setAppFocused(true));
       window.addEventListener("blur", handleBlur);
       window.addEventListener("focus", handleFocus);
-      void window.openbot
-        .getAppInfo()
-        .then((info) => {
-          infoFromHost = true;
-          setAppInfo(info);
-        })
-        .catch(() =>
-          setAppInfo({
-            name: "OpenBot",
-            version: "unavailable",
-            platform: "darwin",
-            variant: "production",
-          }),
-        );
+      // The web client has no main process to ask, so it passes a fixed `appInfo`.
+      if (!props.appInfo)
+        void appPort()
+          .getAppInfo()
+          .then((info) => {
+            infoFromHost = true;
+            setAppInfo(info);
+          })
+          .catch(() =>
+            setAppInfo({
+              name: "OpenBot",
+              version: "unavailable",
+              platform: "darwin",
+              variant: "production",
+            }),
+          );
       return () => {
         window.removeEventListener("blur", handleBlur);
         window.removeEventListener("focus", handleFocus);
@@ -58,14 +61,6 @@ const Platform = createSimpleContext({
     return {
       appInfo,
       appFocused,
-      /**
-       * Whether the window draws the vertical server rail. Every desktop
-       * platform does; the memo exists because three components need the answer
-       * once the view is split along context boundaries - the frame class, the
-       * rail itself and the account dock - and because `appInfo` is null until
-       * main answers, which is the state that actually has to be handled.
-       */
-      serverRailVisible: createMemo(() => appInfo() !== null),
       appInfoLoadedFromHost: () => infoFromHost,
       landingPreview: props.landingPreview === true,
       peopleEnabled: props.peopleEnabled === true,

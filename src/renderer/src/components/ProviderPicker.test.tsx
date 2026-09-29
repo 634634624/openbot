@@ -1,7 +1,7 @@
 import type { AgentProviderId, ProviderRuntimeStatus } from "@openbot/contracts/ipc";
-import { fireEvent, render } from "@solidjs/testing-library";
+import { freeModelsReady, ProviderPicker, type ProviderPickerOption } from "@openbot/ui/components/ProviderPicker";
+import { fireEvent, render, screen, waitFor } from "@solidjs/testing-library";
 import { describe, expect, it, vi } from "vitest";
-import { ProviderPicker, type ProviderPickerOption } from "./ProviderPicker";
 
 /*
  * The two provider rows OpenBot treats differently.
@@ -65,6 +65,14 @@ describe("ProviderPicker", () => {
     expect(view.queryByRole("button", { name: "Sign in to Claude" })).toBeNull();
   });
 
+  it("reads free models as ready only once the OpenCode runtime is on disk", () => {
+    const signedOut = { ...openCode, freeModels: true, state: "sign-in-required" as const };
+    // Setup must not continue on a runtime status that has not arrived: nothing would start it.
+    expect(freeModelsReady(signedOut)).toBe(false);
+    expect(freeModelsReady({ ...signedOut, runtimeStatus: runtime({ phase: "not-downloaded" }) })).toBe(false);
+    expect(freeModelsReady({ ...signedOut, runtimeStatus: runtime({}) })).toBe(true);
+  });
+
   it("opens the OpenCode key dialog from Reconnect, with no second Sign in button", () => {
     const onConnectProvider = vi.fn();
     const { view, onSignInProvider } = renderPicker(
@@ -114,25 +122,93 @@ describe("ProviderPicker", () => {
     expect(downloading.view.getByRole("button", { name: "Cancel OpenCode" })).toBeTruthy();
   });
 
-  it("badges the OpenCode row with the free tier, and only while keyless", () => {
-    // A saved key leaves the runtime "Connected" to speak for the row: no second chip.
-    const saved = renderPicker([{ ...openCode, keyStatus: "saved" }]);
-    expect(saved.view.queryByText("Free")).toBeNull();
+  it("offers the code sign-in on a connected row, and not while the runtime is still downloading", () => {
+    const onSignInWithCodeProvider = vi.fn();
+    const codex: ProviderPickerOption = { id: "codex", name: "ChatGPT", state: "available", message: null };
+    const menu = (option: ProviderPickerOption) =>
+      render(() => (
+        <ProviderPicker
+          value="codex"
+          options={[option]}
+          ariaLabel="AI providers"
+          allowUnavailableSelection
+          onChange={vi.fn()}
+          onSignInProvider={vi.fn()}
+          onSignInWithCodeProvider={onSignInWithCodeProvider}
+        />
+      )).queryByRole("button", { name: "More actions for ChatGPT" });
 
-    const missing = renderPicker([{ ...openCode, keyStatus: "missing" }]);
-    expect(missing.view.getByText("Free")).toBeTruthy();
-
-    // An unreadable key runs keyless, so it reads as free as well.
-    const unreadable = renderPicker([{ ...openCode, keyStatus: "unreadable" }]);
-    expect(unreadable.view.getByText("Free")).toBeTruthy();
-
-    // Unknown until the first read: no badge rather than a wrong one, and never on another row.
-    const unknown = renderPicker([openCode, { ...claude, keyStatus: "saved" }]);
-    expect(unknown.view.queryByText("Free")).toBeNull();
+    // Signed in is not a reason to hide it: this is the way to a second account.
+    expect(menu(codex)).toBeTruthy();
+    expect(menu({ ...codex, state: "sign-in-required" })).toBeTruthy();
+    // Nothing to ask for a code with until the CLI is on the computer.
+    expect(
+      menu({ ...codex, runtimeStatus: runtime({ phase: "downloading", progress: 40, version: null }) }),
+    ).toBeNull();
+    // Claude has no code sign-in, so its row has no menu to hold one.
+    expect(
+      render(() => (
+        <ProviderPicker
+          value="claude"
+          options={[{ ...claude, state: "available" }]}
+          ariaLabel="AI providers"
+          allowUnavailableSelection
+          onChange={vi.fn()}
+          onSignInProvider={vi.fn()}
+          onSignInWithCodeProvider={onSignInWithCodeProvider}
+        />
+      )).queryByRole("button", { name: "More actions for Claude" }),
+    ).toBeNull();
   });
 
-  it("prints Connected once on a signed-in OpenCode row, and keeps busy states reporting", () => {
-    // Steady and signed in: the runtime badge alone, no key chip beside it.
+  it("offers Update in every downloaded row's actions menu, and a check where no newer version is known", async () => {
+    const onUpdateProvider = vi.fn();
+    const view = render(() => (
+      <ProviderPicker
+        value="claude"
+        options={[
+          {
+            ...claude,
+            state: "available",
+            runtimeStatus: runtime({ version: "2.1.246" }),
+            availableVersion: "2.1.250",
+          },
+          { ...openCode, state: "available", runtimeStatus: runtime({}), availableVersion: null },
+          { ...openCode, id: "grok", name: "Grok", runtimeStatus: runtime({ phase: "not-downloaded", version: null }) },
+        ]}
+        ariaLabel="AI providers"
+        allowUnavailableSelection
+        onChange={vi.fn()}
+        onUpdateProvider={onUpdateProvider}
+      />
+    ));
+    const openMenu = (name: string) =>
+      fireEvent.pointerDown(view.getByRole("button", { name: `More actions for ${name}` }), { button: 0 });
+
+    // Nothing on the computer to update yet.
+    expect(view.queryByRole("button", { name: "More actions for Grok" })).toBeNull();
+
+    await openMenu("OpenCode");
+    await fireEvent.pointerUp(await screen.findByRole("menuitem", { name: "Check for updates" }), { button: 0 });
+    await waitFor(() => expect(onUpdateProvider).toHaveBeenCalledWith("opencode"));
+
+    await openMenu("Claude");
+    await fireEvent.pointerUp(await screen.findByRole("menuitem", { name: "Update to 2.1.250" }), { button: 0 });
+    await waitFor(() => expect(onUpdateProvider).toHaveBeenCalledWith("claude"));
+  });
+
+  it("badges the tier and connection state without doubling them", () => {
+    // A saved key leaves the runtime "Connected" to speak for the row: no second chip.
+    expect(renderPicker([{ ...openCode, keyStatus: "saved" }]).view.queryByText("Free")).toBeNull();
+
+    // Keyless rows read as free, including when the key is unreadable.
+    expect(renderPicker([{ ...openCode, keyStatus: "missing" }]).view.getByText("Free")).toBeTruthy();
+    expect(renderPicker([{ ...openCode, keyStatus: "unreadable" }]).view.getByText("Free")).toBeTruthy();
+
+    // Unknown until the first read: no badge rather than a wrong one, and never on another row.
+    expect(renderPicker([openCode, { ...claude, keyStatus: "saved" }]).view.queryByText("Free")).toBeNull();
+
+    // Steady and signed in: the runtime badge alone, printed once.
     const steady = renderPicker([{ ...openCode, state: "available", runtimeStatus: runtime({}), keyStatus: "saved" }]);
     expect(steady.view.getAllByText("Connected")).toHaveLength(1);
 
@@ -143,15 +219,47 @@ describe("ProviderPicker", () => {
     expect(keyless.view.getByText("Free")).toBeTruthy();
     expect(keyless.view.getByText("Connected")).toBeTruthy();
 
-    // Busy states still report, with no tier chip beside them once signed in.
+    // Busy states still report, with no tier chip beside them once signed in. Main holds the
+    // provider "connecting" for the whole install, so the row reports the download, not the word.
     const downloading = renderPicker([
       {
         ...openCode,
+        connectionState: "connecting",
         runtimeStatus: runtime({ phase: "downloading", progress: 40, version: null }),
         keyStatus: "saved",
       },
     ]);
     expect(downloading.view.getByText("40%")).toBeTruthy();
     expect(downloading.view.queryByText("Free")).toBeNull();
+    expect(downloading.view.queryByText("Connecting")).toBeNull();
+  });
+
+  it("keeps the managed download reachable while the providers are being checked", async () => {
+    const onDownloadProvider = vi.fn();
+    const view = render(() => (
+      <ProviderPicker
+        value="opencode"
+        options={[
+          { ...claude, runtimeStatus: runtime({ phase: "not-downloaded", version: null }) },
+          { ...openCode, state: "available", runtimeStatus: runtime({}) },
+        ]}
+        ariaLabel="AI providers"
+        allowUnavailableSelection
+        refreshingProviders
+        onChange={vi.fn()}
+        onDownloadProvider={onDownloadProvider}
+        onConnectProvider={vi.fn()}
+      />
+    ));
+
+    // The download is a file transfer main's runtime store owns, so a provider check that has not
+    // finished - or never will - must not take it away: it is what ends the check.
+    const download = view.getByRole("button", { name: "Download Claude" });
+    expect(download).toBeEnabled();
+    await fireEvent.click(download);
+    expect(onDownloadProvider).toHaveBeenCalledWith("claude");
+
+    // The CLI is what a reconnect asks, so that one still waits.
+    expect(view.getByRole("button", { name: "Reconnect OpenCode" })).toBeDisabled();
   });
 });

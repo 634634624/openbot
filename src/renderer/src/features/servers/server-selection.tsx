@@ -1,4 +1,7 @@
-import type { AgentProviderId, AgentSummary, ServerSummary } from "@openbot/contracts/ipc";
+import type { AddedAgent, AgentProviderId, NotificationOpenedEvent, ServerSummary } from "@openbot/contracts/ipc";
+import { toast } from "@openbot/ui";
+import { currentText } from "@openbot/ui/text";
+import { onSettled } from "solid-js";
 import { desktopAnalytics } from "../../analytics";
 import { createSimpleContext } from "../../simple-context";
 import { useAgents } from "../agents/agents-context";
@@ -9,6 +12,7 @@ import { useRemoteDesktop } from "../remote-desktop/remote-desktop-context";
 import { useSettings } from "../settings/settings-context";
 import { useServerSwitch } from "./server-switch";
 import { useServers } from "./servers-context";
+import { activeServerId, serversPort } from "./servers-port";
 
 /**
  * Switching the active server, and the two ways a new one arrives: joining from
@@ -64,12 +68,14 @@ const ServerSelection = createSimpleContext({
           setDirectTyping(false);
           await disconnectRemoteDesktopWorkspace(false);
           if (!selectionIsCurrent()) return false;
-          await window.openbot.browser.setVisible({ visible: false }).catch(() => undefined);
+          await serversPort()
+            .browser.setVisible({ visible: false })
+            .catch(() => undefined);
           if (!selectionIsCurrent()) return false;
         }
         let nextServers: ServerSummary[];
         try {
-          nextServers = await window.openbot.servers.select(serverId);
+          nextServers = await serversPort().servers.select(serverId);
           if (!selectionIsCurrent()) return false;
           const authoritativeServerId = nextServers.find((server) => server.active)?.id;
           if (authoritativeServerId !== serverId) {
@@ -93,7 +99,9 @@ const ServerSelection = createSimpleContext({
             });
           }
           if (recoverAuthoritativeServer) {
-            const authoritativeServers = await window.openbot.servers.list().catch(() => null);
+            const authoritativeServers = await serversPort()
+              .servers.list()
+              .catch(() => null);
             if (!selectionIsCurrent()) return false;
             const authoritativeServerId = authoritativeServers?.find((server) => server.active)?.id;
             if (authoritativeServerId && authoritativeServerId !== previousServerId) {
@@ -109,8 +117,18 @@ const ServerSelection = createSimpleContext({
       }
     }
 
-    async function openInstalledMarketplaceAgent(agent: AgentSummary): Promise<void> {
-      if (!(await selectServer("local", false))) return;
+    /**
+     * Never rejects: the agent is installed by now, and a failure to open it must not read as a failed
+     * install, or the user would add it a second time. Both the marketplace and a shared-agent link
+     * call this after their install. `serverId` is the joined server whose host added the agent.
+     */
+    async function openInstalledMarketplaceAgent(agent: AddedAgent, serverId = "local"): Promise<void> {
+      try {
+        if (!(await selectServer(serverId, false))) return;
+      } catch {
+        toast.error(currentText().t("server.select.openAgentFailed", { name: agent.name }));
+        return;
+      }
       // Published rather than called: if this was a switch, the navigation
       // domain that owns `selectAgent` has already been replaced by the one in
       // the new scope, and that is the one that has to run it.
@@ -118,16 +136,26 @@ const ServerSelection = createSimpleContext({
       setSkillsMarketplaceOpen(false);
     }
 
+    async function openNotifiedAgent(event: NotificationOpenedEvent): Promise<void> {
+      const onServer = servers().find((server) => server.active)?.id === event.serverId;
+      if (!onServer && !(await selectServer(event.serverId, false))) return;
+      // Published for the same reason as the marketplace agent above.
+      setPendingAgentSelection(event.agentId);
+    }
+
+    onSettled(() =>
+      serversPort().notifications.onOpened((event) => {
+        void openNotifiedAgent(event).catch(() => undefined);
+      }),
+    );
+
     async function joinServer(input: { inviteUrl: string }): Promise<void> {
       const analytics = desktopAnalytics.scope();
       const entryPoint = pendingInviteUrl() ? "invite_deep_link" : "in_app";
       try {
-        await window.openbot.servers.join(input);
+        await serversPort().servers.join(input);
         setPendingInviteUrl("");
-        await selectServer(
-          window.openbot ? ((await window.openbot.servers.list()).find((item) => item.active)?.id ?? "local") : "local",
-          false,
-        );
+        await selectServer(await activeServerId(), false);
         analytics.track("team_action", { action: "server_joined", result: "succeeded", entry_point: entryPoint });
       } catch (error) {
         analytics.track("team_action", {

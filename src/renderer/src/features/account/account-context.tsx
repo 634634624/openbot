@@ -1,7 +1,9 @@
 import type { AccountUsage, AvatarImageInput, CentralAuthState } from "@openbot/contracts/ipc";
+import { currentText } from "@openbot/ui/text";
 import { createMemo, createSignal, createStore, flush, onCleanup, onSettled } from "solid-js";
 import { desktopAnalytics } from "../../analytics";
 import { createSimpleContext } from "../../simple-context";
+import { accountPort } from "./account-port";
 
 /** How long the sign-in success animation holds the account out of the view. */
 const AUTH_SUCCESS_HOLD_MS = 600;
@@ -63,6 +65,8 @@ const Auth = createSimpleContext({
       refreshRevision: number;
     }>({ targetKey: null, data: null, refreshRevision: 0 });
     let accountUsageRequestGeneration = 0;
+    /** The providers an event updated while the current refresh runs. Their rows are newer than it. */
+    let accountUsageEventIds = new Set<string>();
     let authSuccessTimer: ReturnType<typeof setTimeout> | undefined;
 
     onCleanup(() => {
@@ -95,22 +99,22 @@ const Auth = createSimpleContext({
     }
 
     onSettled(() => {
-      const unsubscribe = window.openbot.auth.onEvent((state) => {
+      const unsubscribe = accountPort().auth.onEvent((state) => {
         flush(() => applyCentralAuthState(state));
       });
       // The bootstrap read sets the signal directly, not through
       // `applyCentralAuthState`: there is no earlier state to have completed a
       // code challenge against, so a restart into a signed-in account must not
       // play the success hold.
-      void window.openbot.auth
-        .getState()
+      void accountPort()
+        .auth.getState()
         .then(setCentralAuth)
         .catch(() =>
           setCentralAuth({
             status: "error",
             issue: {
               code: "auth_unavailable",
-              message: "OpenBot could not load the account service.",
+              message: currentText().t("account.login.loadFailed"),
             },
           }),
         );
@@ -120,7 +124,7 @@ const Auth = createSimpleContext({
     async function requestEmailCode(email: string): Promise<void> {
       const analytics = desktopAnalytics.anonymousScope();
       try {
-        const state = await window.openbot.auth.requestEmailCode(email);
+        const state = await accountPort().auth.requestEmailCode(email);
         analytics.track("account_sign_in_started", {
           result: state.status === "code_sent" ? "code_sent" : "failed",
           ...(state.status === "error" ? { failure_code: authFailureCode(state.issue.code) } : {}),
@@ -137,13 +141,13 @@ const Auth = createSimpleContext({
 
     async function retryCentralAccount(): Promise<void> {
       applyCentralAuthState({ status: "loading" });
-      applyCentralAuthState(await window.openbot.auth.retry());
+      applyCentralAuthState(await accountPort().auth.retry());
     }
 
     async function verifyEmailCode(challengeId: string, code: string): Promise<void> {
       const anonymousAnalytics = desktopAnalytics.anonymousScope();
       try {
-        const state = await window.openbot.auth.verifyEmailCode(challengeId, code);
+        const state = await accountPort().auth.verifyEmailCode({ challengeId, code });
         applyCentralAuthState(state);
         desktopAnalytics.track("account_sign_in_completed", {
           result: state.status === "signed_in" ? "succeeded" : "failed",
@@ -161,7 +165,7 @@ const Auth = createSimpleContext({
     async function logoutCentralAccount(): Promise<void> {
       const analytics = desktopAnalytics.scope();
       try {
-        const state = await window.openbot.auth.logout();
+        const state = await accountPort().auth.logout();
         analytics.track("account_sign_out", { result: "succeeded" });
         applyCentralAuthState(state);
       } catch (error) {
@@ -174,11 +178,11 @@ const Auth = createSimpleContext({
     }
 
     async function updateAccountAvatar(image: AvatarImageInput | null): Promise<void> {
-      applyCentralAuthState(await window.openbot.auth.updateAvatar(image));
+      applyCentralAuthState(await accountPort().auth.updateAvatar(image));
     }
 
     async function updateAccountName(name: string): Promise<void> {
-      applyCentralAuthState(await window.openbot.auth.updateName(name));
+      applyCentralAuthState(await accountPort().auth.updateName(name));
     }
 
     const accountUsage = () => accountUsageState.data;
@@ -202,12 +206,15 @@ const Auth = createSimpleContext({
     }
 
     function applyAccountUsage(usage: AccountUsage): void {
-      accountUsageRequestGeneration += 1;
-      setAccountUsageState((state) => {
-        if (usage.limits.length === 0) {
+      if (usage.limits.length === 0) {
+        accountUsageRequestGeneration += 1;
+        setAccountUsageState((state) => {
           state.data = usage;
-          return;
-        }
+        });
+        return;
+      }
+      for (const limit of usage.limits) accountUsageEventIds.add(limit.id);
+      setAccountUsageState((state) => {
         const byId = new Map((state.data?.limits ?? []).map((limit) => [limit.id, limit]));
         for (const limit of usage.limits) byId.set(limit.id, limit);
         state.data = { limits: [...byId.values()] };
@@ -217,25 +224,32 @@ const Auth = createSimpleContext({
     async function refreshAccountUsage(targetKey: string): Promise<AccountUsage> {
       selectAccountUsageTarget(targetKey);
       const generation = ++accountUsageRequestGeneration;
-      const usage = await window.openbot.agent.getUsage();
+      accountUsageEventIds = new Set();
+      const usage = await accountPort().agent.getUsage();
       if (generation === accountUsageRequestGeneration && accountUsageState.targetKey === targetKey) {
+        // The refresh reads every provider, so a row it omits has stopped reporting, such as a revoked
+        // OpenCode Go key. It keeps only the rows an event updated after it started.
         setAccountUsageState((state) => {
-          state.data = usage;
+          const byId = new Map(usage.limits.map((limit) => [limit.id, limit]));
+          for (const limit of state.data?.limits ?? []) {
+            if (accountUsageEventIds.has(limit.id)) byId.set(limit.id, limit);
+          }
+          state.data = { limits: [...byId.values()] };
         });
       }
       return usage;
     }
 
     function createMobileConnect() {
-      return window.openbot.auth.createMobileConnect();
+      return accountPort().auth.createMobileConnect();
     }
 
     function listMobileConnectedDevices() {
-      return window.openbot.auth.listMobileConnectedDevices();
+      return accountPort().auth.listMobileConnectedDevices();
     }
 
     function revokeMobileConnectedDevice(sessionId: string) {
-      return window.openbot.auth.revokeMobileConnectedDevice(sessionId);
+      return accountPort().auth.revokeMobileConnectedDevice(sessionId);
     }
 
     const signedInAccount = createMemo(() => {
@@ -264,8 +278,8 @@ const Auth = createSimpleContext({
       createMobileConnect,
       listMobileConnectedDevices,
       revokeMobileConnectedDevice,
-      listAccountSessions: () => window.openbot.auth.listAccountSessions(),
-      revokeAccountSession: (sessionId: string) => window.openbot.auth.revokeAccountSession(sessionId),
+      listAccountSessions: () => accountPort().auth.listAccountSessions(),
+      revokeAccountSession: (sessionId: string) => accountPort().auth.revokeAccountSession(sessionId),
     };
   },
 });

@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import { COMPUTER_USE_MCP_SERVER_NAME } from "@openbot/contracts/ipc";
 import { type DynamicRecord, isDynamicRecord, isNumber, isString } from "@openbot/contracts/runtime-values";
 import { isGeneratedAgentId } from "@openbot/contracts/validation";
 import { createOpenBotLogger, toLogValue } from "@openbot/logging";
@@ -303,12 +304,19 @@ const V12_REACTIONS_TABLE_SQL = `  CREATE TABLE IF NOT EXISTS projection_reactio
     PRIMARY KEY(agent_id, message_id, actor_kind, actor_agent_id)
   );`;
 
-// Migration 17 widens the provider CHECK, so the fresh schema is no longer the v8 baseline here either.
+// Migrations 17, 22 and 23 widen the provider CHECK, so the fresh schema is no longer the v8 baseline here either.
 // One line rather than the whole table: the substitution then survives any later baseline edit that does
 // not touch this constraint, and `substituteOnce` still shouts if the line ever stops being unique.
 const BASELINE_PROVIDER_SESSIONS_CHECK_SQL = `provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude', 'grok')),`;
 
 const V17_PROVIDER_SESSIONS_CHECK_SQL = `provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude', 'grok', 'opencode')),`;
+
+// Migration 22 adds the Antigravity provider. This list is frozen with the migration: do not derive it
+// from `AGENT_PROVIDERS`, because a later provider must get its own migration.
+const V22_PROVIDER_SESSIONS_CHECK_SQL = `provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude', 'grok', 'opencode', 'antigravity')),`;
+
+// Migration 23 adds `acp`, the one provider of every custom ACP agent. Frozen with the migration, like V22.
+const V23_PROVIDER_SESSIONS_CHECK_SQL = `provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude', 'grok', 'opencode', 'antigravity', 'acp')),`;
 
 // IF NOT EXISTS throughout, because this text is both migration 15 and the tail of the latest
 // schema. A database built from the latest schema and then replayed forward - which is how a
@@ -366,7 +374,7 @@ const LATEST_SCHEMA_SQL =
   substituteOnce(
     substituteOnce(BASELINE_V8_SCHEMA_SQL, BASELINE_REACTIONS_TABLE_SQL, V12_REACTIONS_TABLE_SQL),
     BASELINE_PROVIDER_SESSIONS_CHECK_SQL,
-    V17_PROVIDER_SESSIONS_CHECK_SQL,
+    V23_PROVIDER_SESSIONS_CHECK_SQL,
   ) +
   ANALYTICS_SCHEMA_SQL +
   ANALYTICS_DATE_INDEX_SQL +
@@ -458,6 +466,25 @@ const MIGRATIONS: readonly OpenBotMigration[] = [
     version: 20,
     // Only creates a table, so no foreign-key pause and no vacuum.
     up: (db) => db.exec(MCP_SERVERS_SCHEMA_SQL),
+  },
+  {
+    version: 21,
+    // Renames rows only, so no foreign-key pause, no vacuum, and nothing to mirror in the latest
+    // schema: a new database has no rows to rename.
+    up: freeComputerUseServerName,
+  },
+  {
+    version: 22,
+    // The same table rebuild as migration 17, so foreign keys stay off for the same reason: with them
+    // on, the DROP would set `projection_turns.provider_session_id` to NULL on every turn.
+    disableForeignKeys: true,
+    up: migrateProviderSessionsForAntigravity,
+  },
+  {
+    version: 23,
+    // The same rebuild as migrations 17 and 22, with foreign keys off for the same reason.
+    disableForeignKeys: true,
+    up: migrateProviderSessionsForCustomAgents,
   },
 ];
 
@@ -712,16 +739,38 @@ function migrateProviderSessionsForGrok(db: DatabaseSync): void {
 // already built with the wider list, which is how a test replays an older version forward over a fresh file.
 // The index goes with the table it indexes, so it has to be recreated by name after the rename.
 function migrateProviderSessionsForOpencode(db: DatabaseSync): void {
+  widenProviderSessionsCheck(db, "'opencode'", V17_PROVIDER_SESSIONS_CHECK_SQL, "projection_provider_sessions_v17");
+}
+
+// Migration 22 uses the same rebuild as migration 17. It also skips a table that already allows the
+// provider, so a replay over a database that `createLatestDatabase` built does not rebuild the table.
+function migrateProviderSessionsForAntigravity(db: DatabaseSync): void {
+  widenProviderSessionsCheck(db, "'antigravity'", V22_PROVIDER_SESSIONS_CHECK_SQL, "projection_provider_sessions_v22");
+}
+
+// Migration 23 adds the custom ACP agent provider with the same rebuild and the same skip.
+function migrateProviderSessionsForCustomAgents(db: DatabaseSync): void {
+  widenProviderSessionsCheck(db, "'acp'", V23_PROVIDER_SESSIONS_CHECK_SQL, "projection_provider_sessions_v23");
+}
+
+// Migrations 17, 22 and 23 share this SQL. Each migration gives its own CHECK line and staging table name, so the
+// SQL that migration 17 runs is the same text as before this function was shared.
+function widenProviderSessionsCheck(
+  db: DatabaseSync,
+  providerLiteral: string,
+  providerCheckSql: string,
+  stagingTable: string,
+): void {
   const row = db
     .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'projection_provider_sessions'")
     .get();
-  if (!isDynamicRecord(row) || !isString(row.sql) || row.sql.includes("'opencode'")) return;
+  if (!isDynamicRecord(row) || !isString(row.sql) || row.sql.includes(providerLiteral)) return;
 
   db.exec(`
-    CREATE TABLE projection_provider_sessions_v17 (
+    CREATE TABLE ${stagingTable} (
       id TEXT PRIMARY KEY,
       thread_id TEXT NOT NULL REFERENCES projection_threads(thread_id) ON DELETE CASCADE,
-      ${V17_PROVIDER_SESSIONS_CHECK_SQL}
+      ${providerCheckSql}
       external_session_id TEXT NOT NULL,
       model TEXT NOT NULL,
       effort TEXT NOT NULL,
@@ -732,7 +781,7 @@ function migrateProviderSessionsForOpencode(db: DatabaseSync): void {
       last_event_sequence INTEGER NOT NULL,
       UNIQUE(provider, external_session_id)
     );
-    INSERT INTO projection_provider_sessions_v17 (
+    INSERT INTO ${stagingTable} (
       id, thread_id, provider, external_session_id, model, effort, state,
       created_at, updated_at, resume_cursor, last_event_sequence
     ) SELECT
@@ -740,10 +789,54 @@ function migrateProviderSessionsForOpencode(db: DatabaseSync): void {
       created_at, updated_at, resume_cursor, last_event_sequence
     FROM projection_provider_sessions;
     DROP TABLE projection_provider_sessions;
-    ALTER TABLE projection_provider_sessions_v17 RENAME TO projection_provider_sessions;
+    ALTER TABLE ${stagingTable} RENAME TO projection_provider_sessions;
     CREATE INDEX provider_sessions_thread
       ON projection_provider_sessions(thread_id, provider, state);
   `);
+}
+
+/**
+ * Moves a saved MCP server off the name the Computer Use driver now takes.
+ *
+ * The name was free until the driver arrived, so a database written by a shipped release can hold a
+ * server the user named `computer_use`. OpenBot appends its own entry under that name at spawn, and
+ * all four providers key servers by name: Codex and Claude would hand the agent OpenBot's server in
+ * place of the user's, and an ACP provider would receive two servers with one name. The row is
+ * renamed rather than removed, so the user keeps the server, its command and its secrets, and sees
+ * the new name where they configured it. A later save cannot take the name back: `mcpConfigErrors`
+ * refuses it.
+ */
+function freeComputerUseServerName(db: DatabaseSync): void {
+  const colliding = db
+    .prepare("SELECT mcp_server_id, name FROM projection_mcp_servers WHERE lower(name) = ?")
+    .all(COMPUTER_USE_MCP_SERVER_NAME);
+  if (colliding.length === 0) return;
+
+  const taken = new Set<string>();
+  for (const row of db.prepare("SELECT name FROM projection_mcp_servers").all()) {
+    if (isDynamicRecord(row) && isString(row.name)) taken.add(row.name.toLowerCase());
+  }
+  const rename = db.prepare("UPDATE projection_mcp_servers SET name = ? WHERE mcp_server_id = ?");
+  for (const row of colliding) {
+    if (!isDynamicRecord(row) || !isString(row.mcp_server_id) || !isString(row.name)) continue;
+    const name = freeServerName(taken);
+    taken.add(name.toLowerCase());
+    rename.run(name, row.mcp_server_id);
+    logger.warn("Renamed a saved MCP server, because Computer Use now uses its name.", {
+      from: row.name,
+      to: name,
+    });
+  }
+}
+
+/** The first `computer_use_saved` name the unique index will accept. */
+function freeServerName(taken: ReadonlySet<string>): string {
+  const base = `${COMPUTER_USE_MCP_SERVER_NAME}_saved`;
+  if (!taken.has(base)) return base;
+  for (let suffix = 2; ; suffix += 1) {
+    const candidate = `${base}_${suffix}`;
+    if (!taken.has(candidate)) return candidate;
+  }
 }
 
 function migrateChannelSettings(db: DatabaseSync): void {
@@ -953,7 +1046,7 @@ function legacyWorkspaceRoots(renames: readonly AgentIdRename[]): readonly { fro
       for (const [rawFrom, rawTo] of [
         [from, to],
         [jsonEscape(from), jsonEscape(to)],
-      ]) {
+      ] as const) {
         roots.set(rawFrom, { from: rawFrom, to: rawTo });
       }
     }

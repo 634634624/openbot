@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { isSkillCategory, type SkillCategory } from "@openbot/contracts/ipc";
+import { isSkillCategory, SKILL_DESCRIPTION_MAX_LENGTH, type SkillCategory } from "@openbot/contracts/ipc";
 import { isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
 import { unzipSync } from "fflate";
 import { parse as parseYaml } from "yaml";
@@ -384,8 +384,9 @@ export class SkillMarketplace {
     if (action === "reject" && !rejectionNote?.trim()) {
       throw new SkillMarketplaceError(400, "rejection_note_required", "A rejection note is required.");
     }
-    await this.bindings.DB.prepare(
-      "UPDATE marketplace_skill_versions SET status = ?, rejection_note = ?, reviewed_at = ? WHERE id = ? AND status = 'pending'",
+    // The status guard and RETURNING make a second, concurrent review lose instead of overwriting.
+    const reviewed = await this.bindings.DB.prepare(
+      "UPDATE marketplace_skill_versions SET status = ?, rejection_note = ?, reviewed_at = ? WHERE id = ? AND status = 'pending' RETURNING id",
     )
       .bind(
         action === "approve" ? "approved" : "rejected",
@@ -393,7 +394,8 @@ export class SkillMarketplace {
         now,
         versionId,
       )
-      .run();
+      .first<{ id: string }>();
+    if (!reviewed) throw new SkillMarketplaceError(409, "already_reviewed", "The submission was already reviewed.");
     if (action === "approve") {
       await this.bindings.DB.prepare(
         "UPDATE marketplace_skills SET approved_version_id = ?, updated_at = ? WHERE id = ?",
@@ -535,7 +537,7 @@ function parseSkillMetadata(
   if (!isDynamicRecord(value)) throw new SkillMarketplaceError(400, "invalid_skill", "SKILL.md metadata is invalid.");
   const name = isString(value.name) ? value.name.trim() : "";
   const description = isString(value.description) ? value.description.trim() : "";
-  if (!name || name.length > 80 || !description || description.length > 500) {
+  if (!name || name.length > 80 || !description || description.length > SKILL_DESCRIPTION_MAX_LENGTH) {
     throw new SkillMarketplaceError(
       400,
       "invalid_skill",

@@ -1,16 +1,21 @@
 import { parseDownloadAttachments } from "./agent-inputs";
+import { parseRemoteDesktopSetupAction, parseRemoteDesktopTest } from "./server-inputs";
 // @vitest-environment node
 
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
-import { CUSTOM_PROVIDER_LIMITS } from "@openbot/contracts/ipc";
-import { describe, expect, it } from "vitest";
+import { CUSTOM_PROVIDER_LIMITS, isCustomProviderSummary } from "@openbot/contracts/ipc";
+import { describe, expect, it, vi } from "vitest";
 import {
+  agentRequest,
+  agentScope,
   parseAcknowledgeFailedTurn,
   parseAgentId,
   parseAgentRequest,
   parseApprovalResponse,
+  parseAttachmentId,
   parseBrowserTakeoverResponse,
   parseCancelQueuedMessage,
+  parseChannelId,
   parseChooseAttachments,
   parseCreateAgent,
   parseCreateAgentMemory,
@@ -39,11 +44,15 @@ import {
 } from "./agent-inputs";
 import {
   parseAnalyticsPreference,
+  parseAppLanguagePreference,
+  parseApprovalAutomation,
+  parseDeleteHostedSite,
   parseDynamicIslandAction,
   parseDynamicIslandInteractive,
   parseDynamicIslandPreference,
   parseDynamicIslandPresentation,
   parseExternalDestination,
+  parseInstallSkill,
   parseMacPermission,
   parseMarketplaceAgentQuery,
   parseMarketplaceSkillQuery,
@@ -55,7 +64,13 @@ import {
   parseUpdatePreference,
 } from "./app-inputs";
 import { parseBrowserNavigate, parseBrowserOpen, parseVisibility } from "./browser-inputs";
-import { parseDeleteCustomProvider, parseSaveCustomProvider } from "./custom-provider-inputs";
+import { parseCheckCustomAgent, parseDeleteCustomAgent, parseSaveCustomAgent } from "./custom-agent-inputs";
+import {
+  parseDeleteCustomProvider,
+  parseSaveCustomProvider,
+  parseUpdateCustomProvider,
+} from "./custom-provider-inputs";
+import { parseDiscoverModels, parseProviderDetectionSettings } from "./provider-detection-inputs";
 import {
   parseCreateTeamInvite,
   parseHostConfig,
@@ -64,12 +79,18 @@ import {
   parseMarkDirectRead,
   parseReorderServers,
   parseSetServerMuted,
+  parseSetServerNotificationLevel,
   parseUpdateTeamMember,
 } from "./server-inputs";
 import { nullishPayload, optionalPayload, requireString } from "./validation";
 import { parseVoiceTranscription } from "./voice-inputs";
 
 describe("app IPC input parsing", () => {
+  it("accepts only shipped app languages", () => {
+    expect(parseAppLanguagePreference({ language: "fr" })).toEqual({ language: "fr" });
+    expect(() => parseAppLanguagePreference({ language: "kl" })).toThrowError("Language preference is required.");
+  });
+
   it("validates creator photo consent and agent categories without changing legacy submissions", () => {
     expect(parseSubmitMarketplaceAgent({ agentId: "agent-1" })).toEqual({ agentId: "agent-1" });
     expect(parseSubmitMarketplaceAgent({ agentId: "agent-1", category: "research", showCreatorAvatar: false })).toEqual(
@@ -87,6 +108,29 @@ describe("app IPC input parsing", () => {
     ).toThrow();
   });
 
+  /*
+   * A plugin listing pins the version of each skill it brings. The decoder is where that pin either
+   * reaches the main process or is dropped, and a caller that names no version must still parse as
+   * the install every marketplace screen has always sent.
+   */
+  it("carries a pinned skill version and rejects a version that is not a name", () => {
+    expect(parseInstallSkill({ agentId: "agent-1", skillId: "skill-1" })).toEqual({
+      agentId: "agent-1",
+      skillId: "skill-1",
+    });
+    expect(parseInstallSkill({ agentId: "agent-1", skillId: "skill-1", versionId: "version-7" })).toEqual({
+      agentId: "agent-1",
+      skillId: "skill-1",
+      versionId: "version-7",
+    });
+    expect(() => parseInstallSkill({ agentId: "agent-1", skillId: "skill-1", versionId: 7 })).toThrow(
+      "versionId is required.",
+    );
+    expect(() => parseInstallSkill({ agentId: "agent-1", skillId: "skill-1", versionId: "" })).toThrow(
+      "versionId is required.",
+    );
+  });
+
   it("parses setup and permission values", () => {
     expect(parseSetup({ preferredProvider: "codex", preferredModel: null })).toEqual({
       preferredProvider: "codex",
@@ -101,7 +145,6 @@ describe("app IPC input parsing", () => {
     expect(parseMacPermission("screen-recording")).toBe("screen-recording");
     expect(parseMacPermission("accessibility")).toBe("accessibility");
     expect(parseExternalDestination("claude-install")).toBe("claude-install");
-    expect(parseExternalDestination("claude-sign-in")).toBe("claude-sign-in");
     expect(parseAnalyticsPreference({ enabled: false })).toEqual({ enabled: false });
     expect(parseUpdatePreference({ autoDownload: false })).toEqual({ autoDownload: false });
     expect(parseUpdatePreference({ autoDownload: true })).toEqual({ autoDownload: true });
@@ -151,6 +194,16 @@ describe("app IPC input parsing", () => {
     expect(() => parseAgentId("x".repeat(INPUT_LIMITS.identifier + 1))).toThrowError("agentId is too long.");
   });
 
+  it("validates channel and attachment identifiers and hosted site deletion", () => {
+    expect(parseChannelId("general")).toBe("general");
+    expect(() => parseChannelId(42)).toThrowError("channelId is required.");
+    expect(() => parseChannelId("x".repeat(INPUT_LIMITS.identifier + 1))).toThrowError("channelId is too long.");
+    expect(parseAttachmentId("attachment-1")).toBe("attachment-1");
+    expect(() => parseAttachmentId("x".repeat(INPUT_LIMITS.identifier + 1))).toThrowError("attachmentId is too long.");
+    expect(parseDeleteHostedSite({ siteId: "site-1" })).toEqual({ siteId: "site-1" });
+    expect(() => parseDeleteHostedSite({})).toThrowError("siteId is required.");
+  });
+
   it("keeps setup and permission error messages", () => {
     expect(() => parseSetup(null)).toThrowError("Setup input is required.");
     expect(() => parseSetup({ preferredProvider: "other", preferredModel: null })).toThrowError("Unknown provider.");
@@ -163,6 +216,31 @@ describe("app IPC input parsing", () => {
     expect(() => parseAnalyticsPreference({ enabled: "false" })).toThrowError("Analytics preference is required.");
     expect(() => parseUpdatePreference({ autoDownload: "yes" })).toThrowError("Update preference is required.");
     expect(() => parseUpdatePreference(null)).toThrowError("Update preference is required.");
+  });
+
+  it("takes an approval automation change one field at a time", () => {
+    expect(parseApprovalAutomation({ turbo: true })).toEqual({ turbo: true });
+    expect(parseApprovalAutomation({ agentId: "chief", autoApprove: true })).toEqual({
+      agentId: "chief",
+      autoApprove: true,
+    });
+    expect(parseApprovalAutomation({ turbo: false, agentId: "chief", autoApprove: false })).toEqual({
+      turbo: false,
+      agentId: "chief",
+      autoApprove: false,
+    });
+  });
+
+  it("rejects an approval automation change that says nothing, or only half of a grant", () => {
+    const message = "Approval automation preference is required.";
+    expect(() => parseApprovalAutomation({})).toThrowError(message);
+    expect(() => parseApprovalAutomation(null)).toThrowError(message);
+    expect(() => parseApprovalAutomation({ turbo: "on" })).toThrowError(message);
+    // Half a grant is the dangerous shape: an id with no decision says nothing, and a decision with
+    // no id would be a second way to write the global switch.
+    expect(() => parseApprovalAutomation({ agentId: "chief" })).toThrowError(message);
+    expect(() => parseApprovalAutomation({ autoApprove: true })).toThrowError(message);
+    expect(() => parseApprovalAutomation({ agentId: "", autoApprove: true })).toThrowError(message);
   });
 
   it("validates Dynamic Island data and actions", () => {
@@ -182,16 +260,40 @@ describe("app IPC input parsing", () => {
         hapticsEnabled: false,
         idleVisible: false,
         additionalDisplaysEnabled: true,
+        widthPercent: 85,
+        heightPercent: 110,
       }),
     ).toEqual({
       enabled: true,
       hapticsEnabled: false,
       idleVisible: false,
       additionalDisplaysEnabled: true,
+      widthPercent: 85,
+      heightPercent: 110,
     });
     expect(() => parseDynamicIslandPreference({ enabled: true })).toThrowError(
       "Dynamic Island preference is required.",
     );
+    expect(() =>
+      parseDynamicIslandPreference({
+        enabled: true,
+        hapticsEnabled: true,
+        idleVisible: true,
+        additionalDisplaysEnabled: true,
+        widthPercent: 15,
+        heightPercent: 100,
+      }),
+    ).toThrowError("Dynamic Island preference is required.");
+    expect(() =>
+      parseDynamicIslandPreference({
+        enabled: true,
+        hapticsEnabled: true,
+        idleVisible: true,
+        additionalDisplaysEnabled: true,
+        widthPercent: 72,
+        heightPercent: 100,
+      }),
+    ).toThrowError("Dynamic Island preference is required.");
     expect(parseDynamicIslandInteractive({ interactive: false })).toEqual({ interactive: false });
     expect(parseDynamicIslandPresentation(presentation)).toEqual(presentation);
     const takeoverPresentation = {
@@ -564,6 +666,11 @@ describe("agent IPC input parsing", () => {
     expect(() => parseUpdateAgent({ agentId: "bot-1", notifications: "yes" })).toThrowError(
       "Invalid notifications value.",
     );
+    expect(parseUpdateAgent({ agentId: "bot-1", access: "workspace" })).toEqual({
+      agentId: "bot-1",
+      access: "workspace",
+    });
+    expect(() => parseUpdateAgent({ agentId: "bot-1", access: "read-only" })).toThrowError("Invalid agent access.");
     expect(() => parseImportAttachments({ paths: [""], data: [] })).toThrowError("Invalid attachment path.");
     expect(() => parseChooseAttachments({ filter: "documents" })).toThrowError("Invalid attachment picker filter.");
     expect(() => parseOpenAttachment({ attachmentId: "attachment-1", action: "delete" })).toThrowError(
@@ -616,6 +723,24 @@ describe("agent IPC input parsing", () => {
     expect(() => parseBrowserTakeoverResponse({ requestId: "takeover-1", decision: "maybe" })).toThrowError(
       "Invalid browser takeover response.",
     );
+  });
+});
+
+describe("agent request envelope", () => {
+  it("checks the server scope before the inner decoder sees the payload", () => {
+    const decode = vi.fn((value: unknown) => requireString(value, "Table name"));
+
+    expect(() => agentRequest(decode)({ payload: "notes" })).toThrowError("serverId is required.");
+    expect(decode).not.toHaveBeenCalled();
+    expect(() => agentRequest(decode)({ serverId: "local", payload: 7 })).toThrowError("Table name is required.");
+    expect(agentRequest(decode)({ serverId: "local", payload: "notes" })).toEqual({
+      serverId: "local",
+      payload: "notes",
+    });
+  });
+
+  it("drops the payload of a request that carries only a scope", () => {
+    expect(agentScope({ serverId: "local", payload: { stray: true } })).toEqual({ serverId: "local", payload: null });
   });
 });
 
@@ -823,6 +948,15 @@ describe("custom provider input parsing", () => {
     expect(() => parseDeleteCustomProvider({ id: "studio/local" })).toThrowError("A provider ID must be");
   });
 
+  // An endpoint saved as `antigravity` before Gemini existed must stay in the list and be removable.
+  it("keeps a saved endpoint whose id a newer built-in provider now uses", () => {
+    expect(() => parseSaveCustomProvider({ ...endpoint, id: "antigravity" })).toThrowError("A provider ID must be");
+    expect(parseDeleteCustomProvider({ id: "antigravity" })).toEqual({ id: "antigravity" });
+    expect(
+      isCustomProviderSummary({ id: "antigravity", name: "Mine", baseUrl: "http://x", hasApiKey: false, models: [] }),
+    ).toBe(true);
+  });
+
   // The CLI is given this URL to call. Any other scheme is a way to make the provider process read
   // something local instead of an HTTP API.
   it("rejects a base URL that is not http or https", () => {
@@ -909,17 +1043,98 @@ describe("custom provider input parsing", () => {
   });
 });
 
+describe("custom provider update and detection input parsing", () => {
+  const edit = {
+    id: "studio-local",
+    name: "Studio Local",
+    baseUrl: "http://127.0.0.1:11434/v1",
+    models: [{ id: "glm-5-air", name: "GLM 5 Air" }],
+  };
+
+  it("leaves out a blank or absent key and absent headers, which means keep them", () => {
+    expect(parseUpdateCustomProvider(edit)).toEqual(edit);
+    expect(parseUpdateCustomProvider({ ...edit, apiKey: "  " })).toEqual(edit);
+    expect(parseUpdateCustomProvider({ ...edit, apiKey: "sk-new", headers: [] })).toEqual({
+      ...edit,
+      apiKey: "sk-new",
+      headers: [],
+    });
+  });
+
+  it("refuses a null key, because an update cannot clear it", () => {
+    expect(() => parseUpdateCustomProvider({ ...edit, apiKey: null })).toThrowError();
+  });
+
+  it("accepts a saved endpoint ID only in its own form", () => {
+    const input = { baseUrl: edit.baseUrl, apiKey: null, headers: [] };
+    expect(parseDiscoverModels({ ...input, savedProviderId: "studio-local" })).toEqual({
+      ...input,
+      savedProviderId: "studio-local",
+    });
+    expect(() => parseDiscoverModels({ ...input, savedProviderId: "Studio/Local" })).toThrowError(
+      "A provider ID must be",
+    );
+    expect(() => parseDiscoverModels({ ...input, baseUrl: "file:///etc/passwd" })).toThrowError();
+  });
+
+  it("drops blank and repeated detection rows and refuses unsafe ones", () => {
+    const settings = { enabled: true, addresses: [], folders: [], hiddenIds: [] };
+    expect(
+      parseProviderDetectionSettings({
+        ...settings,
+        addresses: [" http://192.168.1.20:11434/v1 ", "", "http://192.168.1.20:11434/v1"],
+        folders: ["~/bin", "  "],
+        hiddenIds: ["models:http://127.0.0.1:1234/v1"],
+      }),
+    ).toEqual({
+      ...settings,
+      addresses: ["http://192.168.1.20:11434/v1"],
+      folders: ["~/bin"],
+      hiddenIds: ["models:http://127.0.0.1:1234/v1"],
+    });
+    for (const unsafe of [
+      { addresses: ["https://user:secret@example.com/v1"] },
+      { addresses: ["file:///etc/passwd"] },
+      { folders: ["bin"] },
+      { folders: ["/bin\u0000x"] },
+      { hiddenIds: ["other:thing"] },
+    ]) {
+      expect(() => parseProviderDetectionSettings({ ...settings, ...unsafe })).toThrowError();
+    }
+    expect(() =>
+      parseProviderDetectionSettings({ ...settings, folders: Array.from({ length: 17 }, (_, index) => `/f${index}`) }),
+    ).toThrowError();
+  });
+});
+
 it("validates the server mute request", () => {
   expect(parseSetServerMuted({ serverId: "local", muted: true })).toEqual({ serverId: "local", muted: true });
   expect(parseSetServerMuted({ serverId: "remote", muted: false })).toEqual({ serverId: "remote", muted: false });
+  expect(parseSetServerMuted({ serverId: "remote", muted: true, durationMs: 3_600_000 })).toEqual({
+    serverId: "remote",
+    muted: true,
+    durationMs: 3_600_000,
+  });
   for (const input of [
     null,
     {},
     { serverId: "local", muted: "true" },
     { serverId: "", muted: true },
     { serverId: 1, muted: true },
+    { serverId: "local", muted: true, durationMs: 1000 },
+    { serverId: "local", muted: false, durationMs: 3_600_000 },
   ]) {
     expect(() => parseSetServerMuted(input)).toThrow();
+  }
+});
+
+it("validates the server notification level request", () => {
+  expect(parseSetServerNotificationLevel({ serverId: "local", level: "needs-me" })).toEqual({
+    serverId: "local",
+    level: "needs-me",
+  });
+  for (const input of [null, { serverId: "local" }, { serverId: "local", level: "mentions" }, { level: "all" }]) {
+    expect(() => parseSetServerNotificationLevel(input)).toThrow();
   }
 });
 
@@ -948,5 +1163,95 @@ describe("ZIP download inputs", () => {
     { attachments: Array.from({ length: 1000 }, (_, index) => ({ id: String(index), name: "file" })) },
   ])("rejects an invalid archive request", (value) => {
     expect(() => parseDownloadAttachments(value)).toThrow();
+  });
+});
+
+describe("remote desktop setup input", () => {
+  it("accepts only named local setup actions", () => {
+    expect(parseRemoteDesktopSetupAction("accessibility")).toBe("accessibility");
+    expect(parseRemoteDesktopSetupAction("screen-recording")).toBe("screen-recording");
+    expect(parseRemoteDesktopSetupAction("reveal")).toBe("reveal");
+    expect(() => parseRemoteDesktopSetupAction("file:///private")).toThrow();
+  });
+  it("requires a server, a session, and a known test action", () => {
+    expect(parseRemoteDesktopTest({ serverId: "server-1", sessionId: "session-1", action: "start" })).toEqual({
+      serverId: "server-1",
+      sessionId: "session-1",
+      action: "start",
+    });
+    for (const input of [null, { action: "approve" }, { serverId: "server-1", action: "start" }])
+      expect(() => parseRemoteDesktopTest(input)).toThrow();
+  });
+});
+
+describe("custom agent input parsing", () => {
+  const agent = {
+    id: "goose",
+    name: "Goose",
+    command: "goose",
+    args: ["acp"],
+    env: [
+      { name: "OPENAI_API_KEY", value: null },
+      { name: "GOOSE_DEBUG", value: "" },
+    ],
+  };
+
+  it("keeps a null value, which means keep the saved one, and an empty value", () => {
+    expect(parseSaveCustomAgent(agent)).toEqual(agent);
+    expect(parseSaveCustomAgent({ ...agent, args: undefined, env: undefined })).toEqual({
+      ...agent,
+      args: [],
+      env: [],
+    });
+  });
+
+  it("refuses an ID that could name a built-in provider or split a model ID", () => {
+    for (const id of ["codex", "custom", "acp", "Goose", "goose_2", "goose/2", ""]) {
+      expect(() => parseSaveCustomAgent({ ...agent, id }), id).toThrowError();
+      expect(() => parseDeleteCustomAgent({ id }), id).toThrowError();
+    }
+  });
+
+  it("refuses shell text as the command, and a line break in an argument", () => {
+    for (const command of ["goose; id", "goose acp", "$(id)", "-rf", ""]) {
+      expect(() => parseSaveCustomAgent({ ...agent, command }), command).toThrowError();
+    }
+    expect(() => parseSaveCustomAgent({ ...agent, args: ["acp\nid"] })).toThrowError();
+    expect(() => parseSaveCustomAgent({ ...agent, args: [1] })).toThrowError();
+  });
+
+  it("refuses a bad or repeated environment name, and a value that is not text", () => {
+    for (const env of [
+      [{ name: "1KEY", value: "x" }],
+      [{ name: "KEY=1", value: "x" }],
+      [
+        { name: "KEY", value: "x" },
+        { name: "KEY", value: "y" },
+      ],
+      [{ name: "KEY", value: 1 }],
+      [{ name: "KEY" }],
+    ]) {
+      expect(() => parseSaveCustomAgent({ ...agent, env }), JSON.stringify(env)).toThrowError();
+    }
+  });
+
+  it("does not quote an environment value in its error", () => {
+    const error = (() => {
+      try {
+        parseSaveCustomAgent({ ...agent, env: [{ name: "KEY", value: "sk-secret".repeat(2000) }] });
+      } catch (reason) {
+        return reason;
+      }
+      return null;
+    })();
+    expect(error).toBeInstanceOf(Error);
+    expect(String(error)).not.toContain("sk-secret");
+  });
+
+  it("takes a saved agent ID for a check only in its own form", () => {
+    const check = { command: "goose", args: ["acp"], env: [] };
+    expect(parseCheckCustomAgent(check)).toEqual(check);
+    expect(parseCheckCustomAgent({ ...check, savedAgentId: "goose" })).toEqual({ ...check, savedAgentId: "goose" });
+    expect(() => parseCheckCustomAgent({ ...check, savedAgentId: "../goose" })).toThrowError();
   });
 });

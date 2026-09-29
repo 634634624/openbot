@@ -1,6 +1,5 @@
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import type { AvatarHue } from "@openbot/contracts/ipc";
-import { userErrorMessage as errorMessage } from "@openbot/user-errors";
 import * as Crypto from "expo-crypto";
 import { router, Stack, useNavigation } from "expo-router";
 import { usePreventRemove } from "expo-router/react-navigation";
@@ -13,9 +12,12 @@ import { useMobileWorkspace } from "@/features/workspace/context/mobile-workspac
 import { SheetFormField } from "@/shared/components/sheet-form-field";
 import { SheetSaveAction } from "@/shared/components/sheet-save-action";
 import { SheetScrollView } from "@/shared/components/sheet-scroll-view";
+import { haptics } from "@/shared/lib/haptics";
 import { isIOS } from "@/shared/lib/platform";
+import { useText } from "@/shared/lib/text";
 
 export function AddAgentScreen() {
+  const { t, errorMessage } = useText();
   const { createAgent } = useMobileWorkspace();
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
@@ -34,9 +36,13 @@ export function AddAgentScreen() {
   );
   usePreventRemove(!finished && (dirty || saving), ({ data }) => {
     if (pending.current) return;
-    Alert.alert("Discard changes?", "Your changes have not been saved.", [
-      { text: "Keep editing", style: "cancel" },
-      { text: "Discard", style: "destructive", onPress: () => navigation.dispatch(data.action) },
+    Alert.alert(t("mobile.agent.discard.title"), t("mobile.agent.discard.body"), [
+      { text: t("mobile.agent.discard.keepEditing"), style: "cancel" },
+      {
+        text: t("mobile.agent.discard.discard"),
+        style: "destructive",
+        onPress: () => navigation.dispatch(data.action),
+      },
     ]);
   });
   useEffect(() => {
@@ -56,9 +62,11 @@ export function AddAgentScreen() {
         avatarSeed,
         avatarHue,
       });
+      void haptics.notification("success");
       setFinished(true);
     } catch (cause) {
-      setError(errorMessage(cause, "OpenBot could not create this agent."));
+      void haptics.notification("error");
+      setError(errorMessage(cause, t("mobile.agent.add.failed")));
       pending.current = false;
       setSaving(false);
     }
@@ -75,19 +83,22 @@ export function AddAgentScreen() {
       <Stack.Toolbar placement="left">
         <Stack.Toolbar.Button
           icon={isIOS ? "xmark" : undefined}
-          accessibilityLabel="Close"
+          accessibilityLabel={t("common.close")}
           disabled={saving}
-          onPress={() => router.back()}
+          onPress={() => {
+            void haptics.impact("soft");
+            router.back();
+          }}
         >
-          {isIOS ? "Close" : "×"}
+          {isIOS ? t("common.close") : "×"}
         </Stack.Toolbar.Button>
       </Stack.Toolbar>
       <SheetSaveAction
         dirty={dirty}
         canSave={valid && !finished}
         pending={saving}
-        label="Create agent"
-        pendingLabel="Creating…"
+        label={t("mobile.agent.add.create")}
+        pendingLabel={t("mobile.agent.add.creating")}
         onSave={() => void submit()}
       />
       <AgentAppearancePicker
@@ -98,12 +109,10 @@ export function AddAgentScreen() {
           <SheetFormField
             editable={!saving}
             autoCapitalize="words"
-            label="Name"
-            hideLabel
+            label={t("mobile.agent.form.name")}
             appearance="soft"
-            textAlign="center"
             maxLength={INPUT_LIMITS.agentName}
-            placeholder="Name your agent"
+            placeholder={t("mobile.agent.add.namePlaceholder")}
             value={name}
             onChangeText={setName}
           />
@@ -115,18 +124,18 @@ export function AddAgentScreen() {
 
       <SheetFormField
         editable={!saving}
-        label="What should this agent help with?"
+        label={t("mobile.agent.add.descriptionLabel")}
         appearance="soft"
         multiline
         maxLength={INPUT_LIMITS.agentDescription}
-        placeholder="Plan trips, compare options, or help with everyday work."
+        placeholder={t("mobile.agent.add.descriptionPlaceholder")}
         value={description}
         onChangeText={setDescription}
       />
 
       {dirty && !valid ? (
         <Typography.Paragraph accessibilityRole="alert" className="text-danger-text">
-          Enter a name for this agent.
+          {t("mobile.agent.add.nameRequired")}
         </Typography.Paragraph>
       ) : null}
       {error ? (

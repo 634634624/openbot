@@ -18,14 +18,37 @@ import {
   type RemoteSession,
   type RemoteSessionTicket,
 } from "@openbot/contracts/remote-control-plane";
-import { type DynamicRecord, isBoolean, isDynamicRecord, isNumber, isString } from "@openbot/contracts/runtime-values";
+import { isDynamicRecord, isNumber, isString } from "@openbot/contracts/runtime-values";
 import {
   REMOTE_TICKET_AUDIENCE,
   type RemoteMemberRole,
   type RemoteTicketClaims,
 } from "@openbot/contracts/signal-protocol/ticket";
+import { sourceText } from "@openbot/i18n/source";
 import { createLocalJWKSet, jwtVerify } from "jose";
 import { z } from "zod";
+import { isMissingFileError } from "../backend/file-errors";
+import {
+  decodeAcceptedRemoteInvite,
+  decodeCentralAuthUser,
+  decodeCreatedRemoteInvite,
+  decodeEmailChallenge,
+  decodeMobileConnectedDevices,
+  decodeRecordHealth,
+  decodeRegisteredRemoteHost,
+  decodeRemoteHosts,
+  decodeRemoteInvitePreview,
+  decodeRemoteInvites,
+  decodeRemoteMembers,
+  decodeSessionResponse,
+  decodeTicketResponse,
+  decodeVoid,
+  type RegisteredRemoteHost,
+  type RemoteHostSummary,
+  type RemoteInvitePreview,
+  type RemoteInviteRecord,
+  type RemoteMemberRecord,
+} from "./central-auth-records";
 
 interface CentralAuthEvents {
   changed: [state: CentralAuthState];
@@ -53,11 +76,6 @@ interface EmailCodeRequest {
   promise: Promise<CentralAuthState> | null;
 }
 
-interface SessionResponse {
-  sessionToken: string;
-  user: CentralAuthUser;
-}
-
 const STARTUP_RETRY_WINDOW_MS = 30_000;
 const STARTUP_REQUEST_TIMEOUT_MS = 3_000;
 const STARTUP_RETRY_DELAYS_MS = [250, 500, 1_000, 2_000] as const;
@@ -77,19 +95,9 @@ const UNCERTAIN_EMAIL_CODE_REQUEST_FAILURES = new Set([
   "email_delivery_timeout",
   "email_delivery_unknown",
 ]);
-const AUTH_API_UNAVAILABLE_MESSAGE =
-  "OpenBot could not reach the account service. Check that the API is running, then try again.";
 const remoteTicketJwksSchema = z.object({
   keys: z.array(z.object({ kty: z.string() }).loose()).min(1),
 });
-
-export interface RegisteredRemoteHost {
-  hostId: string;
-  name: string;
-  membershipId: string;
-  authEpoch: number;
-  machineToken: string | null;
-}
 
 // The account API answers the same shape for a host credential and for a member session, so both
 // paths below decode it with the one function in `@openbot/contracts/remote-control-plane`.
@@ -105,45 +113,6 @@ export type VerifiedRemoteSessionTicket = Pick<
   role: RemoteMemberRole;
   clientPublicKey: string;
 };
-
-export interface RemoteHostSummary {
-  hostId: string;
-  name: string;
-  logoKey: string | null;
-  devicePublicKey: string | null;
-  authEpoch: number;
-  membershipId: string;
-  role: "owner" | "admin" | "member";
-}
-
-export interface RemoteInviteRecord {
-  inviteId: string;
-  email: string | null;
-  role: "admin" | "member";
-  expiresAt: number;
-  usedAt: number | null;
-  revokedAt: number | null;
-}
-
-export interface RemoteInvitePreview {
-  inviteId: string;
-  hostId: string;
-  hostName: string;
-  role: "admin" | "member";
-  expiresAt: number;
-  emailBound: boolean;
-  devicePublicKey: string | null;
-}
-
-export interface RemoteMemberRecord {
-  membershipId: string;
-  email: string;
-  name: string | null;
-  avatarUrl: string | null;
-  role: "owner" | "admin" | "member";
-  status: "active" | "revoked";
-  createdAt: number;
-}
 
 export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
   readonly #options: Required<CentralAuthManagerOptions>;
@@ -214,7 +183,7 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
 
   getSignedInUser(): CentralAuthUser {
     if (this.#state.status !== "signed_in") {
-      throw new AuthApiError(401, "unauthorized", "Sign in to OpenBot first.");
+      throw new AuthApiError(401, "unauthorized", sourceText("error.auth.signInFirst"));
     }
     return structuredClone(this.#state.user);
   }
@@ -233,7 +202,7 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
   }
 
   async downloadAuthorized(path: string, timeoutMs = 30_000): Promise<Uint8Array> {
-    if (!this.#sessionToken) throw new AuthApiError(401, "unauthorized", "Sign in is required.");
+    if (!this.#sessionToken) throw new AuthApiError(401, "unauthorized", sourceText("error.auth.signInRequired"));
     const response = await this.#options.fetch(new URL(path, this.#options.apiUrl), {
       headers: { Authorization: `Bearer ${this.#sessionToken}` },
       signal: AbortSignal.timeout(timeoutMs),
@@ -350,7 +319,7 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
       // The credential belongs to the account that asked for it. Writing it now would file
       // it under whichever session is stored next, so the caller is told the registration
       // no longer applies instead.
-      throw new Error("The signed-in account changed while this server was being registered.");
+      throw new Error(sourceText("error.auth.accountChangedDuringRegister"));
     }
     if (result.machineToken) this.#teamHostTokens.set(input.hostId.toLowerCase(), result.machineToken);
     await this.#writeStoredSession();
@@ -359,7 +328,7 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
 
   issueRemoteHostTicket(hostId: string): Promise<RemoteConnectionBootstrap> {
     const machineToken = this.#teamHostTokens.get(hostId.toLowerCase());
-    if (!machineToken) throw new Error("The remote host credential is unavailable. Register the host again.");
+    if (!machineToken) throw new Error(sourceText("error.auth.hostCredentialUnavailable"));
     return this.#request(
       `/v2/remote/hosts/${encodeURIComponent(hostId)}/ticket`,
       { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ machineToken }) },
@@ -452,8 +421,8 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
 
   createRemoteInvite(
     hostId: string,
-    input: { role: "admin" | "member"; email?: string },
-  ): Promise<{ inviteId: string; token: string; expiresAt: number }> {
+    input: { role: "admin" | "member"; email?: string; permanent?: boolean },
+  ): Promise<{ inviteId: string; token: string; expiresAt: number; permanent: boolean; useCount: number }> {
     return this.#authorizedRequest(
       `/v2/remote/hosts/${encodeURIComponent(hostId)}/invites`,
       { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) },
@@ -555,7 +524,7 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
   }
 
   async downloadRemoteHostLogo(hostId: string, version: string): Promise<{ bytes: Uint8Array; mimeType: string }> {
-    if (!this.#sessionToken) throw new AuthApiError(401, "unauthorized", "Sign in is required.");
+    if (!this.#sessionToken) throw new AuthApiError(401, "unauthorized", sourceText("error.auth.signInRequired"));
     const url = new URL(`/v2/remote/hosts/${encodeURIComponent(hostId)}/logo`, this.#options.apiUrl);
     url.searchParams.set("v", version);
     const response = await this.#options.fetch(url, {
@@ -626,7 +595,7 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
         const encrypted = Buffer.from(await readFile(this.#options.storagePath, "utf8"), "base64");
         this.#restoreStoredSession(this.#options.decrypt(encrypted));
       } catch (error) {
-        if (!isMissing(error)) {
+        if (!isMissingFileError(error)) {
           await this.#clearStoredSession();
         }
       }
@@ -717,6 +686,7 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
   async verifyEmailCode(challengeId: string, code: string): Promise<CentralAuthState> {
     const challenge = this.#state.status === "code_sent" ? this.#state : null;
     if (challenge) this.#setState({ ...challenge, issue: undefined });
+    let sessionApplied = false;
     try {
       const session = await this.#request(
         "/v1/auth/email/verify",
@@ -733,22 +703,26 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
         this.#teamHostTokens.clear();
       }
       this.#sessionToken = session.sessionToken;
+      sessionApplied = true;
       await this.#writeStoredSession();
       return this.#setState({
         status: "signed_in",
         user: this.#resolveUserAvatar(session.user),
       });
     } catch (error) {
-      await this.#clearStoredSession();
+      // A wrong code or a failed request for a challenge leaves the stored session as it was: the
+      // user can still be signed in to another account, or have a session that only a startup
+      // check failed on.
+      if (sessionApplied || !challenge) await this.#clearStoredSession();
       if (challenge) {
         return this.#setState({
           ...challenge,
-          issue: centralAuthIssue(error, "email_sign_in_failed", "The sign-in code could not be verified."),
+          issue: centralAuthIssue(error, "email_sign_in_failed", sourceText("error.auth.codeNotVerified")),
         });
       }
       return this.#setState({
         status: "error",
-        issue: centralAuthIssue(error, "email_sign_in_failed", "The sign-in code could not be verified."),
+        issue: centralAuthIssue(error, "email_sign_in_failed", sourceText("error.auth.codeNotVerified")),
       });
     }
   }
@@ -768,7 +742,7 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
 
   async updateAvatar(image: AvatarImageInput | null): Promise<CentralAuthState> {
     const sessionToken = this.#sessionToken;
-    if (!sessionToken) throw new AuthApiError(401, "unauthorized", "Sign in is required.");
+    if (!sessionToken) throw new AuthApiError(401, "unauthorized", sourceText("error.auth.signInRequired"));
     const user = image
       ? await this.#authorizedRequest(
           "/v1/me/avatar",
@@ -796,7 +770,7 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
 
   async updateName(name: string): Promise<CentralAuthState> {
     const sessionToken = this.#sessionToken;
-    if (!sessionToken) throw new AuthApiError(401, "unauthorized", "Sign in is required.");
+    if (!sessionToken) throw new AuthApiError(401, "unauthorized", sourceText("error.auth.signInRequired"));
     const user = await this.#authorizedRequest(
       "/v1/me/profile",
       {
@@ -832,7 +806,7 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
     let retryIndex = 0;
     while (true) {
       const remainingMs = deadline - Date.now();
-      if (remainingMs <= 0) throw new Error(AUTH_API_UNAVAILABLE_MESSAGE);
+      if (remainingMs <= 0) throw new Error(sourceText("error.auth.serviceUnavailable"));
       try {
         return await this.#request(
           path,
@@ -846,7 +820,7 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
       } catch (error) {
         if (!isTransientStartupError(error)) throw error;
         const delayMs = Math.min(
-          this.#options.startupRetryDelaysMs[Math.min(retryIndex, this.#options.startupRetryDelaysMs.length - 1)],
+          this.#options.startupRetryDelaysMs[Math.min(retryIndex, this.#options.startupRetryDelaysMs.length - 1)] ?? 0,
           Math.max(0, deadline - Date.now()),
         );
         if (delayMs <= 0) throw error;
@@ -862,7 +836,7 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
     decoder: (value: unknown) => T,
     timeoutMs?: number,
   ): Promise<T> {
-    if (!this.#sessionToken) throw new AuthApiError(401, "unauthorized", "Sign in is required.");
+    if (!this.#sessionToken) throw new AuthApiError(401, "unauthorized", sourceText("error.auth.signInRequired"));
     return this.#request(
       path,
       {
@@ -967,7 +941,7 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
       status: "error",
       issue: {
         code: unavailable ? "auth_api_unavailable" : apiError.code,
-        message: unavailable ? AUTH_API_UNAVAILABLE_MESSAGE : apiError.message,
+        message: unavailable ? sourceText("error.auth.serviceUnavailable") : apiError.message,
         ...(apiError?.retryAfterSeconds === undefined ? {} : { retryAfterSeconds: apiError.retryAfterSeconds }),
       },
     });
@@ -1015,7 +989,7 @@ class AuthApiError extends Error {
     return new AuthApiError(
       response.status,
       "auth_api_error",
-      "The account service returned an error.",
+      sourceText("error.auth.serviceError"),
       retryAfterSeconds,
     );
   }
@@ -1034,24 +1008,23 @@ function centralAuthIssue(error: unknown, fallbackCode: string, fallbackMessage:
 
 function emailCodeRequestIssue(error: unknown): CentralAuthIssue {
   if (error instanceof AuthApiError) {
-    return centralAuthIssue(error, "email_sign_in_start_failed", "OpenBot could not send the sign-in code.");
+    return centralAuthIssue(error, "email_sign_in_start_failed", sourceText("error.auth.codeNotSent"));
   }
   if (error instanceof DOMException && error.name === "TimeoutError") {
     return {
       code: "email_delivery_timeout",
-      message:
-        "OpenBot could not confirm delivery in time. The code may still arrive; check delivery before sending again.",
+      message: sourceText("error.auth.deliveryTimeout"),
     };
   }
   if (error instanceof TypeError || (error instanceof DOMException && error.name === "AbortError")) {
     return {
       code: "email_delivery_unknown",
-      message: "The connection ended before OpenBot confirmed delivery. Check delivery to avoid sending another code.",
+      message: sourceText("error.auth.deliveryInterrupted"),
     };
   }
   return {
     code: "email_delivery_unknown",
-    message: "OpenBot could not confirm whether the sign-in code was sent. Check delivery before sending again.",
+    message: sourceText("error.auth.deliveryUnknown"),
   };
 }
 
@@ -1071,221 +1044,6 @@ function parseRetryAfterSeconds(value: string | null): number | undefined {
   if (!Number.isFinite(retryAt)) return undefined;
   const seconds = Math.ceil((retryAt - Date.now()) / 1_000);
   return seconds > 0 ? seconds : undefined;
-}
-
-function decodeVoid(value: unknown): undefined {
-  if (value !== undefined && value !== null) throw new Error("The account service returned data.");
-  return undefined;
-}
-
-function decodeRecordHealth(value: unknown): DynamicRecord {
-  return decodeRecord(value, "health response");
-}
-
-function decodeCentralAuthUser(value: unknown): CentralAuthUser {
-  const record = decodeRecord(value, "account user");
-  const name = record.name;
-  const avatarUrl = record.avatarUrl;
-  if (name !== null && !isString(name)) throw new Error("Invalid account name.");
-  if (avatarUrl !== null && !isString(avatarUrl)) throw new Error("Invalid account avatar.");
-  return {
-    id: requiredString(record, "id"),
-    email: requiredString(record, "email"),
-    name,
-    avatarUrl,
-  };
-}
-
-function decodeTicketResponse(value: unknown): { ticket: string; expiresAt: number } {
-  const record = decodeRecord(value, "team ticket");
-  if (!isNumber(record.expiresAt)) throw new Error("Invalid team ticket expiration.");
-  return { ticket: requiredString(record, "ticket"), expiresAt: record.expiresAt };
-}
-
-function decodeMobileConnectedDevices(value: unknown): { devices: MobileConnectedDevice[] } {
-  const record = decodeRecord(value, "mobile devices");
-  if (!Array.isArray(record.devices)) throw new Error("Invalid mobile device list.");
-  return { devices: record.devices.map(decodeMobileConnectedDevice) };
-}
-
-function decodeMobileConnectedDevice(value: unknown): MobileConnectedDevice {
-  const record = decodeRecord(value, "mobile device");
-  if (!isNumber(record.connectedAt) || !isNumber(record.lastActiveAt)) {
-    throw new Error("Invalid mobile device timestamps.");
-  }
-  const platform = record.platform;
-  if (platform !== "ios" && platform !== "android" && platform !== "unknown") {
-    throw new Error("Invalid mobile device platform.");
-  }
-  return {
-    sessionId: requiredString(record, "sessionId"),
-    name: requiredString(record, "name"),
-    platform,
-    connectedAt: record.connectedAt,
-    lastActiveAt: record.lastActiveAt,
-  };
-}
-
-function decodeRegisteredRemoteHost(value: unknown): RegisteredRemoteHost {
-  const record = decodeRecord(value, "remote host registration");
-  if (!isNumber(record.authEpoch) || !Number.isSafeInteger(record.authEpoch) || record.authEpoch < 1) {
-    throw new Error("Invalid remote host auth epoch.");
-  }
-  return {
-    hostId: requiredString(record, "hostId"),
-    name: requiredString(record, "name"),
-    membershipId: requiredString(record, "membershipId"),
-    authEpoch: record.authEpoch,
-    machineToken: record.machineToken === null ? null : requiredString(record, "machineToken"),
-  };
-}
-
-function decodeRemoteHosts(value: unknown): RemoteHostSummary[] {
-  const record = decodeRecord(value, "remote hosts");
-  if (!Array.isArray(record.hosts)) throw new Error("Invalid remote host list.");
-  return record.hosts.map((item) => {
-    const host = decodeRecord(item, "remote host");
-    if (!isNumber(host.authEpoch) || !Number.isSafeInteger(host.authEpoch) || host.authEpoch < 1)
-      throw new Error("Invalid remote auth epoch.");
-    if (host.logoKey !== null && !isString(host.logoKey)) throw new Error("Invalid remote host logo.");
-    if (host.devicePublicKey !== null && !isString(host.devicePublicKey)) throw new Error("Invalid remote host key.");
-    if (host.role !== "owner" && host.role !== "admin" && host.role !== "member")
-      throw new Error("Invalid remote host role.");
-    return {
-      hostId: requiredString(host, "hostId"),
-      name: requiredString(host, "name"),
-      logoKey: host.logoKey,
-      devicePublicKey: host.devicePublicKey,
-      authEpoch: host.authEpoch,
-      membershipId: requiredString(host, "membershipId"),
-      role: host.role,
-    };
-  });
-}
-
-function decodeCreatedRemoteInvite(value: unknown): { inviteId: string; token: string; expiresAt: number } {
-  const record = decodeRecord(value, "remote invitation");
-  if (!isNumber(record.expiresAt)) throw new Error("Invalid remote invitation expiration.");
-  return {
-    inviteId: requiredString(record, "inviteId"),
-    token: requiredString(record, "token"),
-    expiresAt: record.expiresAt,
-  };
-}
-
-function decodeRemoteInvite(value: unknown): RemoteInviteRecord {
-  const record = decodeRecord(value, "remote invitation");
-  if (record.role !== "admin" && record.role !== "member") throw new Error("Invalid remote invitation role.");
-  if (!isNumber(record.expiresAt)) throw new Error("Invalid remote invitation expiration.");
-  if (record.usedAt !== null && !isNumber(record.usedAt)) throw new Error("Invalid remote invitation use time.");
-  if (record.revokedAt !== null && !isNumber(record.revokedAt))
-    throw new Error("Invalid remote invitation revocation time.");
-  if (record.email !== null && !isString(record.email)) throw new Error("Invalid remote invitation email.");
-  return {
-    inviteId: requiredString(record, "inviteId"),
-    email: record.email,
-    role: record.role,
-    expiresAt: record.expiresAt,
-    usedAt: record.usedAt,
-    revokedAt: record.revokedAt,
-  };
-}
-
-function decodeRemoteInvites(value: unknown): RemoteInviteRecord[] {
-  const record = decodeRecord(value, "remote invitation list");
-  if (!Array.isArray(record.invites)) throw new Error("Invalid remote invitation list.");
-  return record.invites.map(decodeRemoteInvite);
-}
-
-function decodeRemoteInvitePreview(value: unknown): RemoteInvitePreview {
-  const record = decodeRecord(value, "remote invitation preview");
-  if (record.role !== "admin" && record.role !== "member") throw new Error("Invalid remote invitation role.");
-  if (!isNumber(record.expiresAt) || !isBoolean(record.emailBound))
-    throw new Error("Invalid remote invitation preview.");
-  if (record.devicePublicKey !== null && !isString(record.devicePublicKey))
-    throw new Error("Invalid remote invitation host key.");
-  return {
-    inviteId: requiredString(record, "inviteId"),
-    hostId: requiredString(record, "hostId"),
-    hostName: requiredString(record, "hostName"),
-    role: record.role,
-    expiresAt: record.expiresAt,
-    emailBound: record.emailBound,
-    devicePublicKey: record.devicePublicKey,
-  };
-}
-
-function decodeAcceptedRemoteInvite(value: unknown): {
-  hostId: string;
-  membershipId: string;
-  role: "admin" | "member";
-} {
-  const record = decodeRecord(value, "accepted remote invitation");
-  if (record.role !== "admin" && record.role !== "member") throw new Error("Invalid remote membership role.");
-  return {
-    hostId: requiredString(record, "hostId"),
-    membershipId: requiredString(record, "membershipId"),
-    role: record.role,
-  };
-}
-
-function decodeRemoteMember(value: unknown): RemoteMemberRecord {
-  const record = decodeRecord(value, "remote member");
-  if (record.role !== "owner" && record.role !== "admin" && record.role !== "member")
-    throw new Error("Invalid remote member role.");
-  if (record.status !== "active" && record.status !== "revoked") throw new Error("Invalid remote member status.");
-  if (!isNumber(record.createdAt)) throw new Error("Invalid remote member creation time.");
-  if (record.name !== null && !isString(record.name)) throw new Error("Invalid remote member name.");
-  if (record.avatarUrl !== null && !isString(record.avatarUrl)) throw new Error("Invalid remote member avatar.");
-  return {
-    membershipId: requiredString(record, "membershipId"),
-    email: requiredString(record, "email"),
-    name: record.name,
-    avatarUrl: record.avatarUrl,
-    role: record.role,
-    status: record.status,
-    createdAt: record.createdAt,
-  };
-}
-
-function decodeRemoteMembers(value: unknown): RemoteMemberRecord[] {
-  const record = decodeRecord(value, "remote member list");
-  if (!Array.isArray(record.members)) throw new Error("Invalid remote member list.");
-  return record.members.map(decodeRemoteMember);
-}
-
-function decodeEmailChallenge(value: unknown): {
-  challengeId: string;
-  expiresAt: number;
-  resendAt?: number;
-  developmentCode?: string;
-} {
-  const record = decodeRecord(value, "email challenge");
-  if (!isNumber(record.expiresAt)) throw new Error("Invalid email challenge expiration.");
-  const developmentCode = record.developmentCode;
-  const resendAt = record.resendAt;
-  if (developmentCode !== undefined && !isString(developmentCode)) {
-    throw new Error("Invalid development code.");
-  }
-  if (resendAt !== undefined && !isNumber(resendAt)) throw new Error("Invalid email resend time.");
-  return {
-    challengeId: requiredString(record, "challengeId"),
-    expiresAt: record.expiresAt,
-    ...(resendAt === undefined ? {} : { resendAt }),
-    ...(developmentCode === undefined ? {} : { developmentCode }),
-  };
-}
-
-function decodeSessionResponse(value: unknown): SessionResponse {
-  const record = decodeRecord(value, "session");
-  return {
-    sessionToken: requiredString(record, "sessionToken"),
-    user: decodeCentralAuthUser(record.user),
-  };
-}
-
-function isMissing(error: unknown): error is NodeJS.ErrnoException {
-  return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
 
 function errorMessage(error: unknown, fallback: string): string {

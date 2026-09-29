@@ -10,15 +10,12 @@
 
 import type { ChannelMessage, ChannelPage } from "@openbot/contracts/ipc";
 import { channelRoutingConversationEvent, SIGNED_OUT_CHANNEL_MEMBER_ID } from "@openbot/contracts/ipc";
-import type { AgentMessage, AgentProfile, ChatActionMarkerModel } from "../../data";
-import type { ChatMessageAuthor } from "../conversation/ChatMessageRow";
+import type { AgentMessage, AgentProfile, ChatActionMarkerModel } from "@openbot/ui/data";
+import type { ChatMessageAuthor } from "@openbot/ui/features/conversation/ChatMessageRow";
+import { currentText } from "@openbot/ui/text";
+import { messagePlan } from "../../app-message-projection";
 import { type DayMarkerOptions, dayMarkerLabel } from "../conversation/chat-day-markers";
-
-/**
- * How long a run of messages by one author stays one block. Beyond it the name and the face return,
- * because a reply an hour later is a new turn of the conversation, not a continuation.
- */
-export const CHANNEL_GROUPING_WINDOW_MS = 5 * 60_000;
+import { withinGroupingWindow } from "../conversation/chat-grouping";
 
 export interface ChannelTimelineEntry {
   id: string;
@@ -45,7 +42,7 @@ function hasContent(entry: ChannelMessage): boolean {
  * feedback about how the work was shared, so it carries no bubble, no author face and no message
  * actions, and it does not count as a new message.
  */
-export function channelRoutingMarker(entry: ChannelMessage): ChatActionMarkerModel | null {
+function channelRoutingMarker(entry: ChannelMessage): ChatActionMarkerModel | null {
   const event = channelRoutingConversationEvent(entry.message);
   return event ? { ...event, kind: "channel-routing", timestamp: entry.message.createdAt } : null;
 }
@@ -53,12 +50,20 @@ export function channelRoutingMarker(entry: ChannelMessage): ChatActionMarkerMod
 function toAgentMessage(entry: ChannelMessage, own: boolean, options: DayMarkerOptions): AgentMessage {
   const message = entry.message;
   const actionMarker = channelRoutingMarker(entry);
+  const plan = actionMarker ? null : messagePlan(message);
+  const time = { hour: "numeric", minute: "2-digit" } as const;
+  const createdAt = new Date(message.createdAt);
   return {
     id: entry.id,
     author: own ? "you" : "agent",
     ...(actionMarker ? { kind: "action-marker" as const, actionMarker } : {}),
+    ...(plan ? { kind: "plan" as const, plan } : {}),
     body: message.text,
-    time: new Date(message.createdAt).toLocaleTimeString(options.locale, { hour: "numeric", minute: "2-digit" }),
+    // Intl throws on an invalid date, where `toLocaleTimeString` returns text.
+    time:
+      options.format && !Number.isNaN(createdAt.getTime())
+        ? options.format.date(createdAt, time)
+        : createdAt.toLocaleTimeString(options.locale, time),
     createdAt: message.createdAt,
     streaming: message.status === "streaming",
     status: message.status,
@@ -111,6 +116,7 @@ export function channelTimelineEntries(
   options: DayMarkerOptions = {},
 ): ChannelTimelineEntry[] {
   const entries: ChannelTimelineEntry[] = [];
+  const t = options.t ?? currentText().t;
   let previous: ChannelTimelineEntry | undefined;
   // A run of one author is broken by an activity row the same way a reply from someone else breaks
   // it: the marker draws no name, so the message under it has to show its own again.
@@ -120,16 +126,13 @@ export function channelTimelineEntries(
     const own = source.author.kind === "member" && isOwnMessage(source.author.id);
     const agent = agents.find((candidate) => candidate.id === source.author.id);
     const author: ChatMessageAuthor = own
-      ? { kind: "you", name: "You" }
+      ? { kind: "you", name: t("chat.message.you") }
       : { kind: "agent", name: source.author.name, agent, avatarSeed: agent ? undefined : source.author.id };
     const dayMarker = dayMarkerLabel(previous?.message.createdAt, source.message.createdAt, options);
     const marker = channelRoutingMarker(source);
     const sameAuthor =
       previousAuthored !== undefined && previousAuthored === previous && previousAuthored.authorId === source.author.id;
-    const withinWindow =
-      previousAuthored !== undefined &&
-      new Date(source.message.createdAt).getTime() - new Date(previousAuthored.message.createdAt ?? "").getTime() <=
-        CHANNEL_GROUPING_WINDOW_MS;
+    const withinWindow = withinGroupingWindow(previousAuthored?.message.createdAt, source.message.createdAt);
     const entry: ChannelTimelineEntry = {
       id: source.id,
       sequence: source.sequence,
@@ -159,8 +162,9 @@ export function firstUnreadChannelMessageId(entries: ChannelTimelineEntry[], unr
   let remaining = unreadCount;
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index];
-    // The count from the channel list leaves out activity rows, so the walk back leaves them out.
-    if (entry.author.kind === "you" || entry.message.actionMarker) continue;
+    if (!entry) continue;
+    // The count from the channel list leaves out activity rows and plans, so the walk back leaves them out.
+    if (entry.author.kind === "you" || entry.message.actionMarker || entry.message.kind === "plan") continue;
     remaining -= 1;
     if (remaining === 0) return entry.id;
   }

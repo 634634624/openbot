@@ -1,20 +1,112 @@
 import type { AgentSummary, BrowserPreview, BrowserTab, ServerSummary } from "@openbot/contracts/ipc";
+import { TEAM_BROWSER_VIEW_CAPABILITY } from "@openbot/contracts/team-protocol/browser-view-v1";
+import { TEAM_BROWSER_NAVIGATION_CAPABILITY } from "@openbot/contracts/team-protocol/current";
+import { toast } from "@openbot/ui";
 import { fireEvent, render, screen, waitFor, within } from "@solidjs/testing-library";
 import { createSignal, flush } from "solid-js";
-import { expect, it, vi } from "vitest";
+import { expect, it, type Mock, vi } from "vitest";
 import { App } from "./App";
 import {
   AGENTS,
   attachment,
+  browserTab,
   confirmOnboardingModel,
   emitAgentEvent,
+  emitBrowserLiveView,
   emitBrowserPictureInPicture,
   installOpenbotStub,
   testServer,
 } from "./app-test-harness";
-import { toast } from "./components/ui";
 import BrowserPreviewSidebar, { BrowserPreviewCard } from "./features/conversation/BrowserPreviewSidebar";
 import { TestIntersectionObserver } from "./setupTests";
+
+/** One byte stands in for the host's JPEG: jsdom decodes no image, and the test asserts no pixels. */
+const IMAGE = new Uint8Array([0xff]);
+
+async function openComputer(): Promise<void> {
+  await fireEvent.click(screen.getByRole("button", { name: "Open computer" }));
+}
+
+/** jsdom lays nothing out, so a live view's panel is the rectangle the test says it is. */
+function domRect(left: number, top: number, width: number, height: number): DOMRect {
+  return {
+    x: left,
+    y: top,
+    left,
+    top,
+    right: left + width,
+    bottom: top + height,
+    width,
+    height,
+    toJSON: () => ({}),
+  };
+}
+
+const LIVE_VIEW_LABEL = "Live view of the page on the host";
+const nativeCanvasGetContext = HTMLCanvasElement.prototype.getContext;
+
+/** A server list with one host that can stream its browser, which is what a live view needs. */
+function listHostThatStreamsItsBrowser(): void {
+  const studio = testServer("remote-1", true);
+  vi.mocked(window.openbot.servers.list).mockResolvedValueOnce([
+    testServer("local", false),
+    {
+      ...studio,
+      compatibility: {
+        localAppVersion: "0.0.0",
+        hostAppVersion: "0.0.0",
+        localProtocol: { minimum: 1, maximum: 4 },
+        hostProtocol: { minimum: 1, maximum: 4 },
+        negotiatedProtocol: 4,
+        capabilities: ["browser-control", TEAM_BROWSER_VIEW_CAPABILITY],
+      },
+    },
+  ]);
+}
+
+/**
+ * The two APIs a live view draws with, which jsdom does not implement. Without them the view never
+ * draws a frame, and its pointer geometry - which follows the drawn frame - never becomes available.
+ * `holdDecodes` leaves a frame arrived but undrawn, the state a host viewport resize passes through.
+ */
+function stubCanvasDrawing(): { drawn: Mock; decodes: Mock; closes: Mock; holdDecodes: () => () => void } {
+  const drawn = vi.fn();
+  // Only the live view's own canvas draws through this. Every other canvas keeps the null context
+  // jsdom gives it, so `drawn` counts the frames on the panel and nothing else.
+  Object.defineProperty(HTMLCanvasElement.prototype, "getContext", {
+    configurable: true,
+    writable: true,
+    value: vi.fn(function (this: HTMLCanvasElement) {
+      return this.getAttribute("aria-label") === LIVE_VIEW_LABEL ? { drawImage: drawn } : null;
+    }),
+  });
+  let held: Promise<void> | undefined;
+  // Every decoded frame is closed, drawn or not, so `closes` is where a decode ends.
+  const closes = vi.fn();
+  const decodes = vi.fn(async () => {
+    await held;
+    return { close: closes };
+  });
+  vi.stubGlobal("createImageBitmap", decodes);
+  return {
+    drawn,
+    decodes,
+    closes,
+    holdDecodes() {
+      let release = (): void => undefined;
+      held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return release;
+    },
+  };
+}
+
+/** The two clicks that reach a live browser: the computer panel, then the preview card in it. */
+async function openComputerAndCard(title: string): Promise<void> {
+  await openComputer();
+  await fireEvent.click(await screen.findByRole("button", { name: `Open ${title}` }));
+}
 
 describe("OpenBot connected desktop shell", () => {
   beforeEach(() => {
@@ -24,22 +116,43 @@ describe("OpenBot connected desktop shell", () => {
   afterEach(() => {
     toast.dismiss();
     vi.useRealTimers();
+    vi.unstubAllGlobals();
+    Object.defineProperty(HTMLCanvasElement.prototype, "getContext", {
+      configurable: true,
+      writable: true,
+      value: nativeCanvasGetContext,
+    });
   });
 
-  it("keeps notifications above the browser and restores the same tab after dismissal", async () => {
-    const tab: BrowserTab = {
-      id: "notification-tab",
-      title: "Notification test",
-      url: "https://example.com",
-      loading: false,
-      ownerAgentId: "chief",
-      ownerThreadId: "thread-chief",
+  it("shows a blocked popup reason and lets the user dismiss it", async () => {
+    const tab = {
+      ...browserTab("popup-parent", "Sign in"),
+      popupFailure: {
+        id: "blocked-1",
+        message: "The browser tab limit was reached. Close a tab, then retry from the page.",
+      },
     };
     render(() => <App />);
     await screen.findByRole("heading", { name: "Chief" });
     emitAgentEvent?.({ type: "browser-changed", tabs: [tab], activeTabId: tab.id });
-    await fireEvent.click(screen.getByRole("button", { name: "Open computer" }));
-    await fireEvent.click(await screen.findByRole("button", { name: "Open Notification test" }));
+    await openComputerAndCard("Sign in");
+    expect(await screen.findByRole("alert")).toHaveTextContent(tab.popupFailure.message);
+    await fireEvent.click(screen.getByRole("button", { name: "Dismiss popup message" }));
+    await waitFor(() => expect(screen.queryByText(tab.popupFailure.message)).not.toBeInTheDocument());
+    emitAgentEvent?.({
+      type: "browser-changed",
+      tabs: [{ ...tab, popupFailure: { ...tab.popupFailure, id: "blocked-2" } }],
+      activeTabId: tab.id,
+    });
+    expect(await screen.findByRole("alert")).toHaveTextContent(tab.popupFailure.message);
+  });
+
+  it("keeps notifications above the browser and restores the same tab after dismissal", async () => {
+    const tab = browserTab("notification-tab", "Notification test");
+    render(() => <App />);
+    await screen.findByRole("heading", { name: "Chief" });
+    emitAgentEvent?.({ type: "browser-changed", tabs: [tab], activeTabId: tab.id });
+    await openComputerAndCard("Notification test");
     await waitFor(() =>
       expect(window.openbot.browser.setVisible).toHaveBeenLastCalledWith(expect.objectContaining({ visible: true })),
     );
@@ -60,30 +173,13 @@ describe("OpenBot connected desktop shell", () => {
     render(() => <App />);
     await screen.findByRole("heading", { name: "Chief" });
     const tabs: BrowserTab[] = [
-      {
-        id: "one",
-        title: "First preview",
-        url: "https://example.com/one",
-        loading: false,
-        ownerAgentId: "chief",
-        ownerThreadId: "thread-chief",
-      },
-      {
-        id: "two",
-        title: "Second preview",
-        url: "https://example.com/two",
-        loading: false,
-        ownerAgentId: "chief",
-        ownerThreadId: "thread-chief",
-      },
-      {
-        id: "other",
-        title: "Other agent page",
+      browserTab("one", "First preview", { url: "https://example.com/one" }),
+      browserTab("two", "Second preview", { url: "https://example.com/two" }),
+      browserTab("other", "Other agent page", {
         url: "https://example.com/other",
-        loading: false,
         ownerAgentId: "other",
         ownerThreadId: "thread-other",
-      },
+      }),
     ];
     vi.mocked(window.openbot.browser.activate).mockImplementation(async (tabId) => {
       emitAgentEvent?.({ type: "browser-changed", tabs, activeTabId: tabId });
@@ -92,7 +188,7 @@ describe("OpenBot connected desktop shell", () => {
     const composer = screen.getByRole("textbox", { name: "Message Chief" });
     composer.textContent = "Keep this draft";
     await fireEvent.input(composer);
-    await fireEvent.click(screen.getByRole("button", { name: "Open computer" }));
+    await openComputer();
     const card = await screen.findByRole("button", { name: "Open Second preview" });
     expect(screen.queryByRole("button", { name: "Open Other agent page" })).not.toBeInTheDocument();
     expect(window.openbot.browser.setVisible).toHaveBeenLastCalledWith({ visible: false });
@@ -137,19 +233,11 @@ describe("OpenBot connected desktop shell", () => {
     ["localhost:5173", "https://localhost:5173"],
     ["127.0.0.1:3100", "https://127.0.0.1:3100"],
   ])("opens the address-bar input %s as %s", async (input, url) => {
-    const tab: BrowserTab = {
-      id: "address-tab",
-      title: "Address test",
-      url: "https://example.com",
-      loading: false,
-      ownerAgentId: "chief",
-      ownerThreadId: "thread-chief",
-    };
+    const tab = browserTab("address-tab", "Address test");
     render(() => <App />);
     await screen.findByRole("heading", { name: "Chief" });
     emitAgentEvent?.({ type: "browser-changed", tabs: [tab], activeTabId: tab.id });
-    await fireEvent.click(screen.getByRole("button", { name: "Open computer" }));
-    await fireEvent.click(await screen.findByRole("button", { name: "Open Address test" }));
+    await openComputerAndCard("Address test");
     const address = screen.getByRole("textbox", { name: "Browser address" });
     address.focus();
     await fireEvent.input(address, { target: { value: input } });
@@ -161,14 +249,7 @@ describe("OpenBot connected desktop shell", () => {
   });
 
   it("keeps a new address draft when navigation in another tab completes", async () => {
-    const first: BrowserTab = {
-      id: "slow-tab",
-      title: "Slow page",
-      url: "https://example.com/first",
-      loading: false,
-      ownerAgentId: "chief",
-      ownerThreadId: "thread-chief",
-    };
+    const first = browserTab("slow-tab", "Slow page", { url: "https://example.com/first" });
     const second = { ...first, id: "draft-tab", title: "Draft page", url: "https://example.com/second" };
     const navigation = Promise.withResolvers<void>();
     vi.mocked(window.openbot.browser.navigate).mockReturnValueOnce(navigation.promise);
@@ -178,8 +259,7 @@ describe("OpenBot connected desktop shell", () => {
     render(() => <App />);
     await screen.findByRole("heading", { name: "Chief" });
     emitAgentEvent?.({ type: "browser-changed", tabs: [first, second], activeTabId: first.id });
-    await fireEvent.click(screen.getByRole("button", { name: "Open computer" }));
-    await fireEvent.click(await screen.findByRole("button", { name: "Open Slow page" }));
+    await openComputerAndCard("Slow page");
     const address = screen.getByRole("textbox", { name: "Browser address" });
     address.focus();
     await fireEvent.input(address, { target: { value: "example.com/loading" } });
@@ -205,19 +285,11 @@ describe("OpenBot connected desktop shell", () => {
       testServer("local", false),
       testServer("remote-1", true),
     ]);
-    const tab: BrowserTab = {
-      id: "remote-address-tab",
-      title: "Remote address page",
-      url: "https://example.com",
-      loading: false,
-      ownerAgentId: "chief",
-      ownerThreadId: "thread-chief",
-    };
+    const tab = browserTab("remote-address-tab", "Remote address page");
     render(() => <App />);
     await screen.findByRole("heading", { name: "Chief" });
     emitAgentEvent?.({ type: "browser-changed", tabs: [tab], activeTabId: tab.id });
-    await fireEvent.click(screen.getByRole("button", { name: "Open computer" }));
-    await fireEvent.click(await screen.findByRole("button", { name: "Open Remote address page" }));
+    await openComputerAndCard("Remote address page");
     const address = screen.getByRole("textbox", { name: "Browser address" });
     address.focus();
     await fireEvent.input(address, { target: { value: "remote search" } });
@@ -233,15 +305,250 @@ describe("OpenBot connected desktop shell", () => {
     expect(window.openbot.browser.navigate).not.toHaveBeenCalled();
   });
 
+  it("moves the open tab to an address on a remote host that supports it", async () => {
+    const studio = testServer("remote-1", true);
+    vi.mocked(window.openbot.servers.list).mockResolvedValueOnce([
+      testServer("local", false),
+      {
+        ...studio,
+        compatibility: {
+          localAppVersion: "0.0.0",
+          hostAppVersion: "0.0.0",
+          localProtocol: { minimum: 1, maximum: 4 },
+          hostProtocol: { minimum: 1, maximum: 4 },
+          negotiatedProtocol: 4,
+          capabilities: ["browser-control", TEAM_BROWSER_NAVIGATION_CAPABILITY],
+        },
+      },
+    ]);
+    const tab = browserTab("remote-address-tab", "Remote address page");
+    render(() => <App />);
+    await screen.findByRole("heading", { name: "Chief" });
+    emitAgentEvent?.({ type: "browser-changed", tabs: [tab], activeTabId: tab.id });
+    await openComputerAndCard("Remote address page");
+    const address = screen.getByRole("textbox", { name: "Browser address" });
+    address.focus();
+    await fireEvent.input(address, { target: { value: "remote search" } });
+    const form = address.closest("form");
+    if (!form) throw new Error("Browser address form was not rendered.");
+    await fireEvent.submit(form);
+
+    expect(window.openbot.browser.navigate).toHaveBeenCalledWith({
+      tabId: tab.id,
+      url: "https://www.google.com/search?q=remote%20search",
+    });
+    expect(window.openbot.browser.open).not.toHaveBeenCalled();
+  });
+
+  it("draws a remote host's page and sends a click back as a fraction of the frame", async () => {
+    listHostThatStreamsItsBrowser();
+    const tab = browserTab("remote-live-tab", "Remote live page");
+    const { drawn } = stubCanvasDrawing();
+    render(() => <App />);
+    await screen.findByRole("heading", { name: "Chief" });
+    emitAgentEvent?.({ type: "browser-changed", tabs: [tab], activeTabId: tab.id });
+    await openComputerAndCard("Remote live page");
+    await vi.waitFor(() => expect(window.openbot.browser.startLiveView).toHaveBeenCalledWith(tab.id));
+
+    emitBrowserLiveView?.({ type: "frame", tabId: tab.id, sequence: 1, width: 800, height: 600, image: IMAGE });
+    const view = await screen.findByRole("img", { name: LIVE_VIEW_LABEL });
+    await vi.waitFor(() => expect(drawn).toHaveBeenCalled());
+    // Drawing the frame tells the host which one is on screen, even when the member never clicks.
+    expect(window.openbot.browser.sendLiveViewInput).toHaveBeenCalledWith({ type: "ack", sequence: 1 });
+    // The panel is a different size from the host's viewport, so the click is sent as the point on
+    // the frame rather than the pixel it landed on here. jsdom has no layout to measure.
+    //
+    // The panel is 400x400 and the frame is 800x600, so `object-fit: contain` draws the frame as a
+    // 400x300 band with a 50 bar above and below it. The centre of the panel is still the centre of
+    // the frame; a point anywhere else is not the point the panel's own fraction would name.
+    view.getBoundingClientRect = () => domRect(100, 50, 400, 400);
+    await fireEvent.mouseDown(view, { clientX: 300, clientY: 250, button: 0, detail: 1 });
+
+    expect(window.openbot.browser.sendLiveViewInput).toHaveBeenCalledWith({
+      type: "pointer",
+      action: "down",
+      x: 0.5,
+      y: 0.5,
+      sequence: 1,
+      button: "left",
+      clickCount: 1,
+      modifiers: 0,
+    });
+
+    // A quarter into the drawn band, not a quarter into the panel: the panel's own fraction would
+    // call this point y 0.3125 and click 45 rows lower on the page than the user aimed.
+    vi.mocked(window.openbot.browser.sendLiveViewInput).mockClear();
+    await fireEvent.mouseDown(view, { clientX: 200, clientY: 175, button: 0, detail: 1 });
+
+    expect(window.openbot.browser.sendLiveViewInput).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "pointer", action: "down", x: 0.25, y: 0.25 }),
+    );
+  });
+
+  it("sends a click on a live view that is letterboxed top and bottom as a point on the frame", async () => {
+    listHostThatStreamsItsBrowser();
+    const tab = browserTab("remote-live-tab", "Remote live page");
+    const { drawn } = stubCanvasDrawing();
+    render(() => <App />);
+    await screen.findByRole("heading", { name: "Chief" });
+    emitAgentEvent?.({ type: "browser-changed", tabs: [tab], activeTabId: tab.id });
+    await openComputerAndCard("Remote live page");
+    await vi.waitFor(() => expect(window.openbot.browser.startLiveView).toHaveBeenCalledWith(tab.id));
+
+    // The shape the browser panel actually has: a wide page in a tall, narrow panel. The frame is
+    // drawn as a 380x237.5 band in the middle of a 380x800 panel, so all but a third of the panel
+    // is bar, and a fraction of the panel would miss the page by most of its height.
+    emitBrowserLiveView?.({ type: "frame", tabId: tab.id, sequence: 1, width: 1280, height: 800, image: IMAGE });
+    const view = await screen.findByRole("img", { name: LIVE_VIEW_LABEL });
+    await vi.waitFor(() => expect(drawn).toHaveBeenCalled());
+    view.getBoundingClientRect = () => domRect(0, 0, 380, 800);
+
+    await fireEvent.mouseDown(view, { clientX: 190, clientY: 400, button: 0, detail: 1 });
+    expect(window.openbot.browser.sendLiveViewInput).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "pointer", action: "down", x: 0.5, y: 0.5 }),
+    );
+
+    // The top bar is not the top of the page. A point there placed on the frame's first row would
+    // work whatever control the page keeps at the top, which is not what the user pointed at.
+    vi.mocked(window.openbot.browser.sendLiveViewInput).mockClear();
+    await fireEvent.mouseDown(view, { clientX: 190, clientY: 10, button: 0, detail: 1 });
+    expect(window.openbot.browser.sendLiveViewInput).not.toHaveBeenCalled();
+  });
+
+  it("holds a click back until a frame is drawn on the live view", async () => {
+    listHostThatStreamsItsBrowser();
+    const tab = browserTab("remote-live-tab", "Remote live page");
+    const { drawn, holdDecodes } = stubCanvasDrawing();
+    const decode = holdDecodes();
+    render(() => <App />);
+    await screen.findByRole("heading", { name: "Chief" });
+    emitAgentEvent?.({ type: "browser-changed", tabs: [tab], activeTabId: tab.id });
+    await openComputerAndCard("Remote live page");
+    await vi.waitFor(() => expect(window.openbot.browser.startLiveView).toHaveBeenCalledWith(tab.id));
+
+    // The frame arrived, so the panel stops saying it is connecting, but the decode has not finished
+    // and the canvas is still blank. There is no page under the pointer to aim at yet.
+    emitBrowserLiveView?.({ type: "frame", tabId: tab.id, sequence: 1, width: 800, height: 600, image: IMAGE });
+    const view = await screen.findByRole("img", { name: LIVE_VIEW_LABEL });
+    view.getBoundingClientRect = () => domRect(0, 0, 400, 400);
+    await fireEvent.mouseDown(view, { clientX: 100, clientY: 125, button: 0, detail: 1 });
+    expect(window.openbot.browser.sendLiveViewInput).not.toHaveBeenCalled();
+
+    decode();
+    await vi.waitFor(() => expect(drawn).toHaveBeenCalled());
+    await fireEvent.mouseDown(view, { clientX: 100, clientY: 125, button: 0, detail: 1 });
+    expect(window.openbot.browser.sendLiveViewInput).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "pointer", action: "down", x: 0.25, y: 0.25 }),
+    );
+  });
+
+  it("names the drawn frame when a click is made while a newer frame decodes", async () => {
+    listHostThatStreamsItsBrowser();
+    const tab = browserTab("remote-live-tab", "Remote live page");
+    const { drawn, decodes, holdDecodes } = stubCanvasDrawing();
+    render(() => <App />);
+    await screen.findByRole("heading", { name: "Chief" });
+    emitAgentEvent?.({ type: "browser-changed", tabs: [tab], activeTabId: tab.id });
+    await openComputerAndCard("Remote live page");
+    await vi.waitFor(() => expect(window.openbot.browser.startLiveView).toHaveBeenCalledWith(tab.id));
+
+    emitBrowserLiveView?.({ type: "frame", tabId: tab.id, sequence: 1, width: 800, height: 600, image: IMAGE });
+    const view = await screen.findByRole("img", { name: LIVE_VIEW_LABEL });
+    await vi.waitFor(() => expect(drawn).toHaveBeenCalled());
+    view.getBoundingClientRect = () => domRect(0, 0, 400, 400);
+
+    // The host's viewport changed shape, so the next frame is 400x800 where the drawn one is 800x600.
+    // The panel still shows the wide frame, and the click belongs to that frame: the point goes back
+    // named with its sequence, so the host expands it against the pixels the user aimed at rather
+    // than against the frame that has not arrived on this side yet.
+    const decode = holdDecodes();
+    // A screencast repeats the page until something changes, and a frame that arrives while another
+    // one decodes waits behind it. Offer the resized frame until it is the one being decoded; the
+    // hold keeps it there, so no third decode can start behind it.
+    await vi.waitFor(() => {
+      emitBrowserLiveView?.({ type: "frame", tabId: tab.id, sequence: 2, width: 400, height: 800, image: IMAGE });
+      expect(decodes).toHaveBeenCalledTimes(2);
+    });
+
+    await fireEvent.mouseDown(view, { clientX: 100, clientY: 125, button: 0, detail: 1 });
+    expect(window.openbot.browser.sendLiveViewInput).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "pointer", action: "down", x: 0.25, y: 0.25, sequence: 1 }),
+    );
+
+    // Once the resized frame is drawn, a point names that frame instead. The screencast repeated
+    // the resized frame while the first one decoded, so wait for the click rather than count draws.
+    vi.mocked(window.openbot.browser.sendLiveViewInput).mockClear();
+    decode();
+    await vi.waitFor(async () => {
+      await fireEvent.mouseDown(view, { clientX: 100, clientY: 125, button: 0, detail: 1 });
+      expect(window.openbot.browser.sendLiveViewInput).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "pointer", action: "down", x: 0, y: 0.3125, sequence: 2 }),
+      );
+    });
+  });
+
+  it("draws the frame that arrived last while another was decoding", async () => {
+    listHostThatStreamsItsBrowser();
+    const tab = browserTab("remote-live-tab", "Remote live page");
+    const { drawn, decodes, holdDecodes } = stubCanvasDrawing();
+    render(() => <App />);
+    await screen.findByRole("heading", { name: "Chief" });
+    emitAgentEvent?.({ type: "browser-changed", tabs: [tab], activeTabId: tab.id });
+    await openComputerAndCard("Remote live page");
+    await vi.waitFor(() => expect(window.openbot.browser.startLiveView).toHaveBeenCalledWith(tab.id));
+
+    emitBrowserLiveView?.({ type: "frame", tabId: tab.id, sequence: 1, width: 800, height: 600, image: IMAGE });
+    const view = await screen.findByRole("img", { name: LIVE_VIEW_LABEL });
+    await vi.waitFor(() => expect(drawn).toHaveBeenCalled());
+    view.getBoundingClientRect = () => domRect(0, 0, 400, 400);
+
+    // The page resized and then stopped changing, so the host has no reason to send anything more.
+    // A view that only dropped the frames behind the one it was decoding would show the page from
+    // before the resize for as long as the user keeps watching it.
+    const decode = holdDecodes();
+    await vi.waitFor(() => {
+      emitBrowserLiveView?.({ type: "frame", tabId: tab.id, sequence: 2, width: 800, height: 600, image: IMAGE });
+      expect(decodes).toHaveBeenCalledTimes(2);
+    });
+    emitBrowserLiveView?.({ type: "frame", tabId: tab.id, sequence: 3, width: 400, height: 800, image: IMAGE });
+    decode();
+
+    await vi.waitFor(() => expect(drawn).toHaveBeenCalledTimes(3));
+    await fireEvent.mouseDown(view, { clientX: 100, clientY: 125, button: 0, detail: 1 });
+    expect(window.openbot.browser.sendLiveViewInput).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "pointer", action: "down", x: 0, y: 0.3125, sequence: 3 }),
+    );
+  });
+
+  it("throws away a frame that finishes decoding after the live view stops", async () => {
+    listHostThatStreamsItsBrowser();
+    const tab = browserTab("remote-live-tab", "Remote live page");
+    const { drawn, closes, holdDecodes } = stubCanvasDrawing();
+    const decode = holdDecodes();
+    render(() => <App />);
+    await screen.findByRole("heading", { name: "Chief" });
+    emitAgentEvent?.({ type: "browser-changed", tabs: [tab], activeTabId: tab.id });
+    await openComputerAndCard("Remote live page");
+    await vi.waitFor(() => expect(window.openbot.browser.startLiveView).toHaveBeenCalledWith(tab.id));
+
+    emitBrowserLiveView?.({ type: "frame", tabId: tab.id, sequence: 1, width: 800, height: 600, image: IMAGE });
+    const view = await screen.findByRole("img", { name: LIVE_VIEW_LABEL });
+    view.getBoundingClientRect = () => domRect(0, 0, 400, 400);
+
+    // The stream ends while that frame is still decoding. Its page is gone, so drawing it late would
+    // show pixels of somewhere nobody is watching and aim the pointer at them.
+    emitBrowserLiveView?.({ type: "stopped", tabId: tab.id, reason: "The host stopped the live view." });
+    decode();
+    await vi.waitFor(() => expect(closes).toHaveBeenCalled());
+
+    expect(drawn).not.toHaveBeenCalled();
+    await fireEvent.mouseDown(view, { clientX: 100, clientY: 125, button: 0, detail: 1 });
+    expect(window.openbot.browser.sendLiveViewInput).not.toHaveBeenCalled();
+    expect(await screen.findByText("The host stopped the live view.")).toBeInTheDocument();
+  });
+
   it("keeps existing previews when a new tab is added", async () => {
-    const first: BrowserTab = {
-      id: "existing",
-      title: "Existing page",
-      url: "https://example.com",
-      loading: false,
-      ownerAgentId: "chief",
-      ownerThreadId: "thread-chief",
-    };
+    const first = browserTab("existing", "Existing page");
     const [tabs, setTabs] = createSignal([first]);
     const capture = vi.mocked(window.openbot.browser.capturePreview);
     render(() => (
@@ -267,17 +574,27 @@ describe("OpenBot connected desktop shell", () => {
     expect(screen.getByRole("img", { name: "Preview of Existing page" })).toBeInTheDocument();
   });
 
+  it("does not use the desktop preview capture when web disables capture", async () => {
+    const capture = vi.mocked(window.openbot.browser.capturePreview);
+    render(() => (
+      <BrowserPreviewCard
+        capturePreview={null}
+        tab={browserTab("remote", "Remote page")}
+        contextKey="remote:chief"
+        enabled
+        onOpen={() => undefined}
+      />
+    ));
+
+    await screen.findByRole("button", { name: "Open Remote page" });
+    flush();
+    expect(capture).not.toHaveBeenCalled();
+  });
+
   it("refreshes preview images only while the card is visible and enabled", async () => {
     vi.useFakeTimers();
     const [enabled, setEnabled] = createSignal(true);
-    const [tab, setTab] = createSignal<BrowserTab>({
-      id: "preview",
-      title: "Preview page",
-      url: "https://example.com",
-      loading: false,
-      ownerThreadId: "chief",
-      ownerAgentId: "chief",
-    });
+    const [tab, setTab] = createSignal<BrowserTab>(browserTab("preview", "Preview page", { ownerThreadId: "chief" }));
     const capture = vi.mocked(window.openbot.browser.capturePreview);
     const view = render(() => (
       <BrowserPreviewCard
@@ -318,14 +635,7 @@ describe("OpenBot connected desktop shell", () => {
   it("discards a late preview from another context and retries failed captures", async () => {
     vi.useFakeTimers();
     const [context, setContext] = createSignal("local:chief");
-    const tab: BrowserTab = {
-      id: "preview",
-      title: "Preview page",
-      url: "https://example.com",
-      loading: false,
-      ownerThreadId: "chief",
-      ownerAgentId: "chief",
-    };
+    const tab = browserTab("preview", "Preview page", { ownerThreadId: "chief" });
     let resolvePreview: ((preview: BrowserPreview) => void) | undefined;
     const capture = vi.mocked(window.openbot.browser.capturePreview);
     capture.mockImplementationOnce(
@@ -368,14 +678,7 @@ describe("OpenBot connected desktop shell", () => {
     vi.spyOn(TestIntersectionObserver.prototype, "observe").mockImplementation(() => undefined);
     render(() => (
       <BrowserPreviewCard
-        tab={{
-          id: "offscreen",
-          title: "Offscreen",
-          url: "https://example.com",
-          loading: false,
-          ownerThreadId: "chief",
-          ownerAgentId: "chief",
-        }}
+        tab={browserTab("offscreen", "Offscreen", { ownerThreadId: "chief" })}
         contextKey="local:chief"
         enabled
         onOpen={() => undefined}
@@ -391,21 +694,11 @@ describe("OpenBot connected desktop shell", () => {
     await screen.findByRole("heading", { name: "Chief" });
     emitAgentEvent?.({
       type: "browser-changed",
-      tabs: [
-        {
-          id: "tab-pip",
-          title: "Picture in Picture test",
-          url: "https://example.com/pip",
-          loading: false,
-          ownerThreadId: "thread-chief",
-          ownerAgentId: "chief",
-        },
-      ],
+      tabs: [browserTab("tab-pip", "Picture in Picture test", { url: "https://example.com/pip" })],
       activeTabId: "tab-pip",
     });
 
-    await fireEvent.click(screen.getByRole("button", { name: "Open computer" }));
-    await fireEvent.click(await screen.findByRole("button", { name: "Open Picture in Picture test" }));
+    await openComputerAndCard("Picture in Picture test");
     expect(await screen.findByRole("complementary", { name: "Browser" })).toBeInTheDocument();
 
     await fireEvent.click(screen.getByRole("button", { name: "Open browser Picture in Picture" }));
@@ -439,22 +732,8 @@ describe("OpenBot connected desktop shell", () => {
   });
 
   it("keeps a newly opened browser tab active when the initial tab request resolves late", async () => {
-    const googleTab: BrowserTab = {
-      id: "tab-google",
-      title: "Google",
-      url: "https://www.google.com",
-      loading: false,
-      ownerThreadId: "thread-chief",
-      ownerAgentId: "chief",
-    };
-    const substackTab: BrowserTab = {
-      id: "tab-substack",
-      title: "Substack | Chat",
-      url: "https://substack.com/chat",
-      loading: false,
-      ownerThreadId: "thread-chief",
-      ownerAgentId: "chief",
-    };
+    const googleTab = browserTab("tab-google", "Google", { url: "https://www.google.com" });
+    const substackTab = browserTab("tab-substack", "Substack | Chat", { url: "https://substack.com/chat" });
     let resolveInitialState: (state: { tabs: BrowserTab[]; activeTabId: string | null }) => void = () => undefined;
     vi.mocked(window.openbot.browser.getDisplayState).mockReturnValueOnce(
       new Promise((resolve) => {
@@ -470,8 +749,7 @@ describe("OpenBot connected desktop shell", () => {
       tabs: [googleTab, substackTab],
       activeTabId: substackTab.id,
     });
-    await fireEvent.click(screen.getByRole("button", { name: "Open computer" }));
-    await fireEvent.click(await screen.findByRole("button", { name: "Open Substack | Chat" }));
+    await openComputerAndCard("Substack | Chat");
     const substackTrigger = await screen.findByRole("tab", { name: "Substack | Chat" });
     expect(substackTrigger).toHaveAttribute("aria-selected", "true");
 
@@ -485,36 +763,24 @@ describe("OpenBot connected desktop shell", () => {
   it("restores the active local browser tab after returning from a remote server", async () => {
     const local = testServer("local", true);
     const remote = testServer("remote-1", false);
-    let resolveRemoteTabs: ((tabs: BrowserTab[]) => void) | undefined;
-    const firstTab: BrowserTab = {
-      id: "tab-first",
-      title: "First local tab",
-      url: "https://example.com/first",
-      loading: false,
-      ownerThreadId: "thread-chief",
-      ownerAgentId: "chief",
-    };
-    const activeTab: BrowserTab = {
-      id: "tab-active",
-      title: "Active local tab",
-      url: "https://example.com/active",
-      loading: false,
-      ownerThreadId: "thread-chief",
-      ownerAgentId: "chief",
-    };
+    let resolveRemoteTabs: ((state: { tabs: BrowserTab[]; activeTabId: string | null }) => void) | undefined;
+    const firstTab = browserTab("tab-first", "First local tab", { url: "https://example.com/first" });
+    const activeTab = browserTab("tab-active", "Active local tab", { url: "https://example.com/active" });
     vi.mocked(window.openbot.servers.list).mockResolvedValueOnce([local, remote]);
     vi.mocked(window.openbot.servers.select).mockImplementation(async (serverId) => [
       { ...local, active: serverId === "local" },
       { ...remote, active: serverId === "remote-1" },
     ]);
+    // Main answers this for a remote server too, so the held read is the remote leg's display
+    // state rather than a bare tab list.
     vi.mocked(window.openbot.browser.getDisplayState)
       .mockResolvedValueOnce({ tabs: [], activeTabId: null })
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          resolveRemoteTabs = resolve;
+        }),
+      )
       .mockResolvedValueOnce({ tabs: [firstTab, activeTab], activeTabId: activeTab.id });
-    vi.mocked(window.openbot.browser.listTabs).mockReturnValueOnce(
-      new Promise((resolve) => {
-        resolveRemoteTabs = resolve;
-      }),
-    );
 
     render(() => <App />);
     await screen.findByRole("heading", { name: "Chief" });
@@ -522,19 +788,18 @@ describe("OpenBot connected desktop shell", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Studio Mac server" }));
     await waitFor(() => expect(window.openbot.servers.select).toHaveBeenCalledWith("remote-1"));
     await waitFor(() => expect(resolveRemoteTabs).toBeDefined());
-    resolveRemoteTabs?.([]);
+    resolveRemoteTabs?.({ tabs: [], activeTabId: null });
     await new Promise((resolve) => setTimeout(resolve, 0));
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "Studio Mac server" })).toHaveAttribute("aria-pressed", "true"),
     );
     await fireEvent.click(screen.getByRole("button", { name: "Local server" }));
-    await waitFor(() => expect(window.openbot.browser.getDisplayState).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(window.openbot.browser.getDisplayState).toHaveBeenCalledTimes(3));
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "Local server" })).toHaveAttribute("aria-pressed", "true"),
     );
     await new Promise((resolve) => setTimeout(resolve, 0));
-    await fireEvent.click(screen.getByRole("button", { name: "Open computer" }));
-    await fireEvent.click(await screen.findByRole("button", { name: "Open Active local tab" }));
+    await openComputerAndCard("Active local tab");
 
     expect(await screen.findByRole("tab", { name: "Active local tab" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByRole("tab", { name: "First local tab" })).toHaveAttribute("aria-selected", "false");
@@ -547,20 +812,10 @@ describe("OpenBot connected desktop shell", () => {
     await screen.findByRole("heading", { name: "Chief" });
     emitAgentEvent?.({
       type: "browser-changed",
-      tabs: [
-        {
-          id: "tab-pip-restore",
-          title: "Restored PiP",
-          url: "https://example.com",
-          loading: false,
-          ownerThreadId: "thread-chief",
-          ownerAgentId: "chief",
-        },
-      ],
+      tabs: [browserTab("tab-pip-restore", "Restored PiP")],
       activeTabId: "tab-pip-restore",
     });
-    await fireEvent.click(screen.getByRole("button", { name: "Open computer" }));
-    await fireEvent.click(await screen.findByRole("button", { name: "Open Restored PiP" }));
+    await openComputerAndCard("Restored PiP");
     await fireEvent.click(screen.getByRole("button", { name: "Open browser Picture in Picture" }));
     await waitFor(() =>
       expect(window.openbot.browser.openPictureInPicture).toHaveBeenLastCalledWith({
@@ -601,30 +856,9 @@ describe("OpenBot connected desktop shell", () => {
     emitAgentEvent?.({
       type: "browser-changed",
       tabs: [
-        {
-          id: "tab-1",
-          title: "Local smoke page",
-          url: "http://127.0.0.1:4321",
-          loading: false,
-          ownerThreadId: "thread-chief",
-          ownerAgentId: "chief",
-        },
-        {
-          id: "tab-2",
-          title: "Second page",
-          url: "https://example.com/second",
-          loading: false,
-          ownerThreadId: "thread-chief",
-          ownerAgentId: "chief",
-        },
-        {
-          id: "tab-3",
-          title: "Third page",
-          url: "https://example.com/third",
-          loading: false,
-          ownerThreadId: "thread-chief",
-          ownerAgentId: "chief",
-        },
+        browserTab("tab-1", "Local smoke page", { url: "http://127.0.0.1:4321" }),
+        browserTab("tab-2", "Second page", { url: "https://example.com/second" }),
+        browserTab("tab-3", "Third page", { url: "https://example.com/third" }),
       ],
       activeTabId: "tab-1",
     });
@@ -727,14 +961,7 @@ describe("OpenBot connected desktop shell", () => {
   });
 
   it("coalesces repeated empty-browser opens and does not reopen the panel after a late response", async () => {
-    const openedTab: BrowserTab = {
-      id: "tab-delayed",
-      title: "Delayed page",
-      url: "https://www.google.com",
-      loading: false,
-      ownerThreadId: "thread-chief",
-      ownerAgentId: "chief",
-    };
+    const openedTab = browserTab("tab-delayed", "Delayed page", { url: "https://www.google.com" });
     let resolveOpen: ((tab: BrowserTab) => void) | undefined;
     vi.mocked(window.openbot.browser.open).mockImplementationOnce(
       () =>
@@ -746,12 +973,12 @@ describe("OpenBot connected desktop shell", () => {
     render(() => <App />);
     await screen.findByRole("heading", { name: "Chief" });
 
-    await fireEvent.click(screen.getByRole("button", { name: "Open computer" }));
+    await openComputer();
     expect(await screen.findByRole("complementary", { name: "Browser previews" })).toBeInTheDocument();
     expect(window.openbot.browser.open).toHaveBeenCalledTimes(1);
 
     await fireEvent.click(screen.getByRole("button", { name: "Hide computer" }));
-    await fireEvent.click(screen.getByRole("button", { name: "Open computer" }));
+    await openComputer();
     await fireEvent.click(screen.getByRole("button", { name: "Hide computer" }));
     expect(window.openbot.browser.open).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole("complementary", { name: "Browser previews" })).not.toBeInTheDocument();
@@ -764,28 +991,19 @@ describe("OpenBot connected desktop shell", () => {
     expect(screen.getByRole("button", { name: "Open computer" })).toHaveAttribute("aria-expanded", "false");
     expect(window.openbot.browser.open).toHaveBeenCalledTimes(1);
 
-    await fireEvent.click(screen.getByRole("button", { name: "Open computer" }));
-    await fireEvent.click(await screen.findByRole("button", { name: "Open Delayed page" }));
+    await openComputerAndCard("Delayed page");
     expect(await screen.findByRole("tab", { name: "Delayed page" })).toHaveAttribute("aria-selected", "true");
     await fireEvent.click(screen.getByRole("button", { name: "Reload page" }));
     expect(window.openbot.browser.reload).toHaveBeenCalledWith(openedTab.id);
 
     await fireEvent.click(screen.getByRole("button", { name: "Hide computer" }));
-    await fireEvent.click(screen.getByRole("button", { name: "Open computer" }));
-    await fireEvent.click(await screen.findByRole("button", { name: "Open Delayed page" }));
+    await openComputerAndCard("Delayed page");
     expect(await screen.findByRole("tab", { name: "Delayed page" })).toHaveAttribute("aria-selected", "true");
     expect(window.openbot.browser.open).toHaveBeenCalledTimes(1);
   });
 
   it("allows a replacement when a loading browser tab is closed before its open request settles", async () => {
-    const loadingTab: BrowserTab = {
-      id: "tab-loading",
-      title: "Loading…",
-      url: "https://www.google.com/",
-      loading: true,
-      ownerThreadId: "thread-chief",
-      ownerAgentId: "chief",
-    };
+    const loadingTab = browserTab("tab-loading", "Loading…", { url: "https://www.google.com/", loading: true });
     let resolveFirstOpen: ((tab: BrowserTab) => void) | undefined;
     vi.mocked(window.openbot.browser.open).mockImplementationOnce(
       () =>
@@ -797,7 +1015,7 @@ describe("OpenBot connected desktop shell", () => {
     render(() => <App />);
     await screen.findByRole("heading", { name: "Chief" });
 
-    await fireEvent.click(screen.getByRole("button", { name: "Open computer" }));
+    await openComputer();
     expect(window.openbot.browser.open).toHaveBeenCalledTimes(1);
 
     emitAgentEvent?.({ type: "browser-changed", tabs: [loadingTab], activeTabId: loadingTab.id });
@@ -823,22 +1041,8 @@ describe("OpenBot connected desktop shell", () => {
     emitAgentEvent?.({
       type: "browser-changed",
       tabs: [
-        {
-          id: "tab-public",
-          title: "Public page",
-          url: "https://example.com",
-          loading: false,
-          ownerThreadId: "thread-chief",
-          ownerAgentId: "chief",
-        },
-        {
-          id: "tab-login",
-          title: "Sign in",
-          url: "https://example.com/login",
-          loading: false,
-          ownerThreadId: "thread-chief",
-          ownerAgentId: "chief",
-        },
+        browserTab("tab-public", "Public page"),
+        browserTab("tab-login", "Sign in", { url: "https://example.com/login" }),
       ],
       activeTabId: "tab-public",
     });
@@ -890,16 +1094,7 @@ describe("OpenBot connected desktop shell", () => {
     await waitFor(() => expect(emitAgentEvent).toBeDefined());
     emitAgentEvent?.({
       type: "browser-changed",
-      tabs: [
-        {
-          id: "tab-login",
-          title: "Sign in",
-          url: "https://example.com/login",
-          loading: false,
-          ownerThreadId: "thread-chief",
-          ownerAgentId: "chief",
-        },
-      ],
+      tabs: [browserTab("tab-login", "Sign in", { url: "https://example.com/login" })],
       activeTabId: "tab-login",
     });
     emitAgentEvent?.({
@@ -937,30 +1132,15 @@ describe("OpenBot connected desktop shell", () => {
     );
     render(() => <App />);
     await screen.findByRole("heading", { name: "Chief" });
-    const firstTab = {
-      id: "tab-shortcut-1",
-      title: "First page",
-      url: "https://example.com/first",
-      loading: false,
-      ownerThreadId: "thread-chief",
-      ownerAgentId: "chief",
-    };
-    const secondTab = {
-      id: "tab-shortcut-2",
-      title: "Second page",
-      url: "https://example.com/second",
-      loading: false,
-      ownerThreadId: "thread-chief",
-      ownerAgentId: "chief",
-    };
+    const firstTab = browserTab("tab-shortcut-1", "First page", { url: "https://example.com/first" });
+    const secondTab = browserTab("tab-shortcut-2", "Second page", { url: "https://example.com/second" });
     emitAgentEvent?.({
       type: "browser-changed",
       tabs: [firstTab, secondTab],
       activeTabId: secondTab.id,
     });
 
-    await fireEvent.click(screen.getByRole("button", { name: "Open computer" }));
-    await fireEvent.click(await screen.findByRole("button", { name: "Open First page" }));
+    await openComputerAndCard("First page");
     await screen.findByRole("complementary", { name: "Browser" });
     const closingTab = await screen.findByRole("tab", { name: "Second page" });
     await fireEvent.pointerDown(closingTab, { button: 1 });
@@ -986,30 +1166,17 @@ describe("OpenBot connected desktop shell", () => {
     );
     render(() => <App />);
     await screen.findByRole("heading", { name: "Chief" });
-    const firstTab = {
-      id: "tab-activation-first",
-      title: "First activation page",
-      url: "https://example.com/first",
-      loading: false,
-      ownerThreadId: "thread-chief",
-      ownerAgentId: "chief",
-    };
-    const secondTab = {
-      id: "tab-activation-closing",
-      title: "Closing activation page",
+    const firstTab = browserTab("tab-activation-first", "First activation page", { url: "https://example.com/first" });
+    const secondTab = browserTab("tab-activation-closing", "Closing activation page", {
       url: "https://example.com/closing",
-      loading: false,
-      ownerThreadId: "thread-chief",
-      ownerAgentId: "chief",
-    };
+    });
     emitAgentEvent?.({
       type: "browser-changed",
       tabs: [firstTab, secondTab],
       activeTabId: firstTab.id,
     });
 
-    await fireEvent.click(screen.getByRole("button", { name: "Open computer" }));
-    await fireEvent.click(await screen.findByRole("button", { name: "Open First activation page" }));
+    await openComputerAndCard("First activation page");
     const closingTab = await screen.findByRole("tab", { name: "Closing activation page" });
     await fireEvent.click(closingTab);
     await waitFor(() => expect(window.openbot.browser.activate).toHaveBeenCalledWith(secondTab.id));
@@ -1040,30 +1207,15 @@ describe("OpenBot connected desktop shell", () => {
     );
     render(() => <App />);
     await screen.findByRole("heading", { name: "Chief" });
-    const firstTab = {
-      id: "tab-switch-first",
-      title: "First switch page",
-      url: "https://example.com/first",
-      loading: false,
-      ownerThreadId: "thread-chief",
-      ownerAgentId: "chief",
-    };
-    const closingTab = {
-      id: "tab-switch-closing",
-      title: "Closing switch page",
-      url: "https://example.com/closing",
-      loading: false,
-      ownerThreadId: "thread-chief",
-      ownerAgentId: "chief",
-    };
+    const firstTab = browserTab("tab-switch-first", "First switch page", { url: "https://example.com/first" });
+    const closingTab = browserTab("tab-switch-closing", "Closing switch page", { url: "https://example.com/closing" });
     emitAgentEvent?.({
       type: "browser-changed",
       tabs: [firstTab, closingTab],
       activeTabId: firstTab.id,
     });
 
-    await fireEvent.click(screen.getByRole("button", { name: "Open computer" }));
-    await fireEvent.click(await screen.findByRole("button", { name: "Open First switch page" }));
+    await openComputerAndCard("First switch page");
     const closingTabElement = await screen.findByRole("tab", { name: "Closing switch page" });
     await fireEvent.click(closingTabElement);
     await waitFor(() => expect(resolveActivation).toBeDefined());
@@ -1094,25 +1246,12 @@ describe("OpenBot connected desktop shell", () => {
     );
     render(() => <App />);
     await screen.findByRole("heading", { name: "Chief" });
-    const closingTab = {
-      id: "tab-closing-last",
-      title: "Closing page",
-      url: "https://example.com/closing",
-      loading: false,
-      ownerThreadId: "thread-chief",
-      ownerAgentId: "chief",
-    };
-    const replacementTab = {
-      id: "tab-replacement",
-      title: "Replacement page",
+    const closingTab = browserTab("tab-closing-last", "Closing page", { url: "https://example.com/closing" });
+    const replacementTab = browserTab("tab-replacement", "Replacement page", {
       url: "https://example.com/replacement",
-      loading: false,
-      ownerThreadId: "thread-chief",
-      ownerAgentId: "chief",
-    };
+    });
     emitAgentEvent?.({ type: "browser-changed", tabs: [closingTab], activeTabId: closingTab.id });
-    await fireEvent.click(screen.getByRole("button", { name: "Open computer" }));
-    await fireEvent.click(await screen.findByRole("button", { name: "Open Closing page" }));
+    await openComputerAndCard("Closing page");
     await fireEvent.keyDown(await screen.findByRole("tab", { name: "Closing page" }), { key: "Delete" });
     await waitFor(() => expect(resolveClose).toBeDefined());
 
@@ -1152,20 +1291,10 @@ describe("OpenBot connected desktop shell", () => {
     );
     emitAgentEvent?.({
       type: "browser-changed",
-      tabs: [
-        {
-          id: "remote-tab-during-switch",
-          title: "Remote page",
-          url: "https://example.com/remote",
-          loading: false,
-          ownerThreadId: "thread-chief",
-          ownerAgentId: "chief",
-        },
-      ],
+      tabs: [browserTab("remote-tab-during-switch", "Remote page", { url: "https://example.com/remote" })],
       activeTabId: "remote-tab-during-switch",
     });
-    await fireEvent.click(await screen.findByRole("button", { name: "Open computer" }));
-    await fireEvent.click(await screen.findByRole("button", { name: "Open Remote page" }));
+    await openComputerAndCard("Remote page");
     const remoteTab = await screen.findByRole("tab", { name: "Remote page" });
     const address = screen.getByRole("textbox", { name: "Browser address" });
     const addressForm = address.closest("form");
@@ -1216,21 +1345,11 @@ describe("OpenBot connected desktop shell", () => {
     await screen.findByRole("heading", { name: "Chief" });
     emitAgentEvent?.({
       type: "browser-changed",
-      tabs: [
-        {
-          id: "local-tab",
-          title: "Local page",
-          url: "https://example.com/local",
-          loading: false,
-          ownerThreadId: "thread-chief",
-          ownerAgentId: "chief",
-        },
-      ],
+      tabs: [browserTab("local-tab", "Local page", { url: "https://example.com/local" })],
       activeTabId: "local-tab",
     });
 
-    await fireEvent.click(screen.getByRole("button", { name: "Open computer" }));
-    await fireEvent.click(await screen.findByRole("button", { name: "Open Local page" }));
+    await openComputerAndCard("Local page");
     await screen.findByRole("complementary", { name: "Browser" });
     await waitFor(() =>
       expect(window.openbot.browser.setVisible).toHaveBeenLastCalledWith(
@@ -1345,20 +1464,10 @@ describe("OpenBot connected desktop shell", () => {
     await screen.findByRole("heading", { name: "Chief" });
     emitAgentEvent?.({
       type: "browser-changed",
-      tabs: [
-        {
-          id: "tab-embedded-shortcut",
-          title: "Focused page",
-          url: "https://example.com",
-          loading: false,
-          ownerThreadId: "thread-chief",
-          ownerAgentId: "chief",
-        },
-      ],
+      tabs: [browserTab("tab-embedded-shortcut", "Focused page")],
       activeTabId: "tab-embedded-shortcut",
     });
-    await fireEvent.click(screen.getByRole("button", { name: "Open computer" }));
-    await fireEvent.click(await screen.findByRole("button", { name: "Open Focused page" }));
+    await openComputerAndCard("Focused page");
     expect(await screen.findByRole("complementary", { name: "Browser" })).toBeInTheDocument();
 
     emitAgentEvent?.({ type: "browser-changed", tabs: [], activeTabId: null });
@@ -1540,6 +1649,39 @@ describe("OpenBot connected desktop shell", () => {
     });
 
     await fireEvent.click(screen.getByRole("button", { name: "Close file preview" }));
+    expect(screen.queryByRole("complementary", { name: "File preview" })).not.toBeInTheDocument();
+  });
+
+  it("says that a deleted attached file is no longer available", async () => {
+    const deleted = attachment("att-deleted", "launch-metrics.pdf", "pdf");
+    vi.mocked(window.openbot.agent.readConversation).mockImplementation(async (agentId) => ({
+      agentId,
+      threadId: agentId === "chief" ? "thread-chief" : null,
+      activeTurnId: null,
+      revision: 1,
+      messages:
+        agentId === "chief"
+          ? [
+              {
+                id: "message-deleted-attachment",
+                author: "assistant",
+                text: `Here is @[${deleted.name}](attachment:${deleted.id}).`,
+                createdAt: "2026-08-24T12:16:00.000Z",
+                status: "completed",
+                attachments: [deleted],
+              },
+            ]
+          : [],
+      readState: { unreadCount: 0, firstUnreadMessageId: null, throughMessageId: null },
+    }));
+    const fetch = vi.fn(async () => new Response("Not found", { status: 404 }));
+    vi.stubGlobal("fetch", fetch);
+
+    render(() => <App />);
+    await fireEvent.click(await screen.findByRole("button", { name: `Open attached file ${deleted.name}` }));
+
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith(deleted.previewUrl));
+    expect(await screen.findByText("This file is no longer available.")).toBeInTheDocument();
     expect(screen.queryByRole("complementary", { name: "File preview" })).not.toBeInTheDocument();
   });
 });

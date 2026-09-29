@@ -7,18 +7,21 @@ import {
   type CollectionArticle,
   type ContentCollection,
   formatArticleDate,
+  type ProseCollectionId,
   reportedArticlePath,
 } from "../../lib/content-collection";
 import { createLandingReveal } from "../landing/createLandingReveal";
 import { LandingFooter } from "../landing/LandingFooter";
+import { SiteHeader } from "../landing/SiteHeader";
 import { ArticleCard } from "./ArticleCard";
 import { ArticleGradient } from "./ArticleGradient";
 import { ContentCallToAction } from "./ContentCallToAction";
-import { ContentHeader } from "./ContentHeader";
 import { createArticleReadDepth } from "./createArticleReadDepth";
+import { ReadingProgress } from "./ReadingProgress";
 
 export interface ArticlePageProps {
-  collection: ContentCollection;
+  /** Only collections with prose bodies. A comparison has its own page. */
+  collection: ContentCollection<ProseCollectionId>;
   article: CollectionArticle;
 }
 
@@ -55,7 +58,7 @@ export function ArticlePage(props: ArticlePageProps) {
 
   return (
     <div class="landing-page post-article">
-      <ContentHeader />
+      <SiteHeader page="content" />
 
       <main class="post-main">
         <article ref={articleBody} class="post-container post-article-body">
@@ -102,6 +105,8 @@ export function ArticlePage(props: ArticlePageProps) {
             <Show when={body()}>{(Body) => <Dynamic component={Body()} />}</Show>
           </div>
         </article>
+
+        <ReadingProgress article={() => articleBody} title={props.article.title} slug={props.article.slug} />
 
         <Show when={others().length > 0}>
           <section

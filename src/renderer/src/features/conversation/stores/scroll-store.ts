@@ -1,24 +1,32 @@
-import { createEffect, createMemo, createSignal, onCleanup } from "solid-js";
-import { createScrollFades } from "../../../components/createScrollFades";
-import { errorMessage } from "../../../error-message";
-import type { ConversationProps, ConversationTarget } from "../conversation-types";
-import { calculateChatScrollMargin, chatHistoryBoundaryReached, createChatVirtualizer } from "../createChatVirtualizer";
-import { scrollToLatestMessage } from "../MessageNavigation";
+import { createScrollFades } from "@openbot/ui/components/createScrollFades";
+import {
+  calculateChatScrollMargin,
+  chatHistoryBoundaryReached,
+  createChatVirtualizer,
+} from "@openbot/ui/features/conversation/createChatVirtualizer";
+import { scrollToLatestMessage } from "@openbot/ui/features/conversation/MessageNavigation";
 import {
   anchorNewMessages,
   countableTimelineMessage,
   type NewMessageTally,
   tallyNewMessages,
-} from "../new-message-tally";
-import { scrollToUnreadBoundary, unreadMessagesDividerIsVisible } from "../UnreadMessages";
+} from "@openbot/ui/features/conversation/new-message-tally";
+import {
+  scrollToUnreadBoundary,
+  unreadMessagesDividerIsVisible,
+} from "@openbot/ui/features/conversation/UnreadMessages";
+import { currentText } from "@openbot/ui/text";
+import { createEffect, createMemo, createSignal, onCleanup } from "solid-js";
+import type { ConversationProps, ConversationTarget } from "../conversation-types";
+import { summarizeRoutineRunMessages } from "../routine-run-timeline";
 
-export interface ScrollElements {
+interface ScrollElements {
   scrollElement: () => HTMLDivElement | undefined;
   virtualRoot: () => HTMLDivElement | undefined;
   unreadMessagesDivider: () => HTMLDivElement | undefined;
 }
 
-export interface ScrollStickyState {
+interface ScrollStickyState {
   getStickToLatest: () => boolean;
   setStickToLatest: (value: boolean) => void;
   getCurrentUnreadCount: () => number;
@@ -45,7 +53,9 @@ export function createScrollStore(deps: ScrollStoreDeps) {
   let newMessages: NewMessageTally = { count: 0, anchorId: undefined };
   let talliedConversationIdentity: string | undefined;
 
-  const timelineMessages = createMemo(() => deps.props.messages.filter((message) => message.kind !== "thinking"));
+  const timelineMessages = createMemo(() =>
+    summarizeRoutineRunMessages(deps.props.messages.filter((message) => message.kind !== "thinking")),
+  );
   /* Every row anchors the count, but only some rows add to it. */
   const timelineRows = createMemo(() =>
     deps.props.messages.map((message) => ({ id: message.id, countable: countableTimelineMessage(message) })),
@@ -66,12 +76,12 @@ export function createScrollStore(deps: ScrollStoreDeps) {
       const rows = timelineRows();
       return {
         identity: `${deps.props.server?.id ?? "local"}:${deps.props.agent?.id ?? ""}`,
+        rows,
         length: rows.length,
         lastId: rows.at(-1)?.id,
       };
     },
-    ({ identity }) => {
-      const rows = timelineRows();
+    ({ identity, rows }) => {
       if (identity !== talliedConversationIdentity) {
         talliedConversationIdentity = identity;
         newMessages = anchorNewMessages(rows);
@@ -163,7 +173,7 @@ export function createScrollStore(deps: ScrollStoreDeps) {
     try {
       await deps.props.onMarkRead();
     } catch (error) {
-      deps.setComposerError(errorMessage(error, "Could not mark messages as read."), target);
+      deps.setComposerError(currentText().errorMessage(error, currentText().t("chat.unread.markReadFailed")), target);
     } finally {
       deps.setMarkingRead(false);
     }
@@ -225,5 +235,3 @@ export function createScrollStore(deps: ScrollStoreDeps) {
     jumpToLatestMessage,
   };
 }
-
-export type ScrollStore = ReturnType<typeof createScrollStore>;

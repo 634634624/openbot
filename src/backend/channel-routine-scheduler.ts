@@ -10,8 +10,10 @@ import type {
   TestChannelRoutineInput,
   UpdateChannelRoutineInput,
 } from "@openbot/contracts/ipc";
+import { sourceText } from "@openbot/i18n/source";
 import { ChannelRoutineStore } from "./channel-routine-store";
 import type { ChannelService } from "./channel-service";
+import { recordRestartActivity } from "./restart-activity";
 import { collapseMissedOccurrences } from "./routine-schedule";
 import type { RoutineDueSource } from "./routine-timer";
 
@@ -104,6 +106,20 @@ export class ChannelRoutineScheduler implements RoutineDueSource {
     return this.#routines.list(this.#requireChannel(channelId));
   }
 
+  /**
+   * Whether any channel routine run is executing right now. Scheduled future runs do not count:
+   * they resume from durable rows after a restart. See RoutineScheduler.hasActiveRuns for why the
+   * executing case is still worth naming.
+   */
+  hasActiveRuns(): boolean {
+    for (const channelId of this.#channels.store.ids()) {
+      for (const routine of this.#routines.list(channelId)) {
+        if (this.#routines.activeRuns(channelId, routine.id).length > 0) return true;
+      }
+    }
+    return false;
+  }
+
   listRuns(input: ListChannelRoutineRunsInput): ChannelRoutineRun[] {
     return this.#routines.listRuns(this.#requireChannel(input.channelId), input.routineId, input.limit ?? 50);
   }
@@ -129,7 +145,7 @@ export class ChannelRoutineScheduler implements RoutineDueSource {
   async test(input: TestChannelRoutineInput): Promise<ChannelRoutineRun> {
     const channelId = this.#requireChannel(input.channelId);
     const routine = this.#routines.get(channelId, input.routineId);
-    if (!routine) throw new Error("This routine no longer exists.");
+    if (!routine) throw new Error(sourceText("error.backend.routineGone"));
     const run = await this.#fire(routine, null, new Date().toISOString());
     this.#changed(channelId);
     return run;
@@ -243,6 +259,7 @@ export class ChannelRoutineScheduler implements RoutineDueSource {
   }
 
   async #issue(run: ChannelRoutineRun): Promise<ChannelRoutineRun> {
+    recordRestartActivity();
     if (!run.requestMessageId) throw new Error("The routine run has no request message.");
     try {
       await this.#channels.command(
@@ -293,7 +310,7 @@ export class ChannelRoutineScheduler implements RoutineDueSource {
   }
 
   #requireChannel(channelId: string): string {
-    if (!this.#channels.store.exists(channelId)) throw new Error("Channel not found.");
+    if (!this.#channels.store.exists(channelId)) throw new Error(sourceText("error.backend.channelNotFound"));
     return channelId;
   }
 

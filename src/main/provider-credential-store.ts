@@ -1,9 +1,11 @@
 // The optional API keys a provider CLI needs, encrypted at rest by the operating system.
 
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { readFile, rm } from "node:fs/promises";
 import type { AgentProviderId, ProviderApiKeyStatus } from "@openbot/contracts/ipc";
+import { sourceText } from "@openbot/i18n/source";
+import { registerSecretValue } from "@openbot/logging";
 import { z } from "zod";
+import { writeJsonFileAtomically } from "../backend/atomic-json-file";
 
 /**
  * One envelope holding every provider's key, each encrypted on its own.
@@ -39,6 +41,7 @@ export class ProviderCredentialStore {
   #loaded = false;
   /** Why the file on disk could not be read. Until the user saves or removes a key, it is kept. */
   #loadError: Error | null = null;
+  #writeChain: Promise<void> = Promise.resolve();
 
   constructor(path: string, cipher: SecretCipher) {
     this.#path = path;
@@ -58,7 +61,8 @@ export class ProviderCredentialStore {
     try {
       this.#keys = await this.#read();
     } catch (error) {
-      this.#loadError = error instanceof Error ? error : new Error("The provider credential file is unreadable.");
+      this.#loadError =
+        error instanceof Error ? error : new Error(sourceText("error.provider.credentialFileUnreadable"));
     }
     this.#loaded = true;
     return this.#loadError;
@@ -77,16 +81,33 @@ export class ProviderCredentialStore {
   }
 
   async set(provider: AgentProviderId, key: string): Promise<void> {
-    const next = this.#editableKeys();
-    next.set(provider, key);
-    await this.#commit(next);
+    registerSecretValue(key);
+    await this.#edit((keys) => {
+      keys.set(provider, key);
+      return true;
+    });
   }
 
   async clear(provider: AgentProviderId): Promise<void> {
-    if (this.status(provider) === "missing") return;
-    const next = this.#editableKeys();
-    next.delete(provider);
-    await this.#commit(next);
+    await this.#edit((keys) => {
+      if (this.status(provider) === "missing") return false;
+      keys.delete(provider);
+      return true;
+    });
+  }
+
+  /**
+   * Runs one save or removal after the previous one. Each provider has its own command queue, so
+   * two providers can change their keys at the same time; each edit must start from the keys the
+   * previous edit committed, or the last write drops the other provider's key.
+   */
+  async #edit(change: (keys: Map<string, string>) => boolean): Promise<void> {
+    const operation = this.#writeChain.then(async () => {
+      const next = this.#editableKeys();
+      if (change(next)) await this.#commit(next);
+    });
+    this.#writeChain = operation.catch(() => undefined);
+    await operation;
   }
 
   /**
@@ -120,11 +141,14 @@ export class ProviderCredentialStore {
       if (error instanceof Error && "code" in error && error.code === "ENOENT") return new Map();
       throw error;
     }
-    if (source.length > MAX_ENVELOPE_BYTES) throw new Error("The provider credential file is too large.");
+    if (source.length > MAX_ENVELOPE_BYTES) throw new Error(sourceText("error.provider.credentialFileTooLarge"));
     const envelope = envelopeSchema.parse(JSON.parse(source));
     const keys = new Map<string, string>();
     for (const [provider, encrypted] of Object.entries(envelope.credentials)) {
-      keys.set(provider, this.#cipher.decrypt(Buffer.from(encrypted, "base64")));
+      const key = this.#cipher.decrypt(Buffer.from(encrypted, "base64"));
+      // A provider CLI can echo the key in an error, and no rule knows the shape of every provider's key.
+      registerSecretValue(key);
+      keys.set(provider, key);
     }
     return keys;
   }
@@ -134,11 +158,8 @@ export class ProviderCredentialStore {
     for (const [provider, key] of keys) {
       credentials[provider] = this.#cipher.encrypt(key).toString("base64");
     }
-    await mkdir(dirname(this.#path), { recursive: true, mode: 0o700 });
-    const temporaryPath = `${this.#path}.tmp`;
     // Write then rename, so a crash in the middle leaves the previous envelope readable rather
     // than a truncated one: a half-written key locks the user out of a paid account.
-    await writeFile(temporaryPath, `${JSON.stringify({ version: 1, credentials })}\n`, { mode: 0o600 });
-    await rename(temporaryPath, this.#path);
+    await writeJsonFileAtomically(this.#path, { version: 1, credentials }, { createDirectory: true });
   }
 }

@@ -2,9 +2,21 @@ import { randomUUID } from "node:crypto";
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import type { RoutineFields, RoutineRunFields, RoutineRunStatus, RoutineSchedule } from "@openbot/contracts/ipc";
 import { isRoutineSchedule } from "@openbot/contracts/ipc";
-import { type DynamicRecord, isDynamicRecord, isNumber, isString } from "@openbot/contracts/runtime-values";
+import { type DynamicRecord, isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
+import { sourceText } from "@openbot/i18n/source";
+import {
+  databaseRows,
+  optionalStringColumn,
+  requiredNumberColumn,
+  requiredStringColumn,
+} from "./database/database-rows";
 import type { OpenBotDatabase } from "./openbot-database";
-import { nextRoutineOccurrence, normalizeRoutineSchedule, validateRoutineSchedule } from "./routine-schedule";
+import {
+  nextRoutineOccurrence,
+  normalizeRoutineSchedule,
+  RoutineInputError,
+  validateRoutineSchedule,
+} from "./routine-schedule";
 
 /**
  * Three table names, one owner column and one handle column are the whole difference between an
@@ -85,7 +97,7 @@ export class RoutineStore {
   }
 
   protected listRoutines(ownerId: string): OwnedRoutine[] {
-    return rows(
+    return databaseRows(
       this.database.connection
         .prepare(
           `SELECT ${this.routineColumns}
@@ -108,7 +120,7 @@ export class RoutineStore {
 
   protected createRoutine(ownerId: string, input: RoutineInputFields, now = new Date()): OwnedRoutine {
     this.#validateInput(input.name, input.instruction, input.timezone, input.schedule);
-    if (this.listRoutines(ownerId).length >= this.tables.limit) throw new Error(this.tables.limitMessage);
+    if (this.listRoutines(ownerId).length >= this.tables.limit) throw new RoutineInputError(this.tables.limitMessage);
     const routineId = randomUUID();
     const createdAt = now.toISOString();
     const schedule = normalizeRoutineSchedule(input.schedule, now);
@@ -149,7 +161,7 @@ export class RoutineStore {
 
   protected updateRoutine(ownerId: string, input: RoutineUpdateFields, now = new Date()): OwnedRoutine {
     const current = this.getRoutine(ownerId, input.routineId);
-    if (!current) throw new Error("This routine no longer exists.");
+    if (!current) throw new RoutineInputError(sourceText("error.backend.routineGone"));
     const name = input.name ?? current.name;
     const instruction = input.instruction ?? current.instruction;
     const schedule = normalizeRoutineSchedule(input.schedule ?? current.trigger.schedule, now);
@@ -197,7 +209,7 @@ export class RoutineStore {
   }
 
   delete(ownerId: string, routineId: string): void {
-    if (!this.getRoutine(ownerId, routineId)) throw new Error("This routine no longer exists.");
+    if (!this.getRoutine(ownerId, routineId)) throw new RoutineInputError(sourceText("error.backend.routineGone"));
     const { commandPrefix, eventPrefix, routineAggregate, routineTable, ownerColumn } = this.tables;
     this.database.dispatch(
       `${commandPrefix}:delete:${routineId}:${randomUUID()}`,
@@ -218,7 +230,7 @@ export class RoutineStore {
 
   protected listRunRows(ownerId: string, routineId: string, limit = 50): OwnedRoutineRun[] {
     const safeLimit = Math.max(1, Math.min(INPUT_LIMITS.routineRunsPage, limit));
-    return rows(
+    return databaseRows(
       this.database.connection
         .prepare(
           `SELECT ${this.runColumns}
@@ -241,7 +253,7 @@ export class RoutineStore {
   }
 
   #queuedRunRows(condition: string): OwnedRoutineRun[] {
-    return rows(
+    return databaseRows(
       this.database.connection
         .prepare(
           `SELECT ${this.runColumns}
@@ -254,7 +266,7 @@ export class RoutineStore {
   }
 
   protected activeRunRows(ownerId: string, routineId: string): OwnedRoutineRun[] {
-    return rows(
+    return databaseRows(
       this.database.connection
         .prepare(
           `SELECT ${this.runColumns}
@@ -272,7 +284,7 @@ export class RoutineStore {
    * not by routine: one channel change can settle runs of several routines at once.
    */
   protected openRunRows(ownerId: string): OwnedRoutineRun[] {
-    return rows(
+    return databaseRows(
       this.database.connection
         .prepare(
           `SELECT ${this.runColumns}
@@ -291,7 +303,7 @@ export class RoutineStore {
    */
   protected failedRunRowsForHandles(ownerId: string, handles: readonly string[]): OwnedRoutineRun[] {
     if (!handles.length) return [];
-    return rows(
+    return databaseRows(
       this.database.connection
         .prepare(
           `SELECT ${this.runColumns}
@@ -306,7 +318,7 @@ export class RoutineStore {
 
   /** The owners that still have an unfinished run, so a boot reconcile can visit only those. */
   protected ownersWithOpenRuns(): string[] {
-    return rows(
+    return databaseRows(
       this.database.connection
         .prepare(
           `SELECT DISTINCT ${this.tables.ownerColumn}
@@ -314,12 +326,12 @@ export class RoutineStore {
            WHERE status IN ('queued', 'running', 'needs-attention')`,
         )
         .all(),
-    ).map((row) => stringColumn(row, this.tables.ownerColumn));
+    ).map((row) => requiredStringColumn(row, this.tables.ownerColumn));
   }
 
   protected dueRoutines(now = new Date(), excludedOwnerIds: ReadonlySet<string> = new Set()): DueRoutine[] {
     const { triggerTable, routineTable, ownerColumn } = this.tables;
-    return rows(
+    return databaseRows(
       this.database.connection
         .prepare(
           `SELECT trigger.trigger_id, trigger.next_run_at, trigger.schedule_json, routine.routine_id,
@@ -334,8 +346,8 @@ export class RoutineStore {
     )
       .map((row) => ({
         routine: this.#routine(row),
-        triggerId: stringColumn(row, "trigger_id"),
-        nextRunAt: stringColumn(row, "next_run_at"),
+        triggerId: requiredStringColumn(row, "trigger_id"),
+        nextRunAt: requiredStringColumn(row, "next_run_at"),
         schedule: scheduleColumn(row),
       }))
       .filter((due) => !excludedOwnerIds.has(due.routine.ownerId));
@@ -343,7 +355,7 @@ export class RoutineStore {
 
   nextDueAt(excludedOwnerIds: ReadonlySet<string> = new Set()): string | null {
     const { triggerTable, routineTable, ownerColumn } = this.tables;
-    const row = rows(
+    const row = databaseRows(
       this.database.connection
         .prepare(
           `SELECT trigger.next_run_at, routine.${ownerColumn}
@@ -353,7 +365,7 @@ export class RoutineStore {
            ORDER BY trigger.next_run_at, trigger.trigger_id`,
         )
         .all(),
-    ).find((candidate) => !excludedOwnerIds.has(stringColumn(candidate, ownerColumn)));
+    ).find((candidate) => !excludedOwnerIds.has(requiredStringColumn(candidate, ownerColumn)));
     return row && isString(row.next_run_at) ? row.next_run_at : null;
   }
 
@@ -462,7 +474,7 @@ export class RoutineStore {
   }
 
   #allActive(): OwnedRoutine[] {
-    return rows(
+    return databaseRows(
       this.database.connection
         .prepare(`SELECT ${this.routineColumns} FROM ${this.tables.routineTable} WHERE active = 1`)
         .all(),
@@ -470,14 +482,14 @@ export class RoutineStore {
   }
 
   #routine(row: DynamicRecord): OwnedRoutine {
-    const routineId = stringColumn(row, "routine_id");
+    const routineId = requiredStringColumn(row, "routine_id");
     return {
       id: routineId,
-      ownerId: stringColumn(row, this.tables.ownerColumn),
-      name: stringColumn(row, "name"),
-      instruction: stringColumn(row, "instruction"),
-      active: numberColumn(row, "active") === 1,
-      timezone: stringColumn(row, "timezone"),
+      ownerId: requiredStringColumn(row, this.tables.ownerColumn),
+      name: requiredStringColumn(row, "name"),
+      instruction: requiredStringColumn(row, "instruction"),
+      active: requiredNumberColumn(row, "active") === 1,
+      timezone: requiredStringColumn(row, "timezone"),
       trigger: (() => {
         const trigger = this.database.connection
           .prepare(
@@ -487,38 +499,38 @@ export class RoutineStore {
           .get(routineId);
         if (!isDynamicRecord(trigger)) throw new Error("The routine trigger projection could not be read.");
         return {
-          id: stringColumn(trigger, "trigger_id"),
+          id: requiredStringColumn(trigger, "trigger_id"),
           routineId,
           schedule: scheduleColumn(trigger),
-          nextRunAt: stringColumn(trigger, "next_run_at"),
-          createdAt: stringColumn(trigger, "created_at"),
-          updatedAt: stringColumn(trigger, "updated_at"),
+          nextRunAt: requiredStringColumn(trigger, "next_run_at"),
+          createdAt: requiredStringColumn(trigger, "created_at"),
+          updatedAt: requiredStringColumn(trigger, "updated_at"),
         };
       })(),
-      createdAt: stringColumn(row, "created_at"),
-      updatedAt: stringColumn(row, "updated_at"),
+      createdAt: requiredStringColumn(row, "created_at"),
+      updatedAt: requiredStringColumn(row, "updated_at"),
     };
   }
 
   #run(row: DynamicRecord): OwnedRoutineRun {
-    const status = stringColumn(row, "status");
+    const status = requiredStringColumn(row, "status");
     if (!isRoutineRunStatus(status)) throw new Error("The stored routine run status is invalid.");
-    const kind = stringColumn(row, "run_kind");
+    const kind = requiredStringColumn(row, "run_kind");
     if (kind !== "scheduled" && kind !== "manual") throw new Error("The stored routine run kind is invalid.");
     return {
-      id: stringColumn(row, "run_id"),
-      routineId: stringColumn(row, "routine_id"),
-      ownerId: stringColumn(row, this.tables.ownerColumn),
-      triggerId: nullableStringColumn(row, "trigger_id"),
+      id: requiredStringColumn(row, "run_id"),
+      routineId: requiredStringColumn(row, "routine_id"),
+      ownerId: requiredStringColumn(row, this.tables.ownerColumn),
+      triggerId: optionalStringColumn(row, "trigger_id"),
       kind,
-      scheduledFor: stringColumn(row, "scheduled_for"),
-      routineName: stringColumn(row, "routine_name"),
-      instruction: stringColumn(row, "instruction"),
-      handleId: nullableStringColumn(row, this.tables.handleColumn),
+      scheduledFor: requiredStringColumn(row, "scheduled_for"),
+      routineName: requiredStringColumn(row, "routine_name"),
+      instruction: requiredStringColumn(row, "instruction"),
+      handleId: optionalStringColumn(row, this.tables.handleColumn),
       status,
-      error: nullableStringColumn(row, "error"),
-      createdAt: stringColumn(row, "created_at"),
-      updatedAt: stringColumn(row, "updated_at"),
+      error: optionalStringColumn(row, "error"),
+      createdAt: requiredStringColumn(row, "created_at"),
+      updatedAt: requiredStringColumn(row, "updated_at"),
     };
   }
 
@@ -579,42 +591,19 @@ export class RoutineStore {
   #validateInput(name: string, instruction: string, timezone: string, schedule: RoutineSchedule): void {
     const normalizedName = name.trim();
     const normalizedInstruction = instruction.trim();
-    if (!normalizedName) throw new Error("A routine name is required.");
-    if (name.length > INPUT_LIMITS.routineName) throw new Error("The routine name is too long.");
-    if (!normalizedInstruction) throw new Error("A routine instruction is required.");
-    if (instruction.length > INPUT_LIMITS.routineInstruction) throw new Error("The routine instruction is too long.");
+    if (!normalizedName) throw new RoutineInputError(sourceText("error.backend.routineNameRequired"));
+    if (name.length > INPUT_LIMITS.routineName)
+      throw new RoutineInputError(sourceText("error.backend.routineNameTooLong"));
+    if (!normalizedInstruction) throw new RoutineInputError(sourceText("error.backend.routineInstructionRequired"));
+    if (instruction.length > INPUT_LIMITS.routineInstruction)
+      throw new RoutineInputError(sourceText("error.backend.routineInstructionTooLong"));
     validateRoutineSchedule(schedule, timezone);
   }
 }
 
 function scheduleColumn(row: DynamicRecord): RoutineSchedule {
-  const value = JSON.parse(stringColumn(row, "schedule_json"));
+  const value = JSON.parse(requiredStringColumn(row, "schedule_json"));
   if (!isRoutineSchedule(value)) throw new Error("The stored routine schedule is invalid.");
-  return value;
-}
-
-function rows(values: unknown[]): DynamicRecord[] {
-  return values.map((value) => {
-    if (!isDynamicRecord(value)) throw new Error("A routine database row is invalid.");
-    return value;
-  });
-}
-
-function stringColumn(row: DynamicRecord, key: string): string {
-  const value = row[key];
-  if (!isString(value)) throw new Error(`The routine ${key} column is invalid.`);
-  return value;
-}
-
-function nullableStringColumn(row: DynamicRecord, key: string): string | null {
-  const value = row[key];
-  if (value === null) return null;
-  return stringColumn(row, key);
-}
-
-function numberColumn(row: DynamicRecord, key: string): number {
-  const value = row[key];
-  if (!isNumber(value)) throw new Error(`The routine ${key} column is invalid.`);
   return value;
 }
 

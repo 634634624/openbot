@@ -11,6 +11,7 @@ import {
   bundledOpencodeExecutable,
   CodexCliError,
   cliSpawnTarget,
+  commandPathFromShellOutput,
   loginShellCommand,
   parseClaudeVersion,
   parseCodexVersion,
@@ -21,6 +22,7 @@ import {
   resolveCodexCli,
   resolveGrokCli,
   resolveOpencodeCli,
+  runInLoginShell,
   windowsFallbackPaths,
 } from "./cli";
 
@@ -59,7 +61,8 @@ describe("bundled Codex resolution", () => {
       "C:\\Program Files\\OpenBot\\resources\\codex\\win\\x64\\bin\\codex.exe",
     );
     expect(bundledCodexExecutable("linux", "x64", "/resources")).toBe("/resources/codex/linux/x64/bin/codex");
-    expect(bundledCodexExecutable("linux", "arm64", "/resources")).toBeNull();
+    expect(bundledCodexExecutable("linux", "arm64", "/resources")).toBe("/resources/codex/linux/arm64/bin/codex");
+    expect(bundledCodexExecutable("win32", "arm64", "C:\\resources")).toBeNull();
     expect(bundledCodexExecutable("freebsd", "x64", "/resources")).toBeNull();
   });
 
@@ -160,6 +163,23 @@ describe("login shell discovery", () => {
     expect(loginShellCommand("linux", {})).toEqual({ command: "/bin/sh", args: ["-lc"] });
     expect(loginShellCommand("linux", { SHELL: "  " })).toEqual({ command: "/bin/sh", args: ["-lc"] });
     expect(loginShellCommand("linux", { SHELL: "/bin/sh" })).toEqual({ command: "/bin/sh", args: ["-lc"] });
+  });
+
+  it.runIf(process.platform !== "win32")("runs the shell in a process group of its own", async () => {
+    // An interactive bash in OpenBot's group stops the whole group with SIGTTIN when another
+    // lookup holds the terminal (#766).
+    const shell = { command: "/bin/sh", args: ["-c"] };
+    const [pid, group] = (await runInLoginShell('echo "$$ $(ps -o pgid= -p $$)"', shell)).trim().split(/\s+/u);
+    expect(group).toBe(pid);
+    await expect(runInLoginShell("exit 3", shell)).rejects.toThrow("code 3");
+  });
+
+  it.runIf(process.platform !== "win32")("finds the path after a profile that prints a greeting", async () => {
+    // A `.bashrc` that prints text hid every system CLI on Linux (#1073).
+    const shell = { command: "/bin/sh", args: ["-c"] };
+    const stdout = await runInLoginShell("echo 'Welcome back'; echo; command -v sh", shell);
+    expect(commandPathFromShellOutput(stdout)).toMatch(/^\/.*\/sh$/u);
+    expect(commandPathFromShellOutput("Welcome back\nalias ll='ls -l'\n")).toBeNull();
   });
 });
 

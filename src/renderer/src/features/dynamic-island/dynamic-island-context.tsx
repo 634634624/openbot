@@ -1,8 +1,9 @@
-import { createEffect, flush, onSettled } from "solid-js";
+import { createEffect, flush, onSettled, untrack } from "solid-js";
 import { usePlatform } from "../../platform";
 import { createSimpleContext } from "../../simple-context";
 import { useServers } from "../servers/servers-context";
 import { DynamicIslandCoordinator } from "./dynamic-island-coordinator";
+import { dynamicIslandPort } from "./dynamic-island-port";
 
 /**
  * The macOS Dynamic Island projection: what the desktop shows about servers the
@@ -57,7 +58,9 @@ const DynamicIsland = createSimpleContext({
       queueMicrotask(() => {
         presentationScheduled = false;
         const presentation = coordinator.presentation(serverOrder());
-        void window.openbot.dynamicIsland.publishPresentation(presentation).catch(() => undefined);
+        void dynamicIslandPort()
+          .dynamicIsland.publishPresentation(presentation)
+          .catch(() => undefined);
       });
     }
 
@@ -69,7 +72,8 @@ const DynamicIsland = createSimpleContext({
           .map((server) => `${server.id}:${server.state}:${server.notificationsMuted}`)
           .join("\u0000"),
       () => {
-        const currentServers = servers();
+        // The key above decides when this runs; the list is read once for the current state.
+        const currentServers = untrack(servers);
         const configuredServerIds = new Set(currentServers.map((server) => server.id));
         for (const serverId of connectedServers) {
           const server = currentServers.find((candidate) => candidate.id === serverId);
@@ -84,7 +88,7 @@ const DynamicIsland = createSimpleContext({
     );
 
     onSettled(() =>
-      window.openbot.agent.onScopedEvent((event) => {
+      dynamicIslandPort().agent.onScopedEvent((event) => {
         flush(() => {
           const server = servers().find((candidate) => candidate.id === event.serverId);
           if (server?.kind === "remote" && server.state !== "online") return;

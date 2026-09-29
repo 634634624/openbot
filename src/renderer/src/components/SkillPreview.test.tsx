@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor, within } from "@solidjs/testing-library";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, assert, describe, expect, it, vi } from "vitest";
 import { AgentSkillsModal } from "../features/conversation/AgentSkillsModal";
 import { STORY_MARKETPLACE_SKILL_DETAILS } from "../preview/fixtures";
 import { createMockOpenBot, type MockOpenBotControls } from "../preview/mock-openbot";
@@ -11,6 +11,12 @@ afterEach(() => {
   mock = undefined;
 });
 const skill = STORY_MARKETPLACE_SKILL_DETAILS["skill-release-notes"];
+assert(skill);
+
+function installSkillMock(): void {
+  mock = createMockOpenBot();
+  window.openbot = mock.api;
+}
 
 describe("skill preview", () => {
   it("shows the author example and invokes Try only on user input", async () => {
@@ -30,8 +36,7 @@ describe("skill preview", () => {
     expect(screen.getByText("Install this skill first.")).toBeInTheDocument();
   });
   it("renders Markdown without executing HTML or unsafe links", () => {
-    mock = createMockOpenBot();
-    window.openbot = mock.api;
+    installSkillMock();
     const openUrl = vi.spyOn(window.openbot, "openUrl");
     render(() => (
       <SkillPreview
@@ -51,8 +56,7 @@ describe("skill preview", () => {
     expect(openUrl).toHaveBeenCalledWith("https://example.com/guide");
   });
   it("keeps remote skill details read-only", async () => {
-    mock = createMockOpenBot();
-    window.openbot = mock.api;
+    installSkillMock();
     const onTrySkill = vi.fn();
     render(() => (
       <AgentSkillsModal
@@ -71,8 +75,7 @@ describe("skill preview", () => {
     expect(onTrySkill).not.toHaveBeenCalled();
   });
   it("enables automatically and closes details after Try", async () => {
-    mock = createMockOpenBot();
-    window.openbot = mock.api;
+    installSkillMock();
     const onTrySkill = vi.fn();
     const onOpenChange = vi.fn();
     render(() => (

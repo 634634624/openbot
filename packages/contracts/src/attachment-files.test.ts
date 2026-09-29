@@ -3,6 +3,7 @@ import {
   ATTACHMENT_FILE_ACCEPT,
   attachmentMimeTypeForName,
   isSupportedAttachmentName,
+  isSupportedAttachmentNameFor,
   supportedAttachmentExtensions,
 } from "./attachment-files";
 
@@ -24,16 +25,6 @@ describe("attachment file whitelist", () => {
     expect(isSupportedAttachmentName("no-extension")).toBe(false);
   });
 
-  it("accepts EML as a single attachment", () => {
-    expect(isSupportedAttachmentName("message.eml")).toBe(true);
-    expect(ATTACHMENT_FILE_ACCEPT).toContain(".eml");
-  });
-
-  it.each(["recording.MP3", "Screen Recording.mov"])("accepts %s in the picker", (name) => {
-    expect(isSupportedAttachmentName(name)).toBe(true);
-    expect(ATTACHMENT_FILE_ACCEPT).toContain(`.${name.split(".").at(-1)?.toLowerCase()}`);
-  });
-
   it("offers media only when the selected host supports it, without hiding other files", () => {
     const legacy = supportedAttachmentExtensions({ eml: false, media: false });
     expect(legacy).not.toContain("mp3");
@@ -52,6 +43,17 @@ describe("attachment file whitelist", () => {
         .map((extension) => `.${extension}`)
         .join(","),
     ).toBe(ATTACHMENT_FILE_ACCEPT);
+  });
+
+  it("checks one name against the same host support as the picker filter", () => {
+    const legacy = { eml: false, media: false };
+    expect(isSupportedAttachmentNameFor("photo.png", legacy)).toBe(true);
+    expect(isSupportedAttachmentNameFor("Dockerfile", legacy)).toBe(true);
+    expect(isSupportedAttachmentNameFor("clip.MOV", legacy)).toBe(false);
+    expect(isSupportedAttachmentNameFor("message.eml", legacy)).toBe(false);
+    expect(isSupportedAttachmentNameFor("clip.mov", { eml: false, media: true })).toBe(true);
+    expect(isSupportedAttachmentNameFor("message.eml", { eml: true, media: false })).toBe(true);
+    expect(isSupportedAttachmentNameFor("setup.exe", { eml: true, media: true })).toBe(false);
   });
 
   it("assigns stable MIME types to supported formats", () => {

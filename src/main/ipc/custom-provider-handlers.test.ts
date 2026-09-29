@@ -1,7 +1,7 @@
 // @vitest-environment node
 
 import { describe, expect, it, vi } from "vitest";
-import type { CustomProviderIpcDependencies } from "./custom-provider-handlers";
+import { type CustomProviderChangeDependencies, createCustomProviderChanges } from "../custom-provider-changes";
 
 type TrustedInvoke = (event: { senderFrame: { url: string } }, payload: unknown) => unknown;
 
@@ -28,7 +28,7 @@ describe("custom provider endpoint changes", () => {
     delete process.env.ELECTRON_RENDERER_URL;
     const steps: string[] = [];
     const releases = new Map<string, () => void>();
-    const service: CustomProviderIpcDependencies["service"] = {
+    const service: CustomProviderChangeDependencies["service"] = {
       // Held open, so the second delete has every chance to start inside the first one.
       removeCustomProvider: <T>(id: string, persist: () => Promise<T>) =>
         new Promise<T>((resolve) => {
@@ -39,18 +39,23 @@ describe("custom provider endpoint changes", () => {
         steps.push(`save:${id}`);
         return persist();
       },
+      updateCustomProvider: <T>(_id: string, _removed: readonly string[], persist: () => Promise<T>) => persist(),
       reloadOpenCodeConfig: async () => "restarted",
     };
-    const customProviders: CustomProviderIpcDependencies["customProviders"] = {
+    const customProviders: CustomProviderChangeDependencies["customProviders"] = {
       list: () => [],
       save: async () => [],
+      checkUpdate: () => undefined,
+      update: async () => [],
       remove: async (id: string) => {
         steps.push(`removed:${id}`);
         return [];
       },
     };
 
-    const { customProviders: endpoints } = customProviderIpcHandlers({ service, customProviders });
+    const { customProviders: endpoints } = customProviderIpcHandlers(
+      createCustomProviderChanges({ service, customProviders }),
+    );
     for (const [name, bind] of Object.entries(endpoints)) bind(name);
     const remove = bound.get("delete");
     expect(remove).toBeDefined();

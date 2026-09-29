@@ -1,5 +1,6 @@
 import { env, waitUntil } from "cloudflare:workers";
 import { AgentMarketplace, AgentMarketplaceError } from "./agent-marketplace";
+import { AgentTemplates } from "./agent-templates";
 import { AuthService, AuthServiceError } from "./auth-service";
 import { D1AuthRepository } from "./d1-auth-repository";
 import { createEmailCodeDelivery, createTeamInviteEmailDelivery } from "./email-delivery";
@@ -30,7 +31,10 @@ export function requestAuthService(): AuthService {
     repository: new D1AuthRepository(bindings.DB),
     delivery: exposeDevelopmentCode ? null : createEmailCodeDelivery(bindings),
     exposeDevelopmentCode,
-    flushSessionRevocations: () => deliverPendingRemoteAuthEvents(bindings, Date.now()),
+    // The revocation is already written and the cron redelivers it, so the answer does not wait.
+    flushSessionRevocations: async () => {
+      waitUntil(deliverPendingRemoteAuthEvents(bindings, Date.now()));
+    },
     profileChanged: (userId) => notifyAccountProfileChanged(bindings, userId, waitUntil),
   });
 }
@@ -47,6 +51,10 @@ export function requestSkillMarketplace(): SkillMarketplace {
 
 export function requestAgentMarketplace(): AgentMarketplace {
   return new AgentMarketplace(requireWorkerBindings(env));
+}
+
+export function requestAgentTemplates(): AgentTemplates {
+  return new AgentTemplates(requireWorkerBindings(env));
 }
 
 export function requestHostedSiteService(): HostedSiteService {
@@ -142,7 +150,7 @@ export function requestTeamInviteEmailDelivery(): TeamInviteEmailDelivery | null
 }
 
 export function requestRemoteControlPlane(): RemoteControlPlane {
-  return new RemoteControlPlane(requireWorkerBindings(env));
+  return new RemoteControlPlane(requireWorkerBindings(env), { schedule: waitUntil });
 }
 
 export function verifyRemoteServiceRequest(request: Request, body: string): Promise<boolean> {
@@ -184,7 +192,7 @@ export function bearerToken(request: Request): string | null {
 function constantTimeEqual(left: Uint8Array, right: Uint8Array): boolean {
   if (left.byteLength !== right.byteLength) return false;
   let difference = 0;
-  for (let index = 0; index < left.byteLength; index += 1) difference |= left[index] ^ right[index];
+  for (let index = 0; index < left.byteLength; index += 1) difference |= (left[index] ?? 0) ^ (right[index] ?? 0);
   return difference === 0;
 }
 

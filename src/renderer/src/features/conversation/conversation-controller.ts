@@ -5,10 +5,12 @@ import type {
   BrowserBounds,
   MarketplaceSkillDetail,
 } from "@openbot/contracts/ipc";
+import type { AgentActivityLabel } from "@openbot/ui/features/conversation/AgentActivity";
+import { currentText } from "@openbot/ui/text";
 import { createEffect, createSignal, onCleanup } from "solid-js";
-import type { AgentActivityPresentation } from "./AgentActivity";
 import type { ChatSearchMatch } from "./chat-search";
 import {
+  appendPluginPrompt,
   appendSkillCreationRequest,
   appendSkillExample,
   EMPTY_DRAFT,
@@ -27,12 +29,12 @@ function readBrowserPipBounds(): BrowserBounds | null {
   const values = (window.localStorage.getItem(BROWSER_PIP_STORAGE_KEY) ?? "")
     .split(",")
     .map((value) => Number.parseFloat(value));
-  const [x, y, width, height] = values;
-  return values.length === 4 && values.every(Number.isFinite) ? { x, y, width, height } : null;
+  const [x = Number.NaN, y = Number.NaN, width = Number.NaN, height = Number.NaN] = values;
+  return values.length === 4 && [x, y, width, height].every(Number.isFinite) ? { x, y, width, height } : null;
 }
 
 interface ConversationResources {
-  agentActivityPresentations: Map<string, { activityId: string; presentation: AgentActivityPresentation }>;
+  agentActivityLabels: Map<string, { activityId: string; label: AgentActivityLabel }>;
   browserOpenRequests: Map<
     string,
     {
@@ -92,8 +94,8 @@ interface ConversationResources {
  * Every signal here is keyed by `serverId:agentId` (`composerDraftKey`) or carries
  * its server in the value, which is what makes the shared lifetime safe.
  */
-export function createStableConversationState(props: Pick<ConversationProps, "onTypingChange">) {
-  const restoredEdit = readStoredQueueEdit();
+export function createStableConversationState(props: Pick<ConversationProps, "onTypingChange">, persistDrafts = true) {
+  const restoredEdit = persistDrafts ? readStoredQueueEdit() : null;
   const [drafts, setDrafts] = createSignal<Record<string, ComposerDraft>>(
     restoredEdit ? { [composerDraftKey(restoredEdit)]: restoredEdit.draft } : {},
   );
@@ -130,7 +132,7 @@ export function createStableConversationState(props: Pick<ConversationProps, "on
         : null;
     },
     (edit) => {
-      if (!edit) return;
+      if (!edit || !persistDrafts) return;
       const persist = () => {
         // Read fresh state: a pending Save set after this effect ran must not be
         // overwritten by the previous snapshot without it.
@@ -154,7 +156,7 @@ export function createStableConversationState(props: Pick<ConversationProps, "on
         } catch {
           setConversationErrors((currentErrors) => ({
             ...currentErrors,
-            [composerDraftKey(current)]: "Could not save this edit on this computer.",
+            [composerDraftKey(current)]: currentText().t("composer.error.saveEditLocally"),
           }));
         }
       };
@@ -175,7 +177,7 @@ export function createStableConversationState(props: Pick<ConversationProps, "on
   const [settingsPanelWidth, setSettingsPanelWidth] = createSignal(SETTINGS_PANEL_DEFAULT);
   const [browserPanelWidth, setBrowserPanelWidth] = createSignal(BROWSER_PANEL_DEFAULT);
   const resources: ConversationResources = {
-    agentActivityPresentations: new Map(),
+    agentActivityLabels: new Map(),
     browserOpenRequests: new Map(),
     importTargetAgents: new Map<string, { agentId: string; serverId: string }>(),
     seenMessageIds: new Set<string>(),
@@ -232,6 +234,11 @@ export function createStableConversationState(props: Pick<ConversationProps, "on
     appendSkillExample(target: { serverId: string; agentId: string }, skill: MarketplaceSkillDetail) {
       const key = composerDraftKey(target);
       setDrafts((current) => ({ ...current, [key]: appendSkillExample(current[key] ?? EMPTY_DRAFT, skill) }));
+      setComposerFocusRequest((value) => value + 1);
+    },
+    appendPluginPrompt(target: { serverId: string; agentId: string }, prompt: string) {
+      const key = composerDraftKey(target);
+      setDrafts((current) => ({ ...current, [key]: appendPluginPrompt(current[key] ?? EMPTY_DRAFT, prompt) }));
       setComposerFocusRequest((value) => value + 1);
     },
     stopComposerTyping,
@@ -304,7 +311,7 @@ export function createServerConversationState() {
   const [dropActive, setDropActive] = createSignal(false);
   const [rightPanels, setRightPanels] = createSignal<Record<string, RightPanelMode>>({});
   const [settingsProvider, setSettingsProvider] = createSignal<AgentProviderId>("codex");
-  const [settingsModel, setSettingsModel] = createSignal<AgentModelId>("gpt-5.6-luna");
+  const [settingsModel, setSettingsModel] = createSignal<AgentModelId>("gpt-6-luna");
   const [settingsReasoning, setSettingsReasoning] = createSignal<AgentReasoningEffort>("medium");
   const [browserAddress, setBrowserAddress] = createSignal("https://www.google.com");
   const [browserAddressEditing, setBrowserAddressEditing] = createSignal(false);
@@ -319,6 +326,8 @@ export function createServerConversationState() {
   const [activeChatSearchIndex, setActiveChatSearchIndex] = createSignal(-1);
   const [chatSearchMessageIds, setChatSearchMessageIds] = createSignal<string[]>([]);
   const [chatSearchTotal, setChatSearchTotal] = createSignal(0);
+  // The rows of the waiting block that the person closed. Row ids name the question message.
+  const [hiddenAwaitingReplyIds, setHiddenAwaitingReplyIds] = createSignal<ReadonlySet<string>>(new Set());
 
   return {
     showComposerActions,
@@ -367,6 +376,8 @@ export function createServerConversationState() {
     setChatSearchMessageIds,
     chatSearchTotal,
     setChatSearchTotal,
+    hiddenAwaitingReplyIds,
+    setHiddenAwaitingReplyIds,
   };
 }
 
@@ -375,6 +386,6 @@ export function createServerConversationState() {
  * `Conversation.stories.tsx` and the HMR test have no scope boundary to split
  * across, and `ConversationView` reads one flat object either way.
  */
-export function createConversationController(props: Pick<ConversationProps, "onTypingChange">) {
-  return { ...createStableConversationState(props), ...createServerConversationState() };
+export function createConversationController(props: Pick<ConversationProps, "onTypingChange">, persistDrafts = true) {
+  return { ...createStableConversationState(props, persistDrafts), ...createServerConversationState() };
 }

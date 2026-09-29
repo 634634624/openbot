@@ -3,19 +3,22 @@
 
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import type { AppInfo, AppSetupState, AppVariant, ExternalDestination } from "@openbot/contracts/ipc";
+import { sourceText } from "@openbot/i18n/source";
 import { app, type BrowserWindow, shell } from "electron";
 import type { AgentService } from "../../backend/agent-service";
 import type { BrowserHost } from "../../backend/browser-host";
 import type { MailboxStore } from "../../backend/mailbox-store";
 import { readAnalyticsPreference, writeAnalyticsPreference } from "../analytics-preference-store";
-import { COMPUTER_USE_PERMISSION_URLS } from "../computer-use-mac-setup-window";
+import type { ApprovalAutomation } from "../approval-automation-store";
 import type { LanguageService } from "../language-service";
+import { MAC_PERMISSION_URLS } from "../mac-permission-urls";
 import { exportDiagnostics, exportOpenBotData } from "../maintenance-service";
 import { readSetupState, writeSetupState } from "../setup-store";
 import type { UpdateService } from "../update-service";
 import {
   parseAnalyticsPreference,
   parseAppLanguagePreference,
+  parseApprovalAutomation,
   parseExternalDestination,
   parseSetup,
 } from "./app-inputs";
@@ -29,19 +32,20 @@ import { stringPayload } from "./validation";
  *
  * `mac-screen-recording` is the one entry that is not a web page. macOS opens a settings pane from a
  * URL, and the table is what keeps that address out of the renderer. It is the same pane the
- * computer use setup opens, so it is read from there rather than written twice.
+ * Computer Use panel opens, so it is read from `mac-permission-urls.ts` rather than written twice.
  */
 export const EXTERNAL_DESTINATIONS: Record<ExternalDestination, string> = {
   "agent-setup": "https://github.com/nightly-labs/openbot/blob/main/docs/TROUBLESHOOTING.md",
   "opencode-install": "https://opencode.ai/docs/",
   "opencode-auth": "https://opencode.ai/auth",
   "claude-install": "https://code.claude.com/docs",
-  "claude-sign-in": "https://code.claude.com/docs/en/authentication",
   feedback: "https://x.com/intent/post?text=Feedback%20for%20OpenBot%20%40norbertbodziony%3A%20",
   message: "https://x.com/norbertbodziony",
-  "mac-screen-recording": COMPUTER_USE_PERMISSION_URLS["screen-recording"],
+  "grok-bot-export": "https://x.ai/bot/gI0XdhhDYPJeyQaqQBC0O",
+  "mac-screen-recording": MAC_PERMISSION_URLS["screen-recording"],
 };
 
+import type { TraceFile } from "../trace-file";
 import { handler, type IpcGroupHandlers, payloadHandler } from "./define-ipc-group";
 
 export interface AppIpcDependencies {
@@ -51,11 +55,13 @@ export interface AppIpcDependencies {
   updater: UpdateService;
   setupFile: string;
   analyticsPreferenceFile: string;
+  approvalAutomation: ApprovalAutomation;
   language: LanguageService;
   initializeAgent: () => Promise<void>;
   appVariant: AppVariant;
   getMainWindow: () => BrowserWindow | null;
   setAnalyticsTrackingEnabled: (enabled: boolean) => void;
+  trace: TraceFile;
 }
 
 export function appIpcHandlers({
@@ -65,12 +71,16 @@ export function appIpcHandlers({
   updater,
   setupFile,
   analyticsPreferenceFile,
+  approvalAutomation,
   language,
   initializeAgent,
   appVariant,
   getMainWindow,
   setAnalyticsTrackingEnabled,
+  trace,
 }: AppIpcDependencies): Pick<IpcGroupHandlers, "app" | "maintenance"> {
+  // One write at a time, so two quick toggles leave the file and the tracker at the last choice.
+  let analyticsPreferenceWrite: Promise<unknown> = Promise.resolve();
   return {
     app: {
       getAppInfo: handler((): AppInfo => {
@@ -82,11 +92,17 @@ export function appIpcHandlers({
       }),
       getSetupState: handler(() => readSetupState(setupFile)),
       getAnalyticsPreference: handler(() => readAnalyticsPreference(analyticsPreferenceFile)),
-      setAnalyticsPreference: payloadHandler(parseAnalyticsPreference, async (parsed) => {
-        const preference = await writeAnalyticsPreference(analyticsPreferenceFile, parsed.enabled);
-        setAnalyticsTrackingEnabled(preference.enabled);
-        return preference;
+      setAnalyticsPreference: payloadHandler(parseAnalyticsPreference, (parsed) => {
+        const write = analyticsPreferenceWrite.then(async () => {
+          const preference = await writeAnalyticsPreference(analyticsPreferenceFile, parsed.enabled);
+          setAnalyticsTrackingEnabled(preference.enabled);
+          return preference;
+        });
+        analyticsPreferenceWrite = write.catch(() => undefined);
+        return write;
       }),
+      getApprovalAutomation: handler(() => approvalAutomation.current()),
+      setApprovalAutomation: payloadHandler(parseApprovalAutomation, (parsed) => approvalAutomation.set(parsed)),
       getAppLanguagePreference: handler(() => language.preference),
       setAppLanguagePreference: payloadHandler(parseAppLanguagePreference, (parsed) => language.set(parsed)),
       saveSetup: payloadHandler(parseSetup, async (input): Promise<AppSetupState> => {
@@ -101,14 +117,25 @@ export function appIpcHandlers({
       openUrl: payloadHandler(stringPayload("URL", INPUT_LIMITS.browserUrl), (url) => {
         const parsed = new URL(url);
         if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-          throw new Error("Only HTTP(S) links can open in the external browser.");
+          throw new Error(sourceText("error.app.externalLinkProtocol"));
         }
         return shell.openExternal(parsed.toString());
       }),
     },
     maintenance: {
-      exportData: handler(() => exportOpenBotData({ service, mailbox, parentWindow: getMainWindow() })),
-      exportDiagnostics: handler(() => exportDiagnostics({ service, browser, updater, parentWindow: getMainWindow() })),
+      exportData: handler(() =>
+        exportOpenBotData({ service, mailbox, parentWindow: getMainWindow(), translate: language.translate }),
+      ),
+      exportDiagnostics: handler(() =>
+        exportDiagnostics({
+          service,
+          browser,
+          updater,
+          trace,
+          parentWindow: getMainWindow(),
+          translate: language.translate,
+        }),
+      ),
     },
   };
 }

@@ -4,6 +4,7 @@ import {
   type RoutineIntervalUnit,
   type RoutineSchedule,
 } from "@openbot/contracts/ipc";
+import { sourceText } from "@openbot/i18n/source";
 
 const MINIMUM_INTERVAL_MS = ROUTINE_MINIMUM_INTERVAL_MINUTES * 60_000;
 const MAX_SEARCH_DAYS = 366 * 5;
@@ -32,21 +33,24 @@ interface CronSpec {
   exactTimes?: Set<string>;
 }
 
+/** A routine request the caller can correct. Other errors are faults. */
+export class RoutineInputError extends Error {}
+
 export function validateRoutineSchedule(schedule: RoutineSchedule, timezone: string): void {
-  if (!isRoutineSchedule(schedule)) throw new Error("The routine schedule is invalid.");
+  if (!isRoutineSchedule(schedule)) throw new RoutineInputError(sourceText("error.backend.routineScheduleInvalid"));
   validateTimezone(timezone);
   if (schedule.kind === "interval") {
     if (intervalMilliseconds(schedule.amount, schedule.unit) < MINIMUM_INTERVAL_MS) {
-      throw new Error(
-        `Routine intervals must be at least ${ROUTINE_MINIMUM_INTERVAL_MINUTES} minutes. Use ${ROUTINE_MINIMUM_INTERVAL_MINUTES} minutes or more, or a daily, weekly, or cron schedule.`,
+      throw new RoutineInputError(
+        sourceText("error.backend.routineIntervalTooShort", { minutes: ROUTINE_MINIMUM_INTERVAL_MINUTES }),
       );
     }
     return;
   }
   if (schedule.kind === "advanced" && schedule.time.kind === "every") {
     if (intervalMilliseconds(schedule.time.amount, schedule.time.unit) < MINIMUM_INTERVAL_MS) {
-      throw new Error(
-        `Routine intervals must be at least ${ROUTINE_MINIMUM_INTERVAL_MINUTES} minutes. Use ${ROUTINE_MINIMUM_INTERVAL_MINUTES} minutes or more, or a fixed time.`,
+      throw new RoutineInputError(
+        sourceText("error.backend.routineIntervalTooShortFixed", { minutes: ROUTINE_MINIMUM_INTERVAL_MINUTES }),
       );
     }
   }
@@ -57,8 +61,8 @@ export function validateRoutineSchedule(schedule: RoutineSchedule, timezone: str
   for (let index = 0; index < 200; index += 1) {
     const next = nextCronOccurrence(spec, timezone, previous);
     if (next.getTime() - previous.getTime() < MINIMUM_INTERVAL_MS) {
-      throw new Error(
-        `Custom schedules must run no more often than every ${ROUTINE_MINIMUM_INTERVAL_MINUTES} minutes.`,
+      throw new RoutineInputError(
+        sourceText("error.backend.routineCronTooOften", { minutes: ROUTINE_MINIMUM_INTERVAL_MINUTES }),
       );
     }
     previous = next;
@@ -70,7 +74,7 @@ export function nextRoutineOccurrence(schedule: RoutineSchedule, timezone: strin
   if (schedule.kind === "interval") {
     const duration = intervalMilliseconds(schedule.amount, schedule.unit);
     const anchor = Date.parse(schedule.anchorAt);
-    if (!Number.isFinite(anchor)) throw new Error("The routine interval anchor is invalid.");
+    if (!Number.isFinite(anchor)) throw new RoutineInputError(sourceText("error.backend.routineAnchorInvalid"));
     if (after.getTime() < anchor) return new Date(anchor);
     const elapsed = after.getTime() - anchor;
     return new Date(anchor + (Math.floor(elapsed / duration) + 1) * duration);
@@ -82,27 +86,6 @@ export function normalizeRoutineSchedule(schedule: RoutineSchedule, now = new Da
   if (schedule.kind !== "interval") return structuredClone(schedule);
   const anchor = Number.isNaN(Date.parse(schedule.anchorAt)) ? now.toISOString() : schedule.anchorAt;
   return { ...schedule, anchorAt: anchor };
-}
-
-export function routineScheduleSummary(schedule: RoutineSchedule): string {
-  switch (schedule.kind) {
-    case "hourly":
-      return schedule.minute === 0 ? "Every hour" : `Every hour at :${String(schedule.minute).padStart(2, "0")}`;
-    case "daily":
-      return `Every day at ${displayTime(schedule.time)}`;
-    case "weekdays":
-      return `Weekdays at ${displayTime(schedule.time)}`;
-    case "weekly":
-      return `Every ${WEEKDAYS[schedule.weekday]} at ${displayTime(schedule.time)}`;
-    case "monthly":
-      return `Monthly on day ${schedule.day} at ${displayTime(schedule.time)}`;
-    case "interval":
-      return `Every ${schedule.amount} ${schedule.unit}`;
-    case "advanced":
-      return "Advanced schedule";
-    case "custom":
-      return schedule.expression;
-  }
 }
 
 function scheduleCronSpec(schedule: Exclude<RoutineSchedule, { kind: "interval" }>): CronSpec {
@@ -223,7 +206,7 @@ function nextCronOccurrence(spec: CronSpec, timezone: string, after: Date): Date
       }
     }
   }
-  throw new Error("The schedule has no occurrence within the next five years.");
+  throw new RoutineInputError(sourceText("error.backend.routineNoOccurrence"));
 }
 
 function zonedDateTimeCandidates(parts: CalendarParts, timezone: string): Date[] {
@@ -275,13 +258,13 @@ function validateTimezone(timezone: string): void {
   try {
     new Intl.DateTimeFormat("en-US", { timeZone: timezone }).format();
   } catch {
-    throw new Error("The routine timezone is invalid.");
+    throw new RoutineInputError(sourceText("error.backend.routineTimezoneInvalid"));
   }
 }
 
 function parseCron(expression: string): CronSpec {
   const values = expression.trim().split(/\s+/);
-  if (values.length !== 5) throw new Error("Custom schedules must use five cron fields.");
+  if (!hasFiveFields(values)) throw new RoutineInputError(sourceText("error.backend.routineCronFields"));
   return cronSpec(
     parseCronField(values[0], 0, 59, "minute"),
     parseCronField(values[1], 0, 23, "hour"),
@@ -289,6 +272,10 @@ function parseCron(expression: string): CronSpec {
     parseCronField(values[3], 1, 12, "month"),
     parseCronField(values[4], 0, 6, "weekday", true),
   );
+}
+
+function hasFiveFields(values: string[]): values is [string, string, string, string, string] {
+  return values.length === 5;
 }
 
 function parseCronField(
@@ -302,33 +289,38 @@ function parseCronField(
   const result = new Set<number>();
   for (const segment of source.split(",")) {
     const [rangeSource, stepSource] = segment.split("/");
+    if (rangeSource === undefined)
+      throw new RoutineInputError(sourceText("error.backend.routineCronValueInvalid", { field: label }));
     const step = stepSource === undefined ? 1 : Number(stepSource);
-    if (!Number.isInteger(step) || step < 1) throw new Error(`The cron ${label} step is invalid.`);
+    if (!Number.isInteger(step) || step < 1) throw new RoutineInputError(`The cron ${label} step is invalid.`);
     let start: number;
     let end: number;
     if (rangeSource === "*") {
       start = minimum;
       end = maximum;
     } else if (rangeSource.includes("-")) {
-      const pieces = rangeSource.split("-").map(Number);
-      if (pieces.length !== 2) throw new Error(`The cron ${label} range is invalid.`);
-      [start, end] = pieces;
+      const [rangeStart, rangeEnd, ...extra] = rangeSource.split("-").map(Number);
+      if (rangeStart === undefined || rangeEnd === undefined || extra.length > 0)
+        throw new RoutineInputError(`The cron ${label} range is invalid.`);
+      start = rangeStart;
+      end = rangeEnd;
     } else {
       start = Number(rangeSource);
       end = start;
     }
     const allowedMaximum = sundayAlias ? 7 : maximum;
     if (!Number.isInteger(start) || !Number.isInteger(end) || start < minimum || end > allowedMaximum || end < start) {
-      throw new Error(`The cron ${label} value is invalid.`);
+      throw new RoutineInputError(sourceText("error.backend.routineCronValueInvalid", { field: label }));
     }
     for (let value = start; value <= end; value += step) result.add(sundayAlias && value === 7 ? 0 : value);
   }
-  if (result.size === 0) throw new Error(`The cron ${label} field is empty.`);
+  if (result.size === 0)
+    throw new RoutineInputError(sourceText("error.backend.routineCronFieldEmpty", { field: label }));
   return { values: [...result].sort((left, right) => left - right), wildcard };
 }
 
 function parseTime(value: string): [number, number] {
-  const [hour, minute] = value.split(":").map(Number);
+  const [hour = Number.NaN, minute = Number.NaN] = value.split(":").map(Number);
   return [hour, minute];
 }
 
@@ -351,14 +343,6 @@ function intervalMilliseconds(amount: number, unit: RoutineIntervalUnit): number
   return amount * unitMs;
 }
 
-function displayTime(time: string): string {
-  const [hour, minute] = parseTime(time);
-  const period = hour >= 12 ? "PM" : "AM";
-  const displayHour = hour % 12 || 12;
-  return `${displayHour}:${String(minute).padStart(2, "0")} ${period}`;
-}
-
-const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 const WEEKDAY_INDEX: Record<string, number> = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
 
 /**

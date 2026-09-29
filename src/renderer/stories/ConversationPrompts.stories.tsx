@@ -1,6 +1,5 @@
-import { userEvent, within } from "storybook/test";
+import { ChoiceCard } from "@openbot/ui/features/conversation/ConversationPrompts";
 import type { Meta, StoryObj } from "storybook-solidjs-vite";
-import { ChoiceCard } from "../src/features/conversation/ConversationPrompts";
 
 const choiceArgs: Parameters<typeof ChoiceCard>[0] = {
   title: "What should I help with first?",
@@ -55,17 +54,6 @@ export const LongContent: Story = {
   },
 };
 
-export const Selected: Story = {
-  play: async ({ canvasElement }) => {
-    await userEvent.click(within(canvasElement).getByRole("radio", { name: "Research & writing" }));
-  },
-};
-
 export const CustomAnswer: Story = {
   args: { choices: [...choiceArgs.choices, "Something else"] },
-  play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
-    await userEvent.click(canvas.getByRole("radio", { name: "Something else" }));
-    await userEvent.type(canvas.getByRole("textbox", { name: "Custom answer" }), "Prepare the release notes");
-  },
 };

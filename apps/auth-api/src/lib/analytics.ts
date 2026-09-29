@@ -8,7 +8,7 @@ export const OPENPANEL_API_URL = "https://analytics.openbot.run/api";
 const OPENPANEL_CLIENT_ID = "6c989975-87ef-4f0c-857e-ab449a65b5c2";
 const ANALYTICS_SCHEMA_VERSION = 8;
 
-export type LandingAcquisitionSource = "direct" | "search" | "social" | "github" | "other";
+type LandingAcquisitionSource = "direct" | "search" | "social" | "github" | "other";
 
 /** How far into an article the reader got. Reported once per depth per article view. */
 export type ArticleReadDepth = "start" | "half" | "end";
@@ -78,7 +78,13 @@ type CollectionIndexRoute = ContentCollection["indexRoute"];
  */
 export type LandingScreenPath = "/" | "/join" | CollectionIndexRoute | `${CollectionIndexRoute}/${string}`;
 
-const FIXED_SCREEN_PATHS = ["/", "/join", "/news", "/guides"] as const satisfies readonly LandingScreenPath[];
+const FIXED_SCREEN_PATHS = [
+  "/",
+  "/join",
+  "/news",
+  "/guides",
+  "/compare",
+] as const satisfies readonly LandingScreenPath[];
 
 /**
  * Any path that is not a fixed screen or a published article reports the landing page instead. A
@@ -147,6 +153,8 @@ const LINK_DESTINATIONS = new Map<string, LandingDestination>([
   [OPENBOT_LINKS.contact, "contact"],
   [OPENBOT_LINKS.repository, "repository"],
   [OPENBOT_LINKS.releases, "releases"],
+  // The same destination on this site: the release notes, reported under the name they had.
+  [OPENBOT_LINKS.changelog, "releases"],
   [OPENBOT_LINKS.license, "license"],
   [OPENBOT_LINKS.privacy, "privacy"],
   [OPENBOT_LINKS.documentation, "documentation"],
@@ -374,7 +382,7 @@ function isSafeLandingProperty(name: LandingEventName, key: string, value: unkno
   if (key === "action") return isOneOf(["view", "open_app", "download"] as const, value);
   if (key === "valid_invite") return name === "join_page_action" && isBoolean(value);
   if (key === "detected") return name === "landing_download_selected" && isBoolean(value);
-  if (key === "collection") return isOneOf(["news", "guides"] as const, value);
+  if (key === "collection") return isOneOf(["news", "guides", "compare"] as const, value);
   if (key === "slug") return typeof value === "string" && PUBLISHED_SLUGS.has(value);
   if (key === "depth") return isOneOf(["start", "half", "end"] as const, value);
   // The invitation page only ever offers the two platforms it can detect; the download events cover

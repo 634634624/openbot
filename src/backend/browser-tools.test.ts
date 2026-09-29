@@ -1,5 +1,5 @@
 import { decodeTeamProtocolV1Event, encodeTeamProtocolV1Event } from "@openbot/contracts/team-protocol/v1";
-import { describe, expect, it } from "vitest";
+import { assert, describe, expect, it } from "vitest";
 import { browserInputAction } from "./browser-tool-actions";
 import {
   BROWSER_DYNAMIC_TOOLS,
@@ -12,9 +12,11 @@ import {
 describe("browser tool catalog", () => {
   it("publishes one complete provider-neutral catalog without schema drift", () => {
     const names = BROWSER_TOOL_DEFINITIONS.map((definition) => definition.name);
-    const dynamicNames = BROWSER_DYNAMIC_TOOLS[0].tools.map((definition) => definition.name);
+    const [namespace] = BROWSER_DYNAMIC_TOOLS;
+    assert(namespace);
+    const dynamicNames = namespace.tools.map((definition) => definition.name);
 
-    expect(BROWSER_DYNAMIC_TOOLS[0].name).toBe(OPENBOT_BROWSER_NAMESPACE);
+    expect(namespace.name).toBe(OPENBOT_BROWSER_NAMESPACE);
     expect(dynamicNames).toEqual(names);
     expect(new Set(names).size).toBe(names.length);
     expect(names).toEqual(
@@ -39,10 +41,10 @@ describe("browser tool catalog", () => {
         "act",
       ]),
     );
-    for (const tool of BROWSER_DYNAMIC_TOOLS[0].tools) {
+    for (const tool of namespace.tools) {
       expect(tool.inputSchema).toMatchObject({ type: "object", additionalProperties: false });
     }
-    expect(BROWSER_DYNAMIC_TOOLS[0].tools.find((tool) => tool.name === "evaluate")?.inputSchema).toMatchObject({
+    expect(namespace.tools.find((tool) => tool.name === "evaluate")?.inputSchema).toMatchObject({
       type: "object",
       required: ["tabId", "expression"],
       properties: {
@@ -51,6 +53,23 @@ describe("browser tool catalog", () => {
         timeoutMs: { type: "integer", minimum: 0, maximum: 30_000 },
       },
       additionalProperties: false,
+    });
+  });
+
+  it("requires an explicit submission mode instead of ambiguous auto for secret entry", () => {
+    const args = {
+      tabId: "tab",
+      method: "otp",
+      digits: 6,
+      targets: [{ kind: "ref", ref: "code", revision: 1 }],
+      submitTarget: { kind: "ref", ref: "continue", revision: 1 },
+    };
+    expect(() => parseBrowserToolArguments("submit_secret", { ...args, submission: "auto" })).toThrow(
+      "Invalid browser tool arguments",
+    );
+    expect(parseBrowserToolArguments("submit_secret", { ...args, submission: "click" })).toMatchObject({
+      submission: "click",
+      submitTarget: args.submitTarget,
     });
   });
 

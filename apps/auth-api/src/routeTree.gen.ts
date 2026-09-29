@@ -10,12 +10,19 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as AppRouteImport } from './routes/app'
 import { Route as AppPreviewRouteImport } from './routes/app-preview'
+import { Route as ChangelogRouteImport } from './routes/changelog'
 import { Route as JoinRouteImport } from './routes/join'
+import { Route as LlmsDottxtRouteImport } from './routes/llms[.]txt'
 import { Route as ReportSiteRouteImport } from './routes/report-site'
 import { Route as SitemapDotxmlRouteImport } from './routes/sitemap[.]xml'
 import { Route as DotwellKnownAppleAppSiteAssociationRouteImport } from './routes/[.]well-known/apple-app-site-association'
 import { Route as DotwellKnownJwksDotjsonRouteImport } from './routes/[.]well-known/jwks[.]json'
+import { Route as AgentsTemplateIdRouteImport } from './routes/agents/$templateId'
+import { Route as CompareIndexRouteImport } from './routes/compare/index'
+import { Route as CompareSlugRouteImport } from './routes/compare/$slug'
+import { Route as CompareRssDotxmlRouteImport } from './routes/compare/rss[.]xml'
 import { Route as DownloadLinuxRouteImport } from './routes/download/linux'
 import { Route as DownloadMacosRouteImport } from './routes/download/macos'
 import { Route as DownloadWindowsRouteImport } from './routes/download/windows'
@@ -26,8 +33,17 @@ import { Route as HealthLiveRouteImport } from './routes/health/live'
 import { Route as HealthReadyRouteImport } from './routes/health/ready'
 import { Route as NewsIndexRouteImport } from './routes/news/index'
 import { Route as NewsSlugRouteImport } from './routes/news/$slug'
+import { Route as NewsOpenbotVsGrokbotRouteImport } from './routes/news/openbot-vs-grokbot'
 import { Route as NewsRssDotxmlRouteImport } from './routes/news/rss[.]xml'
+import { Route as PluginsIndexRouteImport } from './routes/plugins/index'
+import { Route as PluginsSlugRouteImport } from './routes/plugins/$slug'
 import { Route as V1MeRouteImport } from './routes/v1/me'
+import { Route as ApiBrowserSplatRouteImport } from './routes/api/browser/$'
+import { Route as NewsOgOpenbotVsGrokbotDotpngRouteImport } from './routes/news/og/openbot-vs-grokbot[.]png'
+import { Route as PluginsIconSlugRouteImport } from './routes/plugins/icon/$slug'
+import { Route as V1AgentTemplatesIndexRouteImport } from './routes/v1/agent-templates/index'
+import { Route as V1AgentTemplatesTemplateIdRouteImport } from './routes/v1/agent-templates/$templateId'
+import { Route as V1AgentTemplatesMineRouteImport } from './routes/v1/agent-templates/mine'
 import { Route as V1AuthLogoutRouteImport } from './routes/v1/auth/logout'
 import { Route as V1AvatarsUserIdRouteImport } from './routes/v1/avatars/$userId'
 import { Route as V1MeAvatarRouteImport } from './routes/v1/me/avatar'
@@ -47,6 +63,8 @@ import { Route as V1TeamAuthTicketRouteImport } from './routes/v1/team-auth/tick
 import { Route as V1TeamHostsIceServersRouteImport } from './routes/v1/team-hosts/ice-servers'
 import { Route as V1TeamInvitationsEmailRouteImport } from './routes/v1/team-invitations/email'
 import { Route as V1TeamTunnelsProvisionRouteImport } from './routes/v1/team-tunnels/provision'
+import { Route as V1AgentTemplatesTemplateIdAvatarRouteImport } from './routes/v1/agent-templates/$templateId/avatar'
+import { Route as V1AgentTemplatesTemplateIdCardRouteImport } from './routes/v1/agent-templates/$templateId/card'
 import { Route as V1AuthEmailStartRouteImport } from './routes/v1/auth/email/start'
 import { Route as V1AuthEmailVerifyRouteImport } from './routes/v1/auth/email/verify'
 import { Route as V1MarketplaceAgentsIndexRouteImport } from './routes/v1/marketplace/agents/index'
@@ -89,14 +107,29 @@ const IndexRoute = IndexRouteImport.update({
   path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const AppRoute = AppRouteImport.update({
+  id: '/app',
+  path: '/app',
+  getParentRoute: () => rootRouteImport,
+} as any).lazy(() => import('./routes/app.lazy').then((d) => d.Route))
 const AppPreviewRoute = AppPreviewRouteImport.update({
   id: '/app-preview',
   path: '/app-preview',
   getParentRoute: () => rootRouteImport,
 } as any).lazy(() => import('./routes/app-preview.lazy').then((d) => d.Route))
+const ChangelogRoute = ChangelogRouteImport.update({
+  id: '/changelog',
+  path: '/changelog',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const JoinRoute = JoinRouteImport.update({
   id: '/join',
   path: '/join',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const LlmsDottxtRoute = LlmsDottxtRouteImport.update({
+  id: '/llms.txt',
+  path: '/llms.txt',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ReportSiteRoute = ReportSiteRouteImport.update({
@@ -118,6 +151,26 @@ const DotwellKnownAppleAppSiteAssociationRoute =
 const DotwellKnownJwksDotjsonRoute = DotwellKnownJwksDotjsonRouteImport.update({
   id: '/.well-known/jwks.json',
   path: '/.well-known/jwks.json',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AgentsTemplateIdRoute = AgentsTemplateIdRouteImport.update({
+  id: '/agents/$templateId',
+  path: '/agents/$templateId',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const CompareIndexRoute = CompareIndexRouteImport.update({
+  id: '/compare/',
+  path: '/compare/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const CompareSlugRoute = CompareSlugRouteImport.update({
+  id: '/compare/$slug',
+  path: '/compare/$slug',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const CompareRssDotxmlRoute = CompareRssDotxmlRouteImport.update({
+  id: '/compare/rss.xml',
+  path: '/compare/rss.xml',
   getParentRoute: () => rootRouteImport,
 } as any)
 const DownloadLinuxRoute = DownloadLinuxRouteImport.update({
@@ -170,14 +223,61 @@ const NewsSlugRoute = NewsSlugRouteImport.update({
   path: '/news/$slug',
   getParentRoute: () => rootRouteImport,
 } as any)
+const NewsOpenbotVsGrokbotRoute = NewsOpenbotVsGrokbotRouteImport.update({
+  id: '/news/openbot-vs-grokbot',
+  path: '/news/openbot-vs-grokbot',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const NewsRssDotxmlRoute = NewsRssDotxmlRouteImport.update({
   id: '/news/rss.xml',
   path: '/news/rss.xml',
   getParentRoute: () => rootRouteImport,
 } as any)
+const PluginsIndexRoute = PluginsIndexRouteImport.update({
+  id: '/plugins/',
+  path: '/plugins/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const PluginsSlugRoute = PluginsSlugRouteImport.update({
+  id: '/plugins/$slug',
+  path: '/plugins/$slug',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const V1MeRoute = V1MeRouteImport.update({
   id: '/v1/me',
   path: '/v1/me',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiBrowserSplatRoute = ApiBrowserSplatRouteImport.update({
+  id: '/api/browser/$',
+  path: '/api/browser/$',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const NewsOgOpenbotVsGrokbotDotpngRoute =
+  NewsOgOpenbotVsGrokbotDotpngRouteImport.update({
+    id: '/news/og/openbot-vs-grokbot.png',
+    path: '/news/og/openbot-vs-grokbot.png',
+    getParentRoute: () => rootRouteImport,
+  } as any)
+const PluginsIconSlugRoute = PluginsIconSlugRouteImport.update({
+  id: '/plugins/icon/$slug',
+  path: '/plugins/icon/$slug',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const V1AgentTemplatesIndexRoute = V1AgentTemplatesIndexRouteImport.update({
+  id: '/v1/agent-templates/',
+  path: '/v1/agent-templates/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const V1AgentTemplatesTemplateIdRoute =
+  V1AgentTemplatesTemplateIdRouteImport.update({
+    id: '/v1/agent-templates/$templateId',
+    path: '/v1/agent-templates/$templateId',
+    getParentRoute: () => rootRouteImport,
+  } as any)
+const V1AgentTemplatesMineRoute = V1AgentTemplatesMineRouteImport.update({
+  id: '/v1/agent-templates/mine',
+  path: '/v1/agent-templates/mine',
   getParentRoute: () => rootRouteImport,
 } as any)
 const V1AuthLogoutRoute = V1AuthLogoutRouteImport.update({
@@ -275,6 +375,18 @@ const V1TeamTunnelsProvisionRoute = V1TeamTunnelsProvisionRouteImport.update({
   path: '/v1/team-tunnels/provision',
   getParentRoute: () => rootRouteImport,
 } as any)
+const V1AgentTemplatesTemplateIdAvatarRoute =
+  V1AgentTemplatesTemplateIdAvatarRouteImport.update({
+    id: '/avatar',
+    path: '/avatar',
+    getParentRoute: () => V1AgentTemplatesTemplateIdRoute,
+  } as any)
+const V1AgentTemplatesTemplateIdCardRoute =
+  V1AgentTemplatesTemplateIdCardRouteImport.update({
+    id: '/card',
+    path: '/card',
+    getParentRoute: () => V1AgentTemplatesTemplateIdRoute,
+  } as any)
 const V1AuthEmailStartRoute = V1AuthEmailStartRouteImport.update({
   id: '/v1/auth/email/start',
   path: '/v1/auth/email/start',
@@ -479,12 +591,18 @@ const V2RemoteHostsHostIdMembersMembershipIdRoute =
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/app': typeof AppRoute
   '/app-preview': typeof AppPreviewRoute
+  '/changelog': typeof ChangelogRoute
   '/join': typeof JoinRoute
+  '/llms.txt': typeof LlmsDottxtRoute
   '/report-site': typeof ReportSiteRoute
   '/sitemap.xml': typeof SitemapDotxmlRoute
   '/.well-known/apple-app-site-association': typeof DotwellKnownAppleAppSiteAssociationRoute
   '/.well-known/jwks.json': typeof DotwellKnownJwksDotjsonRoute
+  '/agents/$templateId': typeof AgentsTemplateIdRoute
+  '/compare/$slug': typeof CompareSlugRoute
+  '/compare/rss.xml': typeof CompareRssDotxmlRoute
   '/download/linux': typeof DownloadLinuxRoute
   '/download/macos': typeof DownloadMacosRoute
   '/download/windows': typeof DownloadWindowsRoute
@@ -493,10 +611,19 @@ export interface FileRoutesByFullPath {
   '/health/live': typeof HealthLiveRoute
   '/health/ready': typeof HealthReadyRoute
   '/news/$slug': typeof NewsSlugRoute
+  '/news/openbot-vs-grokbot': typeof NewsOpenbotVsGrokbotRoute
   '/news/rss.xml': typeof NewsRssDotxmlRoute
+  '/plugins/$slug': typeof PluginsSlugRoute
   '/v1/me': typeof V1MeRouteWithChildren
+  '/compare/': typeof CompareIndexRoute
   '/guides/': typeof GuidesIndexRoute
   '/news/': typeof NewsIndexRoute
+  '/plugins/': typeof PluginsIndexRoute
+  '/api/browser/$': typeof ApiBrowserSplatRoute
+  '/news/og/openbot-vs-grokbot.png': typeof NewsOgOpenbotVsGrokbotDotpngRoute
+  '/plugins/icon/$slug': typeof PluginsIconSlugRoute
+  '/v1/agent-templates/$templateId': typeof V1AgentTemplatesTemplateIdRouteWithChildren
+  '/v1/agent-templates/mine': typeof V1AgentTemplatesMineRoute
   '/v1/auth/logout': typeof V1AuthLogoutRoute
   '/v1/avatars/$userId': typeof V1AvatarsUserIdRoute
   '/v1/me/avatar': typeof V1MeAvatarRoute
@@ -514,8 +641,11 @@ export interface FileRoutesByFullPath {
   '/v1/team-hosts/ice-servers': typeof V1TeamHostsIceServersRoute
   '/v1/team-invitations/email': typeof V1TeamInvitationsEmailRoute
   '/v1/team-tunnels/provision': typeof V1TeamTunnelsProvisionRoute
+  '/v1/agent-templates/': typeof V1AgentTemplatesIndexRoute
   '/v1/sites/': typeof V1SitesIndexRoute
   '/v1/skills/': typeof V1SkillsIndexRoute
+  '/v1/agent-templates/$templateId/avatar': typeof V1AgentTemplatesTemplateIdAvatarRoute
+  '/v1/agent-templates/$templateId/card': typeof V1AgentTemplatesTemplateIdCardRoute
   '/v1/auth/email/start': typeof V1AuthEmailStartRoute
   '/v1/auth/email/verify': typeof V1AuthEmailVerifyRoute
   '/v1/marketplace/agents/$agentId': typeof V1MarketplaceAgentsAgentIdRouteWithChildren
@@ -555,12 +685,18 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/app': typeof AppRoute
   '/app-preview': typeof AppPreviewRoute
+  '/changelog': typeof ChangelogRoute
   '/join': typeof JoinRoute
+  '/llms.txt': typeof LlmsDottxtRoute
   '/report-site': typeof ReportSiteRoute
   '/sitemap.xml': typeof SitemapDotxmlRoute
   '/.well-known/apple-app-site-association': typeof DotwellKnownAppleAppSiteAssociationRoute
   '/.well-known/jwks.json': typeof DotwellKnownJwksDotjsonRoute
+  '/agents/$templateId': typeof AgentsTemplateIdRoute
+  '/compare/$slug': typeof CompareSlugRoute
+  '/compare/rss.xml': typeof CompareRssDotxmlRoute
   '/download/linux': typeof DownloadLinuxRoute
   '/download/macos': typeof DownloadMacosRoute
   '/download/windows': typeof DownloadWindowsRoute
@@ -569,10 +705,19 @@ export interface FileRoutesByTo {
   '/health/live': typeof HealthLiveRoute
   '/health/ready': typeof HealthReadyRoute
   '/news/$slug': typeof NewsSlugRoute
+  '/news/openbot-vs-grokbot': typeof NewsOpenbotVsGrokbotRoute
   '/news/rss.xml': typeof NewsRssDotxmlRoute
+  '/plugins/$slug': typeof PluginsSlugRoute
   '/v1/me': typeof V1MeRouteWithChildren
+  '/compare': typeof CompareIndexRoute
   '/guides': typeof GuidesIndexRoute
   '/news': typeof NewsIndexRoute
+  '/plugins': typeof PluginsIndexRoute
+  '/api/browser/$': typeof ApiBrowserSplatRoute
+  '/news/og/openbot-vs-grokbot.png': typeof NewsOgOpenbotVsGrokbotDotpngRoute
+  '/plugins/icon/$slug': typeof PluginsIconSlugRoute
+  '/v1/agent-templates/$templateId': typeof V1AgentTemplatesTemplateIdRouteWithChildren
+  '/v1/agent-templates/mine': typeof V1AgentTemplatesMineRoute
   '/v1/auth/logout': typeof V1AuthLogoutRoute
   '/v1/avatars/$userId': typeof V1AvatarsUserIdRoute
   '/v1/me/avatar': typeof V1MeAvatarRoute
@@ -590,8 +735,11 @@ export interface FileRoutesByTo {
   '/v1/team-hosts/ice-servers': typeof V1TeamHostsIceServersRoute
   '/v1/team-invitations/email': typeof V1TeamInvitationsEmailRoute
   '/v1/team-tunnels/provision': typeof V1TeamTunnelsProvisionRoute
+  '/v1/agent-templates': typeof V1AgentTemplatesIndexRoute
   '/v1/sites': typeof V1SitesIndexRoute
   '/v1/skills': typeof V1SkillsIndexRoute
+  '/v1/agent-templates/$templateId/avatar': typeof V1AgentTemplatesTemplateIdAvatarRoute
+  '/v1/agent-templates/$templateId/card': typeof V1AgentTemplatesTemplateIdCardRoute
   '/v1/auth/email/start': typeof V1AuthEmailStartRoute
   '/v1/auth/email/verify': typeof V1AuthEmailVerifyRoute
   '/v1/marketplace/agents/$agentId': typeof V1MarketplaceAgentsAgentIdRouteWithChildren
@@ -632,12 +780,18 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/app': typeof AppRoute
   '/app-preview': typeof AppPreviewRoute
+  '/changelog': typeof ChangelogRoute
   '/join': typeof JoinRoute
+  '/llms.txt': typeof LlmsDottxtRoute
   '/report-site': typeof ReportSiteRoute
   '/sitemap.xml': typeof SitemapDotxmlRoute
   '/.well-known/apple-app-site-association': typeof DotwellKnownAppleAppSiteAssociationRoute
   '/.well-known/jwks.json': typeof DotwellKnownJwksDotjsonRoute
+  '/agents/$templateId': typeof AgentsTemplateIdRoute
+  '/compare/$slug': typeof CompareSlugRoute
+  '/compare/rss.xml': typeof CompareRssDotxmlRoute
   '/download/linux': typeof DownloadLinuxRoute
   '/download/macos': typeof DownloadMacosRoute
   '/download/windows': typeof DownloadWindowsRoute
@@ -646,10 +800,19 @@ export interface FileRoutesById {
   '/health/live': typeof HealthLiveRoute
   '/health/ready': typeof HealthReadyRoute
   '/news/$slug': typeof NewsSlugRoute
+  '/news/openbot-vs-grokbot': typeof NewsOpenbotVsGrokbotRoute
   '/news/rss.xml': typeof NewsRssDotxmlRoute
+  '/plugins/$slug': typeof PluginsSlugRoute
   '/v1/me': typeof V1MeRouteWithChildren
+  '/compare/': typeof CompareIndexRoute
   '/guides/': typeof GuidesIndexRoute
   '/news/': typeof NewsIndexRoute
+  '/plugins/': typeof PluginsIndexRoute
+  '/api/browser/$': typeof ApiBrowserSplatRoute
+  '/news/og/openbot-vs-grokbot.png': typeof NewsOgOpenbotVsGrokbotDotpngRoute
+  '/plugins/icon/$slug': typeof PluginsIconSlugRoute
+  '/v1/agent-templates/$templateId': typeof V1AgentTemplatesTemplateIdRouteWithChildren
+  '/v1/agent-templates/mine': typeof V1AgentTemplatesMineRoute
   '/v1/auth/logout': typeof V1AuthLogoutRoute
   '/v1/avatars/$userId': typeof V1AvatarsUserIdRoute
   '/v1/me/avatar': typeof V1MeAvatarRoute
@@ -667,8 +830,11 @@ export interface FileRoutesById {
   '/v1/team-hosts/ice-servers': typeof V1TeamHostsIceServersRoute
   '/v1/team-invitations/email': typeof V1TeamInvitationsEmailRoute
   '/v1/team-tunnels/provision': typeof V1TeamTunnelsProvisionRoute
+  '/v1/agent-templates/': typeof V1AgentTemplatesIndexRoute
   '/v1/sites/': typeof V1SitesIndexRoute
   '/v1/skills/': typeof V1SkillsIndexRoute
+  '/v1/agent-templates/$templateId/avatar': typeof V1AgentTemplatesTemplateIdAvatarRoute
+  '/v1/agent-templates/$templateId/card': typeof V1AgentTemplatesTemplateIdCardRoute
   '/v1/auth/email/start': typeof V1AuthEmailStartRoute
   '/v1/auth/email/verify': typeof V1AuthEmailVerifyRoute
   '/v1/marketplace/agents/$agentId': typeof V1MarketplaceAgentsAgentIdRouteWithChildren
@@ -710,12 +876,18 @@ export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
+    | '/app'
     | '/app-preview'
+    | '/changelog'
     | '/join'
+    | '/llms.txt'
     | '/report-site'
     | '/sitemap.xml'
     | '/.well-known/apple-app-site-association'
     | '/.well-known/jwks.json'
+    | '/agents/$templateId'
+    | '/compare/$slug'
+    | '/compare/rss.xml'
     | '/download/linux'
     | '/download/macos'
     | '/download/windows'
@@ -724,10 +896,19 @@ export interface FileRouteTypes {
     | '/health/live'
     | '/health/ready'
     | '/news/$slug'
+    | '/news/openbot-vs-grokbot'
     | '/news/rss.xml'
+    | '/plugins/$slug'
     | '/v1/me'
+    | '/compare/'
     | '/guides/'
     | '/news/'
+    | '/plugins/'
+    | '/api/browser/$'
+    | '/news/og/openbot-vs-grokbot.png'
+    | '/plugins/icon/$slug'
+    | '/v1/agent-templates/$templateId'
+    | '/v1/agent-templates/mine'
     | '/v1/auth/logout'
     | '/v1/avatars/$userId'
     | '/v1/me/avatar'
@@ -745,8 +926,11 @@ export interface FileRouteTypes {
     | '/v1/team-hosts/ice-servers'
     | '/v1/team-invitations/email'
     | '/v1/team-tunnels/provision'
+    | '/v1/agent-templates/'
     | '/v1/sites/'
     | '/v1/skills/'
+    | '/v1/agent-templates/$templateId/avatar'
+    | '/v1/agent-templates/$templateId/card'
     | '/v1/auth/email/start'
     | '/v1/auth/email/verify'
     | '/v1/marketplace/agents/$agentId'
@@ -786,12 +970,18 @@ export interface FileRouteTypes {
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
+    | '/app'
     | '/app-preview'
+    | '/changelog'
     | '/join'
+    | '/llms.txt'
     | '/report-site'
     | '/sitemap.xml'
     | '/.well-known/apple-app-site-association'
     | '/.well-known/jwks.json'
+    | '/agents/$templateId'
+    | '/compare/$slug'
+    | '/compare/rss.xml'
     | '/download/linux'
     | '/download/macos'
     | '/download/windows'
@@ -800,10 +990,19 @@ export interface FileRouteTypes {
     | '/health/live'
     | '/health/ready'
     | '/news/$slug'
+    | '/news/openbot-vs-grokbot'
     | '/news/rss.xml'
+    | '/plugins/$slug'
     | '/v1/me'
+    | '/compare'
     | '/guides'
     | '/news'
+    | '/plugins'
+    | '/api/browser/$'
+    | '/news/og/openbot-vs-grokbot.png'
+    | '/plugins/icon/$slug'
+    | '/v1/agent-templates/$templateId'
+    | '/v1/agent-templates/mine'
     | '/v1/auth/logout'
     | '/v1/avatars/$userId'
     | '/v1/me/avatar'
@@ -821,8 +1020,11 @@ export interface FileRouteTypes {
     | '/v1/team-hosts/ice-servers'
     | '/v1/team-invitations/email'
     | '/v1/team-tunnels/provision'
+    | '/v1/agent-templates'
     | '/v1/sites'
     | '/v1/skills'
+    | '/v1/agent-templates/$templateId/avatar'
+    | '/v1/agent-templates/$templateId/card'
     | '/v1/auth/email/start'
     | '/v1/auth/email/verify'
     | '/v1/marketplace/agents/$agentId'
@@ -862,12 +1064,18 @@ export interface FileRouteTypes {
   id:
     | '__root__'
     | '/'
+    | '/app'
     | '/app-preview'
+    | '/changelog'
     | '/join'
+    | '/llms.txt'
     | '/report-site'
     | '/sitemap.xml'
     | '/.well-known/apple-app-site-association'
     | '/.well-known/jwks.json'
+    | '/agents/$templateId'
+    | '/compare/$slug'
+    | '/compare/rss.xml'
     | '/download/linux'
     | '/download/macos'
     | '/download/windows'
@@ -876,10 +1084,19 @@ export interface FileRouteTypes {
     | '/health/live'
     | '/health/ready'
     | '/news/$slug'
+    | '/news/openbot-vs-grokbot'
     | '/news/rss.xml'
+    | '/plugins/$slug'
     | '/v1/me'
+    | '/compare/'
     | '/guides/'
     | '/news/'
+    | '/plugins/'
+    | '/api/browser/$'
+    | '/news/og/openbot-vs-grokbot.png'
+    | '/plugins/icon/$slug'
+    | '/v1/agent-templates/$templateId'
+    | '/v1/agent-templates/mine'
     | '/v1/auth/logout'
     | '/v1/avatars/$userId'
     | '/v1/me/avatar'
@@ -897,8 +1114,11 @@ export interface FileRouteTypes {
     | '/v1/team-hosts/ice-servers'
     | '/v1/team-invitations/email'
     | '/v1/team-tunnels/provision'
+    | '/v1/agent-templates/'
     | '/v1/sites/'
     | '/v1/skills/'
+    | '/v1/agent-templates/$templateId/avatar'
+    | '/v1/agent-templates/$templateId/card'
     | '/v1/auth/email/start'
     | '/v1/auth/email/verify'
     | '/v1/marketplace/agents/$agentId'
@@ -939,12 +1159,18 @@ export interface FileRouteTypes {
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  AppRoute: typeof AppRoute
   AppPreviewRoute: typeof AppPreviewRoute
+  ChangelogRoute: typeof ChangelogRoute
   JoinRoute: typeof JoinRoute
+  LlmsDottxtRoute: typeof LlmsDottxtRoute
   ReportSiteRoute: typeof ReportSiteRoute
   SitemapDotxmlRoute: typeof SitemapDotxmlRoute
   DotwellKnownAppleAppSiteAssociationRoute: typeof DotwellKnownAppleAppSiteAssociationRoute
   DotwellKnownJwksDotjsonRoute: typeof DotwellKnownJwksDotjsonRoute
+  AgentsTemplateIdRoute: typeof AgentsTemplateIdRoute
+  CompareSlugRoute: typeof CompareSlugRoute
+  CompareRssDotxmlRoute: typeof CompareRssDotxmlRoute
   DownloadLinuxRoute: typeof DownloadLinuxRoute
   DownloadMacosRoute: typeof DownloadMacosRoute
   DownloadWindowsRoute: typeof DownloadWindowsRoute
@@ -953,10 +1179,19 @@ export interface RootRouteChildren {
   HealthLiveRoute: typeof HealthLiveRoute
   HealthReadyRoute: typeof HealthReadyRoute
   NewsSlugRoute: typeof NewsSlugRoute
+  NewsOpenbotVsGrokbotRoute: typeof NewsOpenbotVsGrokbotRoute
   NewsRssDotxmlRoute: typeof NewsRssDotxmlRoute
+  PluginsSlugRoute: typeof PluginsSlugRoute
   V1MeRoute: typeof V1MeRouteWithChildren
+  CompareIndexRoute: typeof CompareIndexRoute
   GuidesIndexRoute: typeof GuidesIndexRoute
   NewsIndexRoute: typeof NewsIndexRoute
+  PluginsIndexRoute: typeof PluginsIndexRoute
+  ApiBrowserSplatRoute: typeof ApiBrowserSplatRoute
+  NewsOgOpenbotVsGrokbotDotpngRoute: typeof NewsOgOpenbotVsGrokbotDotpngRoute
+  PluginsIconSlugRoute: typeof PluginsIconSlugRoute
+  V1AgentTemplatesTemplateIdRoute: typeof V1AgentTemplatesTemplateIdRouteWithChildren
+  V1AgentTemplatesMineRoute: typeof V1AgentTemplatesMineRoute
   V1AuthLogoutRoute: typeof V1AuthLogoutRoute
   V1AvatarsUserIdRoute: typeof V1AvatarsUserIdRoute
   V1MobileAuthDevicesRoute: typeof V1MobileAuthDevicesRouteWithChildren
@@ -972,6 +1207,7 @@ export interface RootRouteChildren {
   V1TeamHostsIceServersRoute: typeof V1TeamHostsIceServersRoute
   V1TeamInvitationsEmailRoute: typeof V1TeamInvitationsEmailRoute
   V1TeamTunnelsProvisionRoute: typeof V1TeamTunnelsProvisionRoute
+  V1AgentTemplatesIndexRoute: typeof V1AgentTemplatesIndexRoute
   V1SitesIndexRoute: typeof V1SitesIndexRoute
   V1SkillsIndexRoute: typeof V1SkillsIndexRoute
   V1AuthEmailStartRoute: typeof V1AuthEmailStartRoute
@@ -1011,6 +1247,13 @@ declare module '@tanstack/solid-router' {
       preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/app': {
+      id: '/app'
+      path: '/app'
+      fullPath: '/app'
+      preLoaderRoute: typeof AppRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/app-preview': {
       id: '/app-preview'
       path: '/app-preview'
@@ -1018,11 +1261,25 @@ declare module '@tanstack/solid-router' {
       preLoaderRoute: typeof AppPreviewRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/changelog': {
+      id: '/changelog'
+      path: '/changelog'
+      fullPath: '/changelog'
+      preLoaderRoute: typeof ChangelogRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/join': {
       id: '/join'
       path: '/join'
       fullPath: '/join'
       preLoaderRoute: typeof JoinRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/llms.txt': {
+      id: '/llms.txt'
+      path: '/llms.txt'
+      fullPath: '/llms.txt'
+      preLoaderRoute: typeof LlmsDottxtRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/report-site': {
@@ -1051,6 +1308,34 @@ declare module '@tanstack/solid-router' {
       path: '/.well-known/jwks.json'
       fullPath: '/.well-known/jwks.json'
       preLoaderRoute: typeof DotwellKnownJwksDotjsonRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/agents/$templateId': {
+      id: '/agents/$templateId'
+      path: '/agents/$templateId'
+      fullPath: '/agents/$templateId'
+      preLoaderRoute: typeof AgentsTemplateIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/compare/': {
+      id: '/compare/'
+      path: '/compare'
+      fullPath: '/compare/'
+      preLoaderRoute: typeof CompareIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/compare/$slug': {
+      id: '/compare/$slug'
+      path: '/compare/$slug'
+      fullPath: '/compare/$slug'
+      preLoaderRoute: typeof CompareSlugRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/compare/rss.xml': {
+      id: '/compare/rss.xml'
+      path: '/compare/rss.xml'
+      fullPath: '/compare/rss.xml'
+      preLoaderRoute: typeof CompareRssDotxmlRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/download/linux': {
@@ -1123,6 +1408,13 @@ declare module '@tanstack/solid-router' {
       preLoaderRoute: typeof NewsSlugRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/news/openbot-vs-grokbot': {
+      id: '/news/openbot-vs-grokbot'
+      path: '/news/openbot-vs-grokbot'
+      fullPath: '/news/openbot-vs-grokbot'
+      preLoaderRoute: typeof NewsOpenbotVsGrokbotRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/news/rss.xml': {
       id: '/news/rss.xml'
       path: '/news/rss.xml'
@@ -1130,11 +1422,67 @@ declare module '@tanstack/solid-router' {
       preLoaderRoute: typeof NewsRssDotxmlRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/plugins/': {
+      id: '/plugins/'
+      path: '/plugins'
+      fullPath: '/plugins/'
+      preLoaderRoute: typeof PluginsIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/plugins/$slug': {
+      id: '/plugins/$slug'
+      path: '/plugins/$slug'
+      fullPath: '/plugins/$slug'
+      preLoaderRoute: typeof PluginsSlugRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/v1/me': {
       id: '/v1/me'
       path: '/v1/me'
       fullPath: '/v1/me'
       preLoaderRoute: typeof V1MeRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/browser/$': {
+      id: '/api/browser/$'
+      path: '/api/browser/$'
+      fullPath: '/api/browser/$'
+      preLoaderRoute: typeof ApiBrowserSplatRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/news/og/openbot-vs-grokbot.png': {
+      id: '/news/og/openbot-vs-grokbot.png'
+      path: '/news/og/openbot-vs-grokbot.png'
+      fullPath: '/news/og/openbot-vs-grokbot.png'
+      preLoaderRoute: typeof NewsOgOpenbotVsGrokbotDotpngRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/plugins/icon/$slug': {
+      id: '/plugins/icon/$slug'
+      path: '/plugins/icon/$slug'
+      fullPath: '/plugins/icon/$slug'
+      preLoaderRoute: typeof PluginsIconSlugRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/v1/agent-templates/': {
+      id: '/v1/agent-templates/'
+      path: '/v1/agent-templates'
+      fullPath: '/v1/agent-templates/'
+      preLoaderRoute: typeof V1AgentTemplatesIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/v1/agent-templates/$templateId': {
+      id: '/v1/agent-templates/$templateId'
+      path: '/v1/agent-templates/$templateId'
+      fullPath: '/v1/agent-templates/$templateId'
+      preLoaderRoute: typeof V1AgentTemplatesTemplateIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/v1/agent-templates/mine': {
+      id: '/v1/agent-templates/mine'
+      path: '/v1/agent-templates/mine'
+      fullPath: '/v1/agent-templates/mine'
+      preLoaderRoute: typeof V1AgentTemplatesMineRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/v1/auth/logout': {
@@ -1269,6 +1617,20 @@ declare module '@tanstack/solid-router' {
       fullPath: '/v1/team-tunnels/provision'
       preLoaderRoute: typeof V1TeamTunnelsProvisionRouteImport
       parentRoute: typeof rootRouteImport
+    }
+    '/v1/agent-templates/$templateId/avatar': {
+      id: '/v1/agent-templates/$templateId/avatar'
+      path: '/avatar'
+      fullPath: '/v1/agent-templates/$templateId/avatar'
+      preLoaderRoute: typeof V1AgentTemplatesTemplateIdAvatarRouteImport
+      parentRoute: typeof V1AgentTemplatesTemplateIdRoute
+    }
+    '/v1/agent-templates/$templateId/card': {
+      id: '/v1/agent-templates/$templateId/card'
+      path: '/card'
+      fullPath: '/v1/agent-templates/$templateId/card'
+      preLoaderRoute: typeof V1AgentTemplatesTemplateIdCardRouteImport
+      parentRoute: typeof V1AgentTemplatesTemplateIdRoute
     }
     '/v1/auth/email/start': {
       id: '/v1/auth/email/start'
@@ -1537,6 +1899,23 @@ const V1MeRouteChildren: V1MeRouteChildren = {
 
 const V1MeRouteWithChildren = V1MeRoute._addFileChildren(V1MeRouteChildren)
 
+interface V1AgentTemplatesTemplateIdRouteChildren {
+  V1AgentTemplatesTemplateIdAvatarRoute: typeof V1AgentTemplatesTemplateIdAvatarRoute
+  V1AgentTemplatesTemplateIdCardRoute: typeof V1AgentTemplatesTemplateIdCardRoute
+}
+
+const V1AgentTemplatesTemplateIdRouteChildren: V1AgentTemplatesTemplateIdRouteChildren =
+  {
+    V1AgentTemplatesTemplateIdAvatarRoute:
+      V1AgentTemplatesTemplateIdAvatarRoute,
+    V1AgentTemplatesTemplateIdCardRoute: V1AgentTemplatesTemplateIdCardRoute,
+  }
+
+const V1AgentTemplatesTemplateIdRouteWithChildren =
+  V1AgentTemplatesTemplateIdRoute._addFileChildren(
+    V1AgentTemplatesTemplateIdRouteChildren,
+  )
+
 interface V1MobileAuthDevicesRouteChildren {
   V1MobileAuthDevicesSessionIdRoute: typeof V1MobileAuthDevicesSessionIdRoute
 }
@@ -1632,13 +2011,19 @@ const V1MarketplaceAgentsAdminSubmissionsRouteWithChildren =
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  AppRoute: AppRoute,
   AppPreviewRoute: AppPreviewRoute,
+  ChangelogRoute: ChangelogRoute,
   JoinRoute: JoinRoute,
+  LlmsDottxtRoute: LlmsDottxtRoute,
   ReportSiteRoute: ReportSiteRoute,
   SitemapDotxmlRoute: SitemapDotxmlRoute,
   DotwellKnownAppleAppSiteAssociationRoute:
     DotwellKnownAppleAppSiteAssociationRoute,
   DotwellKnownJwksDotjsonRoute: DotwellKnownJwksDotjsonRoute,
+  AgentsTemplateIdRoute: AgentsTemplateIdRoute,
+  CompareSlugRoute: CompareSlugRoute,
+  CompareRssDotxmlRoute: CompareRssDotxmlRoute,
   DownloadLinuxRoute: DownloadLinuxRoute,
   DownloadMacosRoute: DownloadMacosRoute,
   DownloadWindowsRoute: DownloadWindowsRoute,
@@ -1647,10 +2032,19 @@ const rootRouteChildren: RootRouteChildren = {
   HealthLiveRoute: HealthLiveRoute,
   HealthReadyRoute: HealthReadyRoute,
   NewsSlugRoute: NewsSlugRoute,
+  NewsOpenbotVsGrokbotRoute: NewsOpenbotVsGrokbotRoute,
   NewsRssDotxmlRoute: NewsRssDotxmlRoute,
+  PluginsSlugRoute: PluginsSlugRoute,
   V1MeRoute: V1MeRouteWithChildren,
+  CompareIndexRoute: CompareIndexRoute,
   GuidesIndexRoute: GuidesIndexRoute,
   NewsIndexRoute: NewsIndexRoute,
+  PluginsIndexRoute: PluginsIndexRoute,
+  ApiBrowserSplatRoute: ApiBrowserSplatRoute,
+  NewsOgOpenbotVsGrokbotDotpngRoute: NewsOgOpenbotVsGrokbotDotpngRoute,
+  PluginsIconSlugRoute: PluginsIconSlugRoute,
+  V1AgentTemplatesTemplateIdRoute: V1AgentTemplatesTemplateIdRouteWithChildren,
+  V1AgentTemplatesMineRoute: V1AgentTemplatesMineRoute,
   V1AuthLogoutRoute: V1AuthLogoutRoute,
   V1AvatarsUserIdRoute: V1AvatarsUserIdRoute,
   V1MobileAuthDevicesRoute: V1MobileAuthDevicesRouteWithChildren,
@@ -1666,6 +2060,7 @@ const rootRouteChildren: RootRouteChildren = {
   V1TeamHostsIceServersRoute: V1TeamHostsIceServersRoute,
   V1TeamInvitationsEmailRoute: V1TeamInvitationsEmailRoute,
   V1TeamTunnelsProvisionRoute: V1TeamTunnelsProvisionRoute,
+  V1AgentTemplatesIndexRoute: V1AgentTemplatesIndexRoute,
   V1SitesIndexRoute: V1SitesIndexRoute,
   V1SkillsIndexRoute: V1SkillsIndexRoute,
   V1AuthEmailStartRoute: V1AuthEmailStartRoute,

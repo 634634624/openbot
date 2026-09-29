@@ -1,7 +1,10 @@
+import {
+  LANDING_PREVIEW_READY_MESSAGE,
+  LANDING_PREVIEW_START_MESSAGE,
+} from "@openbot/contracts/landing-preview-messages";
+import { prefersReducedMotion } from "@openbot/ui/utils";
 import { onSettled } from "solid-js";
 
-const LANDING_PREVIEW_READY_MESSAGE = "openbot:landing-preview-ready";
-const LANDING_PREVIEW_START_MESSAGE = "openbot:landing-preview-start";
 const LANDING_PREVIEW_URL = "/app-preview";
 const LANDING_PREVIEW_LOAD_DELAY_MS = 300;
 const LANDING_PREVIEW_REVEAL_FALLBACK_MS = 240;
@@ -35,7 +38,7 @@ export function LandingAppPreview() {
     if (!preview || !loadingPlaceholder || !previewFrame) return;
 
     const origin = window.location.origin;
-    const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+    const reducedMotion = prefersReducedMotion();
     let loading = false;
     let ready = false;
     let started = false;

@@ -1,19 +1,28 @@
-import { randomUUID } from "node:crypto";
-import { readFile, rename, rm, writeFile } from "node:fs/promises";
-import type { UpdatePreference } from "@openbot/contracts/ipc";
+import { readFile } from "node:fs/promises";
+import type { UpdatePreference, UpdatePreferenceChange } from "@openbot/contracts/ipc";
 import { isBoolean, isDynamicRecord } from "@openbot/contracts/runtime-values";
+import { writeJsonFileAtomically } from "../backend/atomic-json-file";
+import { isMissingFileError } from "../backend/file-errors";
 
-const DEFAULT_PREFERENCE: UpdatePreference = { autoDownload: true };
+const DEFAULT_PREFERENCE: UpdatePreference = { autoDownload: true, allowRemoteUpdates: true, autoInstall: false };
 
+// `allowRemoteUpdates` and `autoInstall` came later in the same version 1 file. A file without them
+// is one written before remote updates existed, and an older app that reads a newer file ignores them.
 export async function readUpdatePreference(path: string): Promise<UpdatePreference> {
   try {
     const parsed = JSON.parse(await readFile(path, "utf8"));
     if (!isDynamicRecord(parsed) || parsed.version !== 1 || !isBoolean(parsed.autoDownload)) {
       return { ...DEFAULT_PREFERENCE };
     }
-    return { autoDownload: parsed.autoDownload };
+    return {
+      autoDownload: parsed.autoDownload,
+      allowRemoteUpdates: isBoolean(parsed.allowRemoteUpdates)
+        ? parsed.allowRemoteUpdates
+        : DEFAULT_PREFERENCE.allowRemoteUpdates,
+      autoInstall: isBoolean(parsed.autoInstall) ? parsed.autoInstall : DEFAULT_PREFERENCE.autoInstall,
+    };
   } catch (error) {
-    if (isMissing(error) || error instanceof SyntaxError) return { ...DEFAULT_PREFERENCE };
+    if (isMissingFileError(error) || error instanceof SyntaxError) return { ...DEFAULT_PREFERENCE };
     throw error;
   }
 }
@@ -25,30 +34,18 @@ export async function readUpdatePreference(path: string): Promise<UpdatePreferen
  */
 let pendingWrite: Promise<unknown> = Promise.resolve();
 
-export function writeUpdatePreference(path: string, autoDownload: boolean): Promise<UpdatePreference> {
+export function writeUpdatePreference(path: string, change: UpdatePreferenceChange): Promise<UpdatePreference> {
   const write = pendingWrite.then(
-    () => replaceUpdatePreference(path, autoDownload),
-    () => replaceUpdatePreference(path, autoDownload),
+    () => replaceUpdatePreference(path, change),
+    () => replaceUpdatePreference(path, change),
   );
   pendingWrite = write.catch(() => undefined);
   return write;
 }
 
-async function replaceUpdatePreference(path: string, autoDownload: boolean): Promise<UpdatePreference> {
-  const preference = { autoDownload };
-  const temporaryPath = `${path}.${randomUUID()}.tmp`;
-  try {
-    await writeFile(temporaryPath, `${JSON.stringify({ version: 1, autoDownload })}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-    });
-    await rename(temporaryPath, path);
-    return preference;
-  } finally {
-    await rm(temporaryPath, { force: true }).catch(() => undefined);
-  }
-}
-
-function isMissing(error: unknown): error is NodeJS.ErrnoException {
-  return error instanceof Error && "code" in error && error.code === "ENOENT";
+/** The read runs inside the chain, so a change to one field never writes back a stale other one. */
+async function replaceUpdatePreference(path: string, change: UpdatePreferenceChange): Promise<UpdatePreference> {
+  const preference = { ...(await readUpdatePreference(path)), ...change };
+  await writeJsonFileAtomically(path, { version: 1, ...preference });
+  return preference;
 }

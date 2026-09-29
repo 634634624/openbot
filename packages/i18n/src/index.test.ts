@@ -1,9 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolveLocale, translateFor } from "./index";
 import { createTranslate } from "./message";
 
 describe("resolveLocale", () => {
   it("reads a system locale by its language subtag", () => {
+    expect(resolveLocale("system", "fr-FR")).toBe("fr");
+    expect(resolveLocale("system", "fr")).toBe("fr");
     expect(resolveLocale("system", "ja-JP")).toBe("ja");
     expect(resolveLocale("system", "ja")).toBe("ja");
   });
@@ -13,6 +15,7 @@ describe("resolveLocale", () => {
   });
 
   it("lets an explicit choice override the computer", () => {
+    expect(resolveLocale("fr", "ja-JP")).toBe("fr");
     expect(resolveLocale("ja", "en-US")).toBe("ja");
     expect(resolveLocale("en", "ja-JP")).toBe("en");
   });
@@ -20,12 +23,14 @@ describe("resolveLocale", () => {
 
 describe("translateFor", () => {
   it("returns the translation for the locale", () => {
+    expect(translateFor("fr")("menu.stopAllAgents")).toBe("Arrêter tous les agents");
     expect(translateFor("ja")("menu.stopAllAgents")).toBe("すべてのエージェントを停止");
     expect(translateFor("en")("menu.stopAllAgents")).toBe("Stop all agents");
   });
 
-  it("fills a placeholder", () => {
-    expect(translateFor("en")("startup.failedBody", { message: "Disk is full" })).toContain("Disk is full");
+  it("uses French plural forms", () => {
+    expect(translateFor("fr")("provider.endpointCount", { count: 1 })).toBe("1 point de terminaison");
+    expect(translateFor("fr")("provider.endpointCount", { count: 2 })).toBe("2 points de terminaison");
   });
 });
 
@@ -71,5 +76,38 @@ describe("createTranslate", () => {
   it("renders readable text for a locale tag Intl rejects", () => {
     const broken = createTranslate({ source, locale: "not a locale", sourceLocale: "en" });
     expect(broken("replies", { count: 2 })).toBe("2 replies");
+  });
+});
+
+describe("plural forms without Intl.PluralRules", () => {
+  // Hermes, which runs the mobile app, may not ship Intl.PluralRules. Without the built-in rules a
+  // plural message would throw and blank the screen.
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("uses the built-in rule for each translated language", () => {
+    vi.stubGlobal("Intl", { ...Intl, PluralRules: undefined });
+    const source = { replies: { one: "{count} reply", other: "{count} replies" } } as const;
+    const english = createTranslate({ source, locale: "en", sourceLocale: "en" });
+    expect(english("replies", { count: 1 })).toBe("1 reply");
+    expect(english("replies", { count: 0 })).toBe("0 replies");
+
+    const french = createTranslate({
+      source,
+      translation: { replies: { one: "{count} réponse", other: "{count} réponses" } },
+      locale: "fr",
+      sourceLocale: "en",
+    });
+    expect(french("replies", { count: 0 })).toBe("0 réponse");
+    expect(french("replies", { count: 2 })).toBe("2 réponses");
+
+    const japanese = createTranslate({
+      source,
+      translation: { replies: { one: "wrong", other: "{count} 件の返信" } },
+      locale: "ja",
+      sourceLocale: "en",
+    });
+    expect(japanese("replies", { count: 1 })).toBe("1 件の返信");
   });
 });

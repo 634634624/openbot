@@ -1,533 +1,151 @@
-import type { AppLanguagePreference, SetAppLanguagePreferenceInput } from "./app-language";
-import type { AgentAnalytics, AgentAnalyticsInput } from "./ipc-agent-analytics";
-import type { AgentEvent, ScopedAgentEvent } from "./ipc-agent-events";
-import type { AgentModelOption } from "./ipc-agent-identity";
-import type {
-  AgentMemory,
-  CreateAgentMemoryInput,
-  DeleteAgentMemoryInput,
-  UpdateAgentMemoryInput,
-} from "./ipc-agent-memories";
-import type {
-  AgentProfileDraft,
-  GenerateAgentProfileInput,
-  SaveAgentProfileInput,
-  SaveAgentProfileResult,
-} from "./ipc-agent-profile";
-import type { AccountUsage, AgentProviderId, AgentStatus } from "./ipc-agent-status";
-import type {
-  AgentSummary,
-  CreateAgentInput,
-  DuplicateAgentResult,
-  SetAgentAvatarInput,
-  UpdateAgentInput,
-} from "./ipc-agents";
-import type {
-  AnalyticsPreference,
-  AppInfo,
-  AppSetupState,
-  CentralAuthDesktopApi,
-  ComputerUseMacSetupState,
-  ExportResult,
-  ExternalDestination,
-  MacPermissionId,
-  ProviderRuntimeSnapshot,
-  SaveSetupInput,
-  SetAnalyticsPreferenceInput,
-  UpdatePreference,
-  UpdateStatus,
-} from "./ipc-app-auth";
-import type { RespondToApprovalInput, RespondToBrowserTakeoverInput } from "./ipc-approvals";
-import type {
-  AttachmentImportEvent,
-  ChooseAttachmentsInput,
-  DownloadAttachmentsInput,
-  DraftAttachment,
-  FilePreview,
-  OpenAttachmentInput,
-  OpenSharedFileInput,
-  OpenWorkspaceFileInput,
-} from "./ipc-attachments";
-import type {
-  BrowserBounds,
-  BrowserControlState,
-  BrowserDisplayState,
-  BrowserNavigateInput,
-  BrowserOpenInput,
-  BrowserPictureInPictureEvent,
-  BrowserPreview,
-  BrowserTab,
-  BrowserVisibilityInput,
-} from "./ipc-browser";
-import type {
-  ChannelMemory,
-  CreateChannelMemoryInput,
-  DeleteChannelMemoryInput,
-  UpdateChannelMemoryInput,
-} from "./ipc-channel-memories";
-import type {
-  ChannelRoutine,
-  ChannelRoutineRun,
-  CreateChannelRoutineInput,
-  DeleteChannelRoutineInput,
-  ListChannelRoutineRunsInput,
-  TestChannelRoutineInput,
-  UpdateChannelRoutineInput,
-} from "./ipc-channel-routines";
-import type { Channel, ChannelCommand, ChannelPage, ChannelReadInput, ChannelSummary } from "./ipc-chat-channels";
-import type {
-  ConversationPage,
-  ConversationReadState,
-  ConversationSearchPage,
-  ConversationWithReadState,
-  MarkConversationReadInput,
-  ReadConversationPageInput,
-  RespondToPromptInput,
-  SearchConversationMessagesInput,
-  SendMessageInput,
-  SetMessageReactionInput,
-} from "./ipc-conversations";
-import type {
-  CustomProviderResult,
-  CustomProviderSummary,
-  DeleteCustomProviderInput,
-  SaveCustomProviderInput,
-} from "./ipc-custom-providers";
-import type {
-  DynamicIslandAction,
-  DynamicIslandGeometry,
-  DynamicIslandPreference,
-  DynamicIslandPresentation,
-  SetDynamicIslandInteractiveInput,
-  SetDynamicIslandPreferenceInput,
-} from "./ipc-dynamic-island";
-import type { HostAnalytics, HostAnalyticsInput } from "./ipc-host-analytics";
-import type {
-  DeleteHostedSiteInput,
-  HostedSiteSummary,
-  PublishHostedSiteInput,
-  ReplaceHostedSiteInput,
-} from "./ipc-hosted-sites";
-import type {
-  AgentPublicationPreview,
-  AgentSubmission,
-  InstallMarketplaceAgentInput,
-  InstallMarketplaceAgentResult,
-  MarketplaceAgentDetail,
-  MarketplaceAgentPage,
-  MarketplaceAgentQuery,
-  SubmitMarketplaceAgentInput,
-} from "./ipc-marketplace-agents";
-import type {
-  McpServerConfig,
-  McpTestResult,
-  RemoveMcpServerInput,
-  SaveMcpServerInput,
-  SetMcpServerEnabledInput,
-  TestMcpServerInput,
-} from "./ipc-mcp-servers";
-import type {
-  AcknowledgeFailedTurnInput,
-  CancelQueuedMessageInput,
-  InterruptTurnInput,
-  QueuedMessageReceipt,
-  QueueSnapshot,
-  ReorderQueueInput,
-  SteerQueuedMessageInput,
-  UpdateQueuedMessageInput,
-} from "./ipc-queue";
-import type {
-  CreateRoutineInput,
-  DeleteRoutineInput,
-  ListRoutineRunsInput,
-  Routine,
-  RoutineRun,
-  TestRoutineInput,
-  UpdateRoutineInput,
-} from "./ipc-routines";
-import type { DeleteSharedTableInput, SharedTable } from "./ipc-shared-tables";
-import type { SidebarLayoutAction, SidebarLayoutSnapshot } from "./ipc-sidebar-layout";
-import type {
-  CreateLocalSkillInput,
-  InstalledSkill,
-  InstallSkillInput,
-  LocalSkillRevisionInput,
-  MarketplaceSkillDetail,
-  MarketplaceSkillPage,
-  MarketplaceSkillQuery,
-  ReviseLocalSkillInput,
-  SetEnabledSkillInput,
-  SkillPackagePreview,
-  SkillSubmission,
-  SubmitSkillInput,
-  UninstallSkillInput,
-} from "./ipc-skills";
-import type {
-  ConfigureHostInput,
-  CreateTeamInviteInput,
-  DirectConversationPage,
-  DirectConversationReadState,
-  DirectConversationSnapshot,
-  DirectMessage,
-  DirectMessageRealtimeEvent,
-  DirectThreadSummary,
-  DirectTypingInput,
-  DirectTypingRealtimeEvent,
-  HostStatus,
-  InvitePreview,
-  InviteSummary,
-  JoinServerInput,
-  LoginServerInput,
-  MarkDirectReadInput,
-  ReadDirectConversationPageInput,
-  RemoteDesktopConnectInput,
-  RemoteDesktopConnectResult,
-  RemoteDesktopSelectDisplayInput,
-  RemoteDesktopSession,
-  ReorderServersInput,
-  SendDirectMessageInput,
-  ServerSummary,
-  SetTeamTypingInput,
-  TeamInviteSummary,
-  TeamMemberSummary,
-  TeamPresenceSnapshot,
-  TeamSessionSummary,
-  UpdateHostIdentityInput,
-  UpdateTeamMemberInput,
-} from "./ipc-team-host";
-import type { VoiceModelStatus, VoiceTranscriptionInput, VoiceTranscriptionResult } from "./ipc-voice";
-import type { QueueEditRequest } from "./team-protocol/queue-edit-v1";
+import type { AgentEvent } from "./ipc-agent-events";
+import type { AttachmentImportEvent } from "./ipc-attachments";
+import type { BrowserLiveViewInput } from "./ipc-browser";
+import type { GroupApi, IpcEndpoints } from "./ipc-endpoints";
+import type { DirectMessageRealtimeEvent, DirectTypingRealtimeEvent, TeamPresenceSnapshot } from "./ipc-team-host";
 
-export interface AgentDesktopApi {
-  listChannels: () => Promise<ChannelSummary[]>;
-  readChannel: (input: ChannelReadInput) => Promise<ChannelPage>;
-  channelCommand: (input: ChannelCommand) => Promise<Channel>;
-  deleteChannel: (channelId: string) => Promise<void>;
-  getStatus: () => Promise<AgentStatus>;
-  getAnalytics: (input: AgentAnalyticsInput, serverId: string) => Promise<AgentAnalytics | null>;
-  getHostAnalytics: (input: HostAnalyticsInput, serverId: string) => Promise<HostAnalytics | null>;
-  getUsage: (agentId?: string) => Promise<AccountUsage>;
-  listModels: () => Promise<AgentModelOption[]>;
-  listAgents: (serverId?: string) => Promise<AgentSummary[]>;
-  listInstalledSkills: (agentId: string) => Promise<InstalledSkill[]>;
-  getSidebarLayout: () => Promise<SidebarLayoutSnapshot>;
-  mutateSidebarLayout: (action: SidebarLayoutAction) => Promise<SidebarLayoutSnapshot>;
-  generateProfile: (input: GenerateAgentProfileInput) => Promise<AgentProfileDraft>;
-  saveProfile: (input: SaveAgentProfileInput) => Promise<SaveAgentProfileResult>;
-  createAgent: (input: CreateAgentInput) => Promise<AgentSummary>;
-  duplicateAgent: (agentId: string) => Promise<DuplicateAgentResult>;
-  updateAgent: (input: UpdateAgentInput) => Promise<AgentSummary>;
-  setAvatar: (input: SetAgentAvatarInput) => Promise<AgentSummary>;
-  deleteAgent: (agentId: string) => Promise<void>;
-  listMemories: (agentId: string) => Promise<AgentMemory[]>;
-  createMemory: (input: CreateAgentMemoryInput) => Promise<AgentMemory>;
-  updateMemory: (input: UpdateAgentMemoryInput) => Promise<AgentMemory>;
-  deleteMemory: (input: DeleteAgentMemoryInput) => Promise<void>;
-  clearMemories: (agentId: string) => Promise<void>;
-  /**
-   * Shared tables are not scoped to an agent: there is no `agentId` on either call. The list is
-   * every table in the one shared database, and the user's delete is not owner-gated.
-   */
-  listTables: () => Promise<SharedTable[]>;
-  deleteTable: (input: DeleteSharedTableInput) => Promise<void>;
-  listRoutines: (agentId: string) => Promise<Routine[]>;
-  createRoutine: (input: CreateRoutineInput) => Promise<Routine>;
-  updateRoutine: (input: UpdateRoutineInput) => Promise<Routine>;
-  deleteRoutine: (input: DeleteRoutineInput) => Promise<void>;
-  testRoutine: (input: TestRoutineInput) => Promise<RoutineRun>;
-  listRoutineRuns: (input: ListRoutineRunsInput) => Promise<RoutineRun[]>;
-  listChannelMemories: (channelId: string) => Promise<ChannelMemory[]>;
-  createChannelMemory: (input: CreateChannelMemoryInput) => Promise<ChannelMemory>;
-  updateChannelMemory: (input: UpdateChannelMemoryInput) => Promise<ChannelMemory>;
-  deleteChannelMemory: (input: DeleteChannelMemoryInput) => Promise<void>;
-  clearChannelMemories: (channelId: string) => Promise<void>;
-  listChannelRoutines: (channelId: string) => Promise<ChannelRoutine[]>;
-  createChannelRoutine: (input: CreateChannelRoutineInput) => Promise<ChannelRoutine>;
-  updateChannelRoutine: (input: UpdateChannelRoutineInput) => Promise<ChannelRoutine>;
-  deleteChannelRoutine: (input: DeleteChannelRoutineInput) => Promise<void>;
-  testChannelRoutine: (input: TestChannelRoutineInput) => Promise<ChannelRoutineRun>;
-  listChannelRoutineRuns: (input: ListChannelRoutineRunsInput) => Promise<ChannelRoutineRun[]>;
-  // Every MCP method names its server, because the settings modal can be open for a server the user
-  // has not switched to. Each mutation answers with the whole list, so the panel never merges.
-  listMcpServers: (serverId: string) => Promise<McpServerConfig[]>;
-  saveMcpServer: (input: SaveMcpServerInput, serverId: string) => Promise<McpServerConfig[]>;
-  removeMcpServer: (input: RemoveMcpServerInput, serverId: string) => Promise<McpServerConfig[]>;
-  setMcpServerEnabled: (input: SetMcpServerEnabledInput, serverId: string) => Promise<McpServerConfig[]>;
-  /** A test connects once and reports what it found. Nothing is stored, and no agent uses it. */
-  testMcpServer: (input: TestMcpServerInput, serverId: string) => Promise<McpTestResult>;
-  readConversation: (agentId: string) => Promise<ConversationWithReadState>;
-  readConversationPage: (input: ReadConversationPageInput, serverId?: string) => Promise<ConversationPage>;
-  searchConversationMessages: (input: SearchConversationMessagesInput) => Promise<ConversationSearchPage>;
-  listConversationReads: () => Promise<Record<string, ConversationReadState>>;
-  markConversationRead: (input: MarkConversationReadInput, serverId?: string) => Promise<ConversationReadState>;
-  chooseAttachments: (input: ChooseAttachmentsInput) => Promise<DraftAttachment[]>;
+/**
+ * Every agent group, spread into one namespace. Each scoped method takes its server last; left out,
+ * it is the selected server. `onEvent` is `onScopedEvent` filtered to the selected server, and
+ * `onAttachmentImport` reports the files the preload imports from a drop or a paste.
+ */
+export interface AgentDesktopApi
+  extends GroupApi<IpcEndpoints["agent"]>,
+    GroupApi<IpcEndpoints["agentMemories"]>,
+    GroupApi<IpcEndpoints["sharedTables"]>,
+    GroupApi<IpcEndpoints["agentRoutines"]>,
+    GroupApi<IpcEndpoints["channelMemories"]>,
+    GroupApi<IpcEndpoints["channelRoutines"]>,
+    GroupApi<IpcEndpoints["mcpServers"]>,
+    GroupApi<IpcEndpoints["agentAdmin"]>,
+    GroupApi<IpcEndpoints["agentAttachments"]> {
   onAttachmentImport: (listener: (event: AttachmentImportEvent) => void) => () => void;
-  discardDraftAttachment: (attachmentId: string, serverId?: string) => Promise<void>;
-  downloadAttachments: (input: DownloadAttachmentsInput) => Promise<void>;
-  openAttachment: (input: OpenAttachmentInput) => Promise<void>;
-  openSharedFile: (input: OpenSharedFileInput) => Promise<void>;
-  openWorkspaceFile: (input: OpenWorkspaceFileInput) => Promise<void>;
-  previewSharedFile: (input: OpenSharedFileInput) => Promise<FilePreview>;
-  previewWorkspaceFile: (input: OpenWorkspaceFileInput) => Promise<FilePreview>;
-  sendMessage: (input: SendMessageInput, serverId?: string) => Promise<QueuedMessageReceipt>;
-  setMessageReaction: (input: SetMessageReactionInput) => Promise<void>;
-  listQueue: (agentId: string) => Promise<QueueSnapshot>;
-  acknowledgeFailedTurn: (input: AcknowledgeFailedTurnInput) => Promise<void>;
-  cancelQueuedMessage: (input: CancelQueuedMessageInput) => Promise<void>;
-  steerQueuedMessage: (input: SteerQueuedMessageInput) => Promise<void>;
-  editQueuedMessage: (input: QueueEditRequest & { agentId: string }, serverId?: string) => Promise<QueueSnapshot>;
-  updateQueuedMessage: (input: UpdateQueuedMessageInput, serverId?: string) => Promise<void>;
-  reorderQueue: (input: ReorderQueueInput) => Promise<void>;
-  interrupt: (input: InterruptTurnInput) => Promise<void>;
-  respondToPrompt: (input: RespondToPromptInput) => Promise<void>;
-  respondToApproval: (input: RespondToApprovalInput) => Promise<void>;
-  respondToBrowserTakeover: (input: RespondToBrowserTakeoverInput) => Promise<void>;
   onEvent: (listener: (event: AgentEvent) => void) => () => void;
-  onScopedEvent: (listener: (event: ScopedAgentEvent) => void) => () => void;
 }
 
-export interface MarketplaceAgentsDesktopApi {
-  list: (query?: MarketplaceAgentQuery) => Promise<MarketplaceAgentPage>;
-  get: (agentId: string) => Promise<MarketplaceAgentDetail>;
-  listMine: () => Promise<AgentSubmission[]>;
-  preview: (agentId: string) => Promise<AgentPublicationPreview>;
-  submit: (input: SubmitMarketplaceAgentInput) => Promise<AgentSubmission>;
-  install: (input: InstallMarketplaceAgentInput) => Promise<InstallMarketplaceAgentResult>;
-}
+export type AgentTemplatesDesktopApi = GroupApi<IpcEndpoints["agentTemplates"]>;
 
-export interface BrowserDesktopApi {
-  open: (input: BrowserOpenInput) => Promise<BrowserTab>;
-  activate: (tabId: string) => Promise<void>;
-  navigate: (input: BrowserNavigateInput) => Promise<void>;
-  reload: (tabId: string) => Promise<void>;
-  close: (tabId: string) => Promise<void>;
-  listTabs: () => Promise<BrowserTab[]>;
-  getDisplayState: () => Promise<BrowserDisplayState>;
-  getControlState: () => Promise<BrowserControlState>;
-  capturePreview: (tabId: string) => Promise<BrowserPreview>;
-  setVisible: (input: BrowserVisibilityInput) => Promise<void>;
-  onDisplayState: (listener: (state: BrowserDisplayState) => void) => () => void;
-  openPictureInPicture: (bounds?: BrowserBounds) => Promise<BrowserBounds>;
-  closePictureInPicture: () => Promise<void>;
-  dockPictureInPicture: () => Promise<void>;
-  hidePictureInPicture: () => Promise<void>;
-  onPictureInPictureEvent: (listener: (event: BrowserPictureInPictureEvent) => void) => () => void;
-}
+export type MarketplaceAgentsDesktopApi = GroupApi<IpcEndpoints["marketplaceAgents"]>;
 
-export interface UpdateDesktopApi {
-  getStatus: () => Promise<UpdateStatus>;
-  check: () => Promise<UpdateStatus>;
-  download: () => Promise<UpdateStatus>;
-  install: () => Promise<void>;
-  getPreference: () => Promise<UpdatePreference>;
-  setPreference: (input: UpdatePreference) => Promise<UpdatePreference>;
-  onEvent: (listener: (status: UpdateStatus) => void) => () => void;
-}
-
-export interface SetProviderApiKeyInput {
-  provider: AgentProviderId;
-  key: string;
+/**
+ * `startLiveView` starts a live view of a tab on the active remote server; a local tab is already on
+ * screen. `sendLiveViewInput` is the untyped `browserInput` endpoint, so it is written here.
+ */
+export interface BrowserDesktopApi extends GroupApi<IpcEndpoints["browser"]> {
+  sendLiveViewInput: (input: BrowserLiveViewInput) => Promise<void>;
 }
 
 /**
- * Whether a key is stored. `unreadable` is a key file OpenBot could not decrypt or parse: the
- * provider then runs with no key, and the file stays on disk until the user replaces or removes it.
+ * Only the help window may call `startPermissionAppDrag`; main refuses every other sender. Only the
+ * overlay surface listens to `onHighlightPlacement`. It is pushed rather than asked for: the overlay
+ * carries no control and invokes nothing, so a window that floats over another application's has no
+ * channel it could be driven through.
  */
-export type ProviderApiKeyStatus = "missing" | "saved" | "unreadable";
+export type ComputerUseDesktopApi = GroupApi<IpcEndpoints["computerUse"]>;
 
-/** What the renderer may know about a stored key: its status. Never the key. */
-export interface ProviderApiKeyState {
-  provider: AgentProviderId;
-  status: ProviderApiKeyStatus;
-}
+export type CentralAuthDesktopApi = GroupApi<IpcEndpoints["auth"]>;
 
-export interface ProviderRuntimesDesktopApi {
-  getStatus: () => Promise<ProviderRuntimeSnapshot>;
-  download: (provider: AgentProviderId) => Promise<ProviderRuntimeSnapshot>;
-  cancel: (provider: AgentProviderId) => Promise<ProviderRuntimeSnapshot>;
-  onEvent: (listener: (snapshot: ProviderRuntimeSnapshot) => void) => () => void;
-}
+export type UpdateDesktopApi = GroupApi<IpcEndpoints["update"]>;
 
-export interface MaintenanceDesktopApi {
-  exportData: () => Promise<ExportResult>;
-  exportDiagnostics: () => Promise<ExportResult>;
-}
+export type NotificationsDesktopApi = GroupApi<IpcEndpoints["notifications"]>;
 
-export interface DynamicIslandDesktopApi {
-  getPreference: () => Promise<DynamicIslandPreference>;
-  setPreference: (input: SetDynamicIslandPreferenceInput) => Promise<DynamicIslandPreference>;
-  publishPresentation: (presentation: DynamicIslandPresentation) => Promise<void>;
-  getPresentation: () => Promise<DynamicIslandPresentation>;
-  onPreference: (listener: (preference: DynamicIslandPreference) => void) => () => void;
-  onPresentation: (listener: (presentation: DynamicIslandPresentation) => void) => () => void;
-  onGeometry: (listener: (geometry: DynamicIslandGeometry) => void) => () => void;
-  performAction: (action: DynamicIslandAction) => Promise<void>;
-  performHaptic: () => Promise<void>;
-  onAction: (listener: (action: DynamicIslandAction) => void) => () => void;
-  setInteractive: (input: SetDynamicIslandInteractiveInput) => Promise<void>;
-}
+export type ProviderRuntimesDesktopApi = GroupApi<IpcEndpoints["providerRuntimes"]>;
 
-export interface ServersDesktopApi {
-  setMuted: (input: { serverId: string; muted: boolean }) => Promise<ServerSummary[]>;
-  list: () => Promise<ServerSummary[]>;
-  select: (serverId: string) => Promise<ServerSummary[]>;
-  reorder: (input: ReorderServersInput) => Promise<ServerSummary[]>;
-  join: (input: JoinServerInput) => Promise<ServerSummary>;
-  previewInvite: (input: JoinServerInput) => Promise<InvitePreview>;
-  takePendingInvite: () => Promise<string | null>;
-  login: (input: LoginServerInput) => Promise<ServerSummary>;
-  retryConnection: (serverId: string) => Promise<ServerSummary>;
-  remove: (serverId: string) => Promise<void>;
-  getPresence: () => Promise<TeamPresenceSnapshot>;
-  getPresenceFor: (serverId: string) => Promise<TeamPresenceSnapshot>;
-  refreshIdentity: (serverId: string) => Promise<ServerSummary>;
-  listMembers: (serverId: string) => Promise<TeamMemberSummary[]>;
-  updateMember: (serverId: string, input: UpdateTeamMemberInput) => Promise<TeamMemberSummary>;
-  removeMember: (serverId: string, memberId: string) => Promise<void>;
-  listInvites: (serverId: string) => Promise<TeamInviteSummary[]>;
-  revokeInvite: (serverId: string, inviteId: string) => Promise<void>;
-  createInvite: (serverId: string, input: CreateTeamInviteInput) => Promise<InviteSummary>;
-  setTyping: (input: SetTeamTypingInput) => Promise<void>;
+export type MaintenanceDesktopApi = GroupApi<IpcEndpoints["maintenance"]>;
+
+export type DynamicIslandDesktopApi = GroupApi<IpcEndpoints["dynamicIsland"]>;
+
+/**
+ * The preload wraps some bridged methods: the server list calls record which server is selected, and
+ * `onEvent` does too. The scoped events come from every server; the three methods below keep one.
+ */
+export interface ServersDesktopApi extends GroupApi<IpcEndpoints["servers"]> {
+  /** `onScopedPresence` for one server: the selected one when `serverId` is left out. */
   onPresence: (listener: (snapshot: TeamPresenceSnapshot) => void, serverId?: string) => () => void;
-  listDirectThreads: () => Promise<DirectThreadSummary[]>;
-  readDirectConversation: (memberId: string) => Promise<DirectConversationSnapshot>;
-  readDirectConversationPage: (input: ReadDirectConversationPageInput) => Promise<DirectConversationPage>;
-  sendDirectMessage: (input: SendDirectMessageInput) => Promise<DirectMessage>;
-  markDirectRead: (input: MarkDirectReadInput) => Promise<DirectConversationReadState>;
-  setDirectTyping: (input: DirectTypingInput) => Promise<void>;
   onDirectMessage: (listener: (event: DirectMessageRealtimeEvent) => void) => () => void;
   onDirectTyping: (listener: (event: DirectTypingRealtimeEvent) => void) => () => void;
-  onEvent: (listener: (servers: ServerSummary[]) => void) => () => void;
-  onInvite: (listener: (inviteUrl: string) => void) => () => void;
 }
 
-export interface HostDesktopApi {
-  getStatus: () => Promise<HostStatus>;
-  configure: (input: ConfigureHostInput) => Promise<HostStatus>;
-  updateIdentity: (input: UpdateHostIdentityInput) => Promise<HostStatus>;
-  getPresence: () => Promise<TeamPresenceSnapshot>;
-  start: () => Promise<HostStatus>;
-  stop: () => Promise<HostStatus>;
-  /**
-   * Asks the screen sharing runtime again whether the operating system lets it record, and answers
-   * the status that holds the result.
-   *
-   * The refusal is remembered, because the runtime that reported it is dropped so that the next
-   * attempt reads a new grant. Without this call only another member's attempt could clear it, and
-   * the host owner who just gave the grant would keep reading that they had not.
-   */
-  recheckScreenRecording: () => Promise<HostStatus>;
-  listMembers: () => Promise<TeamMemberSummary[]>;
-  updateMember: (input: UpdateTeamMemberInput) => Promise<TeamMemberSummary>;
-  removeMember: (memberId: string) => Promise<void>;
-  listSessions: () => Promise<TeamSessionSummary[]>;
-  revokeSession: (sessionId: string) => Promise<void>;
-  listInvites: () => Promise<TeamInviteSummary[]>;
-  revokeInvite: (inviteId: string) => Promise<void>;
-  createInvite: (input: CreateTeamInviteInput) => Promise<InviteSummary>;
-  onEvent: (listener: (status: HostStatus) => void) => () => void;
-}
+/**
+ * The plugin deep link. Both carry a slug, never a listing: the catalog is already in the renderer,
+ * and a link that carried the listing itself would let the address bar describe what gets installed.
+ */
+export type PluginsDesktopApi = GroupApi<IpcEndpoints["plugins"]>;
 
-export interface RemoteDesktopDesktopApi {
-  list: () => Promise<RemoteDesktopSession[]>;
-  connect: (input: RemoteDesktopConnectInput) => Promise<RemoteDesktopConnectResult>;
-  selectDisplay: (input: RemoteDesktopSelectDisplayInput) => Promise<void>;
-  disconnect: (sessionId: string) => Promise<void>;
-  onEvent: (listener: (sessions: RemoteDesktopSession[]) => void) => () => void;
-}
+export type HostDesktopApi = GroupApi<IpcEndpoints["host"]>;
 
-export interface VoiceDesktopApi {
-  getModelStatus: () => Promise<VoiceModelStatus>;
-  prepareModel: () => Promise<VoiceModelStatus>;
-  transcribe: (input: VoiceTranscriptionInput) => Promise<VoiceTranscriptionResult>;
-  onModelStatus: (listener: (status: VoiceModelStatus) => void) => () => void;
-}
+export type RemoteDesktopDesktopApi = GroupApi<IpcEndpoints["remoteDesktop"]>;
 
-export interface SkillsDesktopApi {
-  localList: () => Promise<MarketplaceSkillDetail[]>;
-  localGet: (input: LocalSkillRevisionInput) => Promise<MarketplaceSkillDetail>;
-  localCreate: (input: CreateLocalSkillInput) => Promise<MarketplaceSkillDetail>;
-  localRevise: (input: ReviseLocalSkillInput) => Promise<MarketplaceSkillDetail>;
-  localInstall: (input: LocalSkillRevisionInput & { agentId: string; revision: number }) => Promise<InstalledSkill>;
+export type VoiceDesktopApi = GroupApi<IpcEndpoints["voice"]>;
 
-  list: (query?: MarketplaceSkillQuery) => Promise<MarketplaceSkillPage>;
-  get: (skillId: string) => Promise<MarketplaceSkillDetail>;
-  listMine: () => Promise<SkillSubmission[]>;
-  choosePackage: () => Promise<SkillPackagePreview | null>;
-  submit: (input: SubmitSkillInput) => Promise<SkillSubmission>;
-  listInstalled: (agentId: string) => Promise<InstalledSkill[]>;
-  install: (input: InstallSkillInput) => Promise<InstalledSkill>;
-  uninstall: (input: UninstallSkillInput) => Promise<void>;
-  setEnabled: (input: SetEnabledSkillInput) => Promise<InstalledSkill>;
-}
+export type SkillsDesktopApi = GroupApi<IpcEndpoints["skills"]>;
 
-export interface HostedSitesDesktopApi {
-  list: () => Promise<HostedSiteSummary[]>;
-  chooseDirectory: () => Promise<string | null>;
-  publish: (input: PublishHostedSiteInput) => Promise<HostedSiteSummary>;
-  replace: (input: ReplaceHostedSiteInput) => Promise<HostedSiteSummary>;
-  delete: (input: DeleteHostedSiteInput) => Promise<void>;
-}
+export type HostedSitesDesktopApi = GroupApi<IpcEndpoints["hostedSites"]>;
 
 /**
  * The user's own model endpoints. `save` and `delete` both answer with the whole list plus how the
  * provider restart went, so the renderer replaces its snapshot in one write and can say honestly
  * whether the models are on their way.
  */
-export interface CustomProvidersDesktopApi {
-  list: () => Promise<CustomProviderSummary[]>;
-  save: (input: SaveCustomProviderInput) => Promise<CustomProviderResult>;
-  delete: (input: DeleteCustomProviderInput) => Promise<CustomProviderResult>;
-}
+export type CustomProvidersDesktopApi = GroupApi<IpcEndpoints["customProviders"]>;
 
-export interface OpenBotDesktopApi {
-  getAppInfo: () => Promise<AppInfo>;
-  getSetupState: () => Promise<AppSetupState>;
-  saveSetup: (input: SaveSetupInput) => Promise<AppSetupState>;
-  getAnalyticsPreference: () => Promise<AnalyticsPreference>;
-  setAnalyticsPreference: (input: SetAnalyticsPreferenceInput) => Promise<AnalyticsPreference>;
-  getAppLanguagePreference: () => Promise<AppLanguagePreference>;
-  setAppLanguagePreference: (input: SetAppLanguagePreferenceInput) => Promise<AppLanguagePreference>;
-  onAppLanguagePreference: (listener: (preference: AppLanguagePreference) => void) => () => void;
-  onOpenSettings: (listener: () => void) => () => void;
+/**
+ * Local model servers on this computer, the model list of one endpoint, and where the scan looks.
+ * Main makes each request; a scan sends no key.
+ */
+export type ProviderDetectionDesktopApi = GroupApi<IpcEndpoints["providerDetection"]>;
+export type CustomAgentsDesktopApi = GroupApi<IpcEndpoints["customAgents"]>;
+
+/**
+ * The providers of one server's host: code sign-in, API keys, managed CLI runtimes and custom
+ * endpoints. Every method names its server. A remote host answers only an owner or admin, and only
+ * when it advertises `providers-v1`.
+ */
+export type ProviderAdminDesktopApi = GroupApi<IpcEndpoints["providerAdmin"]>;
+
+/**
+ * The server name, logo and app update of one server's host. A remote host answers only an owner or
+ * admin, and only when it advertises `host-admin-v1` (name and logo) or `host-update-v1` (update).
+ */
+export type HostAdminDesktopApi = GroupApi<IpcEndpoints["hostAdmin"]>;
+
+/**
+ * Storage and files of one host. Every scoped method names its server, because the settings modal can
+ * be open for a server the user has not switched to. A remote host without `storage-v1` answers null.
+ */
+export type StorageDesktopApi = GroupApi<IpcEndpoints["storage"]>;
+
+/**
+ * Agent import into the local host. `choose` opens the file dialog and answers null when the user
+ * cancels. A token is used once: `apply` and `discard` both release the staged archive.
+ */
+export type AgentImportDesktopApi = GroupApi<IpcEndpoints["agentImport"]>;
+
+// The `app` and `providers` groups sit at the top level, as they did before groups existed.
+export interface OpenBotDesktopApi extends GroupApi<IpcEndpoints["app"]>, GroupApi<IpcEndpoints["providers"]> {
   dynamicIsland: DynamicIslandDesktopApi;
-  getComputerUseMacSetupState: () => Promise<ComputerUseMacSetupState>;
-  openComputerUsePermissionSetup: (permission: MacPermissionId) => Promise<ComputerUseMacSetupState>;
-  startComputerUseHelperDrag: () => Promise<void>;
-  revealComputerUseHelper: () => Promise<void>;
-  closeComputerUsePermissionSetup: () => Promise<void>;
-  openExternal: (destination: ExternalDestination) => Promise<void>;
-  connectProvider: (provider: AgentProviderId) => Promise<AgentStatus>;
-  refreshAgentProviders: () => Promise<AgentStatus>;
-  /**
-   * Runs the provider CLI's own updater, for a CLI the user installed themselves. It is their copy,
-   * so the version they end on is whatever that updater fetches, which owes nothing to the version
-   * OpenBot pins for the runtime it manages.
-   */
-  updateProviderCli: (provider: AgentProviderId) => Promise<AgentStatus>;
-  /**
-   * Stores the optional API key a provider's paid catalog needs, and reconnects the provider.
-   *
-   * The key only ever travels towards main. There is no getter for it, and
-   * `getProviderApiKeyState` answers with a status, because a renderer that can read a key back
-   * puts it in every crash report, export and screenshot that follows.
-   */
-  setProviderApiKey: (input: SetProviderApiKeyInput) => Promise<AgentStatus>;
-  clearProviderApiKey: (provider: AgentProviderId) => Promise<AgentStatus>;
-  getProviderApiKeyState: (provider: AgentProviderId) => Promise<ProviderApiKeyState>;
+  computerUse: ComputerUseDesktopApi;
   providerRuntimes: ProviderRuntimesDesktopApi;
-  openUrl: (url: string) => Promise<void>;
   voice: VoiceDesktopApi;
   skills: SkillsDesktopApi;
   customProviders: CustomProvidersDesktopApi;
+  providerDetection: ProviderDetectionDesktopApi;
+  customAgents: CustomAgentsDesktopApi;
+  providerAdmin: ProviderAdminDesktopApi;
+  hostAdmin: HostAdminDesktopApi;
+  storage: StorageDesktopApi;
+  agentImport: AgentImportDesktopApi;
   hostedSites: HostedSitesDesktopApi;
   marketplaceAgents: MarketplaceAgentsDesktopApi;
+  agentTemplates: AgentTemplatesDesktopApi;
   auth: CentralAuthDesktopApi;
   agent: AgentDesktopApi;
   browser: BrowserDesktopApi;
   update: UpdateDesktopApi;
+  notifications: NotificationsDesktopApi;
   maintenance: MaintenanceDesktopApi;
   servers: ServersDesktopApi;
+  plugins: PluginsDesktopApi;
   host: HostDesktopApi;
   remoteDesktop: RemoteDesktopDesktopApi;
 }

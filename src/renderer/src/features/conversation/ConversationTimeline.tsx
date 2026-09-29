@@ -1,19 +1,24 @@
-import { createMemo, For, Loading, lazy, Show, untrack } from "solid-js";
-import { Button } from "../../components/ui";
-import type { AgentMessage, ChatActionMarkerModel } from "../../data";
-import { errorMessage } from "../../error-message";
-import { AgentActivityIndicator } from "./AgentActivity";
-import { AttachmentCards } from "./AttachmentCards";
-import { ChatActionMarker } from "./ChatActionMarker";
-import { ChatMessageRow } from "./ChatMessageRow";
-import { ChatSearch } from "./ChatSearch";
-import { BrowserTakeoverCard } from "./ConversationPrompts";
+import { Button } from "@openbot/ui";
+import type { AgentMessage, ChatActionMarkerModel } from "@openbot/ui/data";
+import { AgentActivityIndicator } from "@openbot/ui/features/conversation/AgentActivity";
+import { AttachmentCards } from "@openbot/ui/features/conversation/AttachmentCards";
+import { ChatActionMarker } from "@openbot/ui/features/conversation/ChatActionMarker";
+import { ChatMessageRow } from "@openbot/ui/features/conversation/ChatMessageRow";
+import { ChatSearch } from "@openbot/ui/features/conversation/ChatSearch";
+import { BrowserTakeoverCard } from "@openbot/ui/features/conversation/ConversationPrompts";
+import { ScrollToLatestButton } from "@openbot/ui/features/conversation/MessageNavigation";
+import { MessageActions } from "@openbot/ui/features/conversation/MessageRendering";
+import { TaskList } from "@openbot/ui/features/conversation/TaskList";
+import { UnreadMessagesBanner, UnreadMessagesDivider } from "@openbot/ui/features/conversation/UnreadMessages";
+import { useText } from "@openbot/ui/text";
+import { createMemo, createSignal, For, Loading, lazy, Show, untrack } from "solid-js";
+import { planItems, planTitle } from "../../app-message-projection";
 import { dayMarkerLabel } from "./chat-day-markers";
+import { continuesSenderRun } from "./chat-grouping";
+import { conversationRuntime } from "./conversation-runtime";
 import { useConversationViewScope } from "./conversation-scope";
 import type { ConversationProps } from "./conversation-types";
-import { ScrollToLatestButton } from "./MessageNavigation";
-import { MessageActions } from "./MessageRendering";
-import { UnreadMessagesBanner, UnreadMessagesDivider } from "./UnreadMessages";
+import { RoutineChatCard } from "./RoutineChatCard";
 
 /** A message that renders only an action marker, with no bubble of its own. */
 function markerOnlyMessage(message: AgentMessage): boolean {
@@ -25,6 +30,17 @@ function markerOnlyMessage(message: AgentMessage): boolean {
     marker.kind === "routine-lifecycle" ||
     marker.kind === "unavailable"
   );
+}
+
+/**
+ * Does this row draw a time of its own?
+ *
+ * A marker-only row carries the marker's own time, and a question prompt and a plan draw a card
+ * instead of a message row. None shows the header a run continues under, so none can hold a run
+ * open.
+ */
+function rowDrawsTime(message: AgentMessage): boolean {
+  return !markerOnlyMessage(message) && !message.questionPrompt && message.kind !== "plan";
 }
 
 /** Marker-only rows that render attachment cards below the marker do not end with one. */
@@ -47,7 +63,6 @@ export function ConversationTimeline() {
   const {
     activeChatSearchIndex,
     agentActivitySpaceReserved,
-    agentReady,
     attachmentAction,
     downloadAttachments,
     browserTakeoverPreview,
@@ -89,7 +104,6 @@ export function ConversationTimeline() {
     replyToMessage,
     scheduleUnreadDividerVisibilityUpdate,
     setChatSearchQuery,
-    setComposerError,
     setExpandedEmojiMessageId,
     setOpenMoreMessageId,
     setOpenReactionMessageId,
@@ -105,6 +119,34 @@ export function ConversationTimeline() {
     setUnreadMessagesDividerElement,
     setVirtualRootElement,
   } = useConversationViewScope();
+  const { t, format } = useText();
+  const runtime = conversationRuntime(props);
+  /**
+   * An agent's record of a routine it created or changed is a card whose schedule the person can
+   * change. Only a record from an agent turn has a `turnId`. A change the person made in the app
+   * keeps the plain marker, so an edit on a card does not add a second card that replaces it. A
+   * deleted routine also keeps the plain marker, because its schedule is not known.
+   */
+  const routineCardMarker = (message: AgentMessage | undefined, marker: ChatActionMarkerModel | undefined) =>
+    message?.turnId && marker?.kind === "routine-lifecycle" ? marker : undefined;
+  // "Show latest" moves focus to this card. The list mounts it only after the scroll.
+  const [routineCardFocus, setRoutineCardFocus] = createSignal<string | null>(null);
+  // The newest agent record of each routine is the one card that still edits it.
+  const latestRoutineMessageIds = createMemo(() => {
+    const latest = new Map<string, string>();
+    for (const message of timelineMessages()) {
+      const marker = routineCardMarker(message, message.actionMarker);
+      if (marker) latest.set(marker.routineId, message.id);
+    }
+    return latest;
+  });
+  const routineCard = (message: AgentMessage | undefined, marker: ChatActionMarkerModel) => {
+    const agentId = props.agent?.id;
+    const cardMarker = routineCardMarker(message, marker);
+    if (!cardMarker || cardMarker.action === "deleted" || !agentId) return undefined;
+    const routine = props.routines?.find((candidate) => candidate.id === cardMarker.routineId);
+    return routine && { action: cardMarker.action, routine, agentId };
+  };
   const virtualMessageRows = createMemo(() => messageVirtualizer.getVirtualItems());
   let cachedPrompt: { key: string; prompt: NonNullable<ConversationProps["prompt"]> } | null = null;
   const keyedPrompt = createMemo(() => {
@@ -121,7 +163,9 @@ export function ConversationTimeline() {
   return (
     <>
       <span class="sr-only" role="status" aria-live="polite" aria-atomic="true">
-        {keyedPrompt() ? `Input required. ${keyedPrompt()?.prompt.questions[0]?.question ?? ""}` : ""}
+        {keyedPrompt()
+          ? t("prompt.inputRequiredAnnouncement", { question: keyedPrompt()?.prompt.questions[0]?.question ?? "" })
+          : ""}
       </span>
       <Show when={chatSearchOpen()}>
         <ChatSearch
@@ -163,46 +207,12 @@ export function ConversationTimeline() {
           />
         </Show>
         <Show when={props.loaded}>
-          <Show when={!agentReady()}>
-            <section class="agent-setup-card" role="status">
-              <div>
-                <strong>
-                  {props.agentStatus.phase === "starting" || props.agentStatus.phase === "restarting"
-                    ? "Connecting to agent CLIs…"
-                    : "Agent CLI setup required"}
-                </strong>
-                <p>
-                  {errorMessage(
-                    props.agentStatus.message,
-                    "Install and sign in to Codex CLI, Claude CLI, or Grok CLI, then restart OpenBot.",
-                  )}
-                </p>
-              </div>
-              <Show when={props.agentStatus.phase !== "starting" && props.agentStatus.phase !== "restarting"}>
-                <Button
-                  variant="outline"
-                  type="button"
-                  onClick={() => {
-                    const agentId = props.agent?.id;
-                    const target = agentId ? { agentId, serverId: props.server?.id ?? "local" } : undefined;
-                    void props
-                      .onOpenAgentSetup()
-                      .catch((error) =>
-                        setComposerError(errorMessage(error, "Could not open the setup guide. Try again."), target),
-                      );
-                  }}
-                >
-                  Setup guide
-                </Button>
-              </Show>
-            </section>
-          </Show>
           <Show when={props.loadingOlder || props.olderError}>
             <div class="conversation-history-status" role={props.olderError ? "alert" : "status"}>
-              <Show when={props.olderError} fallback="Loading older messages…">
+              <Show when={props.olderError} fallback={t("chat.history.loadingOlder")}>
                 <span>{props.olderError}</span>
                 <Button type="button" variant="ghost" size="xs" onClick={() => props.onLoadOlder?.()}>
-                  Retry
+                  {t("common.retry")}
                 </Button>
               </Show>
             </div>
@@ -217,8 +227,10 @@ export function ConversationTimeline() {
                 const message = createMemo(() => timelineMessages()[virtualRow.index]);
                 const initialMessage = untrack(message);
                 if (!initialMessage) return null;
-                const animateEntrance = initialMessage.animate === true && markMessageSeen(initialMessage.id);
-                const initialActionMarker = initialMessage.actionMarker;
+                const animateEntrance = untrack(
+                  () => initialMessage.animate === true && markMessageSeen(initialMessage.id),
+                );
+                const initialActionMarker = untrack(() => initialMessage.actionMarker);
                 /*
                  * The separator above the row. The first row always carries one, and a later row
                  * carries one when it opens a new day. A message with no stored timestamp can only
@@ -228,10 +240,26 @@ export function ConversationTimeline() {
                   const current = message();
                   if (!current) return null;
                   const previous = timelineMessages()[virtualRow.index - 1];
-                  if (current.createdAt) return dayMarkerLabel(previous?.createdAt, current.createdAt);
-                  return previous === undefined ? (current.time ?? "now") : null;
+                  if (current.createdAt) return dayMarkerLabel(previous?.createdAt, current.createdAt, { t, format });
+                  return previous === undefined ? (current.time ?? t("chat.day.now")) : null;
                 });
-                const markerOnly = markerOnlyMessage(initialMessage);
+                /*
+                 * A row that continues a run by the same sender draws no time: the run carries one
+                 * time at its top, and a header on every row leaves an empty line between them. A
+                 * row that draws a marker of its own opens a run, because the marker stands between
+                 * it and the message above it.
+                 */
+                const continuesRun = createMemo(() => {
+                  const current = message();
+                  if (!current) return false;
+                  if (current.id === props.firstUnreadMessageId || current.actionMarker) return false;
+                  const previous = timelineMessages()[virtualRow.index - 1];
+                  return continuesSenderRun(previous, current, {
+                    previousDrawsTime: previous !== undefined && rowDrawsTime(previous),
+                    startsDay: dayMarker() !== null,
+                  });
+                });
+                const markerOnly = untrack(() => markerOnlyMessage(initialMessage));
                 // Consecutive markers keep the tighter marker gap so they read as one group.
                 const groupedWithMarker = createMemo(() => {
                   const current = message();
@@ -274,16 +302,47 @@ export function ConversationTimeline() {
                       >
                         <Show when={message()?.actionMarker ?? initialActionMarker}>
                           {(marker) => (
-                            <ChatActionMarker
-                              onOpenSkill={props.server?.id === "local" ? openSkillSettings : undefined}
-                              marker={marker()}
-                              agents={props.agents}
-                              announce={animateEntrance}
-                              routineAvailable={routineMarkerAvailable(marker(), props.availableRoutineIds)}
-                              onSelectAgent={props.onSelectAgent}
-                              onOpenRoutine={openRoutineSettings}
-                              onOpenHostedSite={(url) => void openExternalMessageUrl(url)}
-                            />
+                            <Show
+                              when={routineCard(message() ?? initialMessage, marker())}
+                              fallback={
+                                <ChatActionMarker
+                                  onOpenSkill={props.server?.id === "local" ? openSkillSettings : undefined}
+                                  marker={marker()}
+                                  agents={props.agents}
+                                  announce={animateEntrance}
+                                  routineAvailable={routineMarkerAvailable(marker(), props.availableRoutineIds)}
+                                  onSelectAgent={props.onSelectAgent}
+                                  onOpenRoutine={openRoutineSettings}
+                                  onOpenHostedSite={(url) => void openExternalMessageUrl(url)}
+                                />
+                              }
+                            >
+                              {(card) => {
+                                const latestMessageId = () => latestRoutineMessageIds().get(card().routine.id);
+                                const rowMessageId = () => message()?.id ?? initialMessage.id;
+                                return (
+                                  <RoutineChatCard
+                                    action={card().action}
+                                    routine={card().routine}
+                                    agentId={card().agentId}
+                                    latest={latestMessageId() === rowMessageId()}
+                                    onOpenRoutine={openRoutineSettings}
+                                    onShowLatest={
+                                      props.onOpenSearchMessage
+                                        ? () => {
+                                            const messageId = latestMessageId();
+                                            if (!messageId) return;
+                                            setRoutineCardFocus(messageId);
+                                            void props.onOpenSearchMessage?.(messageId);
+                                          }
+                                        : undefined
+                                    }
+                                    focusRequested={routineCardFocus() === rowMessageId()}
+                                    onFocusHandled={() => setRoutineCardFocus(null)}
+                                  />
+                                );
+                              }}
+                            </Show>
                           )}
                         </Show>
                         <Show
@@ -304,6 +363,52 @@ export function ConversationTimeline() {
                     </div>
                   );
                 }
+                if (untrack(() => initialMessage.kind === "plan")) {
+                  // A plan has no bubble, reactions or time: it is the agent's live checklist.
+                  const plan = () => message()?.plan ?? initialMessage.plan;
+                  return (
+                    <div
+                      data-index={virtualRow.index}
+                      ref={messageVirtualizer.measureElement}
+                      class="virtual-chat-row"
+                      style={{
+                        transform: messageVirtualizer.isVirtualized()
+                          ? `translateY(${virtualRow.start - messageVirtualizer.scrollMargin()}px)`
+                          : "none",
+                      }}
+                    >
+                      <Show when={dayMarker()}>
+                        {(label) => (
+                          <div class="time-marker">
+                            <span>{label()}</span>
+                          </div>
+                        )}
+                      </Show>
+                      <Show when={message()?.id === props.firstUnreadMessageId}>
+                        <UnreadMessagesDivider
+                          elementRef={(element) => {
+                            setUnreadMessagesDividerElement(element);
+                            scheduleUnreadDividerVisibilityUpdate();
+                          }}
+                        />
+                      </Show>
+                      <article
+                        data-chat-search-message={message()?.id}
+                        class={{ "message-entry-animated": animateEntrance }}
+                      >
+                        <Show when={plan()}>
+                          {(current) => (
+                            <TaskList
+                              items={planItems(current(), message()?.streaming === true)}
+                              title={planTitle(current())}
+                              defaultOpen={untrack(() => initialMessage.streaming === true)}
+                            />
+                          )}
+                        </Show>
+                      </article>
+                    </div>
+                  );
+                }
                 const displayedReactions = createMemo(() => {
                   const currentMessage = message();
                   if (currentMessage?.reactions?.length) return currentMessage.reactions;
@@ -318,7 +423,7 @@ export function ConversationTimeline() {
                 return (
                   <div
                     data-index={virtualRow.index}
-                    data-grouped={groupedWithMarker() ? "marker" : undefined}
+                    data-grouped={groupedWithMarker() ? "marker" : continuesRun() ? "sender" : undefined}
                     ref={messageVirtualizer.measureElement}
                     class="virtual-chat-row"
                     style={{
@@ -365,9 +470,12 @@ export function ConversationTimeline() {
                             message={message() ?? initialMessage}
                             author={{
                               kind: message()?.author === "you" ? "you" : "agent",
-                              name: message()?.author === "you" ? "You" : (props.agent?.name ?? "Agent"),
+                              name:
+                                message()?.author === "you"
+                                  ? t("chat.message.you")
+                                  : (props.agent?.name ?? t("chat.message.agentFallback")),
                             }}
-                            showTime
+                            showTime={!continuesRun()}
                             animate={animateEntrance}
                             agents={props.agents}
                             skills={installedSkills()}
@@ -390,7 +498,7 @@ export function ConversationTimeline() {
                             onAttachmentAction={attachmentAction}
                             onOpenSharedFile={openSharedFile}
                             onOpenWorkspaceFile={openWorkspaceFile}
-                            onDownloadAttachments={downloadAttachments}
+                            onDownloadAttachments={props.runtime ? undefined : downloadAttachments}
                             onDownload={(attachment) => attachmentAction(attachment, "download")}
                             actions={
                               <MessageActions
@@ -465,7 +573,7 @@ export function ConversationTimeline() {
                 <AgentActivityIndicator
                   agent={activity().agent}
                   detail={activity().detail}
-                  presentation={activity().presentation}
+                  label={activity().label}
                   phase={activity().phase}
                 />
               )}
@@ -489,13 +597,15 @@ export function ConversationTimeline() {
               </Loading>
             )}
           </Show>
-          <Show when={props.approval}>
+          <Show keyed when={props.approval}>
             {(approval) => (
               <Loading>
                 <ApprovalCard
-                  approval={approval()}
+                  approval={approval}
+                  agentName={props.agent?.name}
                   onApprove={() => props.onRespondToApproval("accept")}
                   onReject={() => props.onRespondToApproval("decline")}
+                  onAlwaysAllow={props.onAlwaysAllowApproval}
                 />
               </Loading>
             )}
@@ -503,6 +613,7 @@ export function ConversationTimeline() {
           <Show when={props.browserTakeover}>
             <Loading>
               <BrowserTakeoverCard
+                request={props.browserTakeover}
                 agentName={props.agent?.name ?? "the agent"}
                 tab={browserTakeoverTab()}
                 preview={browserTakeoverPreview().preview}
@@ -510,6 +621,10 @@ export function ConversationTimeline() {
                 onOpen={openBrowserTakeoverTab}
                 onComplete={() => respondToBrowserTakeover("complete")}
                 onCancel={() => respondToBrowserTakeover("cancel")}
+                browserSecret={{
+                  loadPreview: runtime.browser.capturePreview,
+                  onRespond: runtime.agent.respondToBrowserSecret,
+                }}
               />
             </Loading>
           </Show>
@@ -532,7 +647,9 @@ export function ConversationTimeline() {
   );
 }
 
-const ApprovalCard = lazy(() => import("./ConversationPrompts").then((module) => ({ default: module.ApprovalCard })));
+const ApprovalCard = lazy(() =>
+  import("@openbot/ui/features/conversation/ConversationPrompts").then((module) => ({ default: module.ApprovalCard })),
+);
 const QuestionPromptBubble = lazy(() =>
-  import("../../components/QuestionPromptBubble").then((module) => ({ default: module.QuestionPromptBubble })),
+  import("@openbot/ui/components/QuestionPromptBubble").then((module) => ({ default: module.QuestionPromptBubble })),
 );

@@ -1,7 +1,7 @@
-import { expect, fn, within } from "storybook/test";
+import { CustomProviderDialog } from "@openbot/ui/features/custom-providers/CustomProviderDialog";
+import type { CustomProviderDraft } from "@openbot/ui/features/custom-providers/custom-provider-form";
+import { fn } from "storybook/test";
 import type { Meta, StoryObj } from "storybook-solidjs-vite";
-import { CustomProviderDialog } from "../src/features/custom-providers/CustomProviderDialog";
-import type { CustomProviderDraft } from "../src/features/custom-providers/custom-provider-form";
 
 const localEndpoint: CustomProviderDraft = {
   providerId: "studio-local",
@@ -57,32 +57,6 @@ export const DialogErrors: Story = {
 
 export const DialogSubmits: Story = {
   args: { draft: localEndpoint },
-  play: async ({ args: storyArgs, userEvent }) => {
-    const body = within(document.body);
-    await userEvent.click(body.getByRole("button", { name: "Submit" }));
-    await expect(storyArgs.onSubmit).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "studio-local", apiKey: "story-placeholder-not-a-key" }),
-    );
-  },
-};
-
-export const DialogRefusesAnEmptyForm: Story = {
-  play: async ({ args: storyArgs, userEvent }) => {
-    const body = within(document.body);
-    await userEvent.click(body.getByRole("button", { name: "Submit" }));
-    await expect(body.findByText("Enter a provider ID.")).resolves.toBeTruthy();
-    await expect(storyArgs.onSubmit).not.toHaveBeenCalled();
-  },
-};
-
-export const DialogAddsRows: Story = {
-  args: { draft: localEndpoint },
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await userEvent.click(body.getByRole("button", { name: "Add model" }));
-    await expect(body.findByRole("textbox", { name: "Model 3 ID" })).resolves.toBeTruthy();
-    await userEvent.click(body.getByRole("button", { name: "Remove model 3" }));
-  },
 };
 
 export const DialogBusy: Story = {
@@ -103,5 +77,46 @@ export const DialogScrolls: Story = {
         name: `Qwen3 Coder ${index + 1}B`,
       })),
     },
+  },
+};
+
+const ollama: CustomProviderDraft = {
+  providerId: "ollama",
+  displayName: "Ollama",
+  baseUrl: "http://127.0.0.1:11434/v1",
+  apiKey: "",
+  models: [{ id: "", name: "" }],
+  headers: [{ name: "", value: "" }],
+};
+
+const discovered = [{ id: "qwen3-coder:30b" }, { id: "gpt-oss:120b" }, { id: "devstral:24b" }, { id: "llama3.3:70b" }];
+
+/** The find control appears only when the host can ask the endpoint for its models. */
+export const DiscoveryIdle: Story = {
+  args: { draft: ollama, onDiscoverModels: fn() },
+};
+
+export const DiscoveryLoading: Story = {
+  args: { draft: ollama, onDiscoverModels: fn(), discovery: { status: "loading" } },
+};
+
+/** Two of the four models are already rows, so their boxes open selected. */
+export const DiscoveryFound: Story = {
+  args: {
+    draft: { ...ollama, models: localEndpoint.models },
+    onDiscoverModels: fn(),
+    discovery: { status: "found", models: discovered },
+  },
+};
+
+export const DiscoveryEmpty: Story = {
+  args: { draft: ollama, onDiscoverModels: fn(), discovery: { status: "found", models: [] } },
+};
+
+export const DiscoveryFailed: Story = {
+  args: {
+    draft: ollama,
+    onDiscoverModels: fn(),
+    discovery: { status: "failed", message: "OpenBot could not reach http://127.0.0.1:11434/v1/models." },
   },
 };

@@ -65,6 +65,8 @@ export const TEAM_API_ROUTES = {
     logo: "/v1/team/logo",
     members: "/v1/team/members",
     member: (memberId: string) => `/v1/team/members/${segment(memberId)}`,
+    // Behind `member-leave-v1`: the caller removes their own membership.
+    leave: "/v1/team/leave",
     invites: "/v1/team/invites",
     invite: (inviteId: string) => `/v1/team/invites/${segment(inviteId)}`,
     sessions: "/v1/team/sessions",
@@ -90,10 +92,20 @@ export const TEAM_API_ROUTES = {
     control: "/v1/browser/control",
     preview: "/v1/browser/preview",
     visible: "/v1/browser/visible",
+    // Behind `browser-navigation`; see `team-protocol/browser-navigation-v1.ts` for why neither of
+    // these could be a field on the released routes beside them.
+    display: "/v1/browser/display",
+    load: "/v1/browser/load",
+    // Behind `browser-view`. The session is a request; the frames are on the socket at the
+    // `streamPath` it answers with, which `team-protocol/browser-view-v1.ts` builds and reads.
+    viewSessions: "/v1/browser/view/sessions",
+    viewSession: (sessionId: string) => `/v1/browser/view/sessions/${segment(sessionId)}`,
   },
   remoteScreen: {
     prefix: REMOTE_SCREEN,
     capabilities: `${REMOTE_SCREEN}/capabilities`,
+    setup: `${REMOTE_SCREEN}/setup`,
+    test: `${REMOTE_SCREEN}/test`,
     sessions: `${REMOTE_SCREEN}/sessions`,
     session: (sessionId: string) => `${REMOTE_SCREEN}/sessions/${segment(sessionId)}`,
     display: `${REMOTE_SCREEN}/display`,

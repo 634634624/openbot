@@ -1,10 +1,14 @@
+import { type ApprovalAutomationPreference, agentAutoApprovalEnabled } from "@openbot/contracts/ipc";
+import { toast } from "@openbot/ui";
+import { DEFAULT_GENERAL_SETTINGS, type GeneralSettingsValue } from "@openbot/ui/features/settings/app-settings";
+import { currentText } from "@openbot/ui/text";
 import { createEffect, createSignal, onSettled } from "solid-js";
 import { desktopAnalytics } from "../../analytics";
 import { usePlatform } from "../../platform";
 import { createSimpleContext } from "../../simple-context";
 import { useAuth } from "../account/account-context";
 import { useSetup } from "../onboarding/onboarding-context";
-import { DEFAULT_GENERAL_SETTINGS, type GeneralSettingsValue } from "./app-settings";
+import { settingsPort } from "./settings-port";
 import { isOpenSettingsShortcut } from "./settings-shortcut";
 
 const ANALYTICS_APP_VERSION_STORAGE_KEY = "openbot:analytics-app-version";
@@ -34,12 +38,33 @@ const Settings = createSimpleContext({
 
     const [analyticsPreferenceLoaded, setAnalyticsPreferenceLoaded] = createSignal<boolean | null>(null);
     const [skillsMarketplaceOpen, setSkillsMarketplaceOpen] = createSignal(false);
+    /**
+     * The plugin an `openbot://plugins/<slug>` link asked for, held beside the open flag because the
+     * marketplace is loaded lazily: the slug has to outlive the chunk load that shows it. It is a
+     * slug and never a listing, so the link cannot describe what the user is about to install.
+     */
+    const [pendingPluginSlug, setPendingPluginSlug] = createSignal<string | null>(null);
+    /**
+     * The template an `openbot://agents/<id>` link named. The install dialog reads the template by
+     * this id and installs only after the user presses Add agent.
+     */
+    const [pendingAgentTemplateId, setPendingAgentTemplateId] = createSignal<string | null>(null);
     const [appSettingsOpen, setAppSettingsOpen] = createSignal(false);
     const [generalSettings, setGeneralSettings] = createSignal<GeneralSettingsValue>(DEFAULT_GENERAL_SETTINGS);
+    const [approvalAutomation, setApprovalAutomation] = createSignal<ApprovalAutomationPreference>({
+      turbo: false,
+      defaultAutoApprove: false,
+      autoApproveOverrides: {},
+    });
     let appSettingsRestoreTarget: HTMLElement | null = null;
     let analyticsOpened = false;
     let analyticsVersionRecorded = false;
     let autoDownloadUpdatesChanged = false;
+    let allowRemoteUpdatesChanged = false;
+    let autoInstallUpdatesChanged = false;
+    let desktopNotificationsChanged = false;
+    let turboModeChanged = false;
+    const [turboModePending, setTurboModePending] = createSignal(false);
 
     createEffect(
       () => ({
@@ -76,13 +101,16 @@ const Settings = createSimpleContext({
       },
     );
 
+    let dynamicIslandSaveCount = 0;
+
     function updateGeneralSettings(value: GeneralSettingsValue): void {
       const previous = generalSettings();
-      setGeneralSettings(value);
+      const turboMode = turboModePending() ? previous.turboMode : value.turboMode;
+      setGeneralSettings({ ...value, turboMode });
       if (previous.productAnalytics !== value.productAnalytics) {
         desktopAnalytics.setTrackingEnabled(value.productAnalytics);
         setAnalyticsPreferenceLoaded(value.productAnalytics);
-        void window.openbot
+        void settingsPort()
           .setAnalyticsPreference({ enabled: value.productAnalytics })
           .then((preference) => {
             desktopAnalytics.setTrackingEnabled(preference.enabled);
@@ -95,10 +123,26 @@ const Settings = createSimpleContext({
             setGeneralSettings((current) => ({ ...current, productAnalytics: previous.productAnalytics }));
           });
       }
+      if (previous.turboMode !== turboMode) {
+        turboModeChanged = true;
+        setTurboModePending(true);
+        void settingsPort()
+          .setApprovalAutomation({ turbo: turboMode })
+          .then((preference) => {
+            setGeneralSettings((current) => ({ ...current, turboMode: preference.turbo }));
+            setApprovalAutomation(preference);
+          })
+          .catch(() => {
+            setGeneralSettings((current) => ({ ...current, turboMode: previous.turboMode }));
+            const { t } = currentText();
+            toast.error(previous.turboMode ? t("settings.turbo.turnOffFailed") : t("settings.turbo.turnOnFailed"));
+          })
+          .finally(() => setTurboModePending(false));
+      }
       if (previous.autoDownloadUpdates !== value.autoDownloadUpdates) {
         autoDownloadUpdatesChanged = true;
-        void window.openbot.update
-          .setPreference({ autoDownload: value.autoDownloadUpdates })
+        void settingsPort()
+          .update.setPreference({ autoDownload: value.autoDownloadUpdates })
           .then((preference) =>
             setGeneralSettings((current) => ({ ...current, autoDownloadUpdates: preference.autoDownload })),
           )
@@ -106,38 +150,103 @@ const Settings = createSimpleContext({
             setGeneralSettings((current) => ({ ...current, autoDownloadUpdates: previous.autoDownloadUpdates })),
           );
       }
+      if (previous.allowRemoteUpdates !== value.allowRemoteUpdates) {
+        allowRemoteUpdatesChanged = true;
+        void settingsPort()
+          .update.setPreference({ allowRemoteUpdates: value.allowRemoteUpdates })
+          .then((preference) =>
+            setGeneralSettings((current) => ({ ...current, allowRemoteUpdates: preference.allowRemoteUpdates })),
+          )
+          .catch(() =>
+            setGeneralSettings((current) => ({ ...current, allowRemoteUpdates: previous.allowRemoteUpdates })),
+          );
+      }
+      if (previous.autoInstallUpdates !== value.autoInstallUpdates) {
+        autoInstallUpdatesChanged = true;
+        void settingsPort()
+          .update.setPreference({ autoInstall: value.autoInstallUpdates })
+          .then((preference) =>
+            setGeneralSettings((current) => ({ ...current, autoInstallUpdates: preference.autoInstall })),
+          )
+          .catch(() =>
+            setGeneralSettings((current) => ({ ...current, autoInstallUpdates: previous.autoInstallUpdates })),
+          );
+      }
+      if (previous.desktopNotifications !== value.desktopNotifications) {
+        desktopNotificationsChanged = true;
+        void settingsPort()
+          .notifications.setPreference({ desktopNotifications: value.desktopNotifications })
+          .then((preference) =>
+            setGeneralSettings((current) => ({ ...current, desktopNotifications: preference.desktopNotifications })),
+          )
+          .catch(() =>
+            setGeneralSettings((current) => ({ ...current, desktopNotifications: previous.desktopNotifications })),
+          );
+      }
       if (
         previous.macBookNotch !== value.macBookNotch ||
         previous.macBookNotchHaptics !== value.macBookNotchHaptics ||
         previous.macBookNotchIdle !== value.macBookNotchIdle ||
-        previous.macBookNotchAdditionalDisplays !== value.macBookNotchAdditionalDisplays
+        previous.macBookNotchAdditionalDisplays !== value.macBookNotchAdditionalDisplays ||
+        previous.macBookNotchWidthPercent !== value.macBookNotchWidthPercent ||
+        previous.macBookNotchHeightPercent !== value.macBookNotchHeightPercent
       ) {
-        void window.openbot.dynamicIsland
-          .setPreference({
+        // A slider drag sends one save per step. Only the reply to the newest save may change the
+        // form, or an older reply would move the slider back while the user drags.
+        const save = ++dynamicIslandSaveCount;
+        void settingsPort()
+          .dynamicIsland.setPreference({
             enabled: value.macBookNotch,
             hapticsEnabled: value.macBookNotchHaptics,
             idleVisible: value.macBookNotchIdle,
             additionalDisplaysEnabled: value.macBookNotchAdditionalDisplays,
+            widthPercent: value.macBookNotchWidthPercent,
+            heightPercent: value.macBookNotchHeightPercent,
           })
-          .then((preference) =>
+          .then((preference) => {
+            if (save !== dynamicIslandSaveCount) return;
             setGeneralSettings((current) => ({
               ...current,
               macBookNotch: preference.enabled,
               macBookNotchHaptics: preference.hapticsEnabled,
               macBookNotchIdle: preference.idleVisible,
               macBookNotchAdditionalDisplays: preference.additionalDisplaysEnabled,
-            })),
-          )
-          .catch(() =>
+              macBookNotchWidthPercent: preference.widthPercent,
+              macBookNotchHeightPercent: preference.heightPercent,
+            }));
+          })
+          .catch(() => {
+            if (save !== dynamicIslandSaveCount) return;
             setGeneralSettings((current) => ({
               ...current,
               macBookNotch: previous.macBookNotch,
               macBookNotchHaptics: previous.macBookNotchHaptics,
               macBookNotchIdle: previous.macBookNotchIdle,
               macBookNotchAdditionalDisplays: previous.macBookNotchAdditionalDisplays,
-            })),
-          );
+              macBookNotchWidthPercent: previous.macBookNotchWidthPercent,
+              macBookNotchHeightPercent: previous.macBookNotchHeightPercent,
+            }));
+          });
       }
+    }
+
+    /**
+     * Grants or revokes one agent's standing approval.
+     *
+     * Not part of `updateGeneralSettings`: the grant is per agent rather than a field of the one
+     * settings record, and it is written from the approval card as well as from Settings. The
+     * promise is returned so the approval card only accepts the pending request once the grant is
+     * stored - accepting first would leave an agent the user believes is trusted still asking.
+     */
+    async function setAgentAutoApprove(agentId: string, autoApprove: boolean): Promise<void> {
+      const preference = await settingsPort().setApprovalAutomation({ agentId, autoApprove });
+      setApprovalAutomation(preference);
+      setGeneralSettings((current) => ({ ...current, turboMode: preference.turbo }));
+    }
+
+    /** Whether this agent acts without asking, by its own grant or because Turbo covers every agent. */
+    function agentAutoApproves(agentId: string): boolean {
+      return agentAutoApprovalEnabled({ ...approvalAutomation(), turbo: generalSettings().turboMode }, agentId);
     }
 
     /** Remembers what to focus when the dialog closes; the dialog itself restores it. */
@@ -156,15 +265,29 @@ const Settings = createSimpleContext({
         openAppSettings(event.target instanceof HTMLElement ? event.target : null);
       };
       window.addEventListener("keydown", handleSettingsShortcut);
-      const unsubscribe = window.openbot.onOpenSettings(() => openAppSettings());
+      const unsubscribe = settingsPort().onOpenSettings(() => openAppSettings());
+      // A remote owner or admin can change an agent's grant from a phone or the web client.
+      const unsubscribeApprovals = settingsPort().onApprovalAutomation(setApprovalAutomation);
+      // An admin of a joined server can change the update switches of this computer.
+      const unsubscribeUpdates = settingsPort().update.onPreference((preference) => {
+        autoDownloadUpdatesChanged = true;
+        autoInstallUpdatesChanged = true;
+        setGeneralSettings((current) => ({
+          ...current,
+          autoDownloadUpdates: preference.autoDownload,
+          autoInstallUpdates: preference.autoInstall,
+        }));
+      });
       return () => {
         window.removeEventListener("keydown", handleSettingsShortcut);
         unsubscribe();
+        unsubscribeApprovals();
+        unsubscribeUpdates();
       };
     });
 
     onSettled(() => {
-      void window.openbot
+      void settingsPort()
         .getAnalyticsPreference()
         .then((preference) => {
           setAnalyticsPreferenceLoaded(preference.enabled);
@@ -174,17 +297,38 @@ const Settings = createSimpleContext({
           setAnalyticsPreferenceLoaded(false);
           setGeneralSettings((current) => ({ ...current, productAnalytics: false }));
         });
-      void window.openbot.update
-        .getPreference()
+      void settingsPort()
+        .getApprovalAutomation()
+        .then((preference) => {
+          setApprovalAutomation(preference);
+          // A toggle made before this read resolves has already been persisted, so the older value
+          // must not be painted back over it.
+          if (turboModeChanged) return;
+          setGeneralSettings((current) => ({ ...current, turboMode: preference.turbo }));
+        })
+        .catch(() => undefined);
+      void settingsPort()
+        .update.getPreference()
         .then((preference) => {
           // A toggle made before this read resolves has already been persisted, so the older value
           // must not be painted back over it.
-          if (autoDownloadUpdatesChanged) return;
-          setGeneralSettings((current) => ({ ...current, autoDownloadUpdates: preference.autoDownload }));
+          setGeneralSettings((current) => ({
+            ...current,
+            autoDownloadUpdates: autoDownloadUpdatesChanged ? current.autoDownloadUpdates : preference.autoDownload,
+            allowRemoteUpdates: allowRemoteUpdatesChanged ? current.allowRemoteUpdates : preference.allowRemoteUpdates,
+            autoInstallUpdates: autoInstallUpdatesChanged ? current.autoInstallUpdates : preference.autoInstall,
+          }));
         })
         .catch(() => undefined);
-      void window.openbot.dynamicIsland
-        .getPreference()
+      void settingsPort()
+        .notifications.getPreference()
+        .then((preference) => {
+          if (desktopNotificationsChanged) return;
+          setGeneralSettings((current) => ({ ...current, desktopNotifications: preference.desktopNotifications }));
+        })
+        .catch(() => undefined);
+      void settingsPort()
+        .dynamicIsland.getPreference()
         .then((preference) =>
           setGeneralSettings((current) => ({
             ...current,
@@ -192,21 +336,35 @@ const Settings = createSimpleContext({
             macBookNotchHaptics: preference.hapticsEnabled,
             macBookNotchIdle: preference.idleVisible,
             macBookNotchAdditionalDisplays: preference.additionalDisplaysEnabled,
+            macBookNotchWidthPercent: preference.widthPercent,
+            macBookNotchHeightPercent: preference.heightPercent,
           })),
         )
         .catch(() => undefined);
     });
 
+    const sendTestNotification = () => settingsPort().notifications.test();
+    const openNotificationSettings = () => settingsPort().notifications.openSettings();
+
     return {
       analyticsPreferenceLoaded,
       generalSettings,
+      turboModePending,
       updateGeneralSettings,
+      sendTestNotification,
+      openNotificationSettings,
+      setAgentAutoApprove,
+      agentAutoApproves,
       appSettingsOpen,
       setAppSettingsOpen,
       appSettingsRestoreTarget: () => appSettingsRestoreTarget,
       openAppSettings,
       skillsMarketplaceOpen,
       setSkillsMarketplaceOpen,
+      pendingPluginSlug,
+      setPendingPluginSlug,
+      pendingAgentTemplateId,
+      setPendingAgentTemplateId,
     };
   },
 });

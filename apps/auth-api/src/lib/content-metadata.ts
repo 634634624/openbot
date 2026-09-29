@@ -11,22 +11,26 @@ import {
   articleOgImageUrl,
   articleUrl,
   type CollectionArticle,
+  type ContentArtShape,
   type ContentCollection,
   collectionFeedUrl,
   collectionIndexUrl,
 } from "./content-collection";
+import { PLUGINS_DESCRIPTION, PLUGINS_TITLE, pluginIndexUrl, pluginUrl, type SitePlugin } from "./plugins";
 import {
+  OPENBOT_LOGO_URL,
   OPENBOT_SITE_TITLE,
   OPENBOT_SITE_URL,
   OPENBOT_SOCIAL_IMAGE_ALT,
   OPENBOT_SOCIAL_IMAGE_URL,
+  OPENBOT_X_HANDLE,
 } from "./site-metadata";
 
 /** The generated social cards. Matches what `content-images.ts` writes. */
-export const OG_IMAGE_WIDTH = 1200;
-export const OG_IMAGE_HEIGHT = 630;
+const OG_IMAGE_WIDTH = 1200;
+const OG_IMAGE_HEIGHT = 630;
 
-export function articleOgImageAlt(title: string): string {
+function articleOgImageAlt(title: string): string {
   return `${title} — OpenBot`;
 }
 
@@ -51,6 +55,7 @@ export function collectionIndexHead(collection: ContentCollection, siteUrl: stri
       { property: "og:image:height", content: "900" },
       { property: "og:image:alt", content: OPENBOT_SOCIAL_IMAGE_ALT },
       { name: "twitter:card", content: "summary_large_image" },
+      { name: "twitter:site", content: OPENBOT_X_HANDLE },
       { name: "twitter:title", content: collection.indexTitle },
       { name: "twitter:description", content: collection.indexDescription },
       { name: "twitter:image", content: OPENBOT_SOCIAL_IMAGE_URL },
@@ -76,7 +81,13 @@ function featuredArtworkPreload(collection: ContentCollection) {
   return [{ rel: "preload", as: "image" as const, href: articleArtPath(collection, featured.slug, "featured") }];
 }
 
-export function articleHead(collection: ContentCollection, article: CollectionArticle, siteUrl: string) {
+/** `artShape` is the frame under the title: a comparison draws its hero in the featured frame. */
+export function articleHead(
+  collection: ContentCollection,
+  article: CollectionArticle,
+  siteUrl: string,
+  artShape: ContentArtShape = "article",
+) {
   const url = articleUrl(collection, article.slug, siteUrl);
   const image = articleOgImageUrl(collection, article.slug, siteUrl);
   const alt = articleOgImageAlt(article.title);
@@ -88,6 +99,7 @@ export function articleHead(collection: ContentCollection, article: CollectionAr
       { name: "description", content: article.description },
       { name: "author", content: article.author },
       { "script:ld+json": articleStructuredData(collection, article, siteUrl) },
+      { "script:ld+json": articleBreadcrumbData(collection, article, siteUrl) },
       { property: "og:type", content: "article" },
       { property: "og:site_name", content: "OpenBot" },
       { property: "og:locale", content: "en_US" },
@@ -104,6 +116,7 @@ export function articleHead(collection: ContentCollection, article: CollectionAr
       { property: "article:author", content: article.author },
       { property: "article:section", content: collection.name },
       { name: "twitter:card", content: "summary_large_image" },
+      { name: "twitter:site", content: OPENBOT_X_HANDLE },
       { name: "twitter:title", content: title },
       { name: "twitter:description", content: article.description },
       { name: "twitter:image", content: image },
@@ -119,7 +132,7 @@ export function articleHead(collection: ContentCollection, article: CollectionAr
       },
       // The same reason as on the index: this article's artwork is the first
       // thing under the title and it is a background, not an <img>.
-      { rel: "preload", as: "image" as const, href: articleArtPath(collection, article.slug, "article") },
+      { rel: "preload", as: "image" as const, href: articleArtPath(collection, article.slug, artShape) },
     ],
   };
 }
@@ -142,7 +155,7 @@ export function articleStructuredData(collection: ContentCollection, article: Co
       "@type": "Organization",
       name: "OpenBot",
       url: OPENBOT_SITE_URL,
-      logo: { "@type": "ImageObject", url: OPENBOT_SOCIAL_IMAGE_URL },
+      logo: { "@type": "ImageObject", url: OPENBOT_LOGO_URL, width: 512, height: 512 },
     },
     mainEntityOfPage: { "@type": "WebPage", "@id": url },
     isAccessibleForFree: true,
@@ -150,7 +163,26 @@ export function articleStructuredData(collection: ContentCollection, article: Co
   };
 }
 
-export function collectionStructuredData(collection: ContentCollection, siteUrl: string) {
+/** Home › collection › article, which search results show in place of the bare URL. */
+function articleBreadcrumbData(collection: ContentCollection, article: CollectionArticle, siteUrl: string) {
+  const trail = [
+    { name: "OpenBot", url: siteUrl },
+    { name: collection.name, url: collectionIndexUrl(collection, siteUrl) },
+    { name: article.title, url: articleUrl(collection, article.slug, siteUrl) },
+  ];
+  return {
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    itemListElement: trail.map((item, index) => ({
+      "@type": "ListItem",
+      position: index + 1,
+      name: item.name,
+      item: item.url,
+    })),
+  };
+}
+
+function collectionStructuredData(collection: ContentCollection, siteUrl: string) {
   return {
     "@context": "https://schema.org",
     "@type": "Blog",
@@ -165,5 +197,84 @@ export function collectionStructuredData(collection: ContentCollection, siteUrl:
       author: { "@type": "Person", name: article.author },
       url: articleUrl(collection, article.slug, siteUrl),
     })),
+  };
+}
+
+/**
+ * The plugin pages. They carry the site's own social card rather than a generated one: the artwork
+ * pipeline in `content-images.ts` draws articles, and a listing is not an article. The structured
+ * data is `SoftwareApplication`, which is what a plugin is.
+ */
+export function pluginsIndexHead(siteUrl: string) {
+  const url = pluginIndexUrl(siteUrl);
+
+  return {
+    meta: [
+      { title: PLUGINS_TITLE },
+      { name: "description", content: PLUGINS_DESCRIPTION },
+      { property: "og:type", content: "website" },
+      { property: "og:site_name", content: "OpenBot" },
+      { property: "og:locale", content: "en_US" },
+      { property: "og:url", content: url },
+      { property: "og:title", content: PLUGINS_TITLE },
+      { property: "og:description", content: PLUGINS_DESCRIPTION },
+      { property: "og:image", content: OPENBOT_SOCIAL_IMAGE_URL },
+      { property: "og:image:alt", content: OPENBOT_SOCIAL_IMAGE_ALT },
+      { name: "twitter:card", content: "summary_large_image" },
+      { name: "twitter:site", content: OPENBOT_X_HANDLE },
+      { name: "twitter:title", content: PLUGINS_TITLE },
+      { name: "twitter:description", content: PLUGINS_DESCRIPTION },
+      { name: "twitter:image", content: OPENBOT_SOCIAL_IMAGE_URL },
+      { name: "twitter:image:alt", content: OPENBOT_SOCIAL_IMAGE_ALT },
+    ],
+    links: [{ rel: "canonical", href: url }],
+  };
+}
+
+export function pluginHead(plugin: SitePlugin, siteUrl: string) {
+  const url = pluginUrl(plugin.slug, siteUrl);
+  const title = `${plugin.name} — OpenBot plugins`;
+
+  return {
+    meta: [
+      { title },
+      { name: "description", content: plugin.tagline },
+      { "script:ld+json": pluginStructuredData(plugin, siteUrl) },
+      { property: "og:type", content: "website" },
+      { property: "og:site_name", content: "OpenBot" },
+      { property: "og:locale", content: "en_US" },
+      { property: "og:url", content: url },
+      { property: "og:title", content: title },
+      { property: "og:description", content: plugin.tagline },
+      { property: "og:image", content: OPENBOT_SOCIAL_IMAGE_URL },
+      { property: "og:image:alt", content: OPENBOT_SOCIAL_IMAGE_ALT },
+      { name: "twitter:card", content: "summary_large_image" },
+      { name: "twitter:site", content: OPENBOT_X_HANDLE },
+      { name: "twitter:title", content: title },
+      { name: "twitter:description", content: plugin.tagline },
+      { name: "twitter:image", content: OPENBOT_SOCIAL_IMAGE_URL },
+      { name: "twitter:image:alt", content: OPENBOT_SOCIAL_IMAGE_ALT },
+    ],
+    links: [{ rel: "canonical", href: url }],
+  };
+}
+
+/**
+ * The listing as schema.org sees it. `softwareVersion` is the developer's own string, and the
+ * offer says free because installing a plugin costs nothing; what the developer's own service
+ * charges is between the reader and the developer, so nothing here claims otherwise.
+ */
+export function pluginStructuredData(plugin: SitePlugin, siteUrl: string) {
+  return {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    name: plugin.name,
+    description: plugin.description,
+    applicationCategory: "DeveloperApplication",
+    softwareVersion: plugin.version,
+    author: { "@type": "Organization", name: plugin.creatorName },
+    isPartOf: { "@type": "SoftwareApplication", name: "OpenBot", url: OPENBOT_SITE_URL },
+    mainEntityOfPage: { "@type": "WebPage", "@id": pluginUrl(plugin.slug, siteUrl) },
+    url: pluginUrl(plugin.slug, siteUrl),
   };
 }

@@ -4,10 +4,15 @@ import { mkdir, readdir, realpath, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { serializeAttachmentReference } from "@openbot/contracts/attachment-references";
 import { serializeChatTagReference } from "@openbot/contracts/chat-tag-references";
-import type { AgentEvent } from "@openbot/contracts/ipc";
+import {
+  type AgentEvent,
+  COMPUTER_USE_MCP_SERVER_ID,
+  COMPUTER_USE_MCP_SERVER_NAME,
+  type McpServerConfig,
+} from "@openbot/contracts/ipc";
 import { isDynamicRecord } from "@openbot/contracts/runtime-values";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AgentProvider } from "./agent-client";
+import { afterEach, assert, beforeEach, describe, expect, it, vi } from "vitest";
+import { type AgentProvider, RequestTimeoutError } from "./agent-client";
 import type { AgentService } from "./agent-service";
 import {
   CREATE_AGENT_INPUT,
@@ -22,13 +27,18 @@ import {
   paramsRecord,
   protocolMessages,
   startAgentTestFixture,
+  startService,
   stopAgentTestFixture,
   stores,
   waitFor,
+  waitForQueue,
 } from "./agent-service-test-harness";
-import { loginShellPath } from "./mcp-provider-shapes";
+import { loginShellPath, type McpToolRuntimes, NO_MCP_TOOL_RUNTIMES } from "./mcp-provider-shapes";
 import type { DynamicToolCallParams } from "./protocol";
 import { SidebarLayoutStore } from "./sidebar-layout-store";
+
+// Every Codex session is given the plan tool.
+const CODEX_TOOLS = { update_plan: { enabled: true } };
 
 let root: string;
 let logPath: string;
@@ -54,17 +64,16 @@ afterEach(async () => {
 
 describe.sequential("AgentService: providers", () => {
   it("runs a channel turn in a separate session and returns to the unchanged normal conversation", async () => {
-    const { store, mailbox } = stores(root);
-    const client = new FakeAgentClient("codex", "CODEX_DONE");
-    service = createTestService({
-      store,
-      mailbox,
+    const { service: agentService, store } = await startService(root, {
+      provider: "codex",
+      output: "CODEX_DONE",
       preferredProvider: "codex",
-      clientFactory: () => client,
     });
-    await service.initialize();
+    service = agentService;
     await service.sendMessage({ agentId: "chief", text: "This is my normal conversation." });
-    await waitFor(() => service?.listQueue("chief").deliveries.every((delivery) => delivery.status === "completed"));
+    await waitForQueue(service, "chief", (queue) =>
+      queue.deliveries.every((delivery) => delivery.status === "completed"),
+    );
     const agent = service.listAgents().find((item) => item.id === "chief");
     if (!agent?.threadId) throw new Error("Normal conversation did not start.");
     const normalSession = store.activeProviderSession(agent.id)?.externalSessionId;
@@ -116,16 +125,17 @@ describe.sequential("AgentService: providers", () => {
     expect(store.activeProviderSession(agent.id)?.externalSessionId).toBe(normalSession);
   });
 
-  it("resumes a channel session after the profile or the memories of the agent change", async () => {
-    const { store, mailbox } = stores(root);
-    const client = new FakeAgentClient("codex", "CODEX_DONE");
-    service = createTestService({
+  it("carries a change to the profile or the memories of the agent to its channel session", async () => {
+    const {
+      service: agentService,
+      client,
       store,
-      mailbox,
+    } = await startService(root, {
+      provider: "codex",
+      output: "CODEX_DONE",
       preferredProvider: "codex",
-      clientFactory: () => client,
     });
-    await service.initialize();
+    service = agentService;
     await store.getOrCreate("chief");
     const actor = { id: "human", name: "Alex" };
     await service.channels.command(
@@ -181,9 +191,18 @@ describe.sequential("AgentService: providers", () => {
     await ask("second", "Continue the shared work.", 2);
     expect(lastChannelResume()).toContain("The user prefers concise status updates.");
 
+    // Codex keeps the developer instructions a loaded session started with, so a profile edit
+    // replaces the session instead of resuming it. The old one is closed in the client.
+    const channelSessionNow = () =>
+      store.database.activeProviderSession(execution.threadId, "codex")?.externalSessionId;
+    const lastStart = (): string =>
+      JSON.stringify(client.requests.filter((request) => request.method === "thread/start").at(-1)?.params ?? "");
     await service.updateAgent({ agentId: "chief", description: "Owns the quarterly report." });
     await ask("third", "Report on the shared work.", 3);
-    expect(lastChannelResume()).toContain("Owns the quarterly report.");
+    const editedSession = channelSessionNow();
+    expect(editedSession).not.toBe(channelSession);
+    expect(client.releasedThreads).toContain(channelSession);
+    expect(lastStart()).toContain("Owns the quarterly report.");
 
     // The profile dialog saves through a second path, which holds the same standing instructions.
     const sidebar = new SidebarLayoutStore(join(root, "sidebar.json"));
@@ -204,19 +223,18 @@ describe.sequential("AgentService: providers", () => {
       sidebar,
     );
     await ask("fourth", "Review the shared work.", 4);
-    expect(lastChannelResume()).toContain("Runs the weekly review.");
+    expect(channelSessionNow()).not.toBe(editedSession);
+    expect(lastStart()).toContain("Runs the weekly review.");
   });
 
   it("keeps an agent with active channel work from being deleted", async () => {
-    const { store, mailbox } = stores(root);
-    const client = new FakeAgentClient("codex", "", false);
-    service = createTestService({
-      store,
-      mailbox,
+    const { service: agentService, store } = await startService(root, {
+      provider: "codex",
+      output: "",
+      autoComplete: false,
       preferredProvider: "codex",
-      clientFactory: () => client,
     });
-    await service.initialize();
+    service = agentService;
     await store.getOrCreate("chief");
     await service.channels.command(
       {
@@ -269,7 +287,9 @@ describe.sequential("AgentService: providers", () => {
     };
     service = await startService();
     await service.sendMessage({ agentId: "chief", text: "Remember that my researchers cover tennis and football." });
-    await waitFor(() => service?.listQueue("chief").deliveries.every((delivery) => delivery.status === "completed"));
+    await waitForQueue(service, "chief", (queue) =>
+      queue.deliveries.every((delivery) => delivery.status === "completed"),
+    );
     const original = service.listAgents().find((agent) => agent.id === "chief");
     const originalSession = store.activeProviderSession("chief")?.externalSessionId;
     if (!original || !originalSession) throw new Error("The original session did not start.");
@@ -282,7 +302,7 @@ describe.sequential("AgentService: providers", () => {
     rejectTurn = true;
     service = await startService();
     await service.sendMessage({ agentId: "chief", text: "Group my researchers." });
-    await waitFor(() => service?.listQueue("chief").deliveries.some((delivery) => delivery.status === "failed"));
+    await waitForQueue(service, "chief", (queue) => queue.deliveries.some((delivery) => delivery.status === "failed"));
     await service.stop();
     rejectTurn = false;
     service = await startService();
@@ -340,11 +360,13 @@ describe.sequential("AgentService: providers", () => {
     };
     service = await startService();
     await service.sendMessage({ agentId: "chief", text: "Start." });
-    await waitFor(() => service?.listQueue("chief").deliveries.every((delivery) => delivery.status === "completed"));
-    const firstSession = store.activeProviderSession("chief")?.externalSessionId;
-    expect(paramsRecord(client.requests.find((request) => request.method === "thread/start")?.params)?.config).toBe(
-      undefined,
+    await waitForQueue(service, "chief", (queue) =>
+      queue.deliveries.every((delivery) => delivery.status === "completed"),
     );
+    const firstSession = store.activeProviderSession("chief")?.externalSessionId;
+    expect(paramsRecord(client.requests.find((request) => request.method === "thread/start")?.params)?.config).toEqual({
+      tools: CODEX_TOOLS,
+    });
 
     // Codex ignores the configuration on resume, so a new MCP server has to force a new session.
     service.saveMcpServer({
@@ -372,15 +394,301 @@ describe.sequential("AgentService: providers", () => {
     const starts = client.requests.filter((request) => request.method === "thread/start");
     expect(starts).toHaveLength(2);
     expect(paramsRecord(starts[1]?.params)?.config).toEqual({
+      tools: CODEX_TOOLS,
       mcp_servers: {
         Filesystem: { command: "/bin/echo", args: ["ready"], env: await launchEnvironment({ TOKEN: "secret" }) },
       },
     });
   });
 
+  // A server Codex cannot be given used to vanish: the adapter skipped it, the provider never saw
+  // it, and so nothing anywhere failed. The user is told once, and told again only if they change
+  // the list - not once per turn.
+  it("reports the MCP server Codex cannot start in a working directory, once", async () => {
+    const { store, mailbox } = stores(root);
+    const client = new FakeAgentClient("codex", "CODEX_DONE", true, true);
+    const events: AgentEvent[] = [];
+    service = createTestService({ store, mailbox, preferredProvider: "codex", clientFactory: () => client });
+    service.on("event", (event) => events.push(event));
+    await service.initialize();
+    service.saveMcpServer({
+      config: {
+        id: "",
+        name: "Local SQLite",
+        transport: "stdio",
+        enabled: true,
+        command: "/bin/echo",
+        args: ["ready"],
+        env: [],
+        envPassthrough: [],
+        workingDirectory: "/tmp",
+        url: "",
+        headers: [],
+      },
+    });
+
+    await service.sendMessage({ agentId: "chief", text: "Start." });
+    await waitForQueue(service, "chief", (queue) =>
+      queue.deliveries.every((delivery) => delivery.status === "completed"),
+    );
+    const reported = events.filter((event) => event.type === "error" && event.code === "mcp_server_not_started");
+    expect(reported).toHaveLength(1);
+    expect(reported[0]).toMatchObject({
+      agentId: undefined,
+      message: expect.stringContaining('did not get the MCP server "Local SQLite"'),
+    });
+
+    // Reported, and still not sent: the point of the report is that the server is missing.
+    const starts = client.requests.filter((request) => request.method === "thread/start");
+    expect(paramsRecord(starts.at(-1)?.params)?.config).toEqual({ tools: CODEX_TOOLS });
+
+    await service.sendMessage({ agentId: "chief", text: "Again." });
+    await waitForQueue(service, "chief", (queue) =>
+      queue.deliveries.every((delivery) => delivery.status === "completed"),
+    );
+    expect(events.filter((event) => event.type === "error" && event.code === "mcp_server_not_started")).toHaveLength(1);
+  });
+
+  /* The token OpenBot mints is never on a row, so the stored configuration cannot name it. It still
+     reaches a provider process, and that process quotes what it sent when a request fails. */
+  it("hands a signed-in http server its bearer token and keeps that token out of the error it causes", async () => {
+    const { store, mailbox } = stores(root);
+    const token = "minted-access-token-abc";
+    const client = new FakeAgentClient("codex", "CODEX_DONE", true, true, {}, async (method) => {
+      // Quoted bare, the way a CLI reports the request it failed on. No shared pattern covers it:
+      // only the value itself, remembered at hand-off, can take it out again.
+      if (method === "turn/start") throw new Error(`upstream refused the token ${token}`);
+    });
+    const events: AgentEvent[] = [];
+    service = createTestService({
+      store,
+      mailbox,
+      preferredProvider: "codex",
+      clientFactory: () => client,
+      credentials: {
+        apiKey: () => null,
+        customProviders: () => [],
+        mcpServers: () => [],
+        mcpOAuth: {
+          accessToken: async (url) => (url === "https://mcp.example.com/mcp" ? token : null),
+          signIn: () => null,
+          forget: async () => undefined,
+        },
+      },
+    });
+    service.on("event", (event) => events.push(event));
+    await service.initialize();
+    service.saveMcpServer({
+      config: {
+        id: "",
+        name: "Signed in",
+        transport: "http",
+        enabled: true,
+        command: "",
+        args: [],
+        env: [],
+        envPassthrough: [],
+        workingDirectory: "",
+        url: "https://mcp.example.com/mcp",
+        headers: [],
+      },
+    });
+
+    await service.sendMessage({ agentId: "chief", text: "Start." });
+    await waitForQueue(service, "chief", (queue) => queue.deliveries.every((delivery) => delivery.status === "failed"));
+
+    const starts = client.requests.filter((request) => request.method === "thread/start");
+    expect(paramsRecord(starts.at(-1)?.params)?.config).toEqual({
+      tools: CODEX_TOOLS,
+      mcp_servers: {
+        "Signed in": { url: "https://mcp.example.com/mcp", http_headers: { Authorization: `Bearer ${token}` } },
+      },
+    });
+    const reported = events.filter((event) => event.type === "error");
+    expect(reported.length).toBeGreaterThan(0);
+    for (const event of reported) expect(event.message).not.toContain(token);
+    expect(service.listQueue("chief").deliveries.at(-1)?.error ?? "").not.toContain(token);
+  });
+
+  // A manifest written by an older adapter holds the same stored set as today, so the fingerprint
+  // has to carry the adapter: without it the stale session resumes forever with the servers it
+  // was given. A manifest that matches nothing - deleted or predating the version - forces the
+  // same replacement, with the public thread and its history intact.
+  it("replaces a Codex session whose tool manifest predates the adapter", async () => {
+    const { store, mailbox } = stores(root);
+    const client = new FakeAgentClient("codex", "CODEX_DONE", true, true);
+    service = createTestService({
+      store,
+      mailbox,
+      preferredProvider: "codex",
+      clientFactory: () => client,
+    });
+    await service.initialize();
+    await service.sendMessage({ agentId: "chief", text: "Start." });
+    await waitForQueue(service, "chief", (queue) =>
+      queue.deliveries.every((delivery) => delivery.status === "completed"),
+    );
+    const firstSession = store.activeProviderSession("chief")?.externalSessionId;
+    if (!firstSession) throw new Error("The Codex session did not start.");
+    await writeFile(
+      join(root, "user-data", "provider-toolsets", createHash("sha256").update(firstSession).digest("hex")),
+      "stale-manifest",
+    );
+
+    await service.sendMessage({ agentId: "chief", text: "Continue." });
+    await waitFor(() =>
+      service?.listQueue("chief").deliveries.every((delivery) => ["completed", "failed"].includes(delivery.status)),
+    );
+    expect(store.activeProviderSession("chief")?.externalSessionId).not.toBe(firstSession);
+    expect(client.releasedThreads).toEqual([firstSession]);
+    expect(client.requests.filter((request) => request.method === "thread/start")).toHaveLength(2);
+  });
+
+  // A session started before Bun finished downloading drops its `npx` servers, while the
+  // configured set alone reads unchanged. The tool fingerprint folds the runtimes in as well, so
+  // the next turn replaces the session once its servers can actually start - without it the old
+  // session would resume forever with the tools it was given.
+  it("replaces a Codex session started before the tool runtime was ready", async () => {
+    const { store, mailbox } = stores(root);
+    const client = new FakeAgentClient("codex", "CODEX_DONE", true, true);
+    let toolRuntimes: McpToolRuntimes = NO_MCP_TOOL_RUNTIMES;
+    service = createTestService({
+      store,
+      mailbox,
+      preferredProvider: "codex",
+      clientFactory: () => client,
+      credentials: {
+        apiKey: () => null,
+        customProviders: () => [],
+        mcpServers: () => [],
+        mcpToolRuntimes: () => toolRuntimes,
+      },
+    });
+    await service.initialize();
+    service.saveMcpServer({
+      config: {
+        id: "",
+        name: "Npx tool",
+        transport: "stdio",
+        enabled: true,
+        command: "npx",
+        args: ["-y", "some-tool"],
+        // An isolated `PATH` stands in for a machine with no Node: the command is looked up in
+        // this list, so `npx` is missing until the managed runtime joins it.
+        env: [{ key: "PATH", value: "/nonexistent-test-dir" }],
+        envPassthrough: [],
+        workingDirectory: "",
+        url: "",
+        headers: [],
+      },
+    });
+
+    await service.sendMessage({ agentId: "chief", text: "Start." });
+    await waitForQueue(service, "chief", (queue) =>
+      queue.deliveries.every((delivery) => delivery.status === "completed"),
+    );
+    const firstSession = store.activeProviderSession("chief")?.externalSessionId;
+    if (!firstSession) throw new Error("The Codex session did not start.");
+    // No runtime yet, so the server is dropped from the session while the stored row stays.
+    const firstStart = client.requests.filter((request) => request.method === "thread/start").at(-1);
+    expect(paramsRecord(firstStart?.params)?.config ?? {}).not.toHaveProperty("mcp_servers");
+
+    // Bun finishes downloading between the turns. Nothing about the stored set changed.
+    toolRuntimes = { binDirectories: ["/tmp/fake-bun-bin"], commandAliases: { npx: "/tmp/fake-bun-bin/bunx" } };
+
+    await service.sendMessage({ agentId: "chief", text: "Continue." });
+    await waitFor(() =>
+      service?.listQueue("chief").deliveries.every((delivery) => ["completed", "failed"].includes(delivery.status)),
+    );
+    expect(store.activeProviderSession("chief")?.externalSessionId).not.toBe(firstSession);
+    expect(client.releasedThreads).toEqual([firstSession]);
+    const starts = client.requests.filter((request) => request.method === "thread/start");
+    expect(starts).toHaveLength(2);
+    const config = paramsRecord(starts.at(-1)?.params)?.config;
+    expect(isDynamicRecord(config) ? config.mcp_servers : undefined).toMatchObject({
+      "Npx tool": expect.anything(),
+    });
+  });
+
   // Save, remove and toggle all go through the same refresh, so one of them proves the mechanism.
   // Without it a loaded session keeps the tools it was given until the app restarts: the reason the
   // test above had to stop and start the service to see its new server.
+  // A managed tool runtime becoming ready spends the same refresh: sessions that dropped their
+  // stdio servers before it finished downloading are replaced on the next turn.
+  it("starts a fresh provider session after the tool runtimes become ready", async () => {
+    const { store, mailbox } = stores(root);
+    const client = new FakeAgentClient("codex", "CODEX_DONE", true, true);
+    service = createTestService({
+      store,
+      mailbox,
+      preferredProvider: "codex",
+      clientFactory: () => client,
+    });
+    await service.initialize();
+    await service.sendMessage({ agentId: "chief", text: "Start." });
+    await waitForQueue(service, "chief", (queue) =>
+      queue.deliveries.every((delivery) => delivery.status === "completed"),
+    );
+    const firstSession = store.activeProviderSession("chief")?.externalSessionId;
+    if (!firstSession) throw new Error("The Codex session did not start.");
+
+    service.refreshAllAgentRuntimes();
+
+    await service.sendMessage({ agentId: "chief", text: "Continue." });
+    await waitFor(() =>
+      service?.listQueue("chief").deliveries.every((delivery) => ["completed", "failed"].includes(delivery.status)),
+    );
+    expect(store.activeProviderSession("chief")?.externalSessionId).not.toBe(firstSession);
+    expect(client.releasedThreads).toEqual([firstSession]);
+  });
+
+  // Two rows on one URL are one account to the server: removing either row keeps the other's
+  // sign-in. Compared normalized, as the store keys it - a trailing slash names the same account.
+  it("keeps the shared sign-in until the last row on its URL is removed", async () => {
+    const { store, mailbox } = stores(root);
+    const forget = vi.fn(async (_url: string) => undefined);
+    service = createTestService({
+      store,
+      mailbox,
+      credentials: {
+        apiKey: () => null,
+        customProviders: () => [],
+        mcpServers: () => [],
+        mcpOAuth: {
+          accessToken: async () => null,
+          signIn: () => null,
+          forget,
+        },
+      },
+    });
+    await service.initialize();
+    const httpConfig = (name: string, url: string): McpServerConfig => ({
+      id: "",
+      name,
+      transport: "http",
+      enabled: true,
+      command: "",
+      args: [],
+      env: [],
+      envPassthrough: [],
+      workingDirectory: "",
+      url,
+      headers: [],
+    });
+    const [first] = service.saveMcpServer({ config: httpConfig("Stripe", "https://mcp.stripe.com") });
+    const [second] = service
+      .saveMcpServer({ config: httpConfig("Stripe copy", "https://mcp.stripe.com/") })
+      .filter((config) => config.name === "Stripe copy");
+    if (!first || !second) throw new Error("The Stripe rows were not saved.");
+
+    service.removeMcpServer({ mcpServerId: first.id });
+    expect(forget).not.toHaveBeenCalled();
+
+    service.removeMcpServer({ mcpServerId: second.id });
+    expect(forget).toHaveBeenCalledTimes(1);
+    expect(forget).toHaveBeenCalledWith("https://mcp.stripe.com/");
+  });
+
   it("starts a fresh provider session for the next turn after an MCP server changes", async () => {
     const { store, mailbox } = stores(root);
     const client = new FakeAgentClient("codex", "CODEX_DONE", true, true);
@@ -392,7 +700,9 @@ describe.sequential("AgentService: providers", () => {
     });
     await service.initialize();
     await service.sendMessage({ agentId: "chief", text: "Start." });
-    await waitFor(() => service?.listQueue("chief").deliveries.every((delivery) => delivery.status === "completed"));
+    await waitForQueue(service, "chief", (queue) =>
+      queue.deliveries.every((delivery) => delivery.status === "completed"),
+    );
     const firstSession = store.activeProviderSession("chief")?.externalSessionId;
 
     service.saveMcpServer({
@@ -439,16 +749,93 @@ describe.sequential("AgentService: providers", () => {
     // `Database` is left out: the Codex configuration shape for a working directory is unconfirmed,
     // and a server told to open `./data.db` from the wrong place creates a second database.
     expect(paramsRecord(starts[1]?.params)?.config).toEqual({
+      tools: CODEX_TOOLS,
       mcp_servers: { Filesystem: { command: "/bin/echo", args: ["ready"], env: await launchEnvironment() } },
     });
   });
 
-  // The same refresh asks one question of each thread: is a turn running on it. `readConversation`
-  // answers that too, but it loads and parses every message of the thread to do it, so a settings
-  // change would read the whole history of every agent on the main process and throw it away.
-  it("does not read a conversation to find whether a thread is busy", async () => {
+  // One append in `enabledMcpServers` is what gives Codex, Claude and the ACP providers the same
+  // Computer Use tools, so the Codex thread configuration proving it stands for all three. It also
+  // proves the name is not a reserved one: `usableMcpServers` drops those on the way out.
+  it("hands the provider the Computer Use entry while the driver runs, and nothing when it stops", async () => {
     const { store, mailbox } = stores(root);
     const client = new FakeAgentClient("codex", "CODEX_DONE", true, true);
+    let driverRunning = true;
+    service = createTestService({
+      store,
+      mailbox,
+      preferredProvider: "codex",
+      clientFactory: () => client,
+      computerUseMcpServer: () =>
+        driverRunning
+          ? {
+              id: COMPUTER_USE_MCP_SERVER_ID,
+              name: COMPUTER_USE_MCP_SERVER_NAME,
+              transport: "stdio",
+              enabled: true,
+              command: "/opt/cua/bin/cua-driver",
+              args: ["mcp", "--socket", "/tmp/openbot-test.sock"],
+              env: [{ key: "CUA_DRIVER_EMBEDDED", value: "1" }],
+              envPassthrough: [],
+              workingDirectory: "",
+              url: "",
+              headers: [],
+            }
+          : null,
+    });
+    await service.initialize();
+
+    expect(service.enabledMcpServers().map((entry) => entry.name)).toEqual([COMPUTER_USE_MCP_SERVER_NAME]);
+    await service.sendMessage({ agentId: "chief", text: "Start." });
+    await waitForQueue(service, "chief", (queue) =>
+      queue.deliveries.every((delivery) => delivery.status === "completed"),
+    );
+    const [start] = client.requests.filter((request) => request.method === "thread/start");
+    expect(paramsRecord(start?.params)?.config).toEqual({
+      tools: CODEX_TOOLS,
+      mcp_servers: {
+        [COMPUTER_USE_MCP_SERVER_NAME]: {
+          command: "/opt/cua/bin/cua-driver",
+          args: ["mcp", "--socket", "/tmp/openbot-test.sock"],
+          env: await launchEnvironment({ CUA_DRIVER_EMBEDDED: "1" }),
+        },
+      },
+    });
+
+    // The user turns Computer Use off for this agent. Codex ignores MCP changes on resume, so the
+    // session must be replaced without the server.
+    await service.updateAgent({ agentId: "chief", computerUse: false });
+    await service.sendMessage({ agentId: "chief", text: "Continue." });
+    await waitForQueue(service, "chief", (queue) =>
+      queue.deliveries.every((delivery) => delivery.status === "completed"),
+    );
+    const restart = paramsRecord(client.requests.filter((request) => request.method === "thread/start")[1]?.params);
+    expect(restart?.config).toEqual({ tools: CODEX_TOOLS });
+    expect(restart?.developerInstructions).toContain("The user turned Computer Use off for you.");
+
+    driverRunning = false;
+    expect(service.enabledMcpServers()).toEqual([]);
+  });
+
+  /*
+   * The second door. Codex merges the servers of `~/.codex/config.toml` into the set it is given,
+   * so a name there reaches an agent without passing the MCP panel, and two computers holding the
+   * same OpenBot settings answer "which servers does my agent have" differently.
+   *
+   * The replacement half is not decoration: nothing tells OpenBot that the file changed, Codex
+   * ignores MCP configuration on resume, and a session that keeps the old set makes the panel a
+   * lie until the app restarts.
+   */
+  it("turns off the MCP servers Codex declares in its own file, and replaces a session when they change", async () => {
+    const { store, mailbox } = stores(root);
+    const client = new FakeAgentClient("codex", "CODEX_DONE", true, true);
+    // `Filesystem` is in both places, and the panel's entry is the one that wins: a name the user
+    // can see and edit must not resolve to a command from a file OpenBot does not show.
+    client.configRead = {
+      config: {
+        mcp_servers: { "Local notes": { command: "/usr/bin/notes" }, Filesystem: { command: "/usr/bin/other" } },
+      },
+    };
     service = createTestService({
       store,
       mailbox,
@@ -456,12 +843,6 @@ describe.sequential("AgentService: providers", () => {
       clientFactory: () => client,
     });
     await service.initialize();
-    await service.sendMessage({ agentId: "chief", text: "Start." });
-    await waitFor(() => service?.listQueue("chief").deliveries.every((delivery) => delivery.status === "completed"));
-    const firstSession = store.activeProviderSession("chief")?.externalSessionId;
-
-    const readConversation = vi.spyOn(store.database, "readConversation");
-    const readActiveTurnId = vi.spyOn(store.database, "readActiveTurnId");
     service.saveMcpServer({
       config: {
         id: "",
@@ -477,18 +858,38 @@ describe.sequential("AgentService: providers", () => {
         headers: [],
       },
     });
-    // The refresh did reach the question - otherwise the first expectation would pass on a path that
-    // never ran - and it answered it from the thread row alone.
-    expect(readActiveTurnId).toHaveBeenCalled();
-    expect(readConversation).not.toHaveBeenCalled();
-    readConversation.mockRestore();
-    readActiveTurnId.mockRestore();
+    await service.sendMessage({ agentId: "chief", text: "Start." });
+    await waitForQueue(service, "chief", (queue) =>
+      queue.deliveries.every((delivery) => delivery.status === "completed"),
+    );
+    const firstSession = store.activeProviderSession("chief")?.externalSessionId;
+    if (!firstSession) throw new Error("The Codex session did not start.");
+    const starts = () => client.requests.filter((request) => request.method === "thread/start");
+    // The file's own name carries no command, which is what turning it off means, and OpenBot's
+    // entry is whole.
+    expect(paramsRecord(starts().at(-1)?.params)?.config).toEqual({
+      tools: CODEX_TOOLS,
+      mcp_servers: {
+        "Local notes": { enabled: false },
+        Filesystem: { command: "/bin/echo", args: ["ready"], env: await launchEnvironment() },
+      },
+    });
 
+    client.configRead = {
+      config: {
+        mcp_servers: { "Local notes": { command: "/usr/bin/notes" }, Scratch: { command: "/usr/bin/scratch" } },
+      },
+    };
     await service.sendMessage({ agentId: "chief", text: "Continue." });
     await waitFor(() =>
       service?.listQueue("chief").deliveries.every((delivery) => ["completed", "failed"].includes(delivery.status)),
     );
     expect(store.activeProviderSession("chief")?.externalSessionId).not.toBe(firstSession);
+    expect(client.releasedThreads).toEqual([firstSession]);
+    expect(starts()).toHaveLength(2);
+    expect(paramsRecord(starts().at(-1)?.params)?.config).toMatchObject({
+      mcp_servers: { "Local notes": { enabled: false }, Scratch: { enabled: false } },
+    });
   });
 
   // The queue keeps a failed delivery's reason in the database and shows it again in the app, so a
@@ -522,7 +923,7 @@ describe.sequential("AgentService: providers", () => {
     });
 
     await service.sendMessage({ agentId: "chief", text: "Start." });
-    await waitFor(() => service?.listQueue("chief").deliveries.some((delivery) => delivery.status === "failed"));
+    await waitForQueue(service, "chief", (queue) => queue.deliveries.some((delivery) => delivery.status === "failed"));
     const failed = service.listQueue("chief").deliveries.find((delivery) => delivery.status === "failed");
     expect(failed?.error).toBe("Rejected ••• from Filesystem.");
   });
@@ -560,7 +961,9 @@ describe.sequential("AgentService: providers", () => {
     });
     await service.initialize();
     await service.sendMessage({ agentId: "chief", text: "Start." });
-    await waitFor(() => service?.listQueue("chief").deliveries.every((delivery) => delivery.status === "completed"));
+    await waitForQueue(service, "chief", (queue) =>
+      queue.deliveries.every((delivery) => delivery.status === "completed"),
+    );
     const firstSession = store.activeProviderSession("chief")?.externalSessionId;
 
     await service.sendMessage({ agentId: "chief", text: "Continue." });
@@ -575,6 +978,7 @@ describe.sequential("AgentService: providers", () => {
     const starts = client.requests.filter((request) => request.method === "thread/start");
     expect(starts).toHaveLength(2);
     expect(paramsRecord(starts[1]?.params)?.config).toEqual({
+      tools: CODEX_TOOLS,
       mcp_servers: { Filesystem: { command: "/bin/echo", args: ["ready"], env: await launchEnvironment() } },
     });
   });
@@ -614,7 +1018,9 @@ describe.sequential("AgentService: providers", () => {
 
     await service.sendMessage({ agentId: "chief", text: "Start." });
     // Completed, not left running: the turn that was starting still owns its routing.
-    await waitFor(() => service?.listQueue("chief").deliveries.every((delivery) => delivery.status === "completed"));
+    await waitForQueue(service, "chief", (queue) =>
+      queue.deliveries.every((delivery) => delivery.status === "completed"),
+    );
     const firstSession = store.activeProviderSession("chief")?.externalSessionId;
     expect(client.releasedThreads).toEqual([]);
 
@@ -636,7 +1042,7 @@ describe.sequential("AgentService: providers", () => {
     const client = new FakeAgentClient("codex", "CODEX_DONE", true, true, {}, async (method) => {
       if (method !== "turn/start" || timedOut) return;
       timedOut = true;
-      throw new Error("Codex request timed out: turn/start");
+      throw new RequestTimeoutError("Codex", "turn/start");
     });
     service = createTestService({
       store,
@@ -680,7 +1086,9 @@ describe.sequential("AgentService: providers", () => {
       notification("turn/completed", { threadId: session, turn: { id: turnId, status: "completed" } }),
     );
 
-    await waitFor(() => service?.listQueue("chief").deliveries.every((delivery) => delivery.status === "completed"));
+    await waitForQueue(service, "chief", (queue) =>
+      queue.deliveries.every((delivery) => delivery.status === "completed"),
+    );
   });
 
   // The manifest is the only record that survives a restart, and the in-memory refresh mark does
@@ -720,7 +1128,9 @@ describe.sequential("AgentService: providers", () => {
     };
     service = await start();
     await service.sendMessage({ agentId: "chief", text: "Start." });
-    await waitFor(() => service?.listQueue("chief").deliveries.every((delivery) => delivery.status === "completed"));
+    await waitForQueue(service, "chief", (queue) =>
+      queue.deliveries.every((delivery) => delivery.status === "completed"),
+    );
     const firstSession = store.activeProviderSession("chief")?.externalSessionId;
 
     // The restart drops the held refresh, so the manifest alone decides whether the session is kept.
@@ -735,8 +1145,34 @@ describe.sequential("AgentService: providers", () => {
     const starts = client.requests.filter((request) => request.method === "thread/start");
     expect(starts).toHaveLength(2);
     expect(paramsRecord(starts[1]?.params)?.config).toEqual({
+      tools: CODEX_TOOLS,
       mcp_servers: { Filesystem: { command: "/bin/echo", args: ["ready"], env: await launchEnvironment() } },
     });
+  });
+
+  // Windows cannot remove a workspace that a live provider process still uses (`EBUSY`), so the
+  // deletion closes the agent's sessions before it removes any file.
+  it("closes the agent's provider sessions before it removes the agent's files", async () => {
+    const { store, mailbox } = stores(root);
+    const client = new FakeAgentClient("codex");
+    service = createTestService({ store, mailbox, preferredProvider: "codex", clientFactory: () => client });
+    await service.initialize();
+    await service.sendMessage({ agentId: "chief", text: "Start." });
+    await waitForQueue(service, "chief", (queue) =>
+      queue.deliveries.every((delivery) => delivery.status === "completed"),
+    );
+    const session = store.activeProviderSession("chief")?.externalSessionId;
+    if (!session) throw new Error("The Codex session did not start.");
+    const removeFiles = store.deleteAgent.bind(store);
+    let releasedAtRemoval: string[] = [];
+    vi.spyOn(store, "deleteAgent").mockImplementationOnce(async (id) => {
+      releasedAtRemoval = [...client.releasedThreads];
+      return removeFiles(id);
+    });
+
+    await service.deleteAgent("chief");
+    expect(releasedAtRemoval).toEqual([session]);
+    expect(service.listAgents().some((agent) => agent.id === "chief")).toBe(false);
   });
 
   it("deletes unloaded pending handoffs for active and retired sessions with their agent", async () => {
@@ -757,7 +1193,9 @@ describe.sequential("AgentService: providers", () => {
     };
     service = await start();
     await service.sendMessage({ agentId: "chief", text: "Private conversation to remove with this agent." });
-    await waitFor(() => service?.listQueue("chief").deliveries.every((delivery) => delivery.status === "completed"));
+    await waitForQueue(service, "chief", (queue) =>
+      queue.deliveries.every((delivery) => delivery.status === "completed"),
+    );
     const manifests = join(store.database.userDataPath, "provider-toolsets");
     const handoffs = join(store.database.userDataPath, "provider-handoffs");
     rejectTurn = true;
@@ -788,17 +1226,15 @@ describe.sequential("AgentService: providers", () => {
   });
 
   it("removes private handoff files immediately when replacement session binding fails", async () => {
-    const { store, mailbox } = stores(root);
-    const client = new FakeAgentClient("codex");
-    service = createTestService({
-      store,
-      mailbox,
+    const { service: agentService, store } = await startService(root, {
+      provider: "codex",
       preferredProvider: "codex",
-      clientFactory: () => client,
     });
-    await service.initialize();
+    service = agentService;
     await service.sendMessage({ agentId: "chief", text: "Private history for the replacement session." });
-    await waitFor(() => service?.listQueue("chief").deliveries.every((delivery) => delivery.status === "completed"));
+    await waitForQueue(service, "chief", (queue) =>
+      queue.deliveries.every((delivery) => delivery.status === "completed"),
+    );
     const original = store.activeProviderSession("chief")?.externalSessionId;
     const manifests = join(store.database.userDataPath, "provider-toolsets");
     const recorded = await readdir(manifests);
@@ -808,7 +1244,9 @@ describe.sequential("AgentService: providers", () => {
     });
     try {
       await service.sendMessage({ agentId: "chief", text: "Continue with new tools." });
-      await waitFor(() => service?.listQueue("chief").deliveries.some((delivery) => delivery.status === "failed"));
+      await waitForQueue(service, "chief", (queue) =>
+        queue.deliveries.some((delivery) => delivery.status === "failed"),
+      );
       expect(store.activeProviderSession("chief")?.externalSessionId).toBe(original);
       expect(await readdir(join(store.database.userDataPath, "provider-handoffs"))).toEqual([]);
       expect(await readdir(manifests)).toEqual(recorded);
@@ -874,14 +1312,95 @@ describe.sequential("AgentService: providers", () => {
     },
   );
 
-  it("moves an agent off a removed endpoint onto a model OpenCode still lists", async () => {
-    process.env.OPENBOT_OPENCODE_PATH = await createFakeOpencode(root);
+  /* Grok takes no sandbox per session. A Workspace only turn that reached the shared process would
+     run with full access, so the turn must go to the agent's own sandboxed process. */
+  it("runs a Workspace only Grok agent in a sandboxed process of its own, and back on the shared one", async () => {
+    process.env.OPENBOT_GROK_PATH = await createFakeGrok(root);
     const { store, mailbox } = stores(root);
+    const created: Array<{ client: FakeAgentClient; roots: readonly string[] | null }> = [];
     service = createTestService({
       store,
       mailbox,
-      preferredProvider: "opencode",
-      clientFactory: (provider) => {
+      preferredProvider: "grok",
+      clientFactory: (provider, _cli, confinement) => {
+        const client = new FakeAgentClient(provider);
+        created.push({ client, roots: confinement?.writableRoots ?? null });
+        return client;
+      },
+    });
+    await service.initialize();
+    await store.getOrCreate("chief");
+    const agent = await service.updateAgent({
+      agentId: "chief",
+      provider: "grok",
+      model: "grok-4.5",
+      access: "workspace",
+    });
+    const turnStarts = (client: FakeAgentClient | undefined) =>
+      client?.requests.filter((request) => request.method === "turn/start").length ?? 0;
+    const sharedStarts = () =>
+      created
+        .filter((entry) => entry.roots === null && entry.client.provider === "grok")
+        .reduce((count, entry) => count + turnStarts(entry.client), 0);
+
+    await service.sendMessage({ agentId: "chief", text: "Write a file." });
+    await waitForQueue(service, "chief", (queue) =>
+      queue.deliveries.every((delivery) => delivery.status === "completed"),
+    );
+    const own = created.find((entry) => entry.roots !== null);
+    expect(own?.roots).toEqual([agent.workspacePath, store.sharedRoot]);
+    expect(turnStarts(own?.client)).toBe(1);
+    expect(sharedStarts()).toBe(0);
+
+    await service.updateAgent({ agentId: "chief", access: "full" });
+    await service.sendMessage({ agentId: "chief", text: "Again." });
+    await waitForQueue(service, "chief", (queue) =>
+      queue.deliveries.every((delivery) => delivery.status === "completed"),
+    );
+    expect(sharedStarts()).toBe(1);
+    expect(own?.client.running).toBe(false);
+  });
+
+  it("keeps the turn of a Workspace only agent when the shared Grok process exits", async () => {
+    process.env.OPENBOT_GROK_PATH = await createFakeGrok(root);
+    const { store, mailbox } = stores(root);
+    const created: Array<{ client: FakeAgentClient; confined: boolean }> = [];
+    service = createTestService({
+      store,
+      mailbox,
+      preferredProvider: "grok",
+      clientFactory: (provider, _cli, confinement) => {
+        const client = new FakeAgentClient(provider, undefined, false);
+        if (confinement) client.sessionIdPrefix = "grok-own";
+        created.push({ client, confined: confinement !== undefined });
+        return client;
+      },
+    });
+    await service.initialize();
+    await store.getOrCreate("chief");
+    await store.getOrCreate("helper");
+    await service.updateAgent({ agentId: "chief", provider: "grok", model: "grok-4.5", access: "workspace" });
+    await service.updateAgent({ agentId: "helper", provider: "grok", model: "grok-4.5" });
+    await service.sendMessage({ agentId: "chief", text: "Long work." });
+    await service.sendMessage({ agentId: "helper", text: "Long work." });
+    for (const agentId of ["chief", "helper"]) {
+      await waitForQueue(service, agentId, (queue) => queue.deliveries[0]?.status === "running");
+    }
+    const shared = created.find(
+      (entry) => !entry.confined && entry.client.requests.some((request) => request.method === "turn/start"),
+    );
+
+    shared?.client.emit("exit", new Error("Grok exited."));
+
+    // The helper's turn ran on the shared process, so its end shows that recovery has run.
+    await waitForQueue(service, "helper", (queue) => queue.deliveries[0]?.status === "interrupted");
+    expect(service.listQueue("chief").deliveries[0]?.status).toBe("running");
+  });
+
+  it("moves an agent off a removed endpoint onto a model OpenCode still lists", async () => {
+    process.env.OPENBOT_OPENCODE_PATH = await createFakeOpencode(root);
+    const { service: agentService, store } = await startService(root, {
+      client: (provider) => {
         const client = new FakeAgentClient(provider);
         // OpenCode reports a custom endpoint's model as `<endpoint id>/<model id>`, beside its own.
         if (provider === "opencode") {
@@ -889,8 +1408,9 @@ describe.sequential("AgentService: providers", () => {
         }
         return client;
       },
+      preferredProvider: "opencode",
     });
-    await service.initialize();
+    service = agentService;
     await store.getOrCreate("chief");
     await service.updateAgent({ agentId: "chief", provider: "opencode", model: "lmstudio/local-llm" });
 
@@ -905,16 +1425,35 @@ describe.sequential("AgentService: providers", () => {
     });
   });
 
+  it("moves an agent onto the provider default when its CLI stops listing the agent's model", async () => {
+    let listed = ["gpt-6-luna", "gpt-5.6-sol"];
+    const { service: agentService, store } = await startService(root, {
+      client: (provider) => {
+        const client = new FakeAgentClient(provider);
+        if (provider === "codex") client.modelList = () => ({ data: listed.map((model) => ({ model })) });
+        return client;
+      },
+      preferredProvider: "codex",
+    });
+    service = agentService;
+    await store.getOrCreate("chief");
+    await service.updateAgent({ agentId: "chief", provider: "codex", model: "gpt-5.6-sol" });
+
+    listed = ["gpt-6-luna"];
+    await service.stop();
+    await service.initialize();
+
+    // The provider stays, so the agent keeps its thread; only the model it can no longer run changes.
+    await waitFor(() => service?.listAgents().find((agent) => agent.id === "chief")?.model === "gpt-6-luna");
+    expect(service.listAgents().find((agent) => agent.id === "chief")).toMatchObject({ provider: "codex" });
+  });
+
   // The catalogue is the running CLI's answer, and a removal during a turn does not restart it. The
   // models of an endpoint already removed are therefore still listed, and must not be chosen.
   it("never falls back onto an endpoint removed earlier in the same OpenCode process", async () => {
     process.env.OPENBOT_OPENCODE_PATH = await createFakeOpencode(root);
-    const { store, mailbox } = stores(root);
-    service = createTestService({
-      store,
-      mailbox,
-      preferredProvider: "opencode",
-      clientFactory: (provider) => {
+    const { service: agentService, store } = await startService(root, {
+      client: (provider) => {
         const client = new FakeAgentClient(provider);
         // Two endpoints and no OpenCode model of its own, so the fallback for one removal is the other
         // endpoint, and the fallback for the second removal must leave OpenCode altogether.
@@ -923,8 +1462,9 @@ describe.sequential("AgentService: providers", () => {
         }
         return client;
       },
+      preferredProvider: "opencode",
     });
-    await service.initialize();
+    service = agentService;
     await service.ensureProvider("codex");
     await store.getOrCreate("chief");
     await service.updateAgent({ agentId: "chief", provider: "opencode", model: "studio/local-llm" });
@@ -947,19 +1487,16 @@ describe.sequential("AgentService: providers", () => {
     process.env.OPENBOT_OPENCODE_PATH = await createFakeOpencode(root);
     // No Codex CLI, so the built-in fallback reports `not-installed` and connecting to it throws.
     process.env.OPENBOT_CODEX_PATH = join(root, "absent-codex");
-    const { store, mailbox } = stores(root);
-    service = createTestService({
-      store,
-      mailbox,
-      preferredProvider: "opencode",
-      clientFactory: (provider) => {
+    const { service: agentService, store } = await startService(root, {
+      client: (provider) => {
         const client = new FakeAgentClient(provider);
         // Every OpenCode model belongs to the endpoint being removed, so there is nothing to move to.
         if (provider === "opencode") client.modelList = () => ({ data: [{ model: "lmstudio/local-llm" }] });
         return client;
       },
+      preferredProvider: "opencode",
     });
-    await service.initialize();
+    service = agentService;
     await store.getOrCreate("chief");
     await service.updateAgent({ agentId: "chief", provider: "opencode", model: "lmstudio/local-llm" });
 
@@ -975,7 +1512,7 @@ describe.sequential("AgentService: providers", () => {
     // The running OpenCode process still serves the removed endpoint, with the credentials it
     // started with, so a later message must not reach it.
     await service.sendMessage({ agentId: "chief", text: "Keep working" });
-    await waitFor(() => service?.listQueue("chief").deliveries.some((delivery) => delivery.status === "failed"));
+    await waitForQueue(service, "chief", (queue) => queue.deliveries.some((delivery) => delivery.status === "failed"));
     expect(service.listQueue("chief").deliveries.at(-1)?.error).toBe(
       "The endpoint this agent used was removed. Choose another model for it.",
     );
@@ -985,20 +1522,17 @@ describe.sequential("AgentService: providers", () => {
   // next removal may still move agents onto it.
   it("keeps an endpoint selectable when its own removal was never written", async () => {
     process.env.OPENBOT_OPENCODE_PATH = await createFakeOpencode(root);
-    const { store, mailbox } = stores(root);
-    service = createTestService({
-      store,
-      mailbox,
-      preferredProvider: "opencode",
-      clientFactory: (provider) => {
+    const { service: agentService, store } = await startService(root, {
+      client: (provider) => {
         const client = new FakeAgentClient(provider);
         if (provider === "opencode") {
           client.modelList = () => ({ data: [{ model: "studio/local-llm" }, { model: "house/router-llm" }] });
         }
         return client;
       },
+      preferredProvider: "opencode",
     });
-    await service.initialize();
+    service = agentService;
     await service.ensureProvider("codex");
     await store.getOrCreate("chief");
     await service.updateAgent({ agentId: "chief", provider: "opencode", model: "studio/local-llm" });
@@ -1023,20 +1557,17 @@ describe.sequential("AgentService: providers", () => {
   // it after the file that defines it is gone.
   it("hides a removed endpoint's models from the catalogue and from selection", async () => {
     process.env.OPENBOT_OPENCODE_PATH = await createFakeOpencode(root);
-    const { store, mailbox } = stores(root);
-    service = createTestService({
-      store,
-      mailbox,
-      preferredProvider: "opencode",
-      clientFactory: (provider) => {
+    const { service: agentService, store } = await startService(root, {
+      client: (provider) => {
         const client = new FakeAgentClient(provider);
         if (provider === "opencode") {
           client.modelList = () => ({ data: [{ model: "studio/local-llm" }, { model: "house/router-llm" }] });
         }
         return client;
       },
+      preferredProvider: "opencode",
     });
-    await service.initialize();
+    service = agentService;
     await store.getOrCreate("chief");
     expect(service.listModels().map((model) => model.id)).toContain("studio/local-llm");
 
@@ -1059,20 +1590,17 @@ describe.sequential("AgentService: providers", () => {
   // would leave one agent on the endpoint that the removal has already finished with.
   it("refuses a model of an endpoint whose removal is still running", async () => {
     process.env.OPENBOT_OPENCODE_PATH = await createFakeOpencode(root);
-    const { store, mailbox } = stores(root);
-    service = createTestService({
-      store,
-      mailbox,
-      preferredProvider: "opencode",
-      clientFactory: (provider) => {
+    const { service: agentService, store } = await startService(root, {
+      client: (provider) => {
         const client = new FakeAgentClient(provider);
         if (provider === "opencode") {
           client.modelList = () => ({ data: [{ model: "studio/local-llm" }, { model: "house/router-llm" }] });
         }
         return client;
       },
+      preferredProvider: "opencode",
     });
-    await service.initialize();
+    service = agentService;
     await store.getOrCreate("chief");
     await service.updateAgent({ agentId: "chief", provider: "opencode", model: "house/router-llm" });
 
@@ -1220,20 +1748,17 @@ describe.sequential("AgentService: providers", () => {
 
   it("keeps an endpoint out while its removal is still being written", async () => {
     process.env.OPENBOT_OPENCODE_PATH = await createFakeOpencode(root);
-    const { store, mailbox } = stores(root);
-    service = createTestService({
-      store,
-      mailbox,
-      preferredProvider: "opencode",
-      clientFactory: (provider) => {
+    const { service: agentService } = await startService(root, {
+      client: (provider) => {
         const client = new FakeAgentClient(provider);
         if (provider === "opencode") {
           client.modelList = () => ({ data: [{ model: "studio/local-llm" }, { model: "house/router-llm" }] });
         }
         return client;
       },
+      preferredProvider: "opencode",
     });
-    await service.initialize();
+    service = agentService;
 
     // The file write is held, so the saved endpoints are still the ones a process spawning now reads.
     let releaseWrite: () => void = () => undefined;
@@ -1296,7 +1821,7 @@ describe.sequential("AgentService: providers", () => {
     await service.removeCustomProvider("lmstudio", async () => undefined);
     releasePreparing();
 
-    await waitFor(() => service?.listQueue("chief").deliveries.some((delivery) => delivery.status === "failed"));
+    await waitForQueue(service, "chief", (queue) => queue.deliveries.some((delivery) => delivery.status === "failed"));
     expect(service.listQueue("chief").deliveries.at(-1)?.error).toBe(
       "The endpoint this agent used was removed. Choose another model for it.",
     );
@@ -1484,20 +2009,17 @@ describe.sequential("AgentService: providers", () => {
   // that read the save answers, those models belong to the old URL, not to the endpoint just saved.
   it("keeps a saved id out until a process that read the save answers", async () => {
     process.env.OPENBOT_OPENCODE_PATH = await createFakeOpencode(root);
-    const { store, mailbox } = stores(root);
-    service = createTestService({
-      store,
-      mailbox,
-      preferredProvider: "opencode",
-      clientFactory: (provider) => {
+    const { service: agentService, store } = await startService(root, {
+      client: (provider) => {
         const client = new FakeAgentClient(provider);
         if (provider === "opencode") {
           client.modelList = () => ({ data: [{ model: "studio/local-llm" }, { model: "house/router-llm" }] });
         }
         return client;
       },
+      preferredProvider: "opencode",
     });
-    await service.initialize();
+    service = agentService;
     await store.getOrCreate("chief");
     await service.updateAgent({ agentId: "chief", provider: "opencode", model: "house/router-llm" });
 
@@ -1513,20 +2035,17 @@ describe.sequential("AgentService: providers", () => {
   // An id saved again is served again, whatever the CLI did with the removal before it.
   it("offers an endpoint's models again after the id is saved a second time", async () => {
     process.env.OPENBOT_OPENCODE_PATH = await createFakeOpencode(root);
-    const { store, mailbox } = stores(root);
-    service = createTestService({
-      store,
-      mailbox,
-      preferredProvider: "opencode",
-      clientFactory: (provider) => {
+    const { service: agentService, store } = await startService(root, {
+      client: (provider) => {
         const client = new FakeAgentClient(provider);
         if (provider === "opencode") {
           client.modelList = () => ({ data: [{ model: "studio/local-llm" }, { model: "house/router-llm" }] });
         }
         return client;
       },
+      preferredProvider: "opencode",
     });
-    await service.initialize();
+    service = agentService;
     await service.ensureProvider("codex");
     await store.getOrCreate("chief");
     await service.updateAgent({ agentId: "chief", provider: "opencode", model: "house/router-llm" });
@@ -1720,9 +2239,8 @@ describe.sequential("AgentService: providers", () => {
   });
 
   it("creates a bounded runtime snapshot for reconnecting clients", async () => {
-    const { store, mailbox } = stores(root);
-    service = createTestService({ store, mailbox });
-    await service.initialize();
+    const { service: agentService, store } = await startService(root);
+    service = agentService;
     await store.getOrCreate("chief");
 
     expect(service.getRuntimeSnapshot()).toMatchObject({
@@ -1740,9 +2258,8 @@ describe.sequential("AgentService: providers", () => {
   });
 
   it("resolves only regular files inside the shared directory", async () => {
-    const { store, mailbox } = stores(root);
-    service = createTestService({ store, mailbox });
-    await service.initialize();
+    const { service: agentService, store } = await startService(root);
+    service = agentService;
 
     const nested = join(store.sharedRoot, "nested");
     const sharedFile = join(nested, "report.csv");
@@ -1763,9 +2280,8 @@ describe.sequential("AgentService: providers", () => {
   });
 
   it("opens a historical routine message that only exists in the mailbox", async () => {
-    const { store, mailbox } = stores(root);
-    service = createTestService({ store, mailbox });
-    await service.initialize();
+    const { service: agentService, store, mailbox } = await startService(root);
+    service = agentService;
     await store.getOrCreate("chief");
     await store.ensureThreadId("chief");
     const receipt = await mailbox.enqueue({
@@ -1795,9 +2311,8 @@ describe.sequential("AgentService: providers", () => {
   });
 
   it("resolves only regular files inside the selected agent workspace", async () => {
-    const { store, mailbox } = stores(root);
-    service = createTestService({ store, mailbox });
-    await service.initialize();
+    const { service: agentService, store } = await startService(root);
+    service = agentService;
 
     const agent = await store.createAgent(CREATE_AGENT_INPUT);
     const appDirectory = join(agent.workspacePath, "app");
@@ -1853,19 +2368,17 @@ describe.sequential("AgentService: providers", () => {
     const source = join(root, "start-types.d.ts");
     await writeFile(source, "export type Start = true;\n");
     const clients = new Map<AgentProvider, FakeAgentClient>();
-    const { store, mailbox } = stores(root);
-    service = createTestService({
-      store,
-      mailbox,
-      preferredProvider: "codex",
-      clientFactory: (provider) => {
+    const { service: agentService } = await startService(root, {
+      client: (provider) => {
         const client = new FakeAgentClient(provider);
         clients.set(provider, client);
         return client;
       },
+      preferredProvider: "codex",
     });
-    await service.initialize();
+    service = agentService;
     const [draft] = await service.prepareAttachments([source]);
+    assert(draft);
 
     await service.sendMessage({
       agentId: "chief",
@@ -1882,18 +2395,15 @@ describe.sequential("AgentService: providers", () => {
 
   it("expands agent and skill tags before sending text to the agent", async () => {
     const clients = new Map<AgentProvider, FakeAgentClient>();
-    const { store, mailbox } = stores(root);
-    service = createTestService({
-      store,
-      mailbox,
-      preferredProvider: "codex",
-      clientFactory: (provider) => {
+    const { service: agentService, store } = await startService(root, {
+      client: (provider) => {
         const client = new FakeAgentClient(provider);
         clients.set(provider, client);
         return client;
       },
+      preferredProvider: "codex",
     });
-    await service.initialize();
+    service = agentService;
     await store.getOrCreate("research", "Research Lead", "Research partner");
 
     await service.sendMessage({
@@ -1908,9 +2418,8 @@ describe.sequential("AgentService: providers", () => {
   });
 
   it("creates independent full-access threads with browser and OpenBot tools", async () => {
-    const { store, mailbox } = stores(root);
-    service = createTestService({ store, mailbox });
-    await service.initialize();
+    const { service: agentService, store } = await startService(root);
+    service = agentService;
 
     expect(service.getStatus()).toMatchObject({
       phase: "ready",
@@ -1925,8 +2434,12 @@ describe.sequential("AgentService: providers", () => {
         { id: "claude", state: "error", version: null },
         { id: "grok", state: "not-installed", version: null },
         { id: "opencode", state: "not-installed", version: null },
+        { id: "antigravity", state: "not-installed", version: null },
+        { id: "acp", state: "not-installed", version: null },
       ],
-      capabilities: { chat: "ready", browser: "ready", computerUse: "ready" },
+      // Unavailable because no Computer Use driver was given to this service. It no longer follows
+      // from Codex being connected.
+      capabilities: { chat: "ready", browser: "ready", computerUse: "unavailable" },
     });
     await expect(service.getUsage()).resolves.toMatchObject({
       limits: [
@@ -1951,7 +2464,7 @@ describe.sequential("AgentService: providers", () => {
       const params = paramsRecord(start.params);
       if (!params) throw new Error("The fake thread request has no parameters.");
       expect(params).toMatchObject({
-        model: "gpt-5.6-luna",
+        model: "gpt-6-luna",
         approvalPolicy: "on-request",
         sandbox: "danger-full-access",
         ephemeral: false,
@@ -1965,8 +2478,8 @@ describe.sequential("AgentService: providers", () => {
         "You may list, read, create, edit, move, and delete files and run local commands in both directories.",
       );
       expect(params.developerInstructions).toContain("For every browser task");
-      expect(params.developerInstructions).toContain("Use the installed Computer Use plugin only");
-      expect(params.developerInstructions).toContain("When you use openbot_browser");
+      expect(params.developerInstructions).toContain(`Use ${COMPUTER_USE_MCP_SERVER_NAME} for every GUI task`);
+      expect(params.developerInstructions).toContain("openbot_browser.submit_secret");
       expect(params.developerInstructions).toContain("openbot.create_routine");
       expect(params.developerInstructions).toContain("Never use ChatGPT Sites");
       expect(params.developerInstructions).toContain("openbot.attach_files_to_response");
@@ -2002,6 +2515,7 @@ describe.sequential("AgentService: providers", () => {
               expect.objectContaining({ name: "list_agents" }),
               expect.objectContaining({ name: "update_profile" }),
               expect.objectContaining({ name: "create_agent" }),
+              expect.objectContaining({ name: "list_models" }),
               expect.objectContaining({ name: "list_sections" }),
               expect.objectContaining({ name: "create_section" }),
               expect.objectContaining({ name: "rename_section" }),
@@ -2029,7 +2543,7 @@ describe.sequential("AgentService: providers", () => {
       const params = paramsRecord(turn.params);
       if (!params) throw new Error("The fake turn request has no parameters.");
       expect(params).toMatchObject({
-        model: "gpt-5.6-luna",
+        model: "gpt-6-luna",
         effort: "low",
         approvalPolicy: "on-request",
         sandboxPolicy: { type: "dangerFullAccess" },
@@ -2042,18 +2556,15 @@ describe.sequential("AgentService: providers", () => {
   it("reads usage for the selected agent provider and prefers its model-specific bucket", async () => {
     process.env.OPENBOT_CLAUDE_PATH = await createFakeClaude(root);
     const clients = new Map<AgentProvider, FakeAgentClient>();
-    const { store, mailbox } = stores(root);
-    service = createTestService({
-      store,
-      mailbox,
-      preferredProvider: "codex",
-      clientFactory: (provider) => {
+    const { service: agentService, store } = await startService(root, {
+      client: (provider) => {
         const client = new FakeAgentClient(provider);
         clients.set(provider, client);
         return client;
       },
+      preferredProvider: "codex",
     });
-    await service.initialize();
+    service = agentService;
     await store.getOrCreate("chief");
     await service.updateAgent({ agentId: "chief", provider: "codex", model: "gpt-5.6-luna" });
     const codex = clients.get("codex");
@@ -2104,18 +2615,15 @@ describe.sequential("AgentService: providers", () => {
   it("reads account-wide usage from every connected provider", async () => {
     process.env.OPENBOT_CLAUDE_PATH = await createFakeClaude(root);
     const clients = new Map<AgentProvider, FakeAgentClient>();
-    const { store, mailbox } = stores(root);
-    service = createTestService({
-      store,
-      mailbox,
-      preferredProvider: "codex",
-      clientFactory: (provider) => {
+    const { service: agentService } = await startService(root, {
+      client: (provider) => {
         const client = new FakeAgentClient(provider);
         clients.set(provider, client);
         return client;
       },
+      preferredProvider: "codex",
     });
-    await service.initialize();
+    service = agentService;
     const codex = clients.get("codex");
     const claude = clients.get("claude");
     if (!codex || !claude) throw new Error("Test clients were not created.");
@@ -2164,19 +2672,16 @@ describe.sequential("AgentService: providers", () => {
       return { success: true, contentItems: [] };
     };
     const clients = new Map<AgentProvider, FakeAgentClient>();
-    const { store, mailbox } = stores(root);
-    service = createTestService({
-      store,
-      mailbox,
-      browser,
-      preferredProvider: "codex",
-      clientFactory: (provider) => {
+    const { service: agentService, store } = await startService(root, {
+      client: (provider) => {
         const client = new FakeAgentClient(provider);
         clients.set(provider, client);
         return client;
       },
+      browser,
+      preferredProvider: "codex",
     });
-    await service.initialize();
+    service = agentService;
     await service.sendMessage({ agentId: "chief", text: "Browse" });
     await waitFor(() => Boolean(store.activeProviderSession("chief")));
 

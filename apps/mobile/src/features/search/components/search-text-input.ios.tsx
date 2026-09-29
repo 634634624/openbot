@@ -1,12 +1,17 @@
-import { Host, TextInput } from "@expo/ui";
+import { Host, TextInput, type TextInputRef } from "@expo/ui";
 import { useNativeState } from "@expo/ui/swift-ui";
 import { useThemeColor } from "heroui-native/hooks";
 import { CircleX } from "lucide-react-native";
+import { useImperativeHandle, useRef } from "react";
 import { Pressable, View } from "react-native";
 
 import type { MobileSearchTextInputProps } from "@/features/search/components/search-text-input.types";
+import { useText } from "@/shared/lib/text";
 
-export function MobileSearchTextInput({ value, onChangeText }: MobileSearchTextInputProps) {
+export function MobileSearchTextInput({ ref, value, onChangeText }: MobileSearchTextInputProps) {
+  const { t } = useText();
+  const input = useRef<TextInputRef>(null);
+  useImperativeHandle(ref, () => ({ focus: () => input.current?.focus() }), []);
   const [foreground, muted, background] = useThemeColor(["foreground", "muted", "background"]);
   const nativeValue = useNativeState(value);
   const clear = () => {
@@ -18,10 +23,11 @@ export function MobileSearchTextInput({ value, onChangeText }: MobileSearchTextI
     <View className="h-8 min-w-0 flex-1 flex-row items-center">
       <Host ignoreSafeArea="all" style={{ flex: 1, height: 32 }}>
         <TextInput
+          ref={input}
           autoCapitalize="none"
           autoCorrect={false}
           autoFocus
-          placeholder="Search"
+          placeholder={t("common.search")}
           placeholderTextColor={muted}
           returnKeyType="search"
           selectionColor={foreground}
@@ -33,7 +39,7 @@ export function MobileSearchTextInput({ value, onChangeText }: MobileSearchTextI
       </Host>
       {value ? (
         <Pressable
-          accessibilityLabel="Clear search"
+          accessibilityLabel={t("mobile.search.clear")}
           accessibilityRole="button"
           className="size-8 items-center justify-center"
           hitSlop={6}

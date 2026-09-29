@@ -2,7 +2,9 @@ import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import type { AgentMemoryOrigin, MemoryEntry } from "@openbot/contracts/ipc";
-import { type DynamicRecord, isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
+import { type DynamicRecord, isString } from "@openbot/contracts/runtime-values";
+import { sourceText } from "@openbot/i18n/source";
+import { databaseRow, databaseRows, requiredStringColumn } from "./database/database-rows";
 import type { OpenBotDatabase } from "./openbot-database";
 
 /**
@@ -174,7 +176,7 @@ export class MemoryStore {
     }
 
     const previous = input.memoryId ? this.get(ownerId, input.memoryId) : null;
-    if (input.memoryId && !previous) throw new Error("This memory no longer exists.");
+    if (input.memoryId && !previous) throw new Error(sourceText("error.backend.memoryGone"));
     if (!previous && this.list(ownerId).length >= this.tables.limit) throw new Error(this.tables.limitMessage);
 
     const now = new Date().toISOString();
@@ -264,31 +266,12 @@ function forgetEventsBefore(db: DatabaseSync, aggregateType: string, memoryId: s
 
 function validateMemoryText(value: string): string {
   const text = value.trim();
-  if (!text) throw new Error("Memory text is required.");
-  if (text.length > INPUT_LIMITS.agentMemoryText) throw new Error("Memory text is too long.");
+  if (!text) throw new Error(sourceText("error.backend.memoryTextRequired"));
+  if (text.length > INPUT_LIMITS.agentMemoryText) throw new Error(sourceText("error.backend.memoryTextTooLong"));
   return text;
 }
 
 function normalizeMemoryText(value: string): string {
-  return value;
-}
-
-function databaseRow(value: unknown): DynamicRecord | null {
-  return isDynamicRecord(value) ? value : null;
-}
-
-function databaseRows(value: unknown): DynamicRecord[] {
-  if (!Array.isArray(value)) throw new Error("Invalid memory query result.");
-  return value.map((row) => {
-    const record = databaseRow(row);
-    if (!record) throw new Error("Invalid memory query row.");
-    return record;
-  });
-}
-
-function requiredStringColumn(row: DynamicRecord, key: string): string {
-  const value = row[key];
-  if (!isString(value)) throw new Error(`Invalid memory column ${key}.`);
   return value;
 }
 

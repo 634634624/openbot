@@ -1,13 +1,24 @@
 import type { AgentSummary, ConversationMessage, QueueDeliveryStatus } from "@openbot/contracts/ipc";
 import {
+  CONVERSATION_PLAN_ITEM_TYPE,
   hostedSiteConversationEvent,
+  isContextResetMarker,
+  parseConversationPlanText,
   routineConversationEvent,
   routineRunConversationEvent,
   skillConversationEvent,
 } from "@openbot/contracts/ipc";
-import type { AgentDeliveryMarkerStatus, AgentMessage, AgentProfile, ChatActionMarkerModel } from "./data";
+import type {
+  AgentDeliveryMarkerStatus,
+  AgentMessage,
+  AgentMessagePlan,
+  AgentProfile,
+  ChatActionMarkerModel,
+} from "@openbot/ui/data";
+import { formatChatTimestamp } from "@openbot/ui/features/conversation/chat-timestamp";
+import type { TaskListItem } from "@openbot/ui/features/conversation/TaskList";
+import { currentText } from "@openbot/ui/text";
 import { cleanAgentMessageText } from "./features/agents/agent-message-text";
-import { formatChatTimestamp } from "./features/conversation/chat-timestamp";
 import { isRoutineEventItem } from "./features/conversation/conversation-read-state";
 
 export function toAgentProfile(stored: AgentSummary): AgentProfile {
@@ -20,6 +31,8 @@ export function toAgentProfile(stored: AgentSummary): AgentProfile {
     provider: stored.provider,
     model: stored.model,
     reasoningEffort: stored.reasoningEffort,
+    access: stored.access,
+    computerUse: stored.computerUse,
     threadId: stored.threadId,
     workspacePath: stored.workspacePath,
     avatarSeed: stored.avatarSeed,
@@ -27,7 +40,7 @@ export function toAgentProfile(stored: AgentSummary): AgentProfile {
     avatarUrl: stored.avatarUrl,
     marketplaceSource: stored.marketplaceSource,
     updatedAt: stored.updatedAt,
-    time: stored.updatedAt ? formatTime(stored.updatedAt) : "now",
+    time: stored.updatedAt ? formatTime(stored.updatedAt) : currentText().t("chat.day.now"),
     preview: cleanPreview(stored.preview),
   };
 }
@@ -38,6 +51,7 @@ export function toAgentMessage(message: ConversationMessage, ownerAgentId?: stri
   const routineRunEvent = routineRunConversationEvent(message);
   const hostedSiteEvent = hostedSiteConversationEvent(message);
   const actionMarker = chatActionMarker(message, ownerAgentId, routineEvent, routineRunEvent, hostedSiteEvent);
+  const plan = messagePlan(message);
   return {
     id: message.id,
     turnId: message.turnId,
@@ -47,7 +61,7 @@ export function toAgentMessage(message: ConversationMessage, ownerAgentId?: stri
     createdAt: message.createdAt,
     streaming: message.status === "streaming",
     itemType: message.itemType,
-    kind: message.questionPrompt ? "question" : actionMarker ? "action-marker" : "text",
+    kind: message.questionPrompt ? "question" : actionMarker ? "action-marker" : plan ? "plan" : "text",
     senderAgentId: exchangeSenderId,
     replyToMessageId: message.replyToMessageId,
     attachments: message.attachments,
@@ -59,6 +73,7 @@ export function toAgentMessage(message: ConversationMessage, ownerAgentId?: stri
       message.reactions ?? (message.reaction ? [{ emoji: message.reaction, actor: { kind: "user" as const } }] : []),
     routine: message.routine,
     actionMarker: actionMarker ?? undefined,
+    plan: plan ?? undefined,
     status:
       message.exchange || message.routine
         ? undefined
@@ -72,6 +87,39 @@ export function toAgentMessage(message: ConversationMessage, ownerAgentId?: stri
                 ? "Stopped"
                 : undefined,
   };
+}
+
+/**
+ * The plan of a `plan` message. A peer on a released Team API protocol sends only the checklist
+ * text, so the plan is read back from it.
+ */
+export function messagePlan(message: ConversationMessage): AgentMessagePlan | null {
+  if (message.author !== "assistant" || message.itemType !== CONVERSATION_PLAN_ITEM_TYPE) return null;
+  const plan = message.plan ?? parseConversationPlanText(message.text);
+  if (!plan?.steps.length) return null;
+  return { ...plan, stopped: message.status === "interrupted" || message.status === "failed" };
+}
+
+/**
+ * The rows of a plan block. A step runs only while its turn runs: after the turn ends, a step that
+ * was not finished shows as not started.
+ */
+export function planItems(plan: AgentMessagePlan, streaming: boolean): TaskListItem[] {
+  return plan.steps.map((step) => {
+    const state =
+      step.status === "completed" ? "done" : step.status === "inProgress" && streaming ? "active" : "pending";
+    return { id: step.id, label: state === "active" ? (step.activeText ?? step.text) : step.text, state };
+  });
+}
+
+const PLAN_TITLE_LIMIT = 80;
+
+/** The header of a plan block: a short explanation, else "Tasks", or "Stopped" for a stopped plan. */
+export function planTitle(plan: AgentMessagePlan): string {
+  const { t } = currentText();
+  if (plan.stopped && plan.steps.some((step) => step.status !== "completed")) return t("chat.taskList.stopped");
+  if (plan.explanation && plan.explanation.length <= PLAN_TITLE_LIMIT) return plan.explanation;
+  return t("chat.taskList.title");
 }
 
 export function toAgentMessages(messages: ConversationMessage[], ownerAgentId?: string): AgentMessage[] {
@@ -126,6 +174,8 @@ export function agentProfilesEqual(left: AgentProfile, right: AgentProfile): boo
     left.provider === right.provider &&
     left.model === right.model &&
     left.reasoningEffort === right.reasoningEffort &&
+    left.access === right.access &&
+    left.computerUse === right.computerUse &&
     left.threadId === right.threadId &&
     left.avatarSeed === right.avatarSeed &&
     left.avatarHue === right.avatarHue &&
@@ -177,7 +227,8 @@ export function agentMessagesEqual(left: AgentMessage, right: AgentMessage): boo
     JSON.stringify(left.routine) === JSON.stringify(right.routine) &&
     JSON.stringify(left.actionMarker) === JSON.stringify(right.actionMarker) &&
     JSON.stringify(left.items) === JSON.stringify(right.items) &&
-    JSON.stringify(left.itemIds) === JSON.stringify(right.itemIds)
+    JSON.stringify(left.itemIds) === JSON.stringify(right.itemIds) &&
+    JSON.stringify(left.plan) === JSON.stringify(right.plan)
   );
 }
 
@@ -209,6 +260,7 @@ function chatActionMarker(
       expectsReply: message.exchange.expectsReply !== false,
     };
   }
+  if (isContextResetMarker(message)) return { kind: "context-reset", timestamp: message.createdAt };
   const skillEvent = skillConversationEvent(message);
   if (skillEvent) return { ...skillEvent, kind: "skill-lifecycle", timestamp: message.createdAt };
   if (routineEvent) {
@@ -259,7 +311,7 @@ function chatActionMarker(
     };
   }
   if (isRoutineEventItem(message)) {
-    return { kind: "unavailable", label: "Action unavailable", timestamp: message.createdAt };
+    return { kind: "unavailable", label: currentText().t("app.action.unavailable"), timestamp: message.createdAt };
   }
   return null;
 }
@@ -313,20 +365,19 @@ function cleanPreview(preview: string): string {
     .replace(/\binbox\s+at\s+zero\b[:,]?\s*/gi, "")
     .replace(/\s{2,}/g, " ")
     .trim();
-  return cleaned || "No messages yet";
+  return cleaned || currentText().t("app.agent.noMessages");
 }
 
-export function formatTime(value: string): string {
+function formatTime(value: string): string {
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "now";
-  return new Intl.DateTimeFormat(undefined, {
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(date);
+  const { t, format } = currentText();
+  if (Number.isNaN(date.getTime())) return t("chat.day.now");
+  return format.date(date, { hour: "2-digit", minute: "2-digit" });
 }
 
 export function formatMessageTime(value: string): string {
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "now";
-  return formatChatTimestamp(date);
+  const { t, format } = currentText();
+  if (Number.isNaN(date.getTime())) return t("chat.day.now");
+  return formatChatTimestamp(date, format);
 }

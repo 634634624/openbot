@@ -5,6 +5,30 @@ browser data, and team data stay on the computer that runs OpenBot. The optional
 service stores the minimum central data needed for email sign-in, account avatars, remote host
 configuration, memberships, invitations, and logical sessions.
 
+The optional browser client at `/app` connects to the computer that runs OpenBot. Conversation
+and attachment data travel through the existing encrypted host connection, not through the
+account Worker. The browser keeps chat pages, drafts, search results, and file previews in memory;
+it does not create a persistent offline chat cache. Files that the user downloads are saved by
+their browser. The host must stay online. An owner or admin can manage members and invitations from
+the browser; these requests go to the account Worker, as they do from the desktop app. A signed-in
+user can also change the display name and avatar and disconnect account sessions from the browser;
+these requests and the avatar image go to the same account Worker as from the desktop app. Host settings,
+such as MCP servers, travel through the encrypted host connection.
+To show each server's state, the browser also keeps a status connection to each host of the account
+that no tab has open, as the mobile app does; the host then shows the member as present. Host logos
+come from the account Worker to members of the host, and the browser can cache them.
+
+Browser email sign-in uses a persistent host-only `Secure`, `HttpOnly`, `SameSite=Lax` cookie.
+Browser JavaScript cannot read the account credential. Trusted host public keys are stored in
+local storage separately for each account. The shared file preview can also store its panel width.
+The sidebar stores pinned agent and channel ids, collapsed section ids, and the selected channel id
+for each account and host. The server rail stores the order of host ids for each account. It stores
+no message content.
+Signing out revokes that credential's remote sessions and tells other open tabs to clear private
+state. Host identity pins remain so a later sign-in cannot silently trust a replacement host key.
+The web client adds no chat or account analytics events. It does not send email codes, credentials,
+message content, file content, or search queries to telemetry.
+
 Production builds of OpenBot desktop, the configured mobile app, and the website use a self-hosted OpenPanel service for product
 analytics. Development builds, previews, tests, and Storybook do not send analytics.
 
@@ -24,6 +48,13 @@ names are not part of the analytics payload; the client shows them from the agen
 reads. These records are separate from product analytics and are not sent
 to OpenPanel or stored by the account service or Signal service. Conversation clearing retains usage;
 agent deletion removes it. A duplicate agent starts with no usage history.
+
+Authenticated members of a host team can also see that host's storage through the Team API: how
+much disk space each location, agent and chat uses, and the name, size, type, date and chat title of
+each sent or generated file. The response contains no file paths, and workspace and download files
+are counted only as totals. Only owners and admins can delete a file or clear caches and logs. A
+deleted file is removed from the host's disk; the message that sent it stays and shows that the file
+is not available.
 
 Costs are API-equivalent estimates in USD, not subscription charges. Missing usage, unknown prices,
 and incomplete billing inputs remain marked as unavailable or partial.
@@ -67,7 +98,7 @@ platform name (or unknown), and the referring domain when available. A recognize
 takes precedence over the referring domain for platform classification; unrecognized tags are not
 sent. Attribution excludes referrer paths, query parameters, fragments, credentials, ports, and
 campaign URLs other than the allowlisted tags described above. Website page and article events carry
-the path of a news article or guide published on openbot.run, together with the collection name, the
+the path of a news article, guide or comparison published on openbot.run, together with the collection name, the
 reading position reached (start, half, or end), and the section of the page a link was clicked in.
 That path is a published article address and nothing else: it is matched against the site's own list
 of articles, so no other part of a visited URL can be reported through it. Reading position is taken
@@ -122,6 +153,14 @@ The service stores:
   end, and expiration times;
 - the current account avatar file and its content type when the user uploads an avatar.
 - optional host logo files and their content types when the owner uploads a logo.
+- published agent templates: the agent name, title, instructions, avatar, routine names, schedules
+  and instructions, marketplace skill references, the `SKILL.md` text of local skills, the local
+  agent ID, a share card image made from these fields, and creation and update times. Anyone
+  with the link can read a template, and sites such as X show the share card when the link is
+  posted. Unpublish removes the template content and its images. The service keeps the link ID,
+  the account ID, the local agent ID and the unpublish time, so publishing the same agent again
+  gives back the same link. Deleting the account removes them. Templates do not include
+  workspace files, memories, conversations, or integration credentials.
 
 The service does not store plaintext one-time codes, account session tokens, or team authentication
 tickets in D1. It returns a new plaintext secret only to the client that requested it. The desktop
@@ -181,12 +220,21 @@ Other attachments are downloaded when you choose Open or save. The phone creates
 the system share sheet and removes it when that sheet closes. The app you select can keep its own copy.
 Cloudflare account storage does not receive these files.
 
+Mobile dictation uses the phone's speech recognition only after you press the microphone. It asks
+for on-device recognition. On iOS, this applies when the phone supports it for your language. On
+Android, it applies when the language model is installed. Otherwise, or when on-device recognition
+fails before it recognizes any speech, the phone's recognition service, Apple or Google, receives the
+audio. The recognized text goes into the message field and is sent
+only when you send the message. OpenBot does not store or send the audio.
+
 ## Email delivery and infrastructure providers
 
 OpenBot sends sign-in and team invitation messages through the configured SMTP provider. The
 provider receives the recipient address and the message content. A sign-in message contains the
 one-time code and its expiration time. A team invitation can contain the inviter address, team name,
-role, and invite URL.
+role, and invite URL. The HTML version of a message loads the OpenBot logo from `openbot.run` when
+the mail client shows images. The image address is the same in every message and identifies no
+recipient.
 
 Cloudflare processes account and configuration API requests. It does not carry Team API, file,
 message, command, Remote Desktop media, or Remote Desktop input traffic. Cloudflare and the email
@@ -213,6 +261,16 @@ provider logs are outside the OpenBot application database and its daily mainten
   manage Codex credentials.
 - `~/.claude` is owned by Claude CLI and contains its login and session data. OpenBot does not copy
   or manage Claude credentials.
+- The MCP sign-ins are kept in `~/Library/Application Support/OpenBot`, encrypted by the operating
+  system's secret storage in the same way as provider API keys. One record per server address holds
+  the client registration and the access and refresh tokens. Removing the server in settings deletes
+  its record. These values are redacted from logs, exports and diagnostics.
+- `~/Library/Application Support/OpenBot/logs/trace.ndjson` is a local trace of IPC calls,
+  provider turns, and main-process failures. Each line holds a time, the IPC channel name, the turn
+  origin or the failure origin (`uncaughtException` or `unhandledRejection`), the duration, and the
+  outcome word. The failure's error text goes only to the redacted log. The trace holds no payloads,
+  messages, URLs, paths, or identifiers, and it goes through log redaction before it is written. It
+  is kept to two files of 2 MB each and is never sent.
 
 Attachments copied into OpenBot remain in managed storage after their original file is moved or
 deleted. All agents share the embedded browser profile, including cookies and website sessions.
@@ -222,13 +280,20 @@ deleted. All agents share the embedded browser profile, including cookies and we
 When the owner publishes OpenBot, the app starts an authenticated Team API on a localhost port. The
 client and host use a separate OpenBot Signal service to establish WebRTC. Signal carries only
 short-lived authentication, SDP, and ICE messages. Team API data uses WebRTC DataChannels. Remote
-Desktop media and input use a separate WebRTC connection. ICE uses a direct peer-to-peer path when
-possible. If a direct path is not possible, encrypted WebRTC traffic uses an OpenBot coturn relay.
+Desktop media and input use a separate WebRTC connection. The live browser view sends compressed
+images of the host's browser tab, and the watching member's pointer and key input, over that same
+media connection. ICE uses a direct peer-to-peer path when possible. If a direct path is not possible, encrypted WebRTC traffic uses an OpenBot coturn relay.
 
 Agents, conversations, queues, direct messages, attachments, browser data, prompts, approvals, and
 Remote Desktop data remain on the host. The central account service does not copy them into D1 or
 R2. The Signal service does not proxy them or write them to logs. The host does not need a public
 inbound port.
+
+An owner or admin of a joined server can manage its host from their own computer, or from the
+browser client at `/app`. A provider API key, a custom endpoint key or header, and a new server logo
+then travel from that computer or browser to the host over the same encrypted team connection. The
+browser does not store a key. The host stores them as it stores a change made on the host.
+No response returns a key, and neither computer writes request bodies to its logs.
 
 ## Other network connections
 
@@ -239,8 +304,22 @@ Network traffic can also occur when:
 - a user or an agent visits a page in the embedded browser;
 - a user submits text that is not a web address in the browser address bar, which sends the query to Google Search;
 - a locally installed Codex plugin connects to its service;
+- an MCP server the user enabled is reached at its own address, and, when that server asks for a
+  sign-in, OpenBot connects to the server's authorization service to register itself, to exchange
+  the grant the browser returns, and to renew the token. Nothing about the user's agents,
+  conversations or files is sent in those requests;
 - an installed build checks GitHub Releases for updates;
+- OpenBot checks for new provider CLI releases when it starts, once an hour, and when you select
+  `Check for updates`. It asks `api.github.com` for Codex, `registry.npmjs.org` for Claude and
+  OpenCode, `x.ai/cli` for Grok, and `raw.githubusercontent.com/agentclientprotocol/registry` and
+  `dl.google.com` (for the download size) for Gemini, and it reads a list of blocked versions from
+  `raw.githubusercontent.com/nightly-labs/openbot`. These requests contain no account, agent,
+  conversation or file data;
 - a user opens an explicitly labeled external support or setup link.
+
+Plugin pages on openbot.run show each listing's own icon. The page asks `openbot.run` for that
+picture, and the website fetches it there from the address the plugin catalog holds, so reading a
+plugin page does not connect your browser to the plugin developer's servers.
 
 Account usage shown in OpenBot is requested through the local Codex App Server. OpenBot does not send
 that usage to its maintainer.
@@ -255,8 +334,32 @@ give an agent a task you would not allow a local command-line tool to perform.
 On first launch, OpenBot explains this access and does not start the agent services until you
 explicitly accept it. The acceptance record stays in OpenBot's local application-support directory.
 
-Computer Use is provided by a separately installed local Codex plugin. macOS permission prompts and
-any plugin safety hand-offs remain controlled by macOS and that plugin.
+Computer Use is provided by `cua-driver`, a local binary that OpenBot ships and starts as its own
+child process. It starts only when you open the Computer Use panel or an agent uses the function, and
+it stops when OpenBot stops. Because OpenBot starts it directly, macOS attributes the Screen Recording
+and Accessibility grants to OpenBot, and macOS keeps control of the prompts. Windows and Linux ask for
+no such grant. Screen contents and accessibility trees that an agent reads through the driver go to
+that agent's provider, the same as any other message content.
+
+The driver is third-party software with its own product analytics, which its vendor turns on by
+default and which are not OpenBot's. They would send the driver version, the operating system, a
+random installation identifier, and a bucketed record of each tool call to that vendor. They never
+send screen contents, window or application names, typed text, or the content of a tool result.
+
+On its own the driver also asks GitHub for a newer release each time it starts.
+
+**OpenBot stops both calls, always.** Every copy of the driver OpenBot starts gets
+`CUA_DRIVER_RS_TELEMETRY_ENABLED=0` and `CUA_DRIVER_RS_UPDATE_CHECK=0`, so it sends the vendor
+nothing and asks GitHub nothing. OpenBot pins the driver version it packages, so a release check
+could only offer you an update OpenBot would refuse. The driver reads the environment before its own
+configuration, and OpenBot sets both variables last, so nothing can turn them back on for a driver
+OpenBot started. OpenBot writes no file, so a driver you run yourself keeps the settings you gave
+it.
+
+Auto approve also permits that agent to publish, update and delete public hosted sites without
+another confirmation. Turbo mode extends this permission to every agent on that host. Publishing
+makes the selected site content publicly accessible. Without either grant, hosted-site changes
+require confirmation. Site ownership and source validation still apply.
 
 ## Exports
 
@@ -264,8 +367,10 @@ The account menu can export a local ZIP containing agent profiles, conversation 
 and managed message attachments. It intentionally excludes CLI credentials, browser cookies, and
 agent workspace files.
 
-The diagnostics export contains application and CLI versions, capability states, and aggregate queue
-counts. It contains no conversations, visited URLs, account email, file contents, or local file paths.
+The diagnostics export contains application and CLI versions, capability states, aggregate queue
+counts, and a summary of the local trace: counts, outcomes, and durations for each IPC channel,
+turn origin, and failure origin. It contains no conversations, visited URLs, account email, file
+contents, or local file paths.
 
 ## Delete local data
 
@@ -290,11 +395,15 @@ The draft is reviewed before OpenBot saves it; generating a draft does not creat
 an OpenBot conversation or change an existing agent. The provider's own data and
 CLI retention policies still apply.
 
+Publishing an agent template from the chat makes its instructions, skills, and routines public to
+anyone with the link at `openbot.run/agents/<id>`, with your account name as the creator. OpenBot
+stops the publish when a text field looks like a secret. Workspace files and memories are not sent.
+
 Marketplace submissions from the desktop app show the publisher’s current account photo publicly on the listing. Account photo updates appear on the listing; removing the account photo removes it from the listing. Private memories and integration credentials are not included.
 
 ### OpenCode
 
-OpenBot downloads the pinned OpenCode CLI from `registry.npmjs.org` and its license from
+OpenBot downloads the OpenCode CLI from `registry.npmjs.org` and its license from
 `github.com/anomalyco/opencode`, then starts it with `opencode acp`. Prompts, attachments, and tool
 results go to that local process. OpenCode can send them to the model provider selected in its
 configuration. OpenCode's free models are the default, and they reach OpenCode Go with no account,
@@ -302,9 +411,50 @@ so a first OpenCode turn leaves this computer without a sign-in.
 
 An OpenCode Go key is optional and unlocks the paid catalog. OpenBot encrypts it with the operating
 system's secret storage, writes it to a file that only your user account can read, and passes it
-only to the local OpenCode process. No screen, log, data export, or diagnostics report contains it;
-the data export lists it under `scope.excludes`. OpenBot does not copy OpenCode credentials or
+to the local OpenCode process. To show the remaining Go quota in Usage, OpenBot also sends the key
+to `opencode.ai/zen/go/v1/usage`; that request contains no conversation, file, or model data, and
+the response contains only the used percentage and reset time of each Go limit. OpenBot does not
+send that usage to its maintainer. No screen, log, data export, or diagnostics report contains the
+key; the data export lists it under `scope.excludes`. OpenBot does not copy OpenCode credentials or
 upload its session files. OpenCode manages its own login and resume state.
+
+### Gemini
+
+OpenBot downloads Google's Antigravity ACP server from `dl.google.com` when you select Download on
+the Gemini row. Each provider update check also asks `dl.google.com` for the size of the newest
+download, also when you do not use Gemini. Google's license does not let OpenBot include it in the application. OpenBot
+starts the server as a local process. Prompts, attachments, and tool results go to that process,
+and the server sends them to Google. Sign in opens Google's sign-in page in your browser. The
+server keeps its login and session files in `~/.gemini`, or in `$GEMINI_HOME`. OpenBot does not
+read, copy, or upload these files. Google's terms apply: <https://antigravity.google/terms>.
+Gemini agents stay on this computer: OpenBot does not show them to team members.
+
+### Local model servers
+
+When Settings shows the AI providers tab, and once on the onboarding provider step, OpenBot looks
+for model servers on this computer. It sends `GET <address>/models` to
+`http://127.0.0.1:11434/v1` (Ollama), `http://127.0.0.1:1234/v1` (LM Studio), and each address you
+add under Local detection. These requests
+contain no key, header, conversation or file data, and OpenBot does not follow a redirect. A found
+server is only listed; OpenBot saves nothing until you select Add.
+
+When you add or edit an endpoint, Load models sends the key and headers you typed to that address.
+For a saved endpoint, OpenBot sends the stored key and headers only to the same origin as the saved
+address. Local detection can be turned off in Settings. Its switch, addresses, folders and hidden
+rows are in `openbot-provider-detection-v1.json` in the app profile.
+
+### Custom agents
+
+A custom agent is an ACP program that you name. OpenBot starts it as a local process, and prompts, attachments, and tool results go to that process. What the program sends
+to the network is its own choice. Check agent starts it once, sends only `initialize`, and stops it.
+To find agents, OpenBot looks up the names of known agents on your `PATH` and in the folders you
+add under Local detection. It does not start a file that it finds.
+
+The command, arguments, and environment names are in `custom-agents.json` in the app profile. The
+environment values are encrypted with the operating system's secret storage, go only to that
+process, and are not in a screen, log, data export, or diagnostics report; the data export lists
+them under `scope.excludes`. Custom agents stay on this computer: OpenBot does not show them to
+team members.
 
 ## Shared desktop channels
 
@@ -338,3 +488,50 @@ local application storage. This lets it recover the held draft after restart. Ne
 releases the host hold merely because the editor closes or disconnects. The host also preserves
 attachment drafts released by edit cancellation or message deletion until they are sent or
 discarded. This lets a disconnected desktop recover its saved composer backup after host restart.
+
+## Optional macOS Host Manager
+
+An administrator can install a local Host Manager for several native macOS users. It reads only
+registered UIDs, process IDs, application versions, restart readiness, timestamps, and health
+booleans through separate local status directories. It does not read or back up tenant homes,
+workspaces, databases, provider directories, browser data, or conversations. It requests release
+metadata and application downloads from the fixed OpenBot GitHub repository; those requests
+expose the host's network address to GitHub. It sends no tenant status or tenant content to GitHub.
+
+The separate, optional administrator account-setup command creates new local Standard users and
+empty private homes. It saves generated login passwords in a root-only file under
+`/private/var/root` for the administrator to retrieve. It does not transmit those credentials or
+include them in logs. The installed administrator CLI shows each password once on the controlling terminal after setup,
+then removes the recovery file. A failed setup retains that root-only file for administrator recovery.
+The administrator controls secure password delivery. Host verification reads home metadata only
+and tests cross-user access using harmless temporary files outside tenant homes.
+
+### Remote desktop setup diagnostics
+
+When an authenticated server member checks remote desktop setup, the host sends its computer name,
+macOS account name, permission and service results, active session count, and check time to that member.
+A live test also sends a temporary four-digit code and mouse and keyboard test results. These results
+stay in memory and are not sent to analytics. Screen video uses the existing remote desktop connection.
+Permission approval remains in macOS System Settings on the host.
+
+## Secure browser authentication
+
+Passwords, email/SMS codes, and authenticator codes entered in a secure chat card are sent to the
+shown HTTPS site for one submission. Connected desktop and mobile clients send the value through
+the authenticated Team API to the computer running the browser. The handoff does not add the value
+to chat, provider tool arguments, diagnostics, analytics, or a credential store. Input and submission
+values are held in memory for the operation; cancellation and submission clear the input.
+
+OpenBot blocks agent browser access while consent is pending. Before entering a submitted value, it
+blocks image capture and live browser streams, and stops
+and discards the active browser recording before entry. After entry, protection stays until the
+browser replaces the document. After a same-page submission, OpenBot clears the filled fields and,
+when the value no longer appears in the page title, address, text, field values, or attributes, keeps
+the page, so a later login step on the same page stays available. Page code can still hold the
+value, so page evaluation and recording stay blocked in that tab and its connected popup or opener
+tabs until the page navigates. Otherwise OpenBot loads the current URL as a new
+document with a GET request instead. Failed submission or reload requires manual takeover. Recording does not restart
+automatically, and the tab's back/forward history is cleared after replacement to prevent restoring
+the sensitive document. The destination site receives the value and controls its own processing.
+This protection does not isolate credentials from the operating system or agents with unrestricted
+machine access. Values pasted into ordinary chat are not covered by secure handoff.

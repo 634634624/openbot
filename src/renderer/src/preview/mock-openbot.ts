@@ -1,168 +1,135 @@
-import { isManagedRuntimeProvider, type ManagedProviderId } from "@openbot/contracts/agent-providers";
-import type {
-  AccountSession,
-  AccountUsage,
-  AgentEvent,
-  AgentMemory,
-  AgentModelOption,
-  AgentProviderId,
-  AgentStatus,
-  AgentSubmission,
-  AgentSummary,
-  AnalyticsPreference,
-  AppInfo,
-  AppLanguagePreference,
-  AppSetupState,
-  AttachmentImportEvent,
-  BrowserControlState,
-  BrowserOpenInput,
-  BrowserPictureInPictureEvent,
-  BrowserPreview,
-  BrowserTab,
-  CentralAuthState,
-  CentralAuthUser,
-  ConfigureHostInput,
-  ConversationMessage,
-  ConversationSnapshot,
-  CreateTeamInviteInput,
-  CustomProviderSummary,
-  DirectConversationSnapshot,
-  DirectMessage,
-  DirectMessageRealtimeEvent,
-  DirectThreadSummary,
-  DirectTypingRealtimeEvent,
-  DynamicIslandPreference,
-  DynamicIslandPresentation,
-  FilePreview,
-  HostedSiteSummary,
-  HostStatus,
-  InstalledSkill,
-  InviteSummary,
-  JoinServerInput,
-  MarketplaceSkillDetail,
-  OpenAttachmentInput,
-  OpenBotDesktopApi,
-  OpenSharedFileInput,
-  OpenWorkspaceFileInput,
-  ProviderRuntimeSnapshot,
-  ProviderRuntimeStatus,
-  QueueDelivery,
-  QueueSnapshot,
-  RemoteDesktopSession,
-  ReorderQueueInput,
-  RespondToPromptInput,
-  Routine,
-  RoutineRun,
-  RoutineSchedule,
-  SendDirectMessageInput,
-  SendMessageInput,
-  ServerSummary,
-  SetAgentAvatarInput,
-  SetMessageReactionInput,
-  SetTeamTypingInput,
-  SharedTable,
-  SidebarLayoutSnapshot,
-  SkillSubmission,
-  SteerQueuedMessageInput,
-  TeamInviteSummary,
-  TeamMemberSummary,
-  TeamPresenceSnapshot,
-  TeamSessionSummary,
-  UpdateAgentInput,
-  UpdateQueuedMessageInput,
-  UpdateStatus,
-  UpdateTeamMemberInput,
-} from "@openbot/contracts/ipc";
 import {
+  type AccountUsage,
+  type AgentEvent,
+  type AgentMemory,
+  type AgentModelOption,
+  type AgentProviderId,
+  type AgentStatus,
+  type AgentSubmission,
+  type AgentSummary,
+  type AgentTemplatePublication,
+  type AnalyticsPreference,
+  type AppInfo,
+  type AppLanguagePreference,
+  type ApprovalAutomationPreference,
+  type AppSetupState,
+  type AttachmentImportEvent,
+  agentAutoApprovalEnabled,
+  type CentralAuthState,
+  CONTEXT_RESET_ITEM_TYPE,
+  type ComputerUseState,
+  type ConversationMessage,
+  type ConversationSnapshot,
+  type CustomAgentSummary,
+  type CustomProviderSummary,
   composedCustomModelId,
   createMcpServerId,
+  DEFAULT_AGENT_ACCESS,
+  DEFAULT_APPROVAL_AUTOMATION_PREFERENCE,
   DEFAULT_DYNAMIC_ISLAND_PREFERENCE,
+  DEFAULT_PROVIDER_DETECTION_SETTINGS,
+  type DirectConversationSnapshot,
+  type DirectMessageRealtimeEvent,
+  type DirectTypingRealtimeEvent,
+  type DynamicIslandPreference,
+  type DynamicIslandPresentation,
+  defaultProviderModel,
+  type FilePreview,
+  type HostedSiteSummary,
+  type HostStatus,
+  type MacPermissionId,
   normalizeMcpConfig,
+  type OpenAttachmentInput,
+  type OpenBotDesktopApi,
+  type OpenSharedFileInput,
+  type OpenWorkspaceFileInput,
+  type ProviderDetectionSettings,
+  type QueueDelivery,
+  type QueueSnapshot,
+  type RemoteDesktopSession,
+  type ReorderQueueInput,
+  type RespondToPromptInput,
+  type Routine,
+  type RoutineRun,
+  type RoutineSchedule,
+  type SendMessageInput,
+  type SetAgentAvatarInput,
+  type SetMessageReactionInput,
+  type SharedTable,
   SIDEBAR_PEOPLE_SECTION_ID,
   SIDEBAR_UNASSIGNED_SECTION_ID,
+  type SidebarLayoutSnapshot,
+  type SteerQueuedMessageInput,
+  sameCustomProviderOrigin,
+  type TeamPresenceSnapshot,
+  type UpdateAgentInput,
+  type UpdatePreference,
+  type UpdateQueuedMessageInput,
+  type UpdateStatus,
 } from "@openbot/contracts/ipc";
-import browserTakeoverPreviewUrl from "../../stories/assets/browser-takeover-preview.svg";
+import { sourceText } from "@openbot/i18n/source";
+import { AGENT_IMPORT_PREVIEW, AGENT_IMPORT_SKILL } from "../../stories/agent-import-fixtures";
 import { filePreviewForPath } from "../../stories/file-previews";
+import { toggleChannelMember } from "../features/channels/channels-draft";
+import {
+  STORY_AGENT_TEMPLATE_DETAIL,
+  STORY_AGENT_TEMPLATE_PUBLICATION,
+  storyAgentTemplatePreview,
+} from "./agent-template-fixtures";
 import {
   STORY_AGENT_STATUS,
   STORY_AGENT_SUBMISSIONS,
   STORY_AGENT_SUMMARIES,
   STORY_APP_INFO,
-  STORY_BROWSER_CONTROL,
-  STORY_BROWSER_TABS,
-  STORY_DIRECT_SNAPSHOTS,
-  STORY_DIRECT_THREADS,
-  STORY_HOST_STATUS,
   STORY_HOSTED_SITES,
-  STORY_INSTALLED_SKILLS,
-  STORY_INVITES,
   STORY_MARKETPLACE_AGENT_DETAILS,
   STORY_MARKETPLACE_AGENTS,
-  STORY_MARKETPLACE_SKILL_DETAILS,
-  STORY_MARKETPLACE_SKILLS,
   STORY_MCP_SERVERS,
   STORY_MODELS,
-  STORY_PRESENCE,
-  STORY_REMOTE_DESKTOP_SESSION,
-  STORY_SERVERS,
-  STORY_SESSIONS,
+  STORY_QUEUES,
   STORY_SHARED_TABLES,
-  STORY_SKILL_PACKAGE_PREVIEW,
-  STORY_SKILL_SUBMISSIONS,
   STORY_SNAPSHOTS,
-  STORY_TEAM_MEMBERS,
   STORY_UPDATE_STATUS,
   STORY_USAGE,
 } from "./fixtures";
 import { mockAgentAnalytics, mockHostAnalytics } from "./mock-agent-analytics";
+import { createMockAuth, type MockAuthOptions } from "./mock-auth";
+import { createMockBrowser, type MockBrowserOptions } from "./mock-browser";
 import { createMockChannels } from "./mock-channels";
+import { createMockHostUpdate, type MockHostUpdateOptions } from "./mock-host-update";
+import { createMockProviderRuntimes, type MockProviderRuntimeOptions } from "./mock-provider-runtimes";
 import { applySidebarLayoutAction } from "./mock-sidebar-layout";
+import { createMockSkills, type MockSkillsOptions } from "./mock-skills";
+import { createMockStorage } from "./mock-storage";
+import { clone, type Listener, type MockRuntime, matchesQuery } from "./mock-support";
+import { createMockTeam, type MockTeamOptions } from "./mock-team";
 
-type Listener<T> = (value: T) => void;
-
-export interface MockOpenBotOptions {
-  providerRuntimeSnapshot?: ProviderRuntimeSnapshot;
-  providerRuntimeFailure?: boolean;
+export interface MockOpenBotOptions
+  extends MockProviderRuntimeOptions,
+    MockAuthOptions,
+    MockBrowserOptions,
+    MockTeamOptions,
+    MockSkillsOptions,
+    MockHostUpdateOptions {
   appInfo?: AppInfo;
   analyticsPreference?: AnalyticsPreference;
   languagePreference?: AppLanguagePreference;
-  authState?: CentralAuthState;
   setupState?: AppSetupState;
   agentStatus?: AgentStatus;
   usage?: AccountUsage;
   agents?: AgentSummary[];
   models?: AgentModelOption[];
   snapshots?: Record<string, ConversationSnapshot>;
-  browserTabs?: BrowserTab[];
-  browserControlState?: BrowserControlState;
-  browserPreview?: BrowserPreview | null;
-  browserPreviews?: Record<string, BrowserPreview | null>;
-  servers?: ServerSummary[];
-  presence?: TeamPresenceSnapshot;
-  directThreads?: DirectThreadSummary[];
-  directSnapshots?: Record<string, DirectConversationSnapshot>;
-  hostStatus?: HostStatus;
-  teamMembers?: TeamMemberSummary[];
-  invites?: TeamInviteSummary[];
-  sessions?: TeamSessionSummary[];
-  remoteDesktopSessions?: RemoteDesktopSession[];
+  /** Deliveries that wait in each agent's queue when the preview starts. */
+  queues?: Record<string, QueueDelivery[]>;
   updateStatus?: UpdateStatus;
   memories?: Record<string, AgentMemory[]>;
   tables?: SharedTable[];
   routines?: Record<string, Routine[]>;
-  localSkills?: MarketplaceSkillDetail[];
-  installedSkills?: Record<string, InstalledSkill[]>;
   customProviders?: CustomProviderSummary[];
 }
 
-/**
- * What the OpenCode CLI would report for one endpoint, read from the endpoint itself. Preview
- * composes these into `listModels()` instead of putting them in `STORY_MODELS`, which several
- * stories read directly as their whole catalogue.
- *
- * OpenCode names a custom model `<provider name>/<model name>` and ids it
- * `<provider id>/<model id>`.
- */
+/** Custom models compose as `<provider>/<model>`; preview builds `listModels()` from these. */
 function mockCustomProviderModels(provider: CustomProviderSummary): AgentModelOption[] {
   return provider.models.map((model) => ({
     provider: "opencode",
@@ -203,11 +170,7 @@ export interface MockOpenBotControls {
   dispose: () => void;
 }
 
-/**
- * The preview build has no main process to read a file, so it answers with the same fixtures that
- * the file preview stories use. A path with no fixture keeps the unsupported shape, which is what
- * the panel shows for a kind it cannot render.
- */
+/** Preview file fixtures; a path with no fixture keeps the unsupported shape. */
 function mockFilePreview(path: string, fallbackName: string): FilePreview {
   return (
     filePreviewForPath(path) ?? {
@@ -223,28 +186,28 @@ function mockFilePreview(path: string, fallbackName: string): FilePreview {
 /** What each story server answers with when it is tested, so a story reads the same way twice. */
 const MOCK_MCP_TOOL_COUNTS: Record<string, number> = { "Local SQLite": 12, Linear: 1, Figma: 6 };
 
-function clone<T>(value: T): T {
-  return structuredClone(value);
-}
-
 export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBotControls {
   const appInfo = clone(options.appInfo ?? STORY_APP_INFO);
-  const defaultAuthState: CentralAuthState = {
-    status: "signed_in",
-    user: {
-      id: "user-1",
-      email: "person@example.com",
-      name: "Norbert",
-      avatarUrl: null,
-    },
-  };
-  let authState = clone<CentralAuthState>(options.authState ?? defaultAuthState);
   let setupState = clone<AppSetupState>(
     options.setupState ?? { completed: true, preferredProvider: "codex", preferredModel: null },
   );
+  const grantedComputerUsePermissions = new Set<MacPermissionId>();
+  const computerUseState = (): ComputerUseState => {
+    const permissions = (["screen-recording", "accessibility"] as const).map((id) => ({
+      id,
+      granted: grantedComputerUsePermissions.has(id),
+    }));
+    return {
+      status: permissions.every(({ granted }) => granted) ? "ready" : "permissions-required",
+      permissions,
+      message: null,
+    };
+  };
   let analyticsPreference = clone<AnalyticsPreference>(options.analyticsPreference ?? { enabled: true });
+  let approvalAutomation = clone<ApprovalAutomationPreference>(DEFAULT_APPROVAL_AUTOMATION_PREFERENCE);
   let languagePreference = clone<AppLanguagePreference>(options.languagePreference ?? { language: "system" });
   const languageListeners = new Set<(preference: AppLanguagePreference) => void>();
+  const approvalAutomationListeners = new Set<(preference: ApprovalAutomationPreference) => void>();
   let dynamicIslandPreference: DynamicIslandPreference = { ...DEFAULT_DYNAMIC_ISLAND_PREFERENCE };
   let dynamicIslandPresentation: DynamicIslandPresentation = { serverId: "local", mode: "idle" };
   const agentStatus = clone(options.agentStatus ?? STORY_AGENT_STATUS);
@@ -259,69 +222,13 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
   };
   const models = clone(options.models ?? STORY_MODELS);
   const snapshots = clone(options.snapshots ?? STORY_SNAPSHOTS);
-  let browserTabs = clone(options.browserTabs ?? STORY_BROWSER_TABS);
-  let activeBrowserTabId = browserTabs.at(-1)?.id ?? null;
-  const browserControlState = clone(options.browserControlState ?? STORY_BROWSER_CONTROL);
-  const browserPreview =
-    options.browserPreview === undefined
-      ? { dataUrl: browserTakeoverPreviewUrl, width: 960, height: 600 }
-      : options.browserPreview;
-  let servers = clone(options.servers ?? STORY_SERVERS);
-  let presence = clone(options.presence ?? STORY_PRESENCE);
-  let directThreads = clone(options.directThreads ?? STORY_DIRECT_THREADS);
-  const directSnapshots = clone(options.directSnapshots ?? STORY_DIRECT_SNAPSHOTS);
-  let hostStatus = clone(options.hostStatus ?? STORY_HOST_STATUS);
-  let teamMembers = clone(options.teamMembers ?? STORY_TEAM_MEMBERS);
-  let invites = clone(options.invites ?? STORY_INVITES);
-  let sessions = clone(options.sessions ?? STORY_SESSIONS);
-  let accountSessions: AccountSession[] = [
-    {
-      sessionId: "22222222-2222-4222-8222-222222222222",
-      name: "This desktop",
-      kind: "desktop",
-      current: true,
-      connectedAt: Date.now() - 86_400_000,
-      lastActiveAt: Date.now(),
-    },
-    {
-      sessionId: "33333333-3333-4333-8333-333333333333",
-      name: "Desktop",
-      kind: "desktop",
-      current: false,
-      connectedAt: Date.now() - 172_800_000,
-      lastActiveAt: Date.now() - 3_600_000,
-    },
-    {
-      sessionId: "11111111-1111-4111-8111-111111111111",
-      name: "Norbert’s iPhone",
-      kind: "mobile",
-      current: false,
-      connectedAt: Date.now() - 86_400_000,
-      lastActiveAt: Date.now() - 60_000,
-    },
-  ];
-  let remoteDesktopSessions = clone(options.remoteDesktopSessions ?? [STORY_REMOTE_DESKTOP_SESSION]);
   let updateStatus = clone(options.updateStatus ?? STORY_UPDATE_STATUS);
+  let updatePreference: UpdatePreference = { autoDownload: true, allowRemoteUpdates: true, autoInstall: false };
   const usage = clone(options.usage ?? STORY_USAGE);
   let agentCounter = agents.length;
-  const marketplaceSkills = clone(STORY_MARKETPLACE_SKILLS);
-  const localSkills = clone(
-    options.localSkills ?? [
-      {
-        ...STORY_MARKETPLACE_SKILL_DETAILS["skill-release-notes"],
-        id: "local-skill-11111111-1111-4111-8111-111111111111",
-        name: "Weekly summary",
-        slug: "weekly-summary",
-        creatorName: "Local",
-        version: 1,
-        versionId: "1",
-      },
-    ],
-  );
-  const localRevisions = new Map(localSkills.map((skill) => [`${skill.id}:${skill.version}`, skill]));
-  let skillSubmissions = clone(STORY_SKILL_SUBMISSIONS);
-  const installedSkills = new Map(Object.entries(clone(options.installedSkills ?? STORY_INSTALLED_SKILLS)));
   let hostedSites = clone(STORY_HOSTED_SITES);
+  let detectionSettings: ProviderDetectionSettings = clone(DEFAULT_PROVIDER_DETECTION_SETTINGS);
+  let customAgents: CustomAgentSummary[] = [];
   // The same two endpoints the model-picker stories invent, so preview shows one list everywhere.
   let customProviders = clone(
     options.customProviders ?? [
@@ -345,45 +252,16 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
     ],
   );
   let marketplaceAgentSubmissions = clone(STORY_AGENT_SUBMISSIONS);
+  const agentTemplatePublications = new Map<string, AgentTemplatePublication>();
   let messageCounter = 10;
-  let directMessageCounter = 10;
 
   /** Which providers have a key saved. The preview holds the flag only, like the real boundary. */
   const providerApiKeys = new Set<AgentProviderId>();
 
-  const runtimeSnapshot: ProviderRuntimeSnapshot = clone(
-    options.providerRuntimeSnapshot ?? {
-      revision: 0,
-      providers: {
-        codex: { phase: "not-downloaded", progress: null, message: null, version: null, availableVersion: null },
-        claude: { phase: "not-downloaded", progress: null, message: null, version: null, availableVersion: null },
-        grok: { phase: "not-downloaded", progress: null, message: null, version: null, availableVersion: null },
-        opencode: { phase: "not-downloaded", progress: null, message: null, version: null, availableVersion: null },
-      },
-    },
-  );
-  let failRuntimeDownload = options.providerRuntimeFailure ?? false;
-  const runtimeListeners = new Set<Listener<ProviderRuntimeSnapshot>>();
-  const runtimeTransfers = new Map<AgentProviderId, symbol>();
-  const setRuntimeStatus = (provider: ManagedProviderId, status: ProviderRuntimeStatus) => {
-    runtimeSnapshot.providers[provider] = status;
-    runtimeSnapshot.revision += 1;
-    for (const listener of runtimeListeners) listener(clone(runtimeSnapshot));
-  };
   const agentListeners = new Set<Listener<AgentEvent>>();
-  const browserDisplayListeners = new Set<Listener<{ tabs: BrowserTab[]; activeTabId: string | null }>>();
-  const browserPictureInPictureListeners = new Set<Listener<BrowserPictureInPictureEvent>>();
-  const authListeners = new Set<Listener<CentralAuthState>>();
-  const presenceListeners = new Set<Listener<TeamPresenceSnapshot>>();
-  const directMessageListeners = new Set<Listener<DirectMessageRealtimeEvent>>();
-  const directTypingListeners = new Set<Listener<DirectTypingRealtimeEvent>>();
-  const inviteListeners = new Set<Listener<string>>();
-  const hostListeners = new Set<Listener<HostStatus>>();
-  const remoteDesktopListeners = new Set<Listener<RemoteDesktopSession[]>>();
   const updateListeners = new Set<Listener<UpdateStatus>>();
   const attachmentListeners = new Set<Listener<AttachmentImportEvent>>();
   const latestConversationListeners = new Set<Listener<string>>();
-  const latestDirectConversationListeners = new Set<Listener<string>>();
   const timers = new Set<ReturnType<typeof setTimeout>>();
 
   const emit = <T>(listeners: Set<Listener<T>>, value: T) => {
@@ -396,9 +274,13 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
     }, delay);
     timers.add(timer);
   };
+  const runtime: MockRuntime = { emit, schedule };
   const emptyQueue = (agentId: string): QueueSnapshot => ({ agentId, deliveries: [] });
   const queueEdits = new Map<string, { agentId: string; delivery: QueueDelivery }>();
-  const queues = new Map<string, QueueSnapshot>(agents.map((agent) => [agent.id, emptyQueue(agent.id)]));
+  const queueSeeds = clone(options.queues ?? STORY_QUEUES);
+  const queues = new Map<string, QueueSnapshot>(
+    agents.map((agent) => [agent.id, { agentId: agent.id, deliveries: queueSeeds[agent.id] ?? [] }]),
+  );
   const memories = new Map<string, AgentMemory[]>(Object.entries(clone(options.memories ?? {})));
   let tables: SharedTable[] = clone(options.tables ?? STORY_SHARED_TABLES);
   const routines = new Map<string, Routine[]>(Object.entries(clone(options.routines ?? {})));
@@ -406,64 +288,6 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
 
   function emitAgentEvent(event: AgentEvent): void {
     emit(agentListeners, event);
-  }
-
-  function emitAuthState(state: CentralAuthState): void {
-    authState = clone(state);
-    emit(authListeners, state);
-  }
-
-  function emitPresence(snapshot: TeamPresenceSnapshot): void {
-    presence = clone(snapshot);
-    emit(presenceListeners, snapshot);
-  }
-
-  function emitDirectMessage(event: DirectMessageRealtimeEvent): void {
-    emit(directMessageListeners, event);
-  }
-
-  function emitDirectTyping(event: DirectTypingRealtimeEvent): void {
-    emit(directTypingListeners, event);
-  }
-
-  function getDirectSnapshot(memberId: string): DirectConversationSnapshot {
-    return (
-      directSnapshots[memberId] ?? {
-        threadId: `direct-${memberId}`,
-        otherMemberId: memberId,
-        messages: [],
-        revision: 0,
-      }
-    );
-  }
-
-  function readDirectConversationSnapshot(memberId: string): DirectConversationSnapshot {
-    return clone(getDirectSnapshot(memberId));
-  }
-
-  function updateDirectConversationSnapshot(
-    memberId: string,
-    update: (snapshot: DirectConversationSnapshot) => void,
-  ): DirectConversationSnapshot {
-    const snapshot = getDirectSnapshot(memberId);
-    update(snapshot);
-    snapshot.revision += 1;
-    directSnapshots[memberId] = snapshot;
-    return readDirectConversationSnapshot(memberId);
-  }
-
-  function emitInvite(inviteUrl: string): void {
-    emit(inviteListeners, inviteUrl);
-  }
-
-  function emitHostStatus(status: HostStatus): void {
-    hostStatus = clone(status);
-    emit(hostListeners, status);
-  }
-
-  function emitRemoteDesktopSessions(sessionsValue: RemoteDesktopSession[]): void {
-    remoteDesktopSessions = clone(sessionsValue);
-    emit(remoteDesktopListeners, sessionsValue);
   }
 
   function getSnapshot(agentId: string): ConversationSnapshot {
@@ -524,8 +348,10 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
       title: input.title ?? "Generalist agent",
       description: input.description ?? "A new agent ready to help with focused work.",
       notifications: input.notifications ?? true,
-      model: input.model ?? "gpt-5.6-luna",
-      reasoningEffort: input.reasoningEffort ?? "medium",
+      model: input.model ?? defaultProviderModel("codex"),
+      reasoningEffort: input.reasoningEffort ?? "low",
+      access: input.access ?? "full",
+      computerUse: input.computerUse ?? true,
       threadId: input.threadId ?? `thread-${id}`,
       workspacePath: input.workspacePath ?? `/mock/OpenBot/Agents/${id}`,
       preview: input.preview ?? "No messages yet",
@@ -535,14 +361,6 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
       avatarUrl: input.avatarUrl ?? null,
       ...(input.marketplaceSource ? { marketplaceSource: input.marketplaceSource } : {}),
     };
-  }
-
-  function matchesQuery(text: string, query: string | undefined): boolean {
-    return !query || text.toLowerCase().includes(query.toLowerCase());
-  }
-
-  function readInstalledSkills(agentId: string): InstalledSkill[] {
-    return installedSkills.get(agentId) ?? [];
   }
 
   function createRoutineRecord(input: {
@@ -575,6 +393,17 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
     };
   }
 
+  const mockChannels = createMockChannels(
+    emitAgentEvent,
+    (agentId) => agents.find((entry) => entry.id === agentId)?.name ?? agentId,
+  );
+  const mockProviderRuntimes = createMockProviderRuntimes(options, runtime);
+  const mockAuth = createMockAuth(options, runtime);
+  const mockSkills = createMockSkills(options, (agentId) => emitAgentEvent({ type: "skills-changed", agentId }));
+  const { installedSkills, readInstalledSkills } = mockSkills;
+  const mockBrowser = createMockBrowser(options, runtime, emitAgentEvent);
+  const mockTeam = createMockTeam(options, runtime, emitAgentEvent, () => agents);
+
   const api: OpenBotDesktopApi = {
     getAppInfo: async () => clone(appInfo),
     getSetupState: async () => clone(setupState),
@@ -586,6 +415,23 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
     setAnalyticsPreference: async ({ enabled }) => {
       analyticsPreference = { enabled };
       return clone(analyticsPreference);
+    },
+    getApprovalAutomation: async () => clone(approvalAutomation),
+    setApprovalAutomation: async ({ turbo, agentId, autoApprove }) => {
+      approvalAutomation = {
+        ...approvalAutomation,
+        turbo: turbo ?? approvalAutomation.turbo,
+        autoApproveOverrides:
+          agentId !== undefined && autoApprove !== undefined
+            ? { ...approvalAutomation.autoApproveOverrides, [agentId]: autoApprove }
+            : approvalAutomation.autoApproveOverrides,
+      };
+      for (const listener of approvalAutomationListeners) listener(clone(approvalAutomation));
+      return clone(approvalAutomation);
+    },
+    onApprovalAutomation: (listener) => {
+      approvalAutomationListeners.add(listener);
+      return () => approvalAutomationListeners.delete(listener);
     },
     getAppLanguagePreference: async () => clone(languagePreference),
     setAppLanguagePreference: async ({ language }) => {
@@ -618,25 +464,39 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
       onAction: () => () => undefined,
       setInteractive: async () => undefined,
     },
-    getComputerUseMacSetupState: async () => ({
-      status: "available",
-      helperName: "Codex Computer Use",
-      helperIconDataUrl: null,
-      message: null,
-    }),
-    openComputerUsePermissionSetup: async () => ({
-      status: "available",
-      helperName: "Codex Computer Use",
-      helperIconDataUrl: null,
-      message: null,
-    }),
-    startComputerUseHelperDrag: async () => undefined,
-    revealComputerUseHelper: async () => undefined,
-    closeComputerUsePermissionSetup: async () => undefined,
+    computerUse: {
+      getState: async () => computerUseState(),
+      // The preview grants the permission the pane was opened for, because the panel's whole job is
+      // to show the answer changing. A mock that always reported the same state would make every
+      // story of this panel look identical.
+      openPermissionPane: async (permission) => {
+        grantedComputerUsePermissions.add(permission);
+        return computerUseState();
+      },
+      // The help window belongs to the desktop app. The preview has no second window to close, and
+      // the panel never waits on the answer.
+      closePermissionHelp: async () => undefined,
+      // No bundle to drag in a browser, so the window draws its steps and nothing else.
+      getPermissionApp: async () => null,
+      startPermissionAppDrag: async () => undefined,
+      revealPermissionApp: async () => undefined,
+      // The rim is drawn over another application's window, which the preview has none of, so this
+      // subscribes to a stream that never carries anything.
+      onHighlightPlacement: () => () => undefined,
+    },
     openExternal: async () => undefined,
     connectProvider: async () => clone(agentStatus),
     updateProviderCli: async () => clone(agentStatus),
     refreshAgentProviders: async () => clone(agentStatus),
+    // A code that never completes: the preview has no provider to finish the sign-in, so this shows
+    // the waiting screen and leaves it there.
+    startProviderCodeLogin: async () => ({
+      kind: "code",
+      userCode: "KTQ4-B62MX",
+      verificationUrl: "https://auth.openai.com/codex/device",
+      expiresAt: Date.now() + 10 * 60_000,
+    }),
+    cancelProviderCodeLogin: async () => clone(agentStatus),
     setProviderApiKey: async ({ provider, key }) => {
       if (!key.trim()) throw new Error("A provider key is required.");
       providerApiKeys.add(provider);
@@ -650,63 +510,7 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
       provider,
       status: providerApiKeys.has(provider) ? "saved" : "missing",
     }),
-    providerRuntimes: {
-      getStatus: async () => clone(runtimeSnapshot),
-      download: async (provider) => {
-        if (!isManagedRuntimeProvider(provider)) throw new Error("OpenBot does not manage this provider's CLI.");
-        const installed = runtimeSnapshot.providers[provider];
-        if (runtimeTransfers.has(provider) || (installed.phase === "ready" && !installed.availableVersion))
-          return clone(runtimeSnapshot);
-        const transfer = Symbol(provider);
-        runtimeTransfers.set(provider, transfer);
-        setRuntimeStatus(provider, { ...installed, phase: "downloading", progress: 0, message: null });
-        const advance = (progress: number) => {
-          if (runtimeTransfers.get(provider) !== transfer) return;
-          if (failRuntimeDownload && progress >= 50) {
-            failRuntimeDownload = false;
-            runtimeTransfers.delete(provider);
-            setRuntimeStatus(provider, {
-              ...installed,
-              phase: "download-error",
-              progress: null,
-              message: "The update was interrupted.",
-            });
-            return;
-          }
-          if (progress < 100) {
-            setRuntimeStatus(provider, { ...installed, phase: "downloading", progress, message: null });
-            schedule(() => advance(progress + 25), 300);
-            return;
-          }
-          setRuntimeStatus(provider, { ...installed, phase: "finishing", progress: null, message: null });
-          schedule(() => {
-            if (runtimeTransfers.get(provider) !== transfer) return;
-            runtimeTransfers.delete(provider);
-            setRuntimeStatus(provider, {
-              phase: "ready",
-              progress: 100,
-              message: null,
-              version: installed.availableVersion ?? installed.version ?? "preview",
-              availableVersion: null,
-            });
-          }, 300);
-        };
-        schedule(() => advance(25), 300);
-        return clone(runtimeSnapshot);
-      },
-      cancel: async (provider) => {
-        if (!isManagedRuntimeProvider(provider)) throw new Error("OpenBot does not manage this provider's CLI.");
-        const current = runtimeSnapshot.providers[provider];
-        if (current.phase !== "downloading") return clone(runtimeSnapshot);
-        runtimeTransfers.delete(provider);
-        setRuntimeStatus(provider, { ...current, phase: "not-downloaded", progress: null, message: null });
-        return clone(runtimeSnapshot);
-      },
-      onEvent: (listener) => {
-        runtimeListeners.add(listener);
-        return () => runtimeListeners.delete(listener);
-      },
-    },
+    providerRuntimes: mockProviderRuntimes.providerRuntimes,
     openUrl: async () => undefined,
     voice: {
       getModelStatus: async () => ({ phase: "ready", progress: 100, message: null }),
@@ -714,240 +518,8 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
       transcribe: async () => ({ text: "Mock voice transcript" }),
       onModelStatus: () => () => undefined,
     },
-    auth: {
-      getState: async () => clone(authState),
-      retry: async () => clone(authState),
-      requestEmailCode: async (email) => {
-        authState = {
-          status: "code_sent",
-          challengeId: "mock-challenge",
-          email,
-          expiresAt: Date.now() + 600_000,
-          resendAvailableAt: Date.now() + 60_000,
-          developmentCode: "2345-6789",
-        };
-        return clone(authState);
-      },
-      verifyEmailCode: async (_challengeId, _code) => {
-        const email = authState.status === "code_sent" ? authState.email : "person@example.com";
-        const user: CentralAuthUser = {
-          id: "user-1",
-          email,
-          name: "Norbert",
-          avatarUrl: null,
-        };
-        authState = { status: "signed_in", user };
-        return clone(authState);
-      },
-      updateName: async (name) => {
-        if (authState.status !== "signed_in") return clone(authState);
-        authState = { ...authState, user: { ...authState.user, name } };
-        emitAuthState(authState);
-        return clone(authState);
-      },
-      updateAvatar: async (image) => {
-        if (authState.status !== "signed_in") return clone(authState);
-        const avatarUrl = image
-          ? `data:${image.mimeType};base64,${btoa(Array.from(image.bytes, (byte) => String.fromCharCode(byte)).join(""))}`
-          : null;
-        authState = { ...authState, user: { ...authState.user, avatarUrl } };
-        emitAuthState(authState);
-        return clone(authState);
-      },
-      createMobileConnect: async () => ({
-        qrData:
-          "openbot://mobile-connect?api=https%3A%2F%2Fapi.openbot.run&ticket=preview-mobile-ticket_1234567890abcdef",
-        expiresAt: Date.now() + 120_000,
-      }),
-      listMobileConnectedDevices: async () =>
-        accountSessions
-          .filter((session) => session.kind === "mobile")
-          .map((session) => ({
-            sessionId: session.sessionId,
-            name: session.name,
-            platform: "ios",
-            connectedAt: session.connectedAt,
-            lastActiveAt: session.lastActiveAt,
-          })),
-      revokeMobileConnectedDevice: async (sessionId) => {
-        accountSessions = accountSessions.filter(
-          (session) => session.kind !== "mobile" || session.sessionId !== sessionId,
-        );
-      },
-      listAccountSessions: async () => clone(accountSessions),
-      revokeAccountSession: async (sessionId) => {
-        accountSessions = accountSessions.filter((session) => session.sessionId !== sessionId);
-      },
-      logout: async () => {
-        authState = { status: "signed_out" };
-        emitAuthState(authState);
-        return clone(authState);
-      },
-      onEvent: (listener) => {
-        authListeners.add(listener);
-        return () => authListeners.delete(listener);
-      },
-    },
-    skills: {
-      localList: async () => clone(localSkills),
-      localGet: async ({ skillId, revision }) => {
-        const skill = revision
-          ? localRevisions.get(`${skillId}:${revision}`)
-          : localSkills.find((item) => item.id === skillId);
-        if (!skill) throw new Error("Local skill not found.");
-        return clone(skill);
-      },
-      localCreate: async ({ agentId, sourcePath }) => {
-        const name = sourcePath.split("/").at(-1) || "New skill";
-        const skill = {
-          ...STORY_MARKETPLACE_SKILL_DETAILS["skill-release-notes"],
-          id: `local-skill-${crypto.randomUUID()}`,
-          name,
-          slug: name,
-          creatorName: "Local",
-          version: 1,
-          versionId: "1",
-        };
-        localSkills.push(skill);
-        localRevisions.set(`${skill.id}:1`, skill);
-        await api.skills.localInstall({ agentId, skillId: skill.id, revision: 1 });
-        return clone(skill);
-      },
-      localRevise: async ({ skillId, expectedRevision }) => {
-        const index = localSkills.findIndex((item) => item.id === skillId);
-        const current = localSkills[index];
-        if (!current || current.version !== expectedRevision)
-          throw new Error("The skill changed. Read its latest revision before revising it.");
-        const skill = { ...current, version: expectedRevision + 1, versionId: String(expectedRevision + 1) };
-        localSkills[index] = skill;
-        localRevisions.set(`${skill.id}:${skill.version}`, skill);
-        return clone(skill);
-      },
-      localInstall: async ({ agentId, skillId, revision }) => {
-        const skill = await api.skills.localGet({ skillId, revision });
-        const previous = readInstalledSkills(agentId).find((item) => item.skillId === skillId);
-        if (previous?.state === "modified")
-          throw new Error("This skill has local changes. Confirm replacement to continue.");
-        const installed: InstalledSkill = {
-          skillId,
-          name: skill.name,
-          slug: skill.slug,
-          installedVersion: revision,
-          availableVersion: revision,
-          state: "installed",
-          origin: "local",
-          enabled: previous?.enabled !== false,
-          description: skill.description,
-        };
-        installedSkills.set(agentId, [
-          ...readInstalledSkills(agentId).filter((item) => item.skillId !== skillId),
-          installed,
-        ]);
-        return clone(installed);
-      },
-      list: async (query) => {
-        const matches = marketplaceSkills.filter(
-          (skill) =>
-            matchesQuery(`${skill.name} ${skill.description} ${skill.creatorName}`, query?.query) &&
-            (!query?.category || skill.category === query.category) &&
-            (query?.featured !== true || skill.featured),
-        );
-        const start = Number(query?.cursor ?? 0);
-        const end = start + (query?.limit ?? 50);
-        return clone({
-          skills: matches.slice(start, end),
-          nextCursor: end < matches.length ? String(end) : null,
-        });
-      },
-      get: async (skillId) => {
-        if (skillId.startsWith("local-skill-")) return api.skills.localGet({ skillId });
-        const detail = STORY_MARKETPLACE_SKILL_DETAILS[skillId];
-        if (!detail) throw new Error("Skill not found");
-        return clone(detail);
-      },
-      listMine: async () => clone(skillSubmissions),
-      choosePackage: async () => clone(STORY_SKILL_PACKAGE_PREVIEW),
-      submit: async (input) => {
-        const preview = STORY_SKILL_PACKAGE_PREVIEW;
-        const submission: SkillSubmission = {
-          id: `submission-${preview.slug}-${skillSubmissions.length + 1}`,
-          showCreatorAvatar: input.showCreatorAvatar ?? false,
-          skillId: input.skillId ?? `skill-${preview.slug}`,
-          slug: preview.slug,
-          name: preview.name,
-          description: preview.description,
-          category: input.category,
-          version: 1,
-          status: "pending",
-          rejectionNote: null,
-          iconUrl: null,
-          createdAt: new Date().toISOString(),
-        };
-        skillSubmissions = [submission, ...skillSubmissions];
-        return clone(submission);
-      },
-      listInstalled: async (agentId) =>
-        clone(
-          readInstalledSkills(agentId).map((skill) => {
-            const latest = localSkills.find((item) => item.id === skill.skillId);
-            return latest
-              ? {
-                  ...skill,
-                  availableVersion: latest.version,
-                  state:
-                    skill.state === "installed" && latest.version > skill.installedVersion
-                      ? "update-available"
-                      : skill.state,
-                }
-              : skill;
-          }),
-        ),
-      install: async ({ agentId, skillId }) => {
-        if (skillId.startsWith("local-skill-")) {
-          const skill = await api.skills.localGet({ skillId });
-          return api.skills.localInstall({ agentId, skillId, revision: skill.version });
-        }
-        const skill = marketplaceSkills.find((candidate) => candidate.id === skillId);
-        if (!skill) throw new Error("Skill not found");
-        const previous = readInstalledSkills(agentId).find((item) => item.skillId === skillId);
-        const installed: InstalledSkill = {
-          skillId: skill.id,
-          slug: skill.slug,
-          name: skill.name,
-          installedVersion: skill.version,
-          availableVersion: skill.version,
-          state: "installed",
-          enabled: previous?.enabled !== false,
-          origin: previous?.origin ?? "marketplace",
-          description: skill.description,
-        };
-        installedSkills.set(agentId, [
-          ...readInstalledSkills(agentId).filter((item) => item.skillId !== skillId),
-          installed,
-        ]);
-        return clone(installed);
-      },
-      uninstall: async ({ agentId, skillId }) => {
-        const skill = readInstalledSkills(agentId).find((item) => item.skillId === skillId);
-        if (skill?.origin === "managed") throw new Error("This skill is managed by OpenBot.");
-        installedSkills.set(
-          agentId,
-          readInstalledSkills(agentId).filter((item) => item.skillId !== skillId),
-        );
-      },
-      setEnabled: async ({ agentId, skillId, enabled }) => {
-        const current = readInstalledSkills(agentId);
-        const skill = current.find((item) => item.skillId === skillId);
-        if (!skill) throw new Error("Skill not found.");
-        if (skill.origin === "managed") throw new Error("This skill is managed by OpenBot.");
-        const next: InstalledSkill = { ...skill, enabled };
-        installedSkills.set(
-          agentId,
-          current.map((item) => (item.skillId === skillId ? next : item)),
-        );
-        return clone(next);
-      },
-    },
+    auth: mockAuth.auth,
+    skills: mockSkills.skills,
     hostedSites: {
       list: async () => clone(hostedSites),
       chooseDirectory: async () => "/mock/OpenBot/Sites/launch-notes",
@@ -1015,6 +587,127 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
         customProviders = customProviders.filter((provider) => provider.id !== id);
         emitAgentEvent({ type: "status", status: clone(agentStatus) });
         return { providers: clone(customProviders), restart: "restarted" };
+      },
+      /** The same keep rule as the real store: a key that is not sent stays, but not for a new origin. */
+      update: async (input) => {
+        const stored = customProviders.find((provider) => provider.id === input.id);
+        if (!stored) throw new Error("This endpoint is not saved.");
+        const keepsKey = input.apiKey === undefined && stored.hasApiKey;
+        if (keepsKey && !sameCustomProviderOrigin(stored.baseUrl, input.baseUrl)) {
+          throw new Error("Enter the API key again for the new address.");
+        }
+        customProviders = customProviders.map((provider) =>
+          provider.id === input.id
+            ? {
+                id: input.id,
+                name: input.name,
+                baseUrl: input.baseUrl,
+                hasApiKey: input.apiKey !== undefined || keepsKey,
+                models: input.models.map((model) => ({ id: model.id, name: model.name })),
+              }
+            : provider,
+        );
+        emitAgentEvent({ type: "status", status: clone(agentStatus) });
+        return { providers: clone(customProviders), restart: "restarted" };
+      },
+    },
+    // Preview starts no process: the names are kept, the values are dropped, and a check answers
+    // for the command without running it.
+    customAgents: {
+      list: async () => clone(customAgents),
+      save: async (input) => {
+        const summary: CustomAgentSummary = {
+          id: input.id,
+          name: input.name,
+          command: input.command,
+          args: [...input.args],
+          envNames: input.env.map((entry) => entry.name),
+          resolvedCommand: input.command.startsWith("/") ? input.command : `/usr/local/bin/${input.command}`,
+        };
+        customAgents = customAgents.some((agent) => agent.id === input.id)
+          ? customAgents.map((agent) => (agent.id === input.id ? summary : agent))
+          : [...customAgents, summary];
+        emitAgentEvent({ type: "status", status: clone(agentStatus) });
+        return { agents: clone(customAgents), restart: "restarted" };
+      },
+      delete: async ({ id }) => {
+        customAgents = customAgents.filter((agent) => agent.id !== id);
+        emitAgentEvent({ type: "status", status: clone(agentStatus) });
+        return { agents: clone(customAgents), restart: "restarted" };
+      },
+      check: async (input) => ({
+        agentName: input.command.split("/").pop() ?? input.command,
+        version: null,
+        protocolVersion: 1,
+        capabilities: ["loadSession"],
+      }),
+    },
+    // Preview reaches no local server, so a scan finds nothing and a model list is empty.
+    providerDetection: {
+      scanModelServers: async () => [],
+      scanAgents: async () => [],
+      discoverModels: async () => ({ models: [] }),
+      getSettings: async () => clone(detectionSettings),
+      setSettings: async (settings) => {
+        detectionSettings = clone(settings);
+        return clone(detectionSettings);
+      },
+    },
+    // Preview has one host, so every server answers from the same providers as this computer.
+    providerAdmin: {
+      startCodeLogin: (provider) => api.startProviderCodeLogin(provider),
+      cancelCodeLogin: (provider) => api.cancelProviderCodeLogin(provider),
+      getApiKeyState: (provider) => api.getProviderApiKeyState(provider),
+      setApiKey: (input) => api.setProviderApiKey(input),
+      clearApiKey: (provider) => api.clearProviderApiKey(provider),
+      getRuntimes: () => api.providerRuntimes.getStatus(),
+      downloadRuntime: (provider) => api.providerRuntimes.download(provider),
+      cancelRuntime: (provider) => api.providerRuntimes.cancel(provider),
+      checkRuntimeUpdates: () => api.providerRuntimes.checkForUpdates(),
+      listCustomProviders: () => api.customProviders.list(),
+      saveCustomProvider: (input) => api.customProviders.save(input),
+      deleteCustomProvider: (input) => api.customProviders.delete(input),
+    },
+    agentTemplates: {
+      // One published template per local agent. The preview shows the agent's own identity with the
+      // fixture skills and routines, so every state of the dialog has content.
+      preview: async (agentId) => {
+        const agent = agents.find((candidate) => candidate.id === agentId);
+        if (!agent) throw new Error("Choose a local agent first.");
+        return clone({
+          ...storyAgentTemplatePreview(agent.id, agentTemplatePublications.get(agent.id) ?? null),
+          name: agent.name,
+          title: agent.title,
+          description: agent.description,
+          avatarSeed: agent.avatarSeed,
+          avatarHue: agent.avatarHue,
+          avatarUrl: agent.avatarUrl,
+          updatedAt: agent.updatedAt,
+        });
+      },
+      publish: async ({ agentId }) => {
+        if (!agents.some((candidate) => candidate.id === agentId)) throw new Error("Choose a local agent first.");
+        const publication = { ...STORY_AGENT_TEMPLATE_PUBLICATION, publishedAt: new Date().toISOString() };
+        agentTemplatePublications.set(agentId, publication);
+        return clone(publication);
+      },
+      unpublish: async (agentId) => {
+        agentTemplatePublications.delete(agentId);
+      },
+      get: async (templateId) => {
+        if (templateId !== STORY_AGENT_TEMPLATE_DETAIL.id) throw new Error("This shared agent is no longer published.");
+        return clone(STORY_AGENT_TEMPLATE_DETAIL);
+      },
+      install: async () => {
+        const agent = agents[0];
+        if (!agent) throw new Error("Agent not found");
+        return clone({ agent });
+      },
+      // The preview is never opened by a link, so there is nothing pending and nothing to push.
+      takePendingLink: async () => null,
+      onOpenLink: (listener) => {
+        void listener;
+        return () => undefined;
       },
     },
     marketplaceAgents: {
@@ -1185,7 +878,48 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
       listModels: async () => clone([...models, ...customProviders.flatMap(mockCustomProviderModels)]),
       listAgents: async () => clone(agents),
       listInstalledSkills: async (agentId) => clone(readInstalledSkills(agentId)),
-      ...createMockChannels(emitAgentEvent, (agentId) => agents.find((entry) => entry.id === agentId)?.name ?? agentId),
+      ...mockChannels,
+      getAgentAdminSettings: async (agentId) => {
+        const agent = agents.find((candidate) => candidate.id === agentId);
+        if (!agent) throw new Error("Agent not found");
+        return {
+          access: agent.access ?? DEFAULT_AGENT_ACCESS,
+          autoApprove: agentAutoApprovalEnabled(approvalAutomation, agentId),
+          autoApproveLocked: approvalAutomation.turbo,
+        };
+      },
+      updateAgentAdminSettings: async ({ agentId, access, autoApprove }) => {
+        const agent = agents.find((candidate) => candidate.id === agentId);
+        if (!agent) throw new Error("Agent not found");
+        if (access !== undefined) {
+          agents = agents.map((candidate) => (candidate.id === agentId ? { ...candidate, access } : candidate));
+          emitAgentEvent({ type: "agents-changed", agents });
+        }
+        if (autoApprove !== undefined) {
+          approvalAutomation = {
+            ...approvalAutomation,
+            autoApproveOverrides: { ...approvalAutomation.autoApproveOverrides, [agentId]: autoApprove },
+          };
+        }
+        return {
+          access: access ?? agent.access ?? DEFAULT_AGENT_ACCESS,
+          autoApprove: agentAutoApprovalEnabled(approvalAutomation, agentId),
+          autoApproveLocked: approvalAutomation.turbo,
+        };
+      },
+      // The preview is one computer, so the host skills are its own.
+      listAgentSkills: (agentId) => mockSkills.skills.listInstalled(agentId),
+      installAgentSkill: (input) => mockSkills.skills.install(input),
+      uninstallAgentSkill: (input) => mockSkills.skills.uninstall(input),
+      setAgentSkillEnabled: (input) => mockSkills.skills.setEnabled(input),
+      addMarketplaceAgent: async (input) => {
+        const { agent } = await api.marketplaceAgents.install(input);
+        return { id: agent.id, name: agent.name };
+      },
+      addTemplateAgent: async (input) => {
+        const { agent } = await api.agentTemplates.install(input);
+        return { id: agent.id, name: agent.name };
+      },
       listMcpServers: async () => clone(mcpServers),
       saveMcpServer: async ({ config }) => {
         const normalized = normalizeMcpConfig(config);
@@ -1353,6 +1087,25 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
         queues.delete(agentId);
         memories.delete(agentId);
         routines.delete(agentId);
+        // The host takes a deleted agent out of every channel it was a member of.
+        for (const channel of await mockChannels.listChannels()) {
+          if (!channel.members.some((member) => member.agentId === agentId)) continue;
+          const draft = {
+            name: channel.name,
+            title: channel.title,
+            instructions: channel.instructions,
+            members: channel.members,
+            leadAgentId: channel.leadAgentId,
+          };
+          toggleChannelMember(draft, agentId, false);
+          await mockChannels.channelCommand({
+            type: "save",
+            operationId: crypto.randomUUID(),
+            channelId: channel.id,
+            draft,
+            update: true,
+          });
+        }
         emitAgentEvent({ type: "agents-changed", agents });
       },
       listMemories: async (agentId) => clone(memories.get(agentId) ?? []),
@@ -1696,8 +1449,25 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
           status: "interrupted",
         });
       },
+      clearContext: async (agentId: string) => {
+        updateSnapshot(agentId, (snapshot) => {
+          snapshot.messages.push({
+            id: crypto.randomUUID(),
+            author: "system",
+            source: "system",
+            text: sourceText("status.agent.contextCleared"),
+            createdAt: new Date().toISOString(),
+            status: "completed",
+            itemType: CONTEXT_RESET_ITEM_TYPE,
+          });
+        });
+      },
       respondToPrompt: async (_input: RespondToPromptInput) => undefined,
       respondToApproval: async () => undefined,
+      respondToBrowserSecret: async (input) => {
+        for (const listener of agentListeners)
+          listener({ type: "browser-takeover-resolved", requestId: input.requestId, agentId: input.agentId });
+      },
       respondToBrowserTakeover: async () => undefined,
       onEvent: (listener) => {
         agentListeners.add(listener);
@@ -1709,83 +1479,7 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
         return () => agentListeners.delete(scopedListener);
       },
     },
-    browser: {
-      open: async (input: BrowserOpenInput) => {
-        const tab: BrowserTab = {
-          id: `browser-tab-${browserTabs.length + 1}`,
-          title: input.url,
-          url: input.url,
-          loading: false,
-          ownerThreadId: input.ownerThreadId ?? null,
-          ownerAgentId: input.ownerAgentId ?? null,
-          // `toPublicTab` in `browser-host.ts` fills all three on every tab it reports, so a mock that
-          // left them undefined would be the only surface where a freshly opened tab has no environment.
-          // These are `defaultBrowserEnvironment()` -- a fill viewport, which the real host then reports
-          // at the view's measured size.
-          environment: {
-            viewport: { mode: "fill", width: 1200, height: 800, deviceScaleFactor: 1, preset: null },
-            colorScheme: "system",
-            reducedMotion: false,
-          },
-          recording: false,
-          diagnosticErrorCount: 0,
-        };
-        browserTabs = [...browserTabs, tab];
-        activeBrowserTabId = tab.id;
-        emit(browserDisplayListeners, { tabs: browserTabs, activeTabId: tab.id });
-        emitAgentEvent({ type: "browser-changed", tabs: browserTabs, activeTabId: tab.id });
-        return clone(tab);
-      },
-      activate: async (tabId) => {
-        activeBrowserTabId = tabId;
-        emit(browserDisplayListeners, { tabs: browserTabs, activeTabId: activeBrowserTabId });
-      },
-      navigate: async (input) => {
-        if (!("url" in input)) return;
-        browserTabs = browserTabs.map((tab) =>
-          tab.id === input.tabId ? { ...tab, url: input.url, title: input.url } : tab,
-        );
-        emit(browserDisplayListeners, { tabs: browserTabs, activeTabId: activeBrowserTabId });
-        emitAgentEvent({ type: "browser-changed", tabs: browserTabs, activeTabId: activeBrowserTabId });
-      },
-      reload: async () => undefined,
-      close: async (tabId) => {
-        browserTabs = browserTabs.filter((tab) => tab.id !== tabId);
-        activeBrowserTabId = browserTabs[0]?.id ?? null;
-        emit(browserDisplayListeners, { tabs: browserTabs, activeTabId: activeBrowserTabId });
-        emitAgentEvent({
-          type: "browser-changed",
-          tabs: browserTabs,
-          activeTabId: activeBrowserTabId,
-        });
-      },
-      listTabs: async () => clone(browserTabs),
-      getDisplayState: async () => ({ tabs: clone(browserTabs), activeTabId: activeBrowserTabId }),
-      getControlState: async () => clone(browserControlState),
-      capturePreview: async (tabId) => {
-        const preview =
-          options.browserPreviews?.[tabId] === undefined ? browserPreview : options.browserPreviews[tabId];
-        if (!preview) throw new Error("Browser preview is unavailable.");
-        return clone(preview);
-      },
-      setVisible: async () => undefined,
-      onDisplayState: (listener) => {
-        browserDisplayListeners.add(listener);
-        return () => browserDisplayListeners.delete(listener);
-      },
-      openPictureInPicture: async (bounds) => bounds ?? { x: 16, y: 16, width: 420, height: 300 },
-      closePictureInPicture: async () => undefined,
-      dockPictureInPicture: async () => {
-        emit(browserPictureInPictureListeners, { type: "dock" });
-      },
-      hidePictureInPicture: async () => {
-        emit(browserPictureInPictureListeners, { type: "hide" });
-      },
-      onPictureInPictureEvent: (listener) => {
-        browserPictureInPictureListeners.add(listener);
-        return () => browserPictureInPictureListeners.delete(listener);
-      },
-    },
+    browser: mockBrowser.browser,
     update: {
       getStatus: async () => clone(updateStatus),
       check: async () => {
@@ -1814,299 +1508,104 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
         updateStatus = { ...updateStatus, phase: "installing" };
         emit(updateListeners, updateStatus);
       },
-      getPreference: async () => ({ autoDownload: true }),
-      setPreference: async (input) => ({ ...input }),
+      getPreference: async () => clone(updatePreference),
+      setPreference: async (input) => {
+        updatePreference = { ...updatePreference, ...input };
+        return clone(updatePreference);
+      },
+      cancelScheduledRestart: async () => {
+        const { scheduledRestart: _cancelled, ...rest } = updateStatus;
+        updateStatus = rest;
+        emit(updateListeners, updateStatus);
+        return clone(updateStatus);
+      },
       onEvent: (listener) => {
         updateListeners.add(listener);
         return () => updateListeners.delete(listener);
       },
+      // The preview has no joined server whose admin could change it.
+      onPreference: () => () => undefined,
+    },
+    notifications: {
+      getPreference: async () => ({ desktopNotifications: true }),
+      setPreference: async (input) => ({ ...input }),
+      test: async () => undefined,
+      openSettings: async () => undefined,
+      onOpened: () => () => undefined,
     },
     maintenance: {
       exportData: async () => ({ saved: true }),
       exportDiagnostics: async () => ({ saved: true }),
     },
-    servers: {
-      setMuted: async ({ serverId, muted }) => {
-        if (!servers.some((server) => server.id === serverId)) throw new Error("Remote server not found.");
-        servers = servers.map((server) => (server.id === serverId ? { ...server, notificationsMuted: muted } : server));
-        return clone(servers);
-      },
-      list: async () => clone(servers),
-      select: async (serverId) => {
-        servers = servers.map((server) => ({ ...server, active: server.id === serverId }));
-        emitAgentEvent({ type: "agents-changed", agents });
-        return clone(servers);
-      },
-      reorder: async ({ serverIds }) => {
-        const serversById = new Map(servers.map((server) => [server.id, server]));
-        servers = [
-          ...servers.filter((server) => server.kind === "local"),
-          ...serverIds.flatMap((serverId) => {
-            const server = serversById.get(serverId);
-            return server?.kind === "remote" ? [server] : [];
-          }),
-        ];
-        return clone(servers);
-      },
-      join: async (input: JoinServerInput) => {
-        const server: ServerSummary = {
-          id: `server-${servers.length + 1}`,
-          name: "Joined workspace",
-          logoUrl: null,
-          notificationsMuted: false,
-          kind: "remote",
-          state: "online",
-          apiUrl: input.inviteUrl,
-          remoteDesktopAvailable: false,
-          role: "member",
-          active: false,
-        };
-        servers = [...servers, server];
-        return clone(server);
-      },
-      previewInvite: async () => ({
-        serverId: "00000000-0000-4000-8000-000000000000",
-        serverName: "Joined workspace",
-        apiHostname: "story-host.openbot.run",
-        role: "member",
-        expiresAt: "2026-09-19T10:00:00.000Z",
-        emailBound: false,
-      }),
-      takePendingInvite: async () => null,
-      login: async (input) => {
-        const server = servers.find((candidate) => candidate.id === input.serverId);
-        if (!server) throw new Error("Server not found");
-        return clone(server);
-      },
-      retryConnection: async (serverId) => {
-        const server = servers.find((candidate) => candidate.id === serverId);
-        if (!server) throw new Error("Server not found");
-        return clone(server);
-      },
-      remove: async (serverId) => {
-        servers = servers.filter((server) => server.id !== serverId);
-      },
-      getPresence: async () => clone(presence),
-      getPresenceFor: async () => clone(presence),
-      refreshIdentity: async (serverId) => {
-        const server = servers.find((candidate) => candidate.id === serverId);
-        if (!server) throw new Error("Server not found");
-        return clone(server);
-      },
-      listMembers: async () => clone(teamMembers),
-      updateMember: async (_serverId, input: UpdateTeamMemberInput) => {
-        const member = teamMembers.find((candidate) => candidate.id === input.memberId);
-        if (!member) throw new Error("Member not found");
-        const updated = { ...member, ...input };
-        teamMembers = teamMembers.map((candidate) => (candidate.id === updated.id ? updated : candidate));
-        return clone(updated);
-      },
-      removeMember: async (_serverId, memberId) => {
-        teamMembers = teamMembers.filter((member) => member.id !== memberId);
-      },
-      listInvites: async () => clone(invites),
-      revokeInvite: async (_serverId, inviteId) => {
-        invites = invites.filter((invite) => invite.id !== inviteId);
-      },
-      createInvite: async (_serverId, input: CreateTeamInviteInput): Promise<InviteSummary> => ({
-        id: `invite-${invites.length + 1}`,
-        inviteUrl: "https://team.example.com/invite/story-invite",
-        expiresAt: "2026-09-19T10:00:00.000Z",
-        role: input.role,
-        usedAt: null,
-        email: input.email ?? null,
-      }),
-      setTyping: async (_input: SetTeamTypingInput) => undefined,
-      onPresence: (listener, serverId) => {
-        const receive = (snapshot: TeamPresenceSnapshot) => {
-          if (
-            !serverId ||
-            snapshot.serverId === serverId ||
-            (serverId === "local" && snapshot.serverId === hostStatus.serverId)
-          )
-            listener(snapshot);
-        };
-        presenceListeners.add(receive);
-        return () => presenceListeners.delete(receive);
-      },
-      listDirectThreads: async () => clone(directThreads),
-      readDirectConversation: async (memberId) =>
-        clone(
-          directSnapshots[memberId] ?? {
-            threadId: `direct-${memberId}`,
-            otherMemberId: memberId,
-            messages: [],
-            revision: 0,
-          },
-        ),
-      readDirectConversationPage: async (input) => {
-        if (!input.anchor || input.anchor.type === "latest") {
-          emit(latestDirectConversationListeners, input.memberId);
-        }
-        const snapshot = clone(
-          directSnapshots[input.memberId] ?? {
-            threadId: `direct-${input.memberId}`,
-            otherMemberId: input.memberId,
-            messages: [],
-            revision: 0,
-          },
-        );
-        const messages = snapshot.messages.slice(-Math.min(input.limit ?? 50, 100));
-        return {
-          ...snapshot,
-          messages,
-          pageInfo: { hasOlder: snapshot.messages.length > messages.length, olderCursor: null },
-        };
-      },
-      sendDirectMessage: async (input: SendDirectMessageInput) => {
-        const message: DirectMessage = {
-          id: input.clientMessageId,
-          threadId: `direct-${input.memberId}`,
-          senderMemberId: "member-self",
-          recipientMemberId: input.memberId,
-          text: input.text,
-          createdAt: new Date().toISOString(),
-          sequence: directMessageCounter++,
-        };
-        const snapshot = directSnapshots[input.memberId] ?? {
-          threadId: message.threadId,
-          otherMemberId: input.memberId,
-          messages: [],
-          revision: 0,
-        };
-        snapshot.messages = [...snapshot.messages, message];
-        snapshot.revision += 1;
-        directSnapshots[input.memberId] = snapshot;
-        return clone(message);
-      },
-      markDirectRead: async (input) => {
-        directThreads = directThreads.map((thread) =>
-          thread.otherMemberId === input.memberId ? { ...thread, unreadCount: 0 } : thread,
-        );
-        const snapshot = directSnapshots[input.memberId];
-        const readState = {
-          unreadCount: 0,
-          firstUnreadMessageId: null,
-          throughSequence: input.throughSequence,
-        };
-        if (snapshot) snapshot.readState = readState;
-        return readState;
-      },
-      setDirectTyping: async () => undefined,
-      onDirectMessage: (listener) => {
-        directMessageListeners.add(listener);
-        return () => directMessageListeners.delete(listener);
-      },
-      onDirectTyping: (listener) => {
-        directTypingListeners.add(listener);
-        return () => directTypingListeners.delete(listener);
-      },
-      onEvent: (listener) => {
+    servers: mockTeam.servers,
+    plugins: {
+      // The preview is never opened by a link, so there is nothing pending and nothing to push.
+      takePendingListing: async () => null,
+      onOpenListing: (listener) => {
         void listener;
         return () => undefined;
       },
-      onInvite: (listener) => {
-        inviteListeners.add(listener);
-        return () => inviteListeners.delete(listener);
-      },
     },
-    host: {
-      getStatus: async () => clone(hostStatus),
-      configure: async (input: ConfigureHostInput) => {
-        hostStatus = {
-          ...hostStatus,
-          configured: true,
-          phase: "idle",
-          serverName: input.serverName,
-        };
-        emitHostStatus(hostStatus);
-        return clone(hostStatus);
+    host: mockTeam.host,
+    // Preview has one host, so every server's name and logo are this computer's.
+    hostAdmin: {
+      updateIdentity: async (input, serverId) => {
+        await mockTeam.host.updateIdentity(input);
+        const server = (await mockTeam.servers.list()).find((candidate) => candidate.id === serverId);
+        if (!server) throw new Error("Server not found");
+        return server;
       },
-      updateIdentity: async (input) => {
-        hostStatus = {
-          ...hostStatus,
-          ...(input.serverName === undefined ? {} : { serverName: input.serverName }),
-        };
-        emitHostStatus(hostStatus);
-        return clone(hostStatus);
-      },
-      getPresence: async () => clone(presence),
-      start: async () => {
-        hostStatus = { ...hostStatus, phase: "online", apiOnline: true, remoteDesktopReady: true };
-        emitHostStatus(hostStatus);
-        return clone(hostStatus);
-      },
-      stop: async () => {
-        hostStatus = { ...hostStatus, phase: "idle", apiOnline: false, remoteDesktopReady: false };
-        emitHostStatus(hostStatus);
-        return clone(hostStatus);
-      },
-      // The preview has no runtime to ask, so the check is what a granted permission looks like.
-      recheckScreenRecording: async () => {
-        hostStatus = { ...hostStatus, remoteDesktopScreenRecordingDenied: false };
-        emitHostStatus(hostStatus);
-        return clone(hostStatus);
-      },
-      listMembers: async () => clone(teamMembers),
-      updateMember: async (input: UpdateTeamMemberInput) => {
-        const member = teamMembers.find((candidate) => candidate.id === input.memberId);
-        if (!member) throw new Error("Member not found");
-        const updated = { ...member, ...input };
-        teamMembers = teamMembers.map((candidate) => (candidate.id === updated.id ? updated : candidate));
-        return clone(updated);
-      },
-      removeMember: async (memberId) => {
-        teamMembers = teamMembers.filter((member) => member.id !== memberId);
-      },
-      listSessions: async () => clone(sessions),
-      revokeSession: async (sessionId) => {
-        sessions = sessions.filter((session) => session.id !== sessionId);
-      },
-      listInvites: async () => clone(invites),
-      revokeInvite: async (inviteId) => {
-        invites = invites.filter((invite) => invite.id !== inviteId);
-      },
-      createInvite: async (input: CreateTeamInviteInput): Promise<InviteSummary> => ({
-        id: `invite-${invites.length + 1}`,
-        role: input.role,
-        expiresAt: "2026-09-19T10:00:00.000Z",
-        usedAt: null,
-        inviteUrl: "https://openbot.run/join?invite=mock-invite",
-        email: input.email ?? null,
-      }),
-      onEvent: (listener) => {
-        hostListeners.add(listener);
-        return () => hostListeners.delete(listener);
-      },
+      ...createMockHostUpdate(options),
     },
-    remoteDesktop: {
-      list: async () => clone(remoteDesktopSessions),
-      connect: async (input) => {
-        const session: RemoteDesktopSession = {
-          ...clone(STORY_REMOTE_DESKTOP_SESSION),
-          id: `remote-desktop-${remoteDesktopSessions.length + 1}`,
-          serverId: input.serverId,
-          createdAt: new Date().toISOString(),
-        };
-        remoteDesktopSessions = [...remoteDesktopSessions, session];
-        emitRemoteDesktopSessions(remoteDesktopSessions);
-        return { status: "connected", session: clone(session) };
-      },
-      selectDisplay: async (input) => {
-        remoteDesktopSessions = remoteDesktopSessions.map((session) =>
-          session.serverId === input.serverId ? { ...session, selectedDisplayId: input.displayId } : session,
+    storage: createMockStorage(),
+    agentImport: {
+      choose: async () => clone(AGENT_IMPORT_PREVIEW),
+      apply: async ({ token, keys, channelKeys }) => {
+        if (token !== AGENT_IMPORT_PREVIEW.token) throw new Error("The export is no longer open. Choose it again.");
+        const selected = AGENT_IMPORT_PREVIEW.agents.filter((agent) => keys.includes(agent.key));
+        const imported = selected.map((agent) =>
+          createAgentSummary({ name: agent.name, title: agent.title, description: agent.description }),
         );
-        emitRemoteDesktopSessions(remoteDesktopSessions);
+        agents = [...agents, ...imported];
+        emitAgentEvent({ type: "agents-changed", agents });
+        // Channels follow the main process: the members that imported, and at least one of them.
+        const agentIds = new Map(selected.map((agent, index) => [agent.key, imported[index]?.id ?? ""]));
+        const channels = [];
+        const skippedChannels = [];
+        for (const source of AGENT_IMPORT_PREVIEW.channels.filter((channel) => channelKeys.includes(channel.key))) {
+          const members = source.memberKeys.flatMap((key) => {
+            const agentId = agentIds.get(key);
+            return agentId ? [{ agentId }] : [];
+          });
+          if (members.length === 0) {
+            skippedChannels.push({
+              key: source.key,
+              name: source.name,
+              reason: "None of its agents were imported.",
+            });
+            continue;
+          }
+          const channel = await api.agent.channelCommand({
+            type: "save",
+            operationId: crypto.randomUUID(),
+            channelId: crypto.randomUUID(),
+            draft: {
+              name: source.name,
+              title: source.title,
+              instructions: "",
+              members,
+              leadAgentId: source.leadKey ? (agentIds.get(source.leadKey) ?? null) : null,
+            },
+          });
+          channels.push({ id: channel.id, name: channel.name });
+        }
+        return clone({ agents: imported, skipped: [], channels, skippedChannels, warnings: [] });
       },
-      disconnect: async (sessionId) => {
-        remoteDesktopSessions = remoteDesktopSessions.filter((session) => session.id !== sessionId);
-        emitRemoteDesktopSessions(remoteDesktopSessions);
-      },
-      onEvent: (listener) => {
-        remoteDesktopListeners.add(listener);
-        return () => remoteDesktopListeners.delete(listener);
-      },
+      discard: async () => undefined,
+      readSkill: async () => AGENT_IMPORT_SKILL,
+      saveSkill: async () => ({ saved: true }),
     },
+    remoteDesktop: mockTeam.remoteDesktop,
   };
 
   return {
@@ -2116,40 +1615,31 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
       latestConversationListeners.add(listener);
       return () => latestConversationListeners.delete(listener);
     },
-    onLatestDirectConversationOpened: (listener) => {
-      latestDirectConversationListeners.add(listener);
-      return () => latestDirectConversationListeners.delete(listener);
-    },
+    onLatestDirectConversationOpened: mockTeam.onLatestDirectConversationOpened,
     readConversationSnapshot,
     updateConversationSnapshot,
-    readDirectConversationSnapshot,
-    updateDirectConversationSnapshot,
+    readDirectConversationSnapshot: mockTeam.readDirectConversationSnapshot,
+    updateDirectConversationSnapshot: mockTeam.updateDirectConversationSnapshot,
     emitConversationDelta,
     setQueueSnapshot,
-    emitAuthState,
-    emitPresence,
-    emitDirectMessage,
-    emitDirectTyping,
-    emitInvite,
-    emitHostStatus,
-    emitRemoteDesktopSessions,
+    emitAuthState: mockAuth.emitAuthState,
+    emitPresence: mockTeam.emitPresence,
+    emitDirectMessage: mockTeam.emitDirectMessage,
+    emitDirectTyping: mockTeam.emitDirectTyping,
+    emitInvite: mockTeam.emitInvite,
+    emitHostStatus: mockTeam.emitHostStatus,
+    emitRemoteDesktopSessions: mockTeam.emitRemoteDesktopSessions,
     dispose: () => {
       for (const timer of timers) clearTimeout(timer);
       timers.clear();
-      runtimeListeners.clear();
-      runtimeTransfers.clear();
+      mockProviderRuntimes.dispose();
+      mockAuth.dispose();
+      mockBrowser.dispose();
+      mockTeam.dispose();
       agentListeners.clear();
-      authListeners.clear();
-      presenceListeners.clear();
-      directMessageListeners.clear();
-      directTypingListeners.clear();
-      inviteListeners.clear();
-      hostListeners.clear();
-      remoteDesktopListeners.clear();
       updateListeners.clear();
       attachmentListeners.clear();
       latestConversationListeners.clear();
-      latestDirectConversationListeners.clear();
       void appInfo;
     },
   };

@@ -1,30 +1,49 @@
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
-import type { UpdateAgentInput } from "@openbot/contracts/ipc";
-import { userErrorMessage as errorMessage } from "@openbot/user-errors";
+import type { AvatarHue, UpdateAgentInput } from "@openbot/contracts/ipc";
 import { router, useLocalSearchParams, useNavigation } from "expo-router";
 import { usePreventRemove } from "expo-router/react-navigation";
 import { Typography } from "heroui-native";
-import { useRef, useState } from "react";
+import { useThemeColor } from "heroui-native/hooks";
+import { Pencil } from "lucide-react-native";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { Alert, Pressable, View } from "react-native";
+import { AgentAccessFields } from "@/features/agents/components/agent-access-fields";
 import { AgentAppearancePicker } from "@/features/agents/components/agent-appearance-picker";
 import { AgentInformation } from "@/features/agents/components/agent-information";
 import { type AgentPhotoDraft, AgentPhotoPicker } from "@/features/agents/components/agent-photo-picker";
 import { AgentRuntimeFields } from "@/features/agents/components/agent-runtime-fields";
 import { BloubAvatarPreview } from "@/features/agents/components/bloub-avatar";
 import { SettingsRow, SettingsSection } from "@/features/settings/components/settings-content";
-import { type MobileAgent, useMobileWorkspace } from "@/features/workspace/context/mobile-workspace-context";
+import {
+  type MobileAgent,
+  type MobileServer,
+  useMobileWorkspace,
+} from "@/features/workspace/context/mobile-workspace-context";
 import { SheetFormField } from "@/shared/components/sheet-form-field";
 import { SheetSaveAction } from "@/shared/components/sheet-save-action";
 import { SheetScrollView } from "@/shared/components/sheet-scroll-view";
+import { haptics } from "@/shared/lib/haptics";
+import { useText } from "@/shared/lib/text";
 
 type AgentEdits = Pick<
   UpdateAgentInput,
   "name" | "title" | "description" | "avatarSeed" | "avatarHue" | "provider" | "model" | "reasoningEffort"
 >;
 
-type AgentPage = "info" | "appearance" | "usage" | "memories" | "routines" | "runtime" | "memory" | "routine";
+type AgentPage =
+  | "info"
+  | "appearance"
+  | "usage"
+  | "memories"
+  | "skills"
+  | "files"
+  | "routines"
+  | "runtime"
+  | "memory"
+  | "routine";
 
 export function EditAgentScreen({ page = "info" }: { page?: AgentPage }) {
+  const { t } = useText();
   const { agentId, serverId } = useLocalSearchParams<{ agentId: string; serverId?: string }>();
   const workspace = useMobileWorkspace();
   const [hostId] = useState(serverId ?? workspace.activeServer.id);
@@ -35,21 +54,35 @@ export function EditAgentScreen({ page = "info" }: { page?: AgentPage }) {
   if (agent) lastAgent.current = agent;
   const displayed = agent ?? lastAgent.current;
   if (displayed) {
-    return <AgentForm agent={displayed} available={Boolean(agent && host?.state === "online")} page={page} />;
+    return (
+      <AgentForm agent={displayed} host={host} available={Boolean(agent && host?.state === "online")} page={page} />
+    );
   }
   return (
     <SheetScrollView className="bg-sheet" contentContainerClassName="p-5 pb-safe-offset-5">
       <Typography.Paragraph>
-        {host?.initialConnectionPending ? "Loading agent…" : "This agent is no longer available on this host."}
+        {t(host?.initialConnectionPending ? "mobile.agent.edit.loading" : "mobile.agent.edit.gone")}
       </Typography.Paragraph>
     </SheetScrollView>
   );
 }
 
-function AgentForm({ agent, available, page }: { agent: MobileAgent; available: boolean; page: AgentPage }) {
+function AgentForm({
+  agent,
+  host,
+  available,
+  page,
+}: {
+  agent: MobileAgent;
+  host: MobileServer | undefined;
+  available: boolean;
+  page: AgentPage;
+}) {
+  const { t, errorMessage } = useText();
   const { updateAgent, setAgentAvatar } = useMobileWorkspace();
   const navigation = useNavigation();
   const [edits, setEdits] = useState<AgentEdits>({});
+  const foreground = useThemeColor("foreground");
   const [photo, setPhoto] = useState<AgentPhotoDraft | null | undefined>();
   const [pickingPhoto, setPickingPhoto] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -73,16 +106,20 @@ function AgentForm({ agent, available, page }: { agent: MobileAgent; available: 
     (edits.reasoningEffort !== undefined && edits.reasoningEffort !== agent.reasoningEffort);
   const valid =
     page !== "info" ||
-    (Boolean(name.trim() && description.trim()) &&
+    (Boolean(name.trim()) &&
       name.length <= INPUT_LIMITS.agentName &&
       title.length <= INPUT_LIMITS.agentTitle &&
       description.length <= INPUT_LIMITS.agentDescription);
 
   usePreventRemove(dirty || saving || pickingPhoto, ({ data }) => {
     if (pending.current || pickingPhoto) return;
-    Alert.alert("Discard changes?", "Your changes have not been saved.", [
-      { text: "Keep editing", style: "cancel" },
-      { text: "Discard", style: "destructive", onPress: () => navigation.dispatch(data.action) },
+    Alert.alert(t("mobile.agent.discard.title"), t("mobile.agent.discard.body"), [
+      { text: t("mobile.agent.discard.keepEditing"), style: "cancel" },
+      {
+        text: t("mobile.agent.discard.discard"),
+        style: "destructive",
+        onPress: () => navigation.dispatch(data.action),
+      },
     ]);
   });
 
@@ -90,6 +127,34 @@ function AgentForm({ agent, available, page }: { agent: MobileAgent; available: 
     setEdits((current) => ({ ...current, ...value }));
     setError(null);
   }
+  // Stable handlers let the memoized face and color choices skip unrelated renders.
+  const changeAvatarSeed = useCallback((avatarSeed: string) => {
+    setEdits((current) => ({ ...current, avatarSeed }));
+    setError(null);
+  }, []);
+  const changeAvatarHue = useCallback((avatarHue: AvatarHue | null) => {
+    setEdits((current) => ({ ...current, avatarHue }));
+    setError(null);
+  }, []);
+  const hasPhoto = photo === undefined ? Boolean(agent.avatarUrl) : Boolean(photo);
+  const photoField = useMemo(
+    () => (
+      <AgentPhotoPicker
+        hasPhoto={hasPhoto}
+        cropRoute={{
+          pathname: "/agent-info/[agentId]/crop-photo",
+          params: { agentId: agent.id, serverId: agent.serverId },
+        }}
+        disabled={saving || pickingPhoto}
+        onChange={(value) => {
+          setPhoto(value);
+          setError(null);
+        }}
+        onBusyChange={setPickingPhoto}
+      />
+    ),
+    [hasPhoto, agent.id, agent.serverId, saving, pickingPhoto],
+  );
 
   async function submit(): Promise<void> {
     if (!valid || !dirty || !available || pickingPhoto || pending.current) return;
@@ -117,8 +182,10 @@ function AgentForm({ agent, available, page }: { agent: MobileAgent; available: 
         await setAgentAvatar(agent.id, photo ?? null, agent.serverId);
         setPhoto(undefined);
       }
+      void haptics.notification("success");
     } catch (cause) {
-      setError(errorMessage(cause, "OpenBot could not update this agent."));
+      void haptics.notification("error");
+      setError(errorMessage(cause, t("mobile.agent.edit.failed")));
     } finally {
       pending.current = false;
       setSaving(false);
@@ -134,17 +201,18 @@ function AgentForm({ agent, available, page }: { agent: MobileAgent; available: 
     >
       {page === "info" ? (
         <>
-          <View className="gap-3">
+          <View className="gap-6">
             <Pressable
-              className="items-center gap-2 self-center"
+              className="self-center"
               accessibilityRole="button"
-              accessibilityLabel="Edit appearance"
-              onPress={() =>
+              accessibilityLabel={t("mobile.agent.edit.appearance")}
+              onPress={() => {
+                void haptics.impact("soft");
                 router.push({
                   pathname: "/agent-info/[agentId]/appearance",
                   params: { agentId: agent.id, serverId: agent.serverId },
-                })
-              }
+                });
+              }}
             >
               <BloubAvatarPreview
                 agentId={agent.id}
@@ -153,15 +221,16 @@ function AgentForm({ agent, available, page }: { agent: MobileAgent; available: 
                 hue={avatarHue}
                 size={112}
               />
-              <Typography type="body-xs" className="text-center text-grouped-secondary">
-                Edit appearance
-              </Typography>
+              {/* A photo fills the circle; the generated avatar leaves space around its shape. */}
+              <View
+                className={`absolute size-9 items-center justify-center rounded-full border-4 border-sheet bg-grouped ${agent.avatarUrl ? "right-0 bottom-0" : "right-3 bottom-3"}`}
+              >
+                <Pencil color={foreground} size={14} />
+              </View>
             </Pressable>
             <SheetFormField
-              label="Name"
-              hideLabel
+              label={t("mobile.agent.form.name")}
               appearance="soft"
-              textAlign="center"
               autoCapitalize="words"
               maxLength={INPUT_LIMITS.agentName}
               value={name}
@@ -170,16 +239,18 @@ function AgentForm({ agent, available, page }: { agent: MobileAgent; available: 
             />
           </View>
           <SheetFormField
-            label="Title"
+            label={t("mobile.agent.edit.title")}
             appearance="soft"
+            placeholder={t("mobile.agent.edit.titlePlaceholder")}
             maxLength={INPUT_LIMITS.agentTitle}
             value={title}
             editable={!saving}
             onChangeText={(value) => change({ title: value })}
           />
           <SheetFormField
-            label="Instructions"
+            label={t("mobile.agent.edit.instructions")}
             appearance="soft"
+            placeholder={t("mobile.agent.edit.instructionsPlaceholder")}
             multiline
             maxLength={INPUT_LIMITS.agentDescription}
             value={description}
@@ -197,21 +268,11 @@ function AgentForm({ agent, available, page }: { agent: MobileAgent; available: 
           hue={avatarHue}
           name={name}
           nameField={null}
-          showFaces={photo === undefined ? !agent.avatarUrl : !photo}
-          photoField={
-            <AgentPhotoPicker
-              hasPhoto={photo === undefined ? Boolean(agent.avatarUrl) : Boolean(photo)}
-              disabled={saving || pickingPhoto}
-              onChange={(value) => {
-                setPhoto(value);
-                setError(null);
-              }}
-              onBusyChange={setPickingPhoto}
-            />
-          }
+          showFaces={!hasPhoto}
+          photoField={photoField}
           disabled={saving || pickingPhoto}
-          onSeedChange={(value) => change({ avatarSeed: value })}
-          onHueChange={(value) => change({ avatarHue: value })}
+          onSeedChange={changeAvatarSeed}
+          onHueChange={changeAvatarHue}
         />
       ) : null}
       {page === "runtime" ? (
@@ -225,19 +286,17 @@ function AgentForm({ agent, available, page }: { agent: MobileAgent; available: 
           onChange={change}
         />
       ) : null}
-      {page === "usage" || page === "memories" || page === "routines" || page === "memory" || page === "routine" ? (
+      {page === "runtime" ? <AgentAccessFields agent={agent} server={host} available={available} /> : null}
+      {page === "usage" ||
+      page === "memories" ||
+      page === "skills" ||
+      page === "files" ||
+      page === "routines" ||
+      page === "memory" ||
+      page === "routine" ? (
         <AgentInformation agent={agent} available={available} section={page} />
       ) : null}
-      {!valid ? (
-        <Typography.Paragraph accessibilityRole="alert">
-          Enter a name and instructions within the character limits.
-        </Typography.Paragraph>
-      ) : null}
-      {!available ? (
-        <Typography.Paragraph>
-          This agent is unavailable. Your edits are kept until you close this sheet.
-        </Typography.Paragraph>
-      ) : null}
+      {!available ? <Typography.Paragraph>{t("mobile.agent.edit.unavailable")}</Typography.Paragraph> : null}
       {error ? (
         <Typography.Paragraph accessibilityRole="alert" className="text-danger-text">
           {error}
@@ -253,7 +312,7 @@ function AgentForm({ agent, available, page }: { agent: MobileAgent; available: 
       ) : null}
       {page === "info" ? (
         <>
-          <SettingsSection title="Info">
+          <SettingsSection title={t("mobile.agent.menu.info")}>
             <SettingsRow
               onPress={() =>
                 router.push({
@@ -262,7 +321,7 @@ function AgentForm({ agent, available, page }: { agent: MobileAgent; available: 
                 })
               }
             >
-              <Typography.Paragraph>Usage</Typography.Paragraph>
+              <Typography.Paragraph>{t("mobile.agent.info.usage.title")}</Typography.Paragraph>
             </SettingsRow>
             <SettingsRow
               onPress={() =>
@@ -272,7 +331,27 @@ function AgentForm({ agent, available, page }: { agent: MobileAgent; available: 
                 })
               }
             >
-              <Typography.Paragraph>Memories</Typography.Paragraph>
+              <Typography.Paragraph>{t("mobile.agent.info.memories.title")}</Typography.Paragraph>
+            </SettingsRow>
+            <SettingsRow
+              onPress={() =>
+                router.push({
+                  pathname: "/agent-info/[agentId]/skills",
+                  params: { agentId: agent.id, serverId: agent.serverId },
+                })
+              }
+            >
+              <Typography.Paragraph>{t("mobile.agent.info.skills.title")}</Typography.Paragraph>
+            </SettingsRow>
+            <SettingsRow
+              onPress={() =>
+                router.push({
+                  pathname: "/agent-info/[agentId]/files",
+                  params: { agentId: agent.id, serverId: agent.serverId },
+                })
+              }
+            >
+              <Typography.Paragraph>{t("mobile.agent.info.files.title")}</Typography.Paragraph>
             </SettingsRow>
             <SettingsRow
               onPress={() =>
@@ -282,7 +361,7 @@ function AgentForm({ agent, available, page }: { agent: MobileAgent; available: 
                 })
               }
             >
-              <Typography.Paragraph>Routines</Typography.Paragraph>
+              <Typography.Paragraph>{t("mobile.agent.info.routines.title")}</Typography.Paragraph>
             </SettingsRow>
           </SettingsSection>
           <SettingsSection>
@@ -295,7 +374,7 @@ function AgentForm({ agent, available, page }: { agent: MobileAgent; available: 
                 })
               }
             >
-              <Typography.Paragraph>Runtime</Typography.Paragraph>
+              <Typography.Paragraph>{t("mobile.agent.runtime.title")}</Typography.Paragraph>
             </SettingsRow>
           </SettingsSection>
         </>

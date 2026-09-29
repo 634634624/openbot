@@ -1,11 +1,52 @@
 import { expandAttachmentReferences } from "@openbot/contracts/attachment-references";
 import { chatTagReferences, expandChatTagReferences } from "@openbot/contracts/chat-tag-references";
 import {
+  type AgentApproval,
   type AttachmentSummary,
+  type BrowserTab,
+  type BrowserTakeoverRequest,
   canPreviewAttachment,
   type DraftAttachment,
   type FilePreview,
 } from "@openbot/contracts/ipc";
+import { ArrowUp, Button, Plus, X } from "@openbot/ui";
+import { QuestionPromptBubble } from "@openbot/ui/components/QuestionPromptBubble";
+import {
+  SettingsPanel,
+  SettingsPanelContent,
+  SettingsPanelHeader,
+  settingsPanelMaxWidth,
+} from "@openbot/ui/components/SettingsPanel";
+import type { AgentMessage } from "@openbot/ui/data";
+import { ChannelActivityIndicator, type ChannelWorker } from "@openbot/ui/features/channels/ChannelActivityIndicator";
+import { ChannelAvatar } from "@openbot/ui/features/channels/ChannelAvatar";
+import { ChannelStoppedTasks } from "@openbot/ui/features/channels/ChannelStoppedTasks";
+import { AwaitingReplies } from "@openbot/ui/features/conversation/AwaitingReplies";
+import { ChatActionMarker } from "@openbot/ui/features/conversation/ChatActionMarker";
+import { ChatMessageRow } from "@openbot/ui/features/conversation/ChatMessageRow";
+import { ComposerEditor, expandComposerMentions } from "@openbot/ui/features/conversation/ComposerEditor";
+import { StopIcon } from "@openbot/ui/features/conversation/ConversationIcons";
+import { ApprovalCard, BrowserTakeoverCard } from "@openbot/ui/features/conversation/ConversationPrompts";
+import {
+  calculateChatScrollMargin,
+  createChatVirtualizer,
+} from "@openbot/ui/features/conversation/createChatVirtualizer";
+import { ScrollToLatestButton, scrollToLatestMessage } from "@openbot/ui/features/conversation/MessageNavigation";
+import { MessageActions } from "@openbot/ui/features/conversation/MessageRendering";
+import {
+  anchorNewMessages,
+  countableTimelineMessage,
+  type NewMessageTally,
+  tallyNewMessages,
+} from "@openbot/ui/features/conversation/new-message-tally";
+import { TaskList } from "@openbot/ui/features/conversation/TaskList";
+import {
+  scrollToUnreadBoundary,
+  UnreadMessagesBanner,
+  UnreadMessagesDivider,
+  unreadMessagesDividerIsVisible,
+} from "@openbot/ui/features/conversation/UnreadMessages";
+import { useText } from "@openbot/ui/text";
 import {
   createEffect,
   createMemo,
@@ -18,70 +59,39 @@ import {
   Show,
   untrack,
 } from "solid-js";
-import { QuestionPromptBubble } from "../../components/QuestionPromptBubble";
-import {
-  createSettingsPanelWidth,
-  SettingsPanel,
-  SettingsPanelContent,
-  SettingsPanelHeader,
-  settingsPanelMaxWidth,
-} from "../../components/SettingsPanel";
-import { ArrowUp, Button, Plus, X } from "../../components/ui";
-import type { AgentMessage } from "../../data";
-import { useNavigation } from "../../navigation";
-import { useTurns } from "../../turns";
-import { useAuth } from "../account/account-context";
-import { useAgents } from "../agents/agents-context";
-import { useBrowserTabs } from "../browser/browser-context";
+import { planItems, planTitle } from "../../app-message-projection";
+import { channelAwaitingReplies } from "../../awaiting-replies";
+import { writeClipboardText } from "../../clipboard";
+import { createSettingsPanelWidth, saveSettingsPanelWidth } from "../../components/settings-panel-width";
 import { AgentMemoriesModal } from "../conversation/AgentMemoriesModal";
 import { AgentRoutinesSettings } from "../conversation/AgentRoutinesSettings";
 import { attachmentFilePreview } from "../conversation/attachment-preview";
-import { ChatActionMarker } from "../conversation/ChatActionMarker";
-import { ChatMessageRow } from "../conversation/ChatMessageRow";
-import { ComposerEditor, expandComposerMentions } from "../conversation/ComposerEditor";
-import { ApprovalCard, BrowserTakeoverCard } from "../conversation/ConversationPrompts";
-import { calculateChatScrollMargin, createChatVirtualizer } from "../conversation/createChatVirtualizer";
-import { ScrollToLatestButton, scrollToLatestMessage } from "../conversation/MessageNavigation";
-import { MessageActions } from "../conversation/MessageRendering";
 import { channelMemoriesPort } from "../conversation/memories-port";
-import {
-  anchorNewMessages,
-  countableTimelineMessage,
-  type NewMessageTally,
-  tallyNewMessages,
-} from "../conversation/new-message-tally";
 import { channelRoutinesPort } from "../conversation/routines-port";
-import {
-  scrollToUnreadBoundary,
-  UnreadMessagesBanner,
-  UnreadMessagesDivider,
-  unreadMessagesDividerIsVisible,
-} from "../conversation/UnreadMessages";
-import { useServers } from "../servers/servers-context";
-import { usePresence } from "../team/team-context";
-import { ChannelActivityIndicator, type ChannelWorker } from "./ChannelActivityIndicator";
-import { ChannelAvatar } from "./ChannelAvatar";
 import { ChannelEditor } from "./ChannelEditor";
-import { ChannelStoppedTasks } from "./ChannelStoppedTasks";
-import { channelTimelineEntries, firstUnreadChannelMessageId, isOwnChannelAuthor } from "./channel-timeline";
+import { channelTimelineEntries, firstUnreadChannelMessageId } from "./channel-timeline";
 import { useChannels } from "./channels-context";
 
 const ChannelFilePreviewPanel = lazy(() => import("../conversation/FilePreviewPanel"));
 
-export function ChannelConversation() {
+/** What the open channel reads from the client around it. The channel itself comes from `useChannels()`. */
+export interface ChannelConversationProps {
+  isOwnMessage: (authorId: string) => boolean;
+  /** Keyed by agent id. */
+  pendingApprovals: Record<string, AgentApproval | undefined>;
+  /** Keyed by agent id. */
+  pendingTakeovers: Record<string, BrowserTakeoverRequest | undefined>;
+  browserTabs: BrowserTab[];
+  onSelectAgent: (agentId: string) => void;
+}
+
+export function ChannelConversation(props: ChannelConversationProps) {
   const channels = useChannels();
-  const { selectAgent } = useNavigation();
-  const { centralAuth } = useAuth();
-  const { currentTeamMember } = usePresence();
-  const { activeServer } = useServers();
-  const isOwnMessage = (authorId: string) => {
-    const auth = centralAuth();
-    return isOwnChannelAuthor(authorId, {
-      memberId: currentTeamMember()?.id ?? null,
-      accountUserId: auth.status === "signed_in" ? auth.user.id : null,
-      onOwnComputer: activeServer()?.kind === "local",
-    });
-  };
+  const { t, format, sourceText } = useText();
+  const runtime = () => channels.port();
+  const agentList = channels.agents;
+  const isOwnMessage = (authorId: string) => props.isOwnMessage(authorId);
+  const selectAgent = (agentId: string) => props.onSelectAgent(agentId);
   /**
    * Memories and routines live here rather than in `ChannelEditor`, because the routines view
    * covers the whole panel - its own header replaces the panel header, the way the agent settings
@@ -112,11 +122,11 @@ export function ChannelConversation() {
   // its event subscription each time a message arrives.
   const memoriesPort = createMemo(() => {
     const id = channelId();
-    return id ? channelMemoriesPort(id, channelName()) : null;
+    return id ? channelMemoriesPort(id, channelName(), runtime().agent) : null;
   });
   const routinesPort = createMemo(() => {
     const id = channelId();
-    return id ? channelRoutinesPort(id) : null;
+    return id ? channelRoutinesPort(id, runtime().agent) : null;
   });
   // The settings row reads both counts before either view opens, so it cannot take them from the
   // view that renders the list. It loads them here and follows the events those views follow.
@@ -150,18 +160,33 @@ export function ChannelConversation() {
       onCleanup(port.subscribe(load));
     },
   );
-  const { pendingApprovals, pendingPrompts } = useTurns();
-  const { browserTabs } = useBrowserTabs();
-  const { agentList } = useAgents();
   const [composer, setComposer] = createStore<{
     text: string;
     reply: string | null;
     attachments: DraftAttachment[];
   }>({ text: "", reply: null, attachments: [] });
+  const addAttachments = (load: () => Promise<AttachmentSummary[]>) =>
+    void channels.perform(async () => {
+      const selectedId = channels.state.selectedId;
+      const attachments = await load();
+      if (selectedId === channels.state.selectedId)
+        setComposer((state) => {
+          state.attachments = [...state.attachments, ...attachments];
+        });
+    });
+  /** Dropped or pasted files. Only a browser runtime imports them here; the desktop preload imports its own. */
+  const canImportFiles = () => Boolean(runtime().importAttachments && channels.state.page?.channel.archived === false);
+  const importFiles = (files: File[]) => {
+    const importAttachments = runtime().importAttachments;
+    if (importAttachments && canImportFiles() && files.length > 0) addAttachments(() => importAttachments(files));
+  };
+  const [dropActive, setDropActive] = createSignal(false);
+  const [copyError, setCopyError] = createSignal<string | null>(null);
   createEffect(
     () => channels.state.selectedId,
     () => {
       resetPanel();
+      setCopyError(null);
       setPanel((state) => {
         state.memories.count = 0;
         state.routines.count = 0;
@@ -191,17 +216,32 @@ export function ChannelConversation() {
   const [filePreview, setFilePreview] = createSignal<ChannelFilePreview | null>(null);
   const previewChannelAttachment = async (attachment: AttachmentSummary) => {
     if (!canPreviewAttachment(attachment)) {
-      void channels.perform(() => window.openbot.agent.openAttachment({ attachmentId: attachment.id, action: "open" }));
+      void channels.perform(() => runtime().agent.openAttachment({ attachmentId: attachment.id, action: "open" }));
       return;
     }
     channels.closeEditor();
     await channels.perform(async (): Promise<void> => {
-      const preview = await attachmentFilePreview(attachment);
+      const preview = await (runtime().previewAttachment ?? attachmentFilePreview)(attachment);
       setFilePreview({ attachment, preview });
     });
   };
   const channelAttachmentAction = (attachment: AttachmentSummary, action: "open" | "reveal" | "download") => {
-    void channels.perform(() => window.openbot.agent.openAttachment({ attachmentId: attachment.id, action }));
+    // The browser has no app to open a file in, so a file it can preview opens in the panel.
+    if (action === "open" && runtime().fileActions === "browser" && canPreviewAttachment(attachment)) {
+      void previewChannelAttachment(attachment);
+      return;
+    }
+    void channels.perform(() => runtime().agent.openAttachment({ attachmentId: attachment.id, action }));
+  };
+  /** Absent where the runtime saves files one at a time, so the row offers no bulk download. */
+  const downloadAttachments = () => {
+    const agent = runtime().agent;
+    if (!agent.downloadAttachments) return undefined;
+    return async (attachments: AttachmentSummary[]) => {
+      await channels.perform(async () => {
+        await agent.downloadAttachments?.({ attachments: attachments.map(({ id, name }) => ({ id, name })) });
+      });
+    };
   };
   // The preview belongs to the channel it was opened from, and the settings panel takes the slot back.
   createEffect(
@@ -223,7 +263,7 @@ export function ChannelConversation() {
   let scrolledChannel: string | undefined;
   const timeline = createMemo(() => {
     const page = channels.state.page;
-    return page ? channelTimelineEntries(page, agentList(), isOwnMessage) : [];
+    return page ? channelTimelineEntries(page, agentList(), isOwnMessage, { t, format }) : [];
   });
   const unreadCount = createMemo(
     () => channels.state.channels.find((channel) => channel.id === channels.state.selectedId)?.unreadCount ?? 0,
@@ -263,7 +303,7 @@ export function ChannelConversation() {
     return [...ids].map((id) => {
       const agent = agentList().find((candidate) => candidate.id === id);
       const authored = page.messages.find((entry) => entry.author.id === id);
-      return { id, name: agent?.name ?? authored?.author.name ?? "Agent", agent };
+      return { id, name: agent?.name ?? authored?.author.name ?? t("chat.activity.agentFallback"), agent };
     });
   });
   const messageVirtualizer = createChatVirtualizer<HTMLElement, HTMLElement>({
@@ -357,7 +397,13 @@ export function ChannelConversation() {
     );
     if (!text) return;
     setOpenMoreMessageId(null);
-    await navigator.clipboard.writeText(text);
+    setCopyError(null);
+    try {
+      await writeClipboardText(text);
+    } catch {
+      setCopyError(t("chat.actions.copyFailed"));
+      return;
+    }
     setCopiedMessageId(message.id);
     window.setTimeout(() => {
       if (copiedMessageId() === message.id) setCopiedMessageId(null);
@@ -399,8 +445,8 @@ export function ChannelConversation() {
     if (scrollFrame !== undefined) cancelAnimationFrame(scrollFrame);
     if (unreadVisibilityFrame !== undefined) cancelAnimationFrame(unreadVisibilityFrame);
   });
-  const messageElements = new Map<string, HTMLElement>();
-  const name = (id: string | null) => agentList().find((agent) => agent.id === id)?.name ?? "Unassigned";
+  const name = (id: string | null) =>
+    agentList().find((agent) => agent.id === id)?.name ?? t("sidebar.section.unassigned");
   /**
    * The work that waits for the reader: one entry for each stopped run, not for each stopped task.
    *
@@ -422,6 +468,56 @@ export function ChannelConversation() {
     }
     return [...roots.values()];
   });
+  // The sub-tasks that an owner waits for, above the composer, as the agent chat shows its questions.
+  const awaitingSubtasks = createMemo(() => {
+    const page = channels.state.page;
+    if (!page || page.channel.archived) return [];
+    return channelAwaitingReplies({ tasks: page.tasks, agents: agentList(), name });
+  });
+  /**
+   * The runs the stop button ends: the top active task above each task that is queued, running or
+   * waiting. `stop` pauses the whole run below the task it names, so one command for each run is
+   * enough. The climb stops at a parent that is not active: a stop would pause a failed parent and
+   * clear the reason it failed, and a completed or cancelled task cannot be stopped.
+   */
+  const activeRuns = createMemo(() => {
+    const page = channels.state.page;
+    if (!page || page.channel.archived) return [];
+    const byId = new Map(page.tasks.map((task) => [task.id, task]));
+    const active = (task: (typeof page.tasks)[number] | undefined) =>
+      task?.state === "queued" || task?.state === "running" || task?.state === "waiting";
+    const activeParent = (task: (typeof page.tasks)[number]) => {
+      const parent = task.parentTaskId ? byId.get(task.parentTaskId) : undefined;
+      return active(parent) ? parent : undefined;
+    };
+    const runs = new Set<string>();
+    for (const task of page.tasks) {
+      if (!active(task)) continue;
+      let top = task;
+      for (let parent = activeParent(top); parent; parent = activeParent(top)) top = parent;
+      runs.add(top.id);
+    }
+    return [...runs];
+  });
+  /**
+   * One stop at a time, and none after the first that fails: the controller keeps one failed
+   * command for its retry, and a later stop that succeeds would clear the error of the one that
+   * failed.
+   */
+  const stopWork = async () => {
+    const channelId = channels.state.page?.channel.id;
+    if (!channelId) return;
+    for (const taskId of activeRuns()) {
+      const stopped = await channels.command({
+        type: "stop",
+        operationId: crypto.randomUUID(),
+        channelId,
+        taskId,
+        recipientAgentId: null,
+      });
+      if (!stopped) return;
+    }
+  };
   const resumeTask = (taskId: string, recipientAgentId: string | null) =>
     channels.command({
       type: recipientAgentId ? "reassign" : "resume",
@@ -457,12 +553,31 @@ export function ChannelConversation() {
     <main
       ref={(element) => (conversationPanel = element)}
       class="conversation-panel"
-      aria-label="Channel conversation"
+      aria-label={t("channel.conversation.label")}
       style={`--settings-panel-width: ${panelWidth()}px`}
+      onDragEnter={(event) => {
+        if (canImportFiles() && event.dataTransfer?.types.includes("Files")) setDropActive(true);
+      }}
+      onDragOver={(event) => {
+        if (canImportFiles() && event.dataTransfer?.types.includes("Files")) event.preventDefault();
+      }}
+      onDragLeave={(event) => {
+        if (!(event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget)))
+          setDropActive(false);
+      }}
+      onDrop={(event) => {
+        setDropActive(false);
+        if (!canImportFiles()) return;
+        event.preventDefault();
+        importFiles([...(event.dataTransfer?.files ?? [])]);
+      }}
     >
+      <Show when={dropActive()}>
+        <div class="attachment-drop-overlay">{t("conversation.view.drop")}</div>
+      </Show>
       <Show when={channels.state.error}>
         <p role="alert">
-          {channels.state.error}
+          {sourceText(channels.state.error ?? "")}
           <Button
             variant="ghost"
             onClick={() =>
@@ -471,12 +586,13 @@ export function ChannelConversation() {
               })
             }
           >
-            Retry
+            {t("common.retry")}
           </Button>
         </p>
       </Show>
+      <Show when={copyError()}>{(message) => <p role="alert">{message()}</p>}</Show>
 
-      <Show when={channels.state.page} fallback={<p>Loading channel…</p>}>
+      <Show when={channels.state.page} fallback={<p>{t("channel.conversation.loading")}</p>}>
         {(page) => (
           <>
             <header class="window-drag conversation-header">
@@ -485,7 +601,7 @@ export function ChannelConversation() {
                   variant="ghost"
                   size="sm"
                   class="conversation-title channel-title no-drag"
-                  aria-label="Channel settings"
+                  aria-label={t("channel.settings.title")}
                   onClick={openSettings}
                   disabled={page().channel.archived}
                 >
@@ -501,7 +617,7 @@ export function ChannelConversation() {
             </header>
             <section
               class="conversation-scroll"
-              aria-label="Shared messages"
+              aria-label={t("channel.conversation.messages")}
               aria-live="polite"
               ref={(element) => {
                 messageList = element;
@@ -531,7 +647,7 @@ export function ChannelConversation() {
               </Show>
               <Show when={page().olderCursor}>
                 <Button variant="ghost" onClick={() => void channels.loadOlder()}>
-                  Load earlier messages
+                  {t("channel.conversation.loadOlder")}
                 </Button>
               </Show>
               <Show when={!page().messages.length}>
@@ -569,10 +685,7 @@ export function ChannelConversation() {
                       <div
                         data-index={virtualRow.index}
                         data-grouped={entry()?.showAuthor === false ? "sender" : undefined}
-                        ref={(element) => {
-                          messageElements.set(initialEntry.id, element);
-                          messageVirtualizer.measureElement(element);
-                        }}
+                        ref={(element) => messageVirtualizer.measureElement(element)}
                         class="virtual-chat-row"
                         style={{
                           transform: messageVirtualizer.isVirtualized()
@@ -607,6 +720,18 @@ export function ChannelConversation() {
                               }}
                             />
                           </article>
+                        ) : initialEntry.message.plan ? (
+                          <article class={{ "message-entry-animated": animate }}>
+                            <Show when={entry()?.message.plan ?? initialEntry.message.plan}>
+                              {(plan) => (
+                                <TaskList
+                                  items={planItems(plan(), entry()?.message.streaming === true)}
+                                  title={planTitle(plan())}
+                                  defaultOpen={initialEntry.message.streaming === true}
+                                />
+                              )}
+                            </Show>
+                          </article>
                         ) : (
                           <ChatMessageRow
                             message={entry()?.message ?? initialEntry.message}
@@ -622,17 +747,12 @@ export function ChannelConversation() {
                               selectAgent(id);
                             }}
                             onOpenLink={(url) => {
-                              void window.openbot.openUrl(url);
+                              void runtime().openUrl(url);
                             }}
                             onPreview={(attachment) => void previewChannelAttachment(attachment)}
-                            onDownloadAttachments={async (attachments) => {
-                              await channels.perform(() =>
-                                window.openbot.agent.downloadAttachments({
-                                  attachments: attachments.map(({ id, name }) => ({ id, name })),
-                                }),
-                              );
-                            }}
+                            onDownloadAttachments={downloadAttachments()}
                             onAttachmentAction={channelAttachmentAction}
+                            onDownload={(attachment) => channelAttachmentAction(attachment, "download")}
                             actions={
                               <MessageActions
                                 message={entry()?.message ?? initialEntry.message}
@@ -672,7 +792,7 @@ export function ChannelConversation() {
                                     page().channel.archived
                                       ? Promise.resolve(false)
                                       : channels.perform(() =>
-                                          window.openbot.agent.respondToPrompt({
+                                          runtime().agent.respondToPrompt({
                                             requestId: prompt().requestId,
                                             answers,
                                           }),
@@ -699,7 +819,7 @@ export function ChannelConversation() {
                     when={
                       !page().channel.archived &&
                       page().tasks.some((task) => task.ownerAgentId === member.agentId && task.state === "running") &&
-                      pendingApprovals()[member.agentId]
+                      props.pendingApprovals[member.agentId]
                     }
                   >
                     {(approval) => (
@@ -707,7 +827,7 @@ export function ChannelConversation() {
                         approval={approval()}
                         onApprove={() =>
                           channels.perform(() =>
-                            window.openbot.agent.respondToApproval({
+                            runtime().agent.respondToApproval({
                               requestId: approval().requestId,
                               decision: "accept",
                             }),
@@ -715,7 +835,7 @@ export function ChannelConversation() {
                         }
                         onReject={() =>
                           channels.perform(() =>
-                            window.openbot.agent.respondToApproval({
+                            runtime().agent.respondToApproval({
                               requestId: approval().requestId,
                               decision: "decline",
                             }),
@@ -729,24 +849,24 @@ export function ChannelConversation() {
               <For each={page().channel.members}>
                 {(member) => {
                   const takeover = () => {
-                    const event = pendingPrompts()[member.agentId];
+                    const request = props.pendingTakeovers[member.agentId];
                     return !page().channel.archived &&
-                      event?.type === "browser-takeover-requested" &&
                       page().tasks.some((task) => task.ownerAgentId === member.agentId && task.state === "running")
-                      ? event.request
+                      ? request
                       : undefined;
                   };
                   return (
                     <Show when={takeover()}>
                       {(request) => (
                         <BrowserTakeoverCard
+                          request={request()}
                           agentName={name(member.agentId)}
-                          tab={browserTabs().find((tab) => tab.id === request().tabId)}
+                          tab={props.browserTabs.find((tab) => tab.id === request().tabId)}
                           preview={null}
                           previewStatus="idle"
                           onComplete={() =>
                             channels.perform(() =>
-                              window.openbot.agent.respondToBrowserTakeover({
+                              runtime().agent.respondToBrowserTakeover({
                                 requestId: request().requestId,
                                 decision: "complete",
                               }),
@@ -754,12 +874,18 @@ export function ChannelConversation() {
                           }
                           onCancel={() =>
                             channels.perform(() =>
-                              window.openbot.agent.respondToBrowserTakeover({
+                              runtime().agent.respondToBrowserTakeover({
                                 requestId: request().requestId,
                                 decision: "cancel",
                               }),
                             )
                           }
+                          browserSecret={{
+                            loadPreview: runtime().browser.capturePreview,
+                            onRespond: async (input) => {
+                              await channels.perform(() => runtime().agent.respondToBrowserSecret(input));
+                            },
+                          }}
                         />
                       )}
                     </Show>
@@ -767,14 +893,15 @@ export function ChannelConversation() {
                 }}
               </For>
               <Show when={!page().channel.archived && !page().channel.members.length}>
-                <p>Add agents in channel settings to start work.</p>
+                <p>{t("channel.conversation.noMembers")}</p>
               </Show>
             </section>
             <Show when={page().channel.archived}>
-              <p class="channel-preview-notice">Deleted channel. Preview only.</p>
+              <p class="channel-preview-notice">{t("channel.conversation.archivedNotice")}</p>
             </Show>
             <Show when={!page().channel.archived}>
               <div class="composer-wrap">
+                <AwaitingReplies items={awaitingSubtasks()} title={t("chat.awaiting.subtasks")} />
                 <ChannelStoppedTasks
                   tasks={pausedTasks()}
                   members={page().channel.members}
@@ -807,7 +934,7 @@ export function ChannelConversation() {
                         })
                       }
                     >
-                      Cancel reply
+                      {t("channel.composer.cancelReply")}
                     </Button>
                   </Show>
                   <Show when={composer.attachments.length}>
@@ -822,7 +949,7 @@ export function ChannelConversation() {
                               type="button"
                               variant="ghost"
                               size="xs"
-                              aria-label={`Remove ${attachment.name}`}
+                              aria-label={t("channel.composer.removeAttachment", { name: attachment.name })}
                               onClick={() =>
                                 setComposer((state) => {
                                   state.attachments = state.attachments.filter((item) => item.id !== attachment.id);
@@ -843,11 +970,12 @@ export function ChannelConversation() {
                         page().channel.members.some((member) => member.agentId === agent.id),
                       )}
                       attachments={composer.attachments}
-                      ariaLabel="Message to channel"
-                      placeholder={`Message ${page().channel.name}`}
+                      ariaLabel={t("channel.composer.label")}
+                      placeholder={t("channel.composer.placeholder", { name: page().channel.name })}
                       value={composer.text}
                       disabled={channels.state.pending}
                       onSubmit={submit}
+                      onPasteFiles={importFiles}
                       onValueChange={(text) =>
                         setComposer((state) => {
                           state.text = text;
@@ -860,30 +988,37 @@ export function ChannelConversation() {
                       type="button"
                       variant="ghost"
                       class="composer-button"
-                      aria-label="Attach files"
-                      onClick={() =>
-                        void channels.perform(async () => {
-                          const selectedId = channels.state.selectedId;
-                          const attachments = await window.openbot.agent.chooseAttachments({ filter: "all" });
-                          if (selectedId === channels.state.selectedId)
-                            setComposer((state) => {
-                              state.attachments = [...state.attachments, ...attachments];
-                            });
-                        })
-                      }
+                      aria-label={t("channel.composer.attach")}
+                      onClick={() => addAttachments(() => runtime().agent.chooseAttachments({ filter: "all" }))}
                     >
                       <Plus aria-hidden="true" />
                     </Button>
                     <div class="composer-primary-actions">
-                      <Button
-                        type="submit"
-                        variant="ghost"
-                        class="voice-button"
-                        aria-label="Send message"
-                        disabled={channels.state.pending || (!composer.text.trim() && !composer.attachments.length)}
+                      {/* As in the agent chat, an empty composer offers stop while work runs. */}
+                      <Show
+                        when={activeRuns().length > 0 && !composer.text.trim() && !composer.attachments.length}
+                        fallback={
+                          <Button
+                            type="submit"
+                            variant="ghost"
+                            class="voice-button"
+                            aria-label={t("channel.composer.send")}
+                            disabled={channels.state.pending || (!composer.text.trim() && !composer.attachments.length)}
+                          >
+                            <ArrowUp aria-hidden="true" />
+                          </Button>
+                        }
                       >
-                        <ArrowUp aria-hidden="true" />
-                      </Button>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          class="voice-button voice-button-active"
+                          aria-label={t("channel.composer.stop")}
+                          onClick={() => void stopWork()}
+                        >
+                          <StopIcon />
+                        </Button>
+                      </Show>
                     </div>
                   </div>
                 </form>
@@ -893,13 +1028,14 @@ export function ChannelConversation() {
               {(file) => (
                 <Loading>
                   <ChannelFilePreviewPanel
+                    allowExternalOpen={runtime().fileActions === "native"}
                     preview={file().preview}
                     agents={agentList()}
                     defaultWidth={panelWidth}
                     maxWidth={() => settingsPanelMaxWidth(conversationPanel)}
                     onWidthChange={setPanelWidth}
                     onOpenLink={(url) => {
-                      void window.openbot.openUrl(url);
+                      void runtime().openUrl(url);
                     }}
                     /* A channel transcript has no agent workspace of its own, so a path in a
                        previewed file cannot be resolved here. Only attachments open in this slot. */
@@ -908,7 +1044,11 @@ export function ChannelConversation() {
                     sourceUrl={file().attachment.previewUrl}
                     onOpenExternally={() => channelAttachmentAction(file().attachment, "open")}
                     onDownload={() => channelAttachmentAction(file().attachment, "download")}
-                    onReveal={() => channelAttachmentAction(file().attachment, "reveal")}
+                    onReveal={
+                      runtime().fileActions === "native"
+                        ? () => channelAttachmentAction(file().attachment, "reveal")
+                        : undefined
+                    }
                     onClose={() => setFilePreview(null)}
                   />
                 </Loading>
@@ -916,8 +1056,9 @@ export function ChannelConversation() {
             </Show>
             <Show when={!page().channel.archived && channels.state.editing === "settings"}>
               <SettingsPanel
+                onResizeEnd={saveSettingsPanelWidth}
                 id="channel-side-panel"
-                label="Channel panel"
+                label={t("channel.panel.label")}
                 width={panelWidth()}
                 maxWidth={() => settingsPanelMaxWidth(conversationPanel)}
                 onResize={setPanelWidth}
@@ -929,9 +1070,9 @@ export function ChannelConversation() {
                   fallback={
                     <>
                       <SettingsPanelHeader
-                        title="Channel settings"
+                        title={t("channel.settings.title")}
                         onClose={closePanel}
-                        closeLabel="Close channel panel"
+                        closeLabel={t("channel.panel.close")}
                       />
                       <SettingsPanelContent>
                         <ChannelEditor

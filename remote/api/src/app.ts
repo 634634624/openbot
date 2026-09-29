@@ -1,3 +1,4 @@
+import type { RemoteAuthEvent } from "@openbot/contracts/signal-protocol/auth-events";
 import { Elysia } from "elysia";
 import { z } from "zod";
 import type { RemoteApiConfig } from "./config";
@@ -6,6 +7,7 @@ import { verifyWebhookSignature } from "./tokens";
 
 const authEventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("account-profile-changed"), userId: z.string().min(1) }),
+  z.object({ type: z.literal("account-servers-changed"), userId: z.string().min(1) }),
   z.object({
     type: z.literal("remote-auth-changed"),
     hostId: z.string().min(1),
@@ -16,7 +18,7 @@ const authEventSchema = z.discriminatedUnion("type", [
     hostId: z.string().min(1),
     sessionId: z.string().min(1),
   }),
-]);
+]) satisfies z.ZodType<RemoteAuthEvent>;
 
 export function createRemoteApiApp(config: RemoteApiConfig, signal: SignalService) {
   const app = new Elysia()
@@ -37,6 +39,7 @@ export function createRemoteApiApp(config: RemoteApiConfig, signal: SignalServic
       }
       if (event.type === "remote-auth-changed") signal.revoke(event.hostId, event.authEpoch);
       else if (event.type === "account-profile-changed") signal.profileChanged(event.userId);
+      else if (event.type === "account-servers-changed") signal.serversChanged(event.userId);
       else signal.revokeSession(event.sessionId);
       return new Response(null, { status: 204 });
     })
@@ -99,7 +102,7 @@ export function signalClientIp(
   return forwarded || remoteAddress || "unknown";
 }
 
-function decodeAuthEvent(body: string): z.infer<typeof authEventSchema> | null {
+function decodeAuthEvent(body: string): RemoteAuthEvent | null {
   try {
     const result = authEventSchema.safeParse(JSON.parse(body));
     return result.success ? result.data : null;

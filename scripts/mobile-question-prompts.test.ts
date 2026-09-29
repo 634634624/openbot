@@ -1,5 +1,6 @@
 import type { AgentPromptQuestion, ConversationSnapshot } from "@openbot/contracts/ipc";
-import { describe, expect, it } from "vitest";
+import { mobileTranslateFor } from "@openbot/i18n/mobile";
+import { assert, describe, expect, it } from "vitest";
 import {
   indexChatMessages,
   latestReadableMessage,
@@ -14,7 +15,7 @@ import {
 } from "../apps/mobile/src/features/chat/model/question-prompt";
 import { conversationMessageId, decodeConversation } from "../apps/mobile/src/features/workspace/model/conversation";
 
-const questions: AgentPromptQuestion[] = [
+const questions: [AgentPromptQuestion, AgentPromptQuestion, AgentPromptQuestion] = [
   {
     id: "place",
     header: "Place",
@@ -64,6 +65,7 @@ describe("mobile question forms", () => {
     const messages = presentChatMessages(projectChatMessages(snapshot.messages), null, aliases);
     const index = indexChatMessages(messages, aliases);
     const reply = messages[1];
+    assert(reply);
     const source = reply.kind === "message" && reply.replyToMessageId ? index.get(reply.replyToMessageId) : null;
     expect(source).toMatchObject({ id: "local-1", body: "Sent from mobile" });
   });
@@ -113,7 +115,15 @@ describe("mobile question forms", () => {
       read: latestReadableMessage(snapshot.messages)?.id,
     }).toEqual({
       projected: [
-        { id: "file-message", kind: "message", author: "user", body: "", streaming: false, attachments: [attachment] },
+        {
+          id: "file-message",
+          kind: "message",
+          author: "user",
+          body: "",
+          streaming: false,
+          status: "completed",
+          attachments: [attachment],
+        },
       ],
       read: "file-message",
     });
@@ -166,14 +176,17 @@ describe("mobile question forms", () => {
 
   it("shows a structured form even when its fallback message text is empty", () => {
     const snapshot = conversation();
-    snapshot.messages[0].text = "";
+    const [prompt] = snapshot.messages;
+    assert(prompt);
+    prompt.text = "";
     expect(projectChatMessages(decodeConversation(snapshot).messages)[0]?.kind).toBe("question");
   });
 
   it("advances the read boundary to a visible prompt with no fallback text", () => {
     const snapshot = conversation();
-    snapshot.messages[0].text = "";
-    const prompt = snapshot.messages[0];
+    const [prompt] = snapshot.messages;
+    assert(prompt);
+    prompt.text = "";
     snapshot.messages.unshift({ ...prompt, id: "earlier", text: "Hello", questionPrompt: undefined });
     snapshot.messages.push({ ...prompt, id: "empty", questionPrompt: undefined });
     const boundary = latestReadableMessage(decodeConversation(snapshot).messages);
@@ -184,7 +197,9 @@ describe("mobile question forms", () => {
   it("preserves an answer sent from another device when history refreshes", () => {
     const snapshot = conversation();
     const resolution = answeredPromptResolution(questions, { place: ["Garden"], token: [], extra: [] });
-    snapshot.messages[0].questionPrompt = { requestId: "request-test", questions, resolution };
+    const [prompt] = snapshot.messages;
+    assert(prompt);
+    prompt.questionPrompt = { requestId: "request-test", questions, resolution };
     const projected = projectChatMessages(decodeConversation(snapshot).messages)[0];
     expect(projected?.kind === "question" && projected.prompt.resolution).toEqual(resolution);
   });
@@ -218,8 +233,8 @@ describe("mobile question forms", () => {
         extra: { status: "skipped" },
       },
     });
-    expect(promptAnswerLabel(questions[1], resolution)).toBe("Private answer");
-    expect(promptAnswerLabel(questions[2], resolution)).toBe("Skipped");
+    expect(promptAnswerLabel(questions[1], resolution, mobileTranslateFor("en"))).toBe("Private answer");
+    expect(promptAnswerLabel(questions[2], resolution, mobileTranslateFor("en"))).toBe("Skipped");
     expect(answeredPromptResolution(questions, {})).toEqual({ status: "cancelled" });
     expect(answers.token).toEqual(["private-value"]);
   });

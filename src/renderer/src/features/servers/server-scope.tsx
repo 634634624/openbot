@@ -1,5 +1,6 @@
-import { createEffect, createSignal, flush, getOwner, isDisposed, onSettled } from "solid-js";
-import { errorMessage } from "../../error-message";
+import { currentText } from "@openbot/ui/text";
+import { createEffect, createSignal, flush, getOwner, isDisposed, onSettled, untrack } from "solid-js";
+import { isGlobalSearchShortcut } from "../../global-search-shortcut";
 import { useNavigation } from "../../navigation";
 import { createSimpleContext } from "../../simple-context";
 import { useAuth } from "../account/account-context";
@@ -12,6 +13,7 @@ import { useSidebar } from "../sidebar/sidebar-context";
 import { usePresence } from "../team/team-context";
 import { useServerSwitch } from "./server-switch";
 import { useServers } from "./servers-context";
+import { serversPort } from "./servers-port";
 
 /**
  * One mount per server. Everything below this provider is disposed and rebuilt
@@ -84,20 +86,20 @@ const ServerScope = createSimpleContext({
         return;
       }
       void Promise.all([
-        window.openbot.agent
-          .getStatus()
+        serversPort()
+          .agent.getStatus()
           .then((value) => {
             if (isCurrent()) setAgentStatus(value);
           })
           .catch(() => undefined),
-        window.openbot.agent
-          .listModels()
+        serversPort()
+          .agent.listModels()
           .then((value) => {
             if (isCurrent()) setModelOptions(value);
           })
           .catch(() => undefined),
-        window.openbot.agent
-          .listAgents()
+        serversPort()
+          .agent.listAgents()
           .then((storedAgents) => {
             if (!isCurrent()) return;
             applyStoredAgents(storedAgents);
@@ -105,9 +107,10 @@ const ServerScope = createSimpleContext({
           })
           .catch((error) => {
             if (!isCurrent()) return;
+            const text = currentText();
             setAgentStatus((current) => ({
               ...current,
-              message: errorMessage(error, "Could not load agents. Check the server connection and try again."),
+              message: text.errorMessage(error, text.t("server.scope.agentsLoadFailed")),
             }));
           }),
         loadSidebarLayout(server)
@@ -115,8 +118,8 @@ const ServerScope = createSimpleContext({
             if (isCurrent()) setSidebarLayout(value);
           })
           .catch(() => undefined),
-        window.openbot.agent
-          .listConversationReads()
+        serversPort()
+          .agent.listConversationReads()
           .then((value) => {
             if (isCurrent()) applyConversationReads(value);
           })
@@ -137,8 +140,8 @@ const ServerScope = createSimpleContext({
           })
           .catch(() => undefined);
       }
-      void window.openbot.servers
-        .getPresence()
+      void serversPort()
+        .servers.getPresence()
         .then((value) => {
           if (isCurrent()) setTeamPresence(value);
         })
@@ -150,10 +153,7 @@ const ServerScope = createSimpleContext({
     onSettled(() => {
       const handleGlobalSearchShortcut = (event: KeyboardEvent) => {
         if (
-          event.key.toLocaleLowerCase() !== "k" ||
-          (!event.metaKey && !event.ctrlKey) ||
-          event.altKey ||
-          event.shiftKey ||
+          !isGlobalSearchShortcut(event) ||
           centralAuth().status !== "signed_in" ||
           setupState()?.completed !== true
         ) {
@@ -194,9 +194,10 @@ const ServerScope = createSimpleContext({
 
     createEffect(
       () => serverLoadRequest(),
-      (request) => {
-        if (request?.serverId === activeServerId()) loadWorkspace();
-      },
+      (request) =>
+        untrack(() => {
+          if (request?.serverId === activeServerId()) loadWorkspace();
+        }),
     );
 
     // "Select this agent once you are on its server" - written before the switch

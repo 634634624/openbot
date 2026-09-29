@@ -25,6 +25,7 @@ async function createHostService(
   remote: Partial<
     Pick<
       HostOptions,
+      | "openRemoteDesktopSetup"
       | "listRemoteInvites"
       | "registerRemoteHost"
       | "updateRemoteHostLogo"
@@ -35,6 +36,7 @@ async function createHostService(
       | "revokeRemoteInvite"
       | "remoteControlPlaneUrl"
       | "sendTeamInviteEmail"
+      | "localDevelopmentHost"
     >
   > = {},
   /** Supplied only by the screen recording cases, which need a runtime to hold an answer. */
@@ -81,13 +83,14 @@ async function createHostService(
       ? {
           platform: "darwin" as const,
           remoteDesktopRuntimePaths: {
-            sunshine: "/sunshine",
+            sunshine: "/runtime/Sunshine.app/Contents/MacOS/Sunshine",
             moonlightWebServer: "/web",
             moonlightStreamer: "/stream",
           },
           createRemoteDesktopRuntime: () => ({
             start: async () => ({
               baseUrl: "http://127.0.0.1:9",
+              authHeader: "X-Test-Remote",
               hostId: 1,
               hostIds: [1],
               desktopAppId: 1,
@@ -127,6 +130,15 @@ type RemoteInvite = Awaited<ReturnType<NonNullable<HostOptions["createRemoteInvi
 
 // The gateway holds the refusal, and this status is the only way it reaches the host owner's screen.
 // A member who is refused cannot grant anything: they are on the other computer.
+describe.runIf(process.platform === "darwin")("HostService permission setup", () => {
+  it.each(["accessibility", "screen-recording", "reveal"] as const)("opens Sunshine setup for %s", async (action) => {
+    const openRemoteDesktopSetup = vi.fn(async () => undefined);
+    const { service } = await createHostService({ openRemoteDesktopSetup }, () => false);
+    await service.openRemoteDesktopSetup(action);
+    expect(openRemoteDesktopSetup).toHaveBeenCalledWith(action, "/runtime/Sunshine.app");
+  });
+});
+
 describe("HostService screen recording", () => {
   it("reports the refusal the gateway holds, and says the status changed", async () => {
     let denied = true;
@@ -224,7 +236,10 @@ describe("HostService account binding", () => {
     const loading = new Promise<RemoteInvites>((resolve) => {
       deliver = resolve;
     });
-    const { service, signIn } = await createHostService({ listRemoteInvites: () => loading });
+    const { service, signIn } = await createHostService({
+      remoteControlPlaneUrl: "https://api.openbot.run",
+      listRemoteInvites: () => loading,
+    });
     await signIn(second);
     await service.configure({ serverName: "Studio Air" });
     await signIn(first);
@@ -240,11 +255,55 @@ describe("HostService account binding", () => {
         expiresAt: Date.now() + 60_000,
         usedAt: null,
         revokedAt: null,
+        permanent: false,
+        useCount: 0,
       },
     ]);
 
     // A's invitation, and the address it was sent to, must not reach B's renderer.
     await expect(pending).resolves.toEqual([]);
+  });
+
+  it("keeps a local development host's members and invitations in its own team file", async () => {
+    const remoteCalls: string[] = [];
+    const { service, signIn, store } = await createHostService({
+      localDevelopmentHost: true,
+      remoteControlPlaneUrl: "http://127.0.0.1:8787",
+      listRemoteInvites: async () => {
+        remoteCalls.push("list invites");
+        return [];
+      },
+      revokeRemoteInvite: async () => {
+        remoteCalls.push("revoke invite");
+      },
+      listRemoteMembers: async () => {
+        remoteCalls.push("list members");
+        return [];
+      },
+      updateRemoteMember: async () => {
+        remoteCalls.push("update member");
+      },
+      removeRemoteMember: async () => {
+        remoteCalls.push("remove member");
+      },
+    });
+    await signIn(first);
+    await service.configure({ serverName: "Studio Mac" });
+    const invite = await store.createInvite("member", "guest@example.com", { permanent: false });
+
+    expect(await service.listInvites()).toEqual([expect.objectContaining({ id: invite.id })]);
+    await service.revokeInvite(invite.id);
+    expect(await service.listInvites()).toEqual([]);
+
+    const joined = await store.createInvite("member");
+    const { member } = await store.acceptInvite(joined.token, "guest", "guest-password");
+    expect(await service.listMembers()).toContainEqual(expect.objectContaining({ id: member.id, role: "member" }));
+    await service.updateMember({ memberId: member.id, role: "admin" });
+    expect(await service.listMembers()).toContainEqual(expect.objectContaining({ id: member.id, role: "admin" }));
+    await service.removeMember(member.id);
+
+    expect((await service.listMembers()).map((listed) => listed.id)).not.toContain(member.id);
+    expect(remoteCalls).toEqual([]);
   });
 
   it("does not push a server update to the remote directory once the account has changed", async () => {
@@ -398,6 +457,8 @@ describe("HostService account binding", () => {
       inviteId: "invite-1",
       token: "invite-token-that-is-long-enough-for-a-link",
       expiresAt: Date.now() + 60_000,
+      permanent: false,
+      useCount: 0,
     });
     await settled;
 

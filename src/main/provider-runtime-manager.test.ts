@@ -17,7 +17,8 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { MANAGED_RUNTIME_PROVIDERS, type ProviderRuntimeSnapshot } from "@openbot/contracts/ipc";
+import { crc32, deflateRawSync } from "node:zlib";
+import { MANAGED_RUNTIME_PROVIDERS, MANAGED_TOOL_RUNTIMES, type ProviderRuntimeSnapshot } from "@openbot/contracts/ipc";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import lockValue from "../../native-runtime.lock.json";
 import { parseAgentRuntimeLock } from "../../scripts/agent-runtime-lock";
@@ -104,6 +105,92 @@ describe("ProviderRuntimeManager", () => {
       expect(snapshot.providers.grok).toMatchObject({ phase: "not-downloaded", version: null, availableVersion: null });
     },
   );
+
+  /*
+   * The lock is only where a first install starts. A check asks upstream, and a newer release is
+   * offered and installed without a new OpenBot build. x.ai publishes no hash for Grok, so this is
+   * the path with TLS alone behind it; the record written at install is what a restart checks.
+   */
+  it("installs the latest upstream release and verifies it again after a restart", async () => {
+    const root = await temporaryRoot();
+    const fixture = latestGrokFixture("1.0.30");
+    const manager = latestGrokManager(root, fixture);
+    await manager.initialize();
+    manager.setSystemVersion("grok", fixture.lock.grok.version);
+    expect(manager.getStatus().providers.grok.availableVersion).toBeNull();
+
+    const checked = await manager.checkForUpdates();
+    expect(checked.providers.grok.availableVersion).toBe("1.0.30");
+    await manager.downloadAndWait("grok");
+    expect(manager.getStatus().providers.grok).toMatchObject({ phase: "ready", version: "1.0.30" });
+    await manager.stop();
+
+    const restarted = latestGrokManager(root, fixture);
+    expect((await restarted.initialize()).providers.grok).toMatchObject({ phase: "ready", version: "1.0.30" });
+    const executable = restarted.executablePath("grok");
+    if (!executable) throw new Error("The managed Grok path is missing.");
+    expect(executable).toBe(join(root, "grok", "darwin-arm64", "1.0.30", "bin", "grok"));
+
+    // A file added after install is not in the record, so the install is not used.
+    const added = join(root, "grok", "darwin-arm64", "1.0.30", "bin", "added");
+    await writeFile(added, "#!/bin/sh\n");
+    const extended = latestGrokManager(root, fixture);
+    expect((await extended.initialize()).providers.grok.phase).not.toBe("ready");
+    await rm(added);
+
+    // A binary changed after install no longer matches its record, so it is not started.
+    await writeFile(executable, "#!/bin/sh\necho 1.0.30\n# changed\n");
+    const tampered = latestGrokManager(root, fixture);
+    expect((await tampered.initialize()).providers.grok.phase).not.toBe("ready");
+  });
+
+  it("does not offer a release the block list names", async () => {
+    const root = await temporaryRoot();
+    const fixture = latestGrokFixture("1.0.30", ["1.0.30"]);
+    const manager = latestGrokManager(root, fixture);
+    await manager.initialize();
+    manager.setSystemVersion("grok", "1.0.21");
+
+    const checked = await manager.checkForUpdates();
+
+    expect(checked.providers.grok.availableVersion).toBe(fixture.lock.grok.version);
+  });
+
+  it("does not retry a failed update back to an older version once the newer one is blocked", async () => {
+    const root = await temporaryRoot();
+    const fixture = latestGrokFixture("1.0.30");
+    const manager = latestGrokManager(root, fixture);
+    await manager.initialize();
+    await manager.checkForUpdates();
+    await manager.downloadAndWait("grok");
+
+    // 1.0.31 reports another version, so its install fails and 1.0.30 stays.
+    fixture.version = "1.0.31";
+    fixture.executable = new TextEncoder().encode(`#!/bin/sh\necho 1.0.30\n${"# runtime\n".repeat(1_000)}`);
+    await manager.checkForUpdates();
+    await expect(manager.downloadAndWait("grok")).rejects.toThrow();
+    expect(manager.getStatus().providers.grok).toMatchObject({ phase: "download-error", version: "1.0.30" });
+
+    fixture.blocked = ["1.0.31"];
+    await manager.checkForUpdates();
+    await manager.downloadAndWait("grok");
+
+    expect(manager.getStatus().providers.grok).toMatchObject({ phase: "ready", version: "1.0.30" });
+    expect(manager.executablePath("grok")).toBe(join(root, "grok", "darwin-arm64", "1.0.30", "bin", "grok"));
+  });
+
+  it("reports a check that no release source answered", async () => {
+    const root = await temporaryRoot();
+    const manager = new ProviderRuntimeManager({
+      root,
+      platform: "darwin",
+      architecture: "arm64",
+      fetchImpl: async () => new Response(null, { status: 503 }),
+    });
+    await manager.initialize();
+
+    await expect(manager.checkForUpdates()).rejects.toThrow("could not reach the provider release sources");
+  });
 
   it("offers the pinned version to an older CLI the user installed", async () => {
     const root = await temporaryRoot();
@@ -819,17 +906,19 @@ describe("ProviderRuntimeManager", () => {
     expect(providerEntries.some((entry) => entry.startsWith(".staging-"))).toBe(false);
   });
 
-  it("installs each provider under its own name and version", async () => {
+  it("installs each runtime under its own name and version", async () => {
     // The manager used to answer "which artifact does this provider get?" with `else grok`, so a
-    // provider it had never heard of got Grok's binary in its own directory. Every managed provider
+    // provider it had never heard of got Grok's binary in its own directory. Every managed runtime
     // is asked here, so a new one joins this case by joining the registry.
     const root = await temporaryRoot();
     const lock = parseAgentRuntimeLock(structuredClone(lockValue));
     const manager = new ProviderRuntimeManager({ root, platform: "darwin", architecture: "arm64", lock });
 
-    for (const provider of MANAGED_RUNTIME_PROVIDERS) {
-      expect(manager.executablePath(provider)).toBe(
-        join(root, provider, "darwin-arm64", lock[provider].version, "bin", provider),
+    for (const runtime of [...MANAGED_RUNTIME_PROVIDERS, ...MANAGED_TOOL_RUNTIMES]) {
+      // Google names the Gemini server after its build, not after the provider.
+      const executable = runtime === "antigravity" ? "agy_acp_server.par" : runtime;
+      expect(manager.executablePath(runtime)).toBe(
+        join(root, runtime, "darwin-arm64", lock[runtime].version, "bin", executable),
       );
     }
   });
@@ -897,9 +986,95 @@ describe("ProviderRuntimeManager", () => {
     expect(entries.some((entry) => entry.startsWith(".staging-"))).toBe(false);
   });
 
+  /*
+   * Google ships the Gemini server as a zip of two programs: the server and the harness it starts
+   * from its own folder. The server has no `--version`, so the version comes from the layout file
+   * staging writes. Any other file in the zip is refused, so no name in it can reach the disk.
+   */
+  it("stages the Gemini server beside its harness, and refuses a zip with another file", async () => {
+    const root = await temporaryRoot();
+    const fixture = antigravityFixture();
+    const manager = antigravityManager(root, fixture.lock, fixture.archive);
+    await manager.initialize();
+
+    await manager.downloadAndWait("antigravity");
+
+    const version = fixture.lock.antigravity.version;
+    expect(manager.getStatus().providers.antigravity).toMatchObject({ phase: "ready", version });
+    const installed = join(root, "antigravity", "darwin-arm64", version);
+    expect(await readFile(join(installed, "bin", "agy_acp_server.par"), "utf8")).toBe(fixture.serverText);
+    expect(await readFile(join(installed, "bin", "localharness_external"), "utf8")).toBe(fixture.harnessText);
+    expect(JSON.parse(await readFile(join(installed, "antigravity-package.json"), "utf8"))).toMatchObject({
+      layoutVersion: 1,
+      version,
+      executable: "bin/agy_acp_server.par",
+      harness: "bin/localharness_external",
+    });
+
+    const otherRoot = await temporaryRoot();
+    const extra = antigravityFixture([["../outside", "x"]]);
+    const refused = antigravityManager(otherRoot, extra.lock, extra.archive);
+    await refused.initialize();
+    await expect(refused.downloadAndWait("antigravity")).rejects.toThrow("The Gemini archive has an unexpected file.");
+    await expect(access(join(otherRoot, "outside"))).rejects.toThrow();
+  });
+
+  /*
+   * Bun is downloaded for the MCP servers, not for an agent, and the two things a server needs from
+   * it are the binary and the second name `bunx`. Bun decides what to do from the name it was
+   * started under, so without that name a catalog entry written for `npx` would reach a runtime
+   * that reads `-y` as a script flag.
+   */
+  it("stages Bun with the bunx name beside it, and lends both to the MCP servers", async () => {
+    const root = await temporaryRoot();
+    const fixture = await bunFixture();
+    const manager = bunManager(root, fixture);
+    await manager.initialize();
+    expect(manager.mcpToolRuntimes()).toEqual({ binDirectories: [], commandAliases: {} });
+
+    await manager.downloadAndWait("bun");
+
+    const version = fixture.lock.bun.version;
+    expect(manager.getStatus().toolRuntimes.bun).toMatchObject({ phase: "ready", version });
+    const installed = join(root, "bun", "darwin-arm64", version);
+    expect(await readFile(join(installed, "bin", "bunx"), "utf8")).toBe(fixture.binaryText);
+    expect(await readFile(join(installed, "LICENSE.md"), "utf8")).toBe(fixture.licenseText);
+    expect(manager.mcpToolRuntimes()).toEqual({
+      binDirectories: [join(installed, "bin")],
+      commandAliases: { npx: join(installed, "bin", "bunx") },
+    });
+  });
+
+  // The connection test waits on this before probing a stdio server: a machine that only needs
+  // the download must not answer `Command not found: npx` for it.
+  it("waits until the tool runtimes are ready", async () => {
+    const root = await temporaryRoot();
+    const fixture = await bunFixture();
+    const manager = bunManager(root, fixture);
+    await manager.initialize();
+    expect(manager.mcpToolRuntimes().binDirectories).toEqual([]);
+
+    await manager.ensureToolRuntimesReady();
+
+    expect(manager.getStatus().toolRuntimes.bun).toMatchObject({ phase: "ready" });
+    expect(manager.mcpToolRuntimes().binDirectories).toHaveLength(1);
+  });
+
+  it("does not offer Bun to the provider cards", async () => {
+    // `providers` is what every renderer reader iterates to draw a provider card. A tool runtime in
+    // it would become a provider everywhere, from the picker to the model list.
+    const root = await temporaryRoot();
+    const manager = new ProviderRuntimeManager({ root, platform: "darwin", architecture: "arm64" });
+
+    const snapshot = await manager.initialize();
+
+    expect(Object.keys(snapshot.providers)).toEqual([...MANAGED_RUNTIME_PROVIDERS]);
+  });
+
   it.each([
     ["darwin", "arm64"],
     ["linux", "x64"],
+    ["linux", "arm64"],
     ["win32", "x64"],
   ] as const)("offers managed downloads on %s %s", async (platform, architecture) => {
     const root = await temporaryRoot();
@@ -910,11 +1085,14 @@ describe("ProviderRuntimeManager", () => {
     for (const provider of MANAGED_RUNTIME_PROVIDERS) {
       expect(snapshot.providers[provider]).toMatchObject({ phase: "not-downloaded", message: null });
     }
+    for (const tool of MANAGED_TOOL_RUNTIMES) {
+      expect(snapshot.toolRuntimes[tool]).toMatchObject({ phase: "not-downloaded", message: null });
+    }
   });
 
   it("reports an unsupported platform rather than a download that cannot work", async () => {
     const root = await temporaryRoot();
-    const manager = new ProviderRuntimeManager({ root, platform: "linux", architecture: "arm64" });
+    const manager = new ProviderRuntimeManager({ root, platform: "win32", architecture: "arm64" });
 
     const snapshot = await manager.initialize();
 
@@ -955,6 +1133,115 @@ async function opencodeFixture(options?: {
   artifact.installedBytes = archive.byteLength + 1_024;
   lock.opencode.licenseSha256 = digest(new TextEncoder().encode(licenseText));
   return { archive, binaryText, licenseText, lock };
+}
+
+/** A served `@oven/bun-darwin-aarch64` tarball with the lock rewritten to match it. */
+async function bunFixture(): Promise<OpencodeFixture> {
+  const lock = parseAgentRuntimeLock(structuredClone(lockValue));
+  const artifact = lock.bun.artifacts["darwin-arm64"];
+  const binaryText = `#!/bin/sh\necho ${lock.bun.version}\n`;
+  const licenseText = "MIT license\n";
+  const source = await temporaryRoot();
+  await mkdir(join(source, "package", "bin"), { recursive: true });
+  await writeFile(
+    join(source, "package", "package.json"),
+    JSON.stringify({ name: artifact.package, version: lock.bun.version }),
+  );
+  await writeFile(join(source, "package", "bin", artifact.executable), binaryText, { mode: 0o755 });
+  const archivePath = join(source, artifact.asset);
+  execFileSync("tar", ["-czf", archivePath, "-C", source, "package"]);
+  const archive = await readFile(archivePath);
+
+  artifact.assetSha256 = digest(archive);
+  artifact.binarySha256 = digest(new TextEncoder().encode(binaryText));
+  artifact.downloadBytes = archive.byteLength;
+  artifact.installedBytes = archive.byteLength + 1_024;
+  lock.bun.licenseSha256 = digest(new TextEncoder().encode(licenseText));
+  return { archive, binaryText, licenseText, lock };
+}
+
+/** A served Gemini zip with the lock rewritten to match it. `extra` adds files the zip must not hold. */
+function antigravityFixture(extra: [string, string][] = []) {
+  const lock = parseAgentRuntimeLock(structuredClone(lockValue));
+  const artifact = lock.antigravity.artifacts["darwin-arm64"];
+  const serverText = "#!/bin/sh\necho server\n";
+  const harnessText = "#!/bin/sh\necho harness\n";
+  const archive = zipArchive([[artifact.executable, serverText], [artifact.harness, harnessText], ...extra]);
+  artifact.assetSha256 = digest(archive);
+  artifact.executableSha256 = digest(new TextEncoder().encode(serverText));
+  artifact.harnessSha256 = digest(new TextEncoder().encode(harnessText));
+  artifact.downloadBytes = archive.byteLength;
+  artifact.installedBytes = archive.byteLength + 1_024;
+  return { archive, serverText, harnessText, lock };
+}
+
+function antigravityManager(
+  root: string,
+  lock: ReturnType<typeof parseAgentRuntimeLock>,
+  archive: Uint8Array,
+): ProviderRuntimeManager {
+  return new ProviderRuntimeManager({
+    root,
+    platform: "darwin",
+    architecture: "arm64",
+    lock,
+    fetchImpl: async () => chunkedResponse(archive, 4_096),
+  });
+}
+
+/** A deflated zip made on Unix, each entry a regular file with mode 755, as Google's zips are. */
+function zipArchive(files: [string, string][]): Uint8Array {
+  const locals: Buffer[] = [];
+  const centrals: Buffer[] = [];
+  let offset = 0;
+  for (const [name, text] of files) {
+    const data = Buffer.from(text);
+    const packed = deflateRawSync(data);
+    const nameBytes = Buffer.from(name);
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(8, 8);
+    local.writeUInt32LE(crc32(data), 14);
+    local.writeUInt32LE(packed.byteLength, 18);
+    local.writeUInt32LE(data.byteLength, 22);
+    local.writeUInt16LE(nameBytes.byteLength, 26);
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE((3 << 8) | 20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(8, 10);
+    central.writeUInt32LE(crc32(data), 16);
+    central.writeUInt32LE(packed.byteLength, 20);
+    central.writeUInt32LE(data.byteLength, 24);
+    central.writeUInt16LE(nameBytes.byteLength, 28);
+    central.writeUInt32LE((0o100755 << 16) >>> 0, 38);
+    central.writeUInt32LE(offset, 42);
+    locals.push(local, nameBytes, packed);
+    centrals.push(central, nameBytes);
+    offset += local.byteLength + nameBytes.byteLength + packed.byteLength;
+  }
+  const directory = Buffer.concat(centrals);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(files.length, 8);
+  end.writeUInt16LE(files.length, 10);
+  end.writeUInt32LE(directory.byteLength, 12);
+  end.writeUInt32LE(offset, 16);
+  return new Uint8Array(Buffer.concat([...locals, directory, end]));
+}
+
+function bunManager(root: string, fixture: OpencodeFixture): ProviderRuntimeManager {
+  return new ProviderRuntimeManager({
+    root,
+    platform: "darwin",
+    architecture: "arm64",
+    lock: fixture.lock,
+    fetchImpl: async (input) =>
+      String(input).endsWith("/LICENSE.md")
+        ? new Response(new TextEncoder().encode(fixture.licenseText))
+        : chunkedResponse(fixture.archive, 4_096),
+  });
 }
 
 function opencodeManager(root: string, fixture: OpencodeFixture): ProviderRuntimeManager {
@@ -1029,6 +1316,41 @@ function grokFixture(): {
   lock.grok.licenseSha256 = digest(license);
   lock.grok.noticesSha256 = digest(notices);
   return { executable, license, notices, lock };
+}
+
+/** Grok's pinned fixture, with x.ai announcing `version` as stable and every other source down. */
+function latestGrokFixture(version: string, blocked: string[] = []) {
+  const fixture = grokFixture();
+  const executable = new TextEncoder().encode(`#!/bin/sh\necho ${version}\n${"# runtime\n".repeat(1_000)}`);
+  return { ...fixture, version, executable, blocked };
+}
+
+function latestGrokManager(root: string, fixture: ReturnType<typeof latestGrokFixture>): ProviderRuntimeManager {
+  return new ProviderRuntimeManager({
+    root,
+    platform: "darwin",
+    architecture: "arm64",
+    lock: fixture.lock,
+    fetchImpl: async (input, init) => {
+      const url = String(input);
+      if (url === "https://x.ai/cli/stable") return new Response(`${fixture.version}\n`);
+      if (url.endsWith("/provider-runtime-blocklist.json")) {
+        return Response.json({ schemaVersion: 1, blocked: { grok: fixture.blocked } });
+      }
+      if (url.endsWith("/LICENSE")) return new Response(fixture.license);
+      if (url.endsWith("/THIRD-PARTY-NOTICES")) return new Response(fixture.notices);
+      if (url === `https://x.ai/cli/grok-${fixture.version}-macos-aarch64`) {
+        if (new Headers(init?.headers).get("Range") === "bytes=0-0") {
+          return new Response(fixture.executable.slice(0, 1), {
+            status: 206,
+            headers: { "content-range": `bytes 0-0/${fixture.executable.byteLength}` },
+          });
+        }
+        return chunkedResponse(fixture.executable, 1_024);
+      }
+      return new Response(null, { status: 404 });
+    },
+  });
 }
 
 /** Six hours is the staging threshold and thirty days the version one; both are cleared here. */

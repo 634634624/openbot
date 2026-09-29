@@ -1,7 +1,13 @@
+// An agent's core surface: status, agents, conversations, the queue and the prompts
+// a turn can raise. Memories, routines and attachments are their own registrars.
+// Every one of these routes to the local service or to a remote server by the
+// `serverId` in the request.
+
 import {
   analyticsQuery,
   assertAnalyticsScope,
   assertHostAnalyticsScope,
+  BROWSER_SECRET_RESPONSE_PATH,
   CHANNEL_DELETE_CAPABILITY,
   decodeAgentProfileDraft,
   decodeChannel,
@@ -10,36 +16,29 @@ import {
   decodeSaveAgentProfileResult,
   hostAnalyticsQuery,
   parseAgentAnalyticsInput,
+  parseBrowserSecretResponse,
   parseChannelCommand,
   parseChannelRead,
   parseGenerateAgentProfile,
   parseHostAnalyticsInput,
   parseSaveAgentProfile,
 } from "@openbot/contracts/ipc";
-import { CHANNEL_ROUTES } from "@openbot/contracts/team-protocol/channels-v1";
-import { decodeAgentAnalyticsFromHost, decodeHostAnalyticsFromHost } from "../remote-agent-decoding";
-// An agent's core surface: status, agents, conversations, the queue and the prompts
-// a turn can raise. Memories, routines and attachments are their own registrars.
-// Every one of these routes to the local service or to a remote server by the
-// `serverId` in the request.
-
-import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
-import type {
-  DuplicateAgentResult,
-  SendMessageInput,
-  SidebarLayoutSnapshot,
-  UpdateAgentInput,
-} from "@openbot/contracts/ipc";
 import { TEAM_API_ROUTES } from "@openbot/contracts/team-api-routes";
+import { CHANNEL_ROUTES } from "@openbot/contracts/team-protocol/channels-v1";
+import { CONTEXT_RESET_CAPABILITY, CONTEXT_RESET_ROUTES } from "@openbot/contracts/team-protocol/context-reset-v1";
+import { sourceText } from "@openbot/i18n/source";
+import { duplicateAgentIntoLayout } from "../../backend/agent/duplication-gate";
 import type { AgentService } from "../../backend/agent-service";
 import type { SidebarLayoutStore } from "../../backend/sidebar-layout-store";
 import type { HostService } from "../host-service";
 import {
   decodeAccountUsageFromHost,
+  decodeAgentAnalyticsFromHost,
   decodeAgentModelOptions,
   decodeAgentStatusFromHost,
   decodeAgentSummaries,
   decodeAgentSummary,
+  decodeHostAnalyticsFromHost,
   decodeInstalledSkillsFromHost,
   decodeQueuedMessageReceipt,
   decodeQueueSnapshot,
@@ -50,10 +49,11 @@ import type { RemoteServerManager } from "../remote-server-manager";
 import type { SkillMarketplaceService } from "../skill-marketplace-service";
 import {
   parseAcknowledgeFailedTurn,
-  parseAgentRequest,
+  parseAgentId,
   parseApprovalResponse,
   parseBrowserTakeoverResponse,
   parseCancelQueuedMessage,
+  parseChannelId,
   parseCreateAgent,
   parseInterrupt,
   parseMarkConversationRead,
@@ -71,9 +71,8 @@ import {
   parseUpdateAgent,
   parseUpdateQueuedMessage,
 } from "./agent-inputs";
-import { type IpcGroupHandlers, payloadHandler } from "./define-ipc-group";
-import { routeToServer } from "./route-to-server";
-import { requireString } from "./validation";
+import type { IpcGroupHandlers } from "./define-ipc-group";
+import { scopedHandler, scopedQueryHandler } from "./scoped-handler";
 
 export interface AgentIpcDependencies {
   service: AgentService;
@@ -92,464 +91,308 @@ export function agentIpcHandlers({
 }: AgentIpcDependencies): Pick<IpcGroupHandlers, "agent"> {
   return {
     agent: {
-      getStatus: payloadHandler(parseAgentRequest, (parsed) => {
-        return routeToServer(parsed.serverId, {
-          local: () => service.getStatus(),
-          remote: (serverId) =>
-            remoteServers.request(serverId, TEAM_API_ROUTES.agents.status, decodeAgentStatusFromHost),
-        });
+      getStatus: scopedQueryHandler({
+        local: () => service.getStatus(),
+        remote: (serverId) => remoteServers.request(serverId, TEAM_API_ROUTES.agents.status, decodeAgentStatusFromHost),
       }),
-      getHostAnalytics: payloadHandler(parseAgentRequest, (parsed) => {
-        const input = parseHostAnalyticsInput(parsed.payload);
-        return routeToServer(parsed.serverId, {
-          local: () => service.getHostAnalytics(input),
-          remote: (serverId) =>
-            remoteServers.supportsCapability(serverId, "host-analytics")
-              ? remoteServers.request(serverId, `${TEAM_API_ROUTES.analytics}?${hostAnalyticsQuery(input)}`, (value) =>
-                  assertHostAnalyticsScope(decodeHostAnalyticsFromHost(value), input),
-                )
-              : null,
-        });
+      getHostAnalytics: scopedHandler(parseHostAnalyticsInput, {
+        local: (input) => service.getHostAnalytics(input),
+        remote: (input, serverId) =>
+          remoteServers.supportsCapability(serverId, "host-analytics")
+            ? remoteServers.request(serverId, `${TEAM_API_ROUTES.analytics}?${hostAnalyticsQuery(input)}`, (value) =>
+                assertHostAnalyticsScope(decodeHostAnalyticsFromHost(value), input),
+              )
+            : null,
       }),
-      getAnalytics: payloadHandler(parseAgentRequest, (parsed) => {
-        const input = parseAgentAnalyticsInput(parsed.payload);
-        return routeToServer(parsed.serverId, {
-          local: () => service.getAnalytics(input),
-          remote: (serverId) =>
-            remoteServers.supportsCapability(serverId, "agent-analytics")
-              ? remoteServers.request(
-                  serverId,
-                  `${TEAM_API_ROUTES.agent.analytics(input.agentId)}?${analyticsQuery(input)}`,
-                  (value) => assertAnalyticsScope(decodeAgentAnalyticsFromHost(value), input),
-                )
-              : null,
-        });
+      getAnalytics: scopedHandler(parseAgentAnalyticsInput, {
+        local: (input) => service.getAnalytics(input),
+        remote: (input, serverId) =>
+          remoteServers.supportsCapability(serverId, "agent-analytics")
+            ? remoteServers.request(
+                serverId,
+                `${TEAM_API_ROUTES.agent.analytics(input.agentId)}?${analyticsQuery(input)}`,
+                (value) => assertAnalyticsScope(decodeAgentAnalyticsFromHost(value), input),
+              )
+            : null,
       }),
-      getUsage: payloadHandler(parseAgentRequest, (parsed) => {
-        const agentId = parseOptionalAgentId(parsed.payload);
-        return routeToServer(parsed.serverId, {
-          local: () => service.getUsage(agentId),
-          remote: (serverId) =>
-            agentId
-              ? remoteServers.supportsCapability(serverId, "model-scoped-usage")
-                ? remoteServers.request(serverId, TEAM_API_ROUTES.agent.usage(agentId), decodeAccountUsageFromHost)
-                : { limits: [] }
-              : remoteServers.request(serverId, TEAM_API_ROUTES.agents.usage, decodeAccountUsageFromHost),
-        });
+      getUsage: scopedHandler(parseOptionalAgentId, {
+        local: (agentId) => service.getUsage(agentId),
+        remote: (agentId, serverId) =>
+          agentId
+            ? remoteServers.supportsCapability(serverId, "model-scoped-usage")
+              ? remoteServers.request(serverId, TEAM_API_ROUTES.agent.usage(agentId), decodeAccountUsageFromHost)
+              : { limits: [] }
+            : remoteServers.request(serverId, TEAM_API_ROUTES.agents.usage, decodeAccountUsageFromHost),
       }),
-      listModels: payloadHandler(parseAgentRequest, (parsed) => {
-        return routeToServer(parsed.serverId, {
-          local: () => service.listModels(),
-          remote: (serverId) => remoteServers.request(serverId, TEAM_API_ROUTES.agents.models, decodeAgentModelOptions),
-        });
+      listModels: scopedQueryHandler({
+        local: () => service.listModels(),
+        remote: (serverId) => remoteServers.request(serverId, TEAM_API_ROUTES.agents.models, decodeAgentModelOptions),
       }),
-      list: payloadHandler(parseAgentRequest, (parsed) => {
-        return routeToServer(parsed.serverId, {
-          local: () => service.listAgents(),
-          remote: (serverId) => remoteServers.request(serverId, TEAM_API_ROUTES.agents.all, decodeAgentSummaries),
-        });
+      listAgents: scopedQueryHandler({
+        local: () => service.listAgents(),
+        remote: (serverId) => remoteServers.request(serverId, TEAM_API_ROUTES.agents.all, decodeAgentSummaries),
       }),
-      listInstalledSkills: payloadHandler(parseAgentRequest, (scoped) => {
-        const agentId = requireString(scoped.payload, "agentId", INPUT_LIMITS.identifier);
-        return routeToServer(scoped.serverId, {
-          local: () => skills.listInstalledForChatTags(agentId),
-          // A server too old to know the endpoint would answer 404, so ask its advertised capabilities first.
-          remote: (serverId) =>
-            remoteServers
-              .list()
-              .find((server) => server.id === serverId)
-              ?.compatibility?.capabilities.includes("installed-skills")
-              ? remoteServers.request(serverId, TEAM_API_ROUTES.agent.skills(agentId), decodeInstalledSkillsFromHost)
-              : Promise.resolve([]),
-        });
+      listInstalledSkills: scopedHandler(parseAgentId, {
+        local: (agentId) => skills.listInstalledForChatTags(agentId),
+        // A server too old to know the endpoint would answer 404, so ask its advertised capabilities first.
+        remote: (agentId, serverId) =>
+          remoteServers
+            .list()
+            .find((server) => server.id === serverId)
+            ?.compatibility?.capabilities.includes("installed-skills")
+            ? remoteServers.request(serverId, TEAM_API_ROUTES.agent.skills(agentId), decodeInstalledSkillsFromHost)
+            : Promise.resolve([]),
       }),
-      listChannels: payloadHandler(parseAgentRequest, (scoped) =>
-        routeToServer(scoped.serverId, {
-          // The reader here is the host user of this computer, so messages they wrote before they
-          // signed in are their own.
-          local: () => service.channels.store.list(host.channelActor().id, true),
-          remote: (serverId) => remoteServers.request(serverId, CHANNEL_ROUTES.list, decodeChannelSummaries),
-        }),
-      ),
-      readChannel: payloadHandler(parseAgentRequest, (scoped) => {
-        const input = parseChannelRead(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => service.channels.store.page(input.channelId, input.beforeSequence),
-          remote: (serverId) =>
-            remoteServers.request(serverId, CHANNEL_ROUTES.read, decodeChannelPage, { method: "POST", body: input }),
-        });
+      listChannels: scopedQueryHandler({
+        // The reader here is the host user of this computer, so messages they wrote before they
+        // signed in are their own.
+        local: () => service.channels.store.list(host.channelActor().id, true),
+        remote: (serverId) => remoteServers.request(serverId, CHANNEL_ROUTES.list, decodeChannelSummaries),
       }),
-      channelCommand: payloadHandler(parseAgentRequest, (scoped) => {
-        const input = parseChannelCommand(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => service.channels.command(input, host.channelActor()),
-          remote: (serverId) =>
-            remoteServers.request(serverId, CHANNEL_ROUTES.command, decodeChannel, { method: "POST", body: input }),
-        });
+      readChannel: scopedHandler(parseChannelRead, {
+        local: (input) => service.channels.store.page(input.channelId, input.beforeSequence),
+        remote: (input, serverId) =>
+          remoteServers.request(serverId, CHANNEL_ROUTES.read, decodeChannelPage, { method: "POST", body: input }),
       }),
-      deleteChannel: payloadHandler(parseAgentRequest, (scoped) => {
-        const channelId = requireString(scoped.payload, "channelId", INPUT_LIMITS.identifier);
-        return routeToServer<void>(scoped.serverId, {
-          local: () => service.deleteChannel(channelId),
-          remote: async (serverId) => {
-            if (!remoteServers.supportsCapability(serverId, CHANNEL_DELETE_CAPABILITY))
-              throw new Error("Channel deletion is not supported by this server.");
-            await remoteServers.request(serverId, CHANNEL_ROUTES.delete, decodeVoid, {
-              method: "POST",
-              body: { channelId },
-            });
-          },
-        });
+      channelCommand: scopedHandler(parseChannelCommand, {
+        local: (input) => service.channels.command(input, host.channelActor()),
+        remote: (input, serverId) =>
+          remoteServers.request(serverId, CHANNEL_ROUTES.command, decodeChannel, { method: "POST", body: input }),
       }),
-      getSidebarLayout: payloadHandler(parseAgentRequest, (parsed): Promise<SidebarLayoutSnapshot> => {
-        return routeToServer(parsed.serverId, {
-          local: () => sidebarLayout.getSnapshot(),
-          remote: (serverId) =>
-            remoteServers.request(serverId, TEAM_API_ROUTES.sidebarLayout.state, decodeSidebarLayoutSnapshot),
-        });
+      deleteChannel: scopedHandler(parseChannelId, {
+        local: (channelId) => service.deleteChannel(channelId),
+        remote: async (channelId, serverId) => {
+          if (!remoteServers.supportsCapability(serverId, CHANNEL_DELETE_CAPABILITY))
+            throw new Error(sourceText("error.backend.channelDeleteUnsupported"));
+          await remoteServers.request(serverId, CHANNEL_ROUTES.delete, decodeVoid, {
+            method: "POST",
+            body: { channelId },
+          });
+        },
       }),
-      mutateSidebarLayout: payloadHandler(parseAgentRequest, (scoped): Promise<SidebarLayoutSnapshot> => {
-        const action = parseSidebarLayoutAction(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => sidebarLayout.mutate(action, service.sidebarChatIds()),
-          remote: (serverId) =>
-            remoteServers.request(serverId, TEAM_API_ROUTES.sidebarLayout.actions, decodeSidebarLayoutSnapshot, {
-              method: "POST",
-              body: action,
-            }),
-        });
+      getSidebarLayout: scopedQueryHandler({
+        local: () => sidebarLayout.getSnapshot(),
+        remote: (serverId) =>
+          remoteServers.request(serverId, TEAM_API_ROUTES.sidebarLayout.state, decodeSidebarLayoutSnapshot),
       }),
-      generateProfile: payloadHandler(parseAgentRequest, (scoped) => {
-        const input = parseGenerateAgentProfile(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => service.generateProfile(input, sidebarLayout.getSnapshot().sections),
-          remote: (serverId) =>
-            remoteServers.request(serverId, TEAM_API_ROUTES.agents.generateProfile, decodeAgentProfileDraft, {
-              method: "POST",
-              body: input,
-              timeoutMs: 150_000,
-            }),
-        });
+      mutateSidebarLayout: scopedHandler(parseSidebarLayoutAction, {
+        local: (action) => sidebarLayout.mutate(action, service.sidebarChatIds()),
+        remote: (action, serverId) =>
+          remoteServers.request(serverId, TEAM_API_ROUTES.sidebarLayout.actions, decodeSidebarLayoutSnapshot, {
+            method: "POST",
+            body: action,
+          }),
       }),
-      saveProfile: payloadHandler(parseAgentRequest, (scoped) => {
-        const input = parseSaveAgentProfile(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => service.saveProfile(input, sidebarLayout),
-          remote: (serverId) =>
-            remoteServers.request(serverId, TEAM_API_ROUTES.agents.saveProfile, decodeSaveAgentProfileResult, {
-              method: "POST",
-              body: input,
-            }),
-        });
+      generateProfile: scopedHandler(parseGenerateAgentProfile, {
+        local: (input) => service.generateProfile(input, sidebarLayout.getSnapshot().sections),
+        remote: (input, serverId) =>
+          remoteServers.request(serverId, TEAM_API_ROUTES.agents.generateProfile, decodeAgentProfileDraft, {
+            method: "POST",
+            body: input,
+            timeoutMs: 150_000,
+          }),
       }),
-      create: payloadHandler(parseAgentRequest, (scoped) => {
-        const parsed = parseCreateAgent(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => service.createAgent(parsed),
-          remote: (serverId) =>
-            remoteServers.request(serverId, TEAM_API_ROUTES.agents.all, decodeAgentSummary, {
-              method: "POST",
-              body: parsed,
-            }),
-        });
+      saveProfile: scopedHandler(parseSaveAgentProfile, {
+        local: (input) => service.saveProfile(input, sidebarLayout),
+        remote: (input, serverId) =>
+          remoteServers.request(serverId, TEAM_API_ROUTES.agents.saveProfile, decodeSaveAgentProfileResult, {
+            method: "POST",
+            body: input,
+          }),
       }),
-      duplicate: payloadHandler(parseAgentRequest, (scoped): Promise<DuplicateAgentResult> => {
-        const agentId = requireString(scoped.payload, "agentId", INPUT_LIMITS.identifier);
-        return routeDuplicateAgent(service, sidebarLayout, remoteServers, scoped.serverId, agentId);
+      createAgent: scopedHandler(parseCreateAgent, {
+        local: (parsed) => service.createAgent(parsed),
+        remote: (parsed, serverId) =>
+          remoteServers.request(serverId, TEAM_API_ROUTES.agents.all, decodeAgentSummary, {
+            method: "POST",
+            body: parsed,
+          }),
       }),
-      update: payloadHandler(parseAgentRequest, (scoped) => {
-        return routeUpdateAgent(service, remoteServers, scoped.serverId, parseUpdateAgent(scoped.payload));
+      duplicateAgent: scopedHandler(parseAgentId, {
+        local: (agentId) => duplicateAgentIntoLayout(service, sidebarLayout, agentId),
+        remote: (agentId, serverId) => remoteServers.duplicateAgent(agentId, serverId),
       }),
-      setAvatar: payloadHandler(parseAgentRequest, (scoped) => {
-        const parsed = parseSetAgentAvatar(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => service.setAvatar(parsed.agentId, parsed.image),
-          remote: (serverId) => remoteServers.setAgentAvatar(parsed.agentId, parsed.image, serverId),
-        });
+      updateAgent: scopedHandler(parseUpdateAgent, {
+        local: (input) => service.updateAgent(input),
+        remote: (input, serverId) => {
+          // The Team API does not carry access, and a team member must not be able to widen it.
+          if (input.access !== undefined) {
+            throw new Error(sourceText("error.agent.accessLocalOnly"));
+          }
+          if (input.computerUse !== undefined) {
+            throw new Error(sourceText("error.agent.computerUseLocalOnly"));
+          }
+          return remoteServers.request(serverId, TEAM_API_ROUTES.agent.one(input.agentId), decodeAgentSummary, {
+            method: "PATCH",
+            body: input,
+          });
+        },
       }),
-      delete: payloadHandler(parseAgentRequest, (scoped) => {
-        const agentId = requireString(scoped.payload, "agentId");
-        return routeDeleteAgent(service, sidebarLayout, remoteServers, scoped.serverId, agentId);
+      setAvatar: scopedHandler(parseSetAgentAvatar, {
+        local: (parsed) => service.setAvatar(parsed.agentId, parsed.image),
+        remote: (parsed, serverId) => remoteServers.setAgentAvatar(parsed.agentId, parsed.image, serverId),
       }),
-      readConversation: payloadHandler(parseAgentRequest, (scoped) => {
-        return routeReadConversation(host, remoteServers, scoped.serverId, requireString(scoped.payload, "agentId"));
+      deleteAgent: scopedHandler(parseAgentId, {
+        local: async (agentId) => {
+          await service.deleteAgent(agentId);
+          await sidebarLayout.removeAgent(agentId);
+        },
+        remote: async (agentId, serverId) => {
+          await remoteServers.request(serverId, TEAM_API_ROUTES.agent.one(agentId), decodeVoid, { method: "DELETE" });
+        },
       }),
-      readConversationPage: payloadHandler(parseAgentRequest, (scoped) => {
-        const parsed = parseReadConversationPage(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => host.readAgentConversationPage(parsed.agentId, parsed.anchor, parsed.limit),
-          remote: (serverId) =>
-            remoteServers.readAgentConversationPage(parsed.agentId, parsed.anchor, parsed.limit, serverId),
-        });
+      readConversation: scopedHandler(parseAgentId, {
+        local: (agentId) => host.readAgentConversation(agentId),
+        remote: (agentId, serverId) => remoteServers.readAgentConversation(agentId, serverId),
       }),
-      searchConversationMessages: payloadHandler(parseAgentRequest, (scoped) => {
-        const parsed = parseSearchConversationMessages(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => host.searchAgentConversationMessages(parsed.query, parsed.agentId, parsed.cursor, parsed.limit),
-          remote: (serverId) =>
-            remoteServers.searchAgentConversationMessages(
-              parsed.query,
-              parsed.agentId,
-              parsed.cursor,
-              parsed.limit,
-              serverId,
-            ),
-        });
+      readConversationPage: scopedHandler(parseReadConversationPage, {
+        local: (parsed) => host.readAgentConversationPage(parsed.agentId, parsed.anchor, parsed.limit),
+        remote: (parsed, serverId) =>
+          remoteServers.readAgentConversationPage(parsed.agentId, parsed.anchor, parsed.limit, serverId),
       }),
-      listConversationReads: payloadHandler(parseAgentRequest, (parsed) => {
-        return routeToServer(parsed.serverId, {
-          local: () => host.listAgentConversationReads(),
-          remote: (serverId) => remoteServers.listAgentConversationReads(serverId),
-        });
+      searchConversationMessages: scopedHandler(parseSearchConversationMessages, {
+        local: (parsed) =>
+          host.searchAgentConversationMessages(parsed.query, parsed.agentId, parsed.cursor, parsed.limit),
+        remote: (parsed, serverId) =>
+          remoteServers.searchAgentConversationMessages(
+            parsed.query,
+            parsed.agentId,
+            parsed.cursor,
+            parsed.limit,
+            serverId,
+          ),
       }),
-      markConversationRead: payloadHandler(parseAgentRequest, (scoped) => {
-        const parsed = parseMarkConversationRead(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => host.markAgentConversationRead(parsed),
-          remote: (serverId) => remoteServers.markAgentConversationRead(parsed, serverId),
-        });
+      listConversationReads: scopedQueryHandler({
+        local: () => host.listAgentConversationReads(),
+        remote: (serverId) => remoteServers.listAgentConversationReads(serverId),
       }),
-      sendMessage: payloadHandler(parseAgentRequest, (scoped) => {
-        return routeSendMessage(service, remoteServers, scoped.serverId, parseSendMessage(scoped.payload));
+      markConversationRead: scopedHandler(parseMarkConversationRead, {
+        local: (parsed) => host.markAgentConversationRead(parsed),
+        remote: (parsed, serverId) => remoteServers.markAgentConversationRead(parsed, serverId),
       }),
-      setMessageReaction: payloadHandler(parseAgentRequest, (scoped) => {
-        const parsed = parseMessageReaction(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => service.setMessageReaction(parsed),
-          remote: (serverId) =>
-            remoteServers.request(serverId, TEAM_API_ROUTES.agent.reactions(parsed.agentId), decodeVoid, {
-              method: "POST",
-              body: parsed,
-            }),
-        });
+      sendMessage: scopedHandler(parseSendMessage, {
+        local: (input) => service.sendMessage(input),
+        remote: (input, serverId) =>
+          remoteServers.request(serverId, TEAM_API_ROUTES.agent.messages(input.agentId), decodeQueuedMessageReceipt, {
+            method: "POST",
+            body: input,
+          }),
       }),
-      listQueue: payloadHandler(parseAgentRequest, (scoped) => {
-        return routeListQueue(service, remoteServers, scoped.serverId, requireString(scoped.payload, "agentId"));
+      setMessageReaction: scopedHandler(parseMessageReaction, {
+        local: (parsed) => service.setMessageReaction(parsed),
+        remote: (parsed, serverId) =>
+          remoteServers.request(serverId, TEAM_API_ROUTES.agent.reactions(parsed.agentId), decodeVoid, {
+            method: "POST",
+            body: parsed,
+          }),
       }),
-      acknowledgeFailedTurn: payloadHandler(parseAgentRequest, (scoped) => {
-        const parsed = parseAcknowledgeFailedTurn(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => service.acknowledgeFailedTurn(parsed.agentId, parsed.turnId),
-          remote: (serverId) =>
-            remoteServers.request(serverId, TEAM_API_ROUTES.agent.failuresAcknowledge(parsed.agentId), decodeVoid, {
-              method: "POST",
-              body: { turnId: parsed.turnId },
-            }),
-        });
+      listQueue: scopedHandler(parseAgentId, {
+        local: (agentId) => service.listQueue(agentId),
+        remote: (agentId, serverId) =>
+          remoteServers.request(serverId, TEAM_API_ROUTES.agent.queue(agentId), decodeQueueSnapshot),
       }),
-      cancelQueuedMessage: payloadHandler(parseAgentRequest, (scoped) => {
-        const parsed = parseCancelQueuedMessage(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => service.cancelQueuedMessage(parsed.agentId, parsed.deliveryId),
-          remote: (serverId) =>
-            remoteServers.request(serverId, TEAM_API_ROUTES.agent.queueCancel(parsed.agentId), decodeVoid, {
-              method: "POST",
-              body: { deliveryId: parsed.deliveryId },
-            }),
-        });
+      acknowledgeFailedTurn: scopedHandler(parseAcknowledgeFailedTurn, {
+        local: (parsed) => service.acknowledgeFailedTurn(parsed.agentId, parsed.turnId),
+        remote: (parsed, serverId) =>
+          remoteServers.request(serverId, TEAM_API_ROUTES.agent.failuresAcknowledge(parsed.agentId), decodeVoid, {
+            method: "POST",
+            body: { turnId: parsed.turnId },
+          }),
       }),
-      steerQueuedMessage: payloadHandler(parseAgentRequest, (scoped) => {
-        const parsed = parseSteerQueuedMessage(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => service.steerQueuedMessage(parsed),
-          remote: (serverId) =>
-            remoteServers.request(serverId, TEAM_API_ROUTES.agent.queueSteer(parsed.agentId), decodeVoid, {
-              method: "POST",
-              body: { deliveryId: parsed.deliveryId, expectedTurnId: parsed.expectedTurnId },
-            }),
-        });
+      cancelQueuedMessage: scopedHandler(parseCancelQueuedMessage, {
+        local: (parsed) => service.cancelQueuedMessage(parsed.agentId, parsed.deliveryId),
+        remote: (parsed, serverId) =>
+          remoteServers.request(serverId, TEAM_API_ROUTES.agent.queueCancel(parsed.agentId), decodeVoid, {
+            method: "POST",
+            body: { deliveryId: parsed.deliveryId },
+          }),
       }),
-      editQueuedMessage: payloadHandler(parseAgentRequest, (scoped) => {
-        const { agentId, ...input } = parseQueueEdit(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => service.editQueuedMessage(agentId, input),
-          remote: (serverId) =>
-            remoteServers.request(serverId, TEAM_API_ROUTES.agent.queueEdit(agentId), decodeQueueSnapshot, {
-              method: "POST",
-              body: { ...input },
-            }),
-        });
+      steerQueuedMessage: scopedHandler(parseSteerQueuedMessage, {
+        local: (parsed) => service.steerQueuedMessage(parsed),
+        remote: (parsed, serverId) =>
+          remoteServers.request(serverId, TEAM_API_ROUTES.agent.queueSteer(parsed.agentId), decodeVoid, {
+            method: "POST",
+            body: { deliveryId: parsed.deliveryId, expectedTurnId: parsed.expectedTurnId },
+          }),
       }),
-      updateQueuedMessage: payloadHandler(parseAgentRequest, (scoped) => {
-        const parsed = parseUpdateQueuedMessage(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => service.updateQueuedMessage(parsed),
-          remote: (serverId) =>
-            remoteServers.request(serverId, TEAM_API_ROUTES.agent.queueUpdate(parsed.agentId), decodeVoid, {
-              method: "POST",
-              body: {
-                deliveryId: parsed.deliveryId,
-                text: parsed.text,
-                keepAttachmentIds: parsed.keepAttachmentIds,
-                attachmentDraftIds: parsed.attachmentDraftIds,
-              },
-            }),
-        });
+      editQueuedMessage: scopedHandler(parseQueueEdit, {
+        local: ({ agentId, ...input }) => service.editQueuedMessage(agentId, input),
+        remote: ({ agentId, ...input }, serverId) =>
+          remoteServers.request(serverId, TEAM_API_ROUTES.agent.queueEdit(agentId), decodeQueueSnapshot, {
+            method: "POST",
+            body: { ...input },
+          }),
       }),
-      reorderQueue: payloadHandler(parseAgentRequest, (scoped) => {
-        const parsed = parseReorderQueue(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => service.reorderQueue(parsed),
-          remote: (serverId) =>
-            remoteServers.request(serverId, TEAM_API_ROUTES.agent.queueReorder(parsed.agentId), decodeVoid, {
-              method: "POST",
-              body: { deliveryIds: parsed.deliveryIds },
-            }),
-        });
+      updateQueuedMessage: scopedHandler(parseUpdateQueuedMessage, {
+        local: (parsed) => service.updateQueuedMessage(parsed),
+        remote: (parsed, serverId) =>
+          remoteServers.request(serverId, TEAM_API_ROUTES.agent.queueUpdate(parsed.agentId), decodeVoid, {
+            method: "POST",
+            body: {
+              deliveryId: parsed.deliveryId,
+              text: parsed.text,
+              keepAttachmentIds: parsed.keepAttachmentIds,
+              attachmentDraftIds: parsed.attachmentDraftIds,
+            },
+          }),
       }),
-      interrupt: payloadHandler(parseAgentRequest, (scoped) => {
-        const parsed = parseInterrupt(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => service.interrupt(parsed.agentId, parsed.turnId),
-          remote: (serverId) =>
-            remoteServers.request(serverId, TEAM_API_ROUTES.agent.interrupt(parsed.agentId), decodeVoid, {
-              method: "POST",
-              body: { turnId: parsed.turnId },
-            }),
-        });
+      reorderQueue: scopedHandler(parseReorderQueue, {
+        local: (parsed) => service.reorderQueue(parsed),
+        remote: (parsed, serverId) =>
+          remoteServers.request(serverId, TEAM_API_ROUTES.agent.queueReorder(parsed.agentId), decodeVoid, {
+            method: "POST",
+            body: { deliveryIds: parsed.deliveryIds },
+          }),
       }),
-      respondToPrompt: payloadHandler(parseAgentRequest, (scoped) => {
-        const parsed = parsePromptResponse(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => service.respondToPrompt(parsed),
-          remote: (serverId) =>
-            remoteServers.request(serverId, TEAM_API_ROUTES.respond.prompt, decodeVoid, {
-              method: "POST",
-              body: parsed,
-            }),
-        });
+      interrupt: scopedHandler(parseInterrupt, {
+        local: (parsed) => service.interrupt(parsed.agentId, parsed.turnId),
+        remote: (parsed, serverId) =>
+          remoteServers.request(serverId, TEAM_API_ROUTES.agent.interrupt(parsed.agentId), decodeVoid, {
+            method: "POST",
+            body: { turnId: parsed.turnId },
+          }),
       }),
-      respondToApproval: payloadHandler(parseAgentRequest, (scoped) => {
-        const parsed = parseApprovalResponse(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => service.respondToApproval(parsed),
-          remote: (serverId) =>
-            remoteServers.request(serverId, TEAM_API_ROUTES.respond.approval, decodeVoid, {
-              method: "POST",
-              body: parsed,
-            }),
-        });
+      clearContext: scopedHandler(parseAgentId, {
+        local: (agentId) => service.clearAgentContext(agentId),
+        remote: async (agentId, serverId) => {
+          if (!remoteServers.supportsCapability(serverId, CONTEXT_RESET_CAPABILITY))
+            throw new Error(sourceText("error.team.contextResetUnsupported"));
+          // The context-reset-v1 codec has already checked the empty reply.
+          await remoteServers.request(serverId, CONTEXT_RESET_ROUTES.clear, () => undefined, {
+            method: "POST",
+            body: { agentId },
+          });
+        },
       }),
-      respondToBrowserTakeover: payloadHandler(parseAgentRequest, (scoped) => {
-        const parsed = parseBrowserTakeoverResponse(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => service.respondToBrowserTakeover(parsed),
-          remote: (serverId) =>
-            remoteServers.request(serverId, TEAM_API_ROUTES.respond.browserTakeover, decodeVoid, {
-              method: "POST",
-              body: parsed,
-            }),
-        });
+      respondToPrompt: scopedHandler(parsePromptResponse, {
+        local: (parsed) => service.respondToPrompt(parsed),
+        remote: (parsed, serverId) =>
+          remoteServers.request(serverId, TEAM_API_ROUTES.respond.prompt, decodeVoid, {
+            method: "POST",
+            body: parsed,
+          }),
+      }),
+      respondToApproval: scopedHandler(parseApprovalResponse, {
+        local: (parsed) => service.respondToApproval(parsed),
+        remote: (parsed, serverId) =>
+          remoteServers.request(serverId, TEAM_API_ROUTES.respond.approval, decodeVoid, {
+            method: "POST",
+            body: parsed,
+          }),
+      }),
+      respondToBrowserSecret: scopedHandler(parseBrowserSecretResponse, {
+        local: (parsed) => service.respondToBrowserSecret(parsed),
+        remote: (parsed, serverId) =>
+          remoteServers.request(serverId, BROWSER_SECRET_RESPONSE_PATH, decodeVoid, { method: "POST", body: parsed }),
+      }),
+      respondToBrowserTakeover: scopedHandler(parseBrowserTakeoverResponse, {
+        local: (parsed) => service.respondToBrowserTakeover(parsed),
+        remote: (parsed, serverId) =>
+          remoteServers.request(serverId, TEAM_API_ROUTES.respond.browserTakeover, decodeVoid, {
+            method: "POST",
+            body: parsed,
+          }),
       }),
     },
   };
-}
-
-function routeUpdateAgent(
-  service: AgentService,
-  remoteServers: RemoteServerManager,
-  serverId: string,
-  input: UpdateAgentInput,
-) {
-  return routeToServer(serverId, {
-    local: () => service.updateAgent(input),
-    remote: (target) =>
-      remoteServers.request(target, TEAM_API_ROUTES.agent.one(input.agentId), decodeAgentSummary, {
-        method: "PATCH",
-        body: input,
-      }),
-  });
-}
-
-function routeDeleteAgent(
-  service: AgentService,
-  sidebarLayout: SidebarLayoutStore,
-  remoteServers: RemoteServerManager,
-  serverId: string,
-  agentId: string,
-): Promise<void> {
-  return routeToServer<void>(serverId, {
-    local: async () => {
-      await service.deleteAgent(agentId);
-      await sidebarLayout.removeAgent(agentId);
-    },
-    remote: async (target) => {
-      await remoteServers.request(target, TEAM_API_ROUTES.agent.one(agentId), decodeVoid, { method: "DELETE" });
-    },
-  });
-}
-
-function routeDuplicateAgent(
-  service: AgentService,
-  sidebarLayout: SidebarLayoutStore,
-  remoteServers: RemoteServerManager,
-  serverId: string,
-  agentId: string,
-): Promise<DuplicateAgentResult> {
-  return routeToServer(serverId, {
-    local: () => duplicateAgentLocally(service, sidebarLayout, agentId),
-    remote: (target) => remoteServers.duplicateAgent(agentId, target),
-  });
-}
-
-// The local copy is a two-store transaction: the agent, then its place in the sidebar. If placing it
-// fails the half-made copy has to go, or the user is left with an agent they never asked for.
-async function duplicateAgentLocally(
-  service: AgentService,
-  sidebarLayout: SidebarLayoutStore,
-  agentId: string,
-): Promise<DuplicateAgentResult> {
-  const agent = await service.duplicateAgent(agentId);
-  try {
-    const layout = await sidebarLayout.placeDuplicateAfter(agentId, agent.id, [...service.sidebarChatIds(), agent.id]);
-    return service.commitAgentDuplication(agent.id, layout);
-  } catch (error) {
-    const rollbackResults = await Promise.allSettled([
-      service.deleteAgent(agent.id),
-      sidebarLayout.removeAgent(agent.id),
-    ]);
-    const rollbackErrors = rollbackResults.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
-    if (rollbackErrors.length > 0) {
-      throw new AggregateError(
-        [error, ...rollbackErrors],
-        "Agent duplication failed and the incomplete copy could not be removed.",
-      );
-    }
-    throw error;
-  }
-}
-
-function routeReadConversation(
-  host: HostService,
-  remoteServers: RemoteServerManager,
-  serverId: string,
-  agentId: string,
-) {
-  return routeToServer(serverId, {
-    local: () => host.readAgentConversation(agentId),
-    remote: (target) => remoteServers.readAgentConversation(agentId, target),
-  });
-}
-
-function routeSendMessage(
-  service: AgentService,
-  remoteServers: RemoteServerManager,
-  serverId: string,
-  input: SendMessageInput,
-) {
-  return routeToServer(serverId, {
-    local: () => service.sendMessage(input),
-    remote: (target) =>
-      remoteServers.request(target, TEAM_API_ROUTES.agent.messages(input.agentId), decodeQueuedMessageReceipt, {
-        method: "POST",
-        body: input,
-      }),
-  });
-}
-
-function routeListQueue(service: AgentService, remoteServers: RemoteServerManager, serverId: string, agentId: string) {
-  return routeToServer(serverId, {
-    local: () => service.listQueue(agentId),
-    remote: (target) => remoteServers.request(target, TEAM_API_ROUTES.agent.queue(agentId), decodeQueueSnapshot),
-  });
 }

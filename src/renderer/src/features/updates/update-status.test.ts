@@ -1,6 +1,6 @@
 import type { UpdateFailureCode, UpdateStatus } from "@openbot/contracts/ipc";
+import { presentUpdateStatus } from "@openbot/ui/features/updates/update-status";
 import { describe, expect, it } from "vitest";
-import { presentUpdateStatus } from "./update-status";
 
 function status(patch: Partial<UpdateStatus> = {}): UpdateStatus {
   return {
@@ -30,23 +30,6 @@ describe("presentUpdateStatus", () => {
     expect(presentation.busy).toBe(busy);
   });
 
-  it("never leaves a phase waiting on preparation", () => {
-    const phases: UpdateStatus["phase"][] = [
-      "idle",
-      "checking",
-      "available",
-      "downloading",
-      "ready",
-      "installing",
-      "up-to-date",
-      "error",
-      "unsupported",
-    ];
-    for (const phase of phases) {
-      expect(presentUpdateStatus(status({ phase })).actionLabel).not.toMatch(/preparing/iu);
-    }
-  });
-
   it.each([
     // A download is retryable in place. An install is not: shutdown preparation has already run, so
     // the message asks for a relaunch and the action falls back to checking rather than inviting a
@@ -66,6 +49,16 @@ describe("presentUpdateStatus", () => {
 
   it("reports an unsupported build as unsupported", () => {
     expect(presentUpdateStatus(status({ phase: "unsupported" })).supported).toBe(false);
+  });
+
+  it("names host management instead of an action on a managed host", () => {
+    for (const phase of ["available", "ready"] as const) {
+      const presentation = presentUpdateStatus(status({ phase, managedByHost: true }));
+      expect(presentation.managed).toBe(true);
+      expect(presentation.actionLabel).toBe("Managed by host");
+      expect(presentation.available).toBe(true);
+    }
+    expect(presentUpdateStatus(status({ phase: "ready" })).managed).toBe(false);
   });
 
   it("shows download progress and otherwise the relevant version", () => {

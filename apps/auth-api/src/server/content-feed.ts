@@ -2,6 +2,8 @@
 // registries. They live here rather than inside the route files so that the
 // tests can assert on the XML without standing up a router.
 
+import { changelogUrl } from "../lib/changelog";
+import { CHANGELOG_UPDATED_AT } from "../lib/changelog-releases";
 import { CONTENT_COLLECTIONS } from "../lib/content";
 import {
   articleOgImageUrl,
@@ -11,6 +13,7 @@ import {
   collectionFeedUrl,
   collectionIndexUrl,
 } from "../lib/content-collection";
+import { PLUGINS_UPDATED_AT, pluginIndexUrl, pluginUrl, SITE_PLUGINS } from "../lib/plugins";
 import { OPENBOT_SITE_TITLE, OPENBOT_SITE_URL } from "../lib/site-metadata";
 
 /**
@@ -47,6 +50,15 @@ export function contentSitemapXml(): string {
         priority: "0.7",
       })),
     ]),
+    /* The plugin pages hold no secret, unlike /join, so they are indexed like any article. Each
+       entry's date is the catalog's own, which is what changes when a listing ships. */
+    { loc: pluginIndexUrl(), lastmod: PLUGINS_UPDATED_AT, priority: "0.8" },
+    ...SITE_PLUGINS.map((plugin) => ({
+      loc: pluginUrl(plugin.slug),
+      lastmod: PLUGINS_UPDATED_AT,
+      priority: "0.7",
+    })),
+    { loc: changelogUrl(), lastmod: CHANGELOG_UPDATED_AT, priority: "0.6" },
   ];
 
   const urls = entries
@@ -99,7 +111,7 @@ export function contentRssXml(collection: ContentCollection): string {
 }
 
 /** One hour at the edge, one day while a redeploy is in flight. */
-const FEED_CACHE_CONTROL = "public, max-age=3600, stale-while-revalidate=86400";
+export const FEED_CACHE_CONTROL = "public, max-age=3600, stale-while-revalidate=86400";
 
 export function contentSitemapResponse(): Response {
   return new Response(contentSitemapXml(), {

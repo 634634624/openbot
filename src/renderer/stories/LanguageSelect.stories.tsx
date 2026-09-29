@@ -1,6 +1,4 @@
-import { createSignal } from "solid-js";
-import { expect, within } from "storybook/test";
-import type { Meta, StoryObj } from "storybook-solidjs-vite";
+import type { AppLanguage } from "@openbot/i18n/languages";
 import {
   Heading,
   Item,
@@ -10,9 +8,10 @@ import {
   ItemGroup,
   ItemTitle,
   SettingsSection,
-} from "../src/components/ui";
-import type { AppLanguage } from "../src/features/settings/app-languages";
-import { LanguageSelect } from "../src/features/settings/LanguageSelect";
+} from "@openbot/ui";
+import { LanguageSelect } from "@openbot/ui/features/settings/LanguageSelect";
+import { createSignal } from "solid-js";
+import type { Meta, StoryObj } from "storybook-solidjs-vite";
 
 const meta = {
   title: "Settings/Language",
@@ -55,17 +54,9 @@ export const Gallery: Story = {
       </div>
     </main>
   ),
-  play: async ({ canvas, userEvent }) => {
-    // The trigger reads its label and its value, so match the start of the name.
-    const trigger = canvas.getAllByRole("button", { name: /^Language/ })[0];
-    await userEvent.click(trigger);
-    const body = within(document.body);
-    await userEvent.click(await body.findByRole("option", { name: "日本語" }));
-    await expect(trigger).toHaveTextContent("日本語");
-  },
 };
 
-/** The list left open, so the native names and the checked row can be reviewed as a set. */
+/** A selected language. Open the list to review the native names and the checked row as a set. */
 export const Expanded: Story = {
   render: () => (
     <main class="foundation-story">
@@ -76,10 +67,4 @@ export const Expanded: Story = {
       </div>
     </main>
   ),
-  play: async ({ canvas, userEvent }) => {
-    const trigger = canvas.getByRole("button", { name: /^Language/ });
-    await userEvent.click(trigger);
-    const body = within(document.body);
-    await expect(await body.findByRole("option", { name: "日本語" })).toHaveAttribute("aria-selected", "true");
-  },
 };

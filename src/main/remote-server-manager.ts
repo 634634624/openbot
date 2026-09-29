@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { basename } from "node:path";
 import { isValidAvatarImage } from "@openbot/contracts/avatar-images";
 import { parseInviteUrl } from "@openbot/contracts/invite-links";
 import type {
@@ -30,6 +31,7 @@ import type {
   MarkDirectReadInput,
   RemoteDesktopSession,
   SendDirectMessageInput,
+  ServerNotificationLevel,
   ServerSummary,
   SetTeamTypingInput,
   TeamInviteSummary,
@@ -38,11 +40,16 @@ import type {
   TeamRealtimeEvent,
   UpdateTeamMemberInput,
 } from "@openbot/contracts/ipc";
-import { LOCAL_SERVER_ID } from "@openbot/contracts/ipc";
+import { LOCAL_SERVER_ID, REMOTE_DESKTOP_SETUP_CAPABILITY, type RemoteDesktopTestInput } from "@openbot/contracts/ipc";
 import { TEAM_API_ROUTES } from "@openbot/contracts/team-api-routes";
-import type { TeamCurrentCapability } from "@openbot/contracts/team-protocol/current";
+import { decodeBrowserViewSessionResponse } from "@openbot/contracts/team-protocol/browser-view-v1";
+import { TEAM_MEMBER_LEAVE_CAPABILITY, type TeamCurrentCapability } from "@openbot/contracts/team-protocol/current";
+import type { HostRestartEvent } from "@openbot/contracts/team-protocol/host-update-v1";
 import { decodeTeamProtocolV1CurrentHttpResponse } from "@openbot/contracts/team-protocol/v1-adapter";
+import { sourceText } from "@openbot/i18n/source";
+import { contentDispositionFileName } from "./content-disposition";
 import { decodeAgentSummary, decodeDraftAttachment, decodeDuplicateAgentResultFromHost } from "./remote-agent-decoding";
+import { type RemoteAttachment, RemoteAttachmentCache } from "./remote-attachment-cache";
 import {
   decodeConversationPageFromHost,
   decodeConversationReadState,
@@ -55,6 +62,7 @@ import {
   decodeDirectMessage,
   decodeDirectThreadSummaries,
 } from "./remote-conversation-decoding";
+import { decodeRemoteDesktopSetupFromHost, decodeRemoteDesktopTestFromHost } from "./remote-desktop-setup-decoding";
 import { decodeRemoteDesktopSession } from "./remote-device-decoding";
 import { decodeVoid, type ResponseDecoder } from "./remote-host-decoding";
 import { type RemoteRequestInit, RemoteServerClient } from "./remote-server-client";
@@ -115,7 +123,10 @@ export interface DevelopmentRemoteServerConnection {
   sessionToken: string;
 }
 
-export const REMOTE_DUPLICATION_TIMEOUT_MS = TEAM_WEBRTC_REMOTE_REQUEST_TIMEOUT_MILLISECONDS;
+const REMOTE_DUPLICATION_TIMEOUT_MS = TEAM_WEBRTC_REMOTE_REQUEST_TIMEOUT_MILLISECONDS;
+// How long a host that restarts into an update keeps the fast retry after Signal first misses it. A
+// host that is not back by then is offline, as any other host.
+const HOST_RESTART_RETRY_MS = 10 * 60_000;
 export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
   readonly #store: RemoteServerStore;
   readonly #connections: RemoteServerConnections;
@@ -123,15 +134,19 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
   readonly #refresh: RemoteEventRefresh;
   readonly #events: RemoteEventStream;
   readonly #presence: RemotePresenceCache;
+  readonly #attachments = new RemoteAttachmentCache();
   readonly #team: RemoteTeamDirectory;
   readonly #centralAccount: CentralAccountSession;
   readonly #allowLocalDevelopmentInvites: boolean;
   readonly #appVersion: string | null;
   #duplicateOperationIds = new Map<string, string>();
+  /** When Signal first missed each host that restarts into an update. */
+  readonly #hostRestartAway = new Map<string, number>();
   readonly #webrtcTransport: TeamWebRtcClientTransport | null;
   readonly #getLocalHostId: () => string | null;
   readonly #remoteViewerProxy: RemoteViewerProxy | null;
   #selectChain = Promise.resolve();
+  #muteExpiryTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     path: string,
@@ -174,7 +189,8 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
       request: (serverId, path, decoder, init) => this.#client.request(serverId, path, decoder, init),
       transport: this.#webrtcTransport,
       sendInviteEmail: (input) => {
-        if (!this.#centralAccount.sendTeamInviteEmail) throw new Error("Email delivery is unavailable.");
+        if (!this.#centralAccount.sendTeamInviteEmail)
+          throw new Error(sourceText("error.remote.emailDeliveryUnavailable"));
         return this.#centralAccount.sendTeamInviteEmail(input);
       },
     });
@@ -191,6 +207,7 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
       onPresence: (serverId, snapshot) => this.#presence.accept(serverId, snapshot),
       onDirectMessage: (serverId, event) => this.emit("directMessage", serverId, event),
       onDirectTyping: (serverId, event) => this.emit("directTyping", serverId, event),
+      onHostRestart: (serverId, event) => this.#applyHostRestart(serverId, event),
       onOffline: (serverId) => this.#presence.markOffline(serverId),
       onChanged: () => this.#emitChanged(),
     });
@@ -202,6 +219,7 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
       : null;
     this.#webrtcTransport?.on("connected", (serverId) => {
       this.#events.clearReconnectBackoff(serverId);
+      this.#hostRestartAway.delete(serverId);
       this.#connections.markConnected(serverId);
       void this.#refresh.refreshAgentRoster(serverId).catch(() => undefined);
       this.#emitChanged();
@@ -233,6 +251,7 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
     });
     this.#webrtcTransport?.on("event", (serverId, event) => this.#handleWebRtcEvent(serverId, event));
     this.#webrtcTransport?.on("error", (serverId, code, message) => {
+      if (code === "host_unavailable" && !this.#awaitsHostRestart(serverId)) this.#events.markHostOffline(serverId);
       if (!this.#connections.reportTransportError(serverId, code, message)) this.#events.scheduleReconnect(serverId);
       if (code === "session_revoked") this.emit("directoryInvalidated");
     });
@@ -253,6 +272,7 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
 
   async initialize(): Promise<void> {
     await this.#store.load();
+    this.#scheduleMuteExpiry();
     if (this.#webrtcTransport) await this.#syncWebRtcHosts().catch(() => undefined);
     for (const server of this.#store.servers) {
       this.#connections.setState(server.id, "offline");
@@ -263,7 +283,40 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
   list(): ServerSummary[] {
     return remoteServerSummaries(this.#store.servers, this.#store.activeServerId, (serverId) =>
       this.#connections.statusFor(serverId),
-    ).map((server) => ({ ...server, notificationsMuted: this.#store.isMuted(server.id) }));
+    ).map((server) => {
+      const mute = this.#store.muteState(server.id);
+      return {
+        ...server,
+        notificationsMuted: mute.muted,
+        notificationsMutedUntil: mute.mutedUntil,
+        notificationLevel: this.#store.notificationLevel(server.id),
+      };
+    });
+  }
+
+  /**
+   * The account service says this user's server list changed, and it reached this computer through
+   * Signal rather than through a poll. The refresh itself belongs to the caller that owns the
+   * account check, so this only says the stored list can no longer be trusted.
+   */
+  invalidateDirectory(): void {
+    this.#events.retryOfflineHosts();
+    this.emit("directoryInvalidated");
+  }
+
+  /** Focus retries an offline host at once. After that, it retries each 5 minutes with focus and each 15 without. */
+  setAppFocused(focused: boolean): void {
+    this.#events.setAppFocused(focused);
+  }
+
+  /** The computer woke from sleep. Each host reconnects at once instead of after its backoff. */
+  wake(): void {
+    this.#events.wake();
+  }
+
+  /** A file on this server was deleted, so a copy of it must not be shown again. */
+  forgetCachedAttachments(serverId: string): void {
+    this.#attachments.forget(serverId);
   }
 
   async syncRemoteHosts(): Promise<ServerSummary[]> {
@@ -295,7 +348,7 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
   select(serverId: string): Promise<ServerSummary[]> {
     const operation = this.#selectChain.then(async () => {
       if (serverId !== LOCAL_SERVER_ID && !this.#store.has(serverId)) {
-        throw new Error("Remote server not found.");
+        throw new Error(sourceText("error.remote.serverNotFound"));
       }
       const previousSelection = this.#store.selection;
       const selectionRevision = this.#store.setActiveServerId(serverId);
@@ -320,10 +373,34 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
     return operation;
   }
 
-  async setMuted(serverId: string, muted: boolean): Promise<ServerSummary[]> {
-    await this.#store.setMuted(serverId, muted);
+  // No duration mutes until the user unmutes.
+  async setMuted(serverId: string, muted: boolean, durationMs?: number): Promise<ServerSummary[]> {
+    await this.#store.setMuted(serverId, muted, durationMs === undefined ? null : Date.now() + durationMs);
+    this.#scheduleMuteExpiry();
     this.#emitChanged();
     return this.list();
+  }
+
+  async setNotificationLevel(serverId: string, level: ServerNotificationLevel): Promise<ServerSummary[]> {
+    await this.#store.setNotificationLevel(serverId, level);
+    this.#emitChanged();
+    return this.list();
+  }
+
+  // The rail shows a muted server until its timed mute ends, so the end has to reach the renderer as a
+  // change. One timer covers the earliest end; each run schedules the next one.
+  #scheduleMuteExpiry(): void {
+    if (this.#muteExpiryTimer) clearTimeout(this.#muteExpiryTimer);
+    this.#muteExpiryTimer = null;
+    const expiry = this.#store.nextMuteExpiry();
+    if (expiry === null) return;
+    // setTimeout overflows above 2^31-1 ms; a later run reschedules until the end is reached.
+    const delay = Math.min(Math.max(expiry - Date.now(), 0) + 1, 2_147_483_647);
+    this.#muteExpiryTimer = setTimeout(() => {
+      this.#scheduleMuteExpiry();
+      this.#emitChanged();
+    }, delay);
+    this.#muteExpiryTimer.unref?.();
   }
 
   async reorder(serverIds: string[]): Promise<ServerSummary[]> {
@@ -337,17 +414,17 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
     });
     if (this.#webrtcTransport && !isLocalDevelopmentApi(invite.apiUrl)) {
       const preview = await this.#webrtcTransport.previewInvite(invite.token);
-      if (preview.hostId !== invite.serverId) throw new Error("The invitation host does not match its token.");
+      if (preview.hostId !== invite.serverId) throw new Error(sourceText("error.remote.inviteHostMismatch"));
       if (!preview.devicePublicKey || fingerprint(preview.devicePublicKey) !== invite.fingerprint) {
-        throw new Error("The invitation host identity does not match its token.");
+        throw new Error(sourceText("error.remote.inviteIdentityMismatch"));
       }
       const accepted = await this.#webrtcTransport.acceptInvite(invite.token);
-      if (accepted.hostId !== invite.serverId) throw new Error("The account service accepted a different host.");
+      if (accepted.hostId !== invite.serverId) throw new Error(sourceText("error.remote.inviteAcceptedOtherHost"));
       await this.#store.unhideHost(accepted.hostId);
       await this.#syncWebRtcHosts();
       const synchronized = this.#store.find(accepted.hostId);
       if (!synchronized || synchronized.fingerprint !== invite.fingerprint) {
-        throw new Error("The invitation host identity changed while it was accepted.");
+        throw new Error(sourceText("error.remote.inviteIdentityChanged"));
       }
       // The identity checked out, so an entry for this host that this build could not read is now
       // superseded. `#syncWebRtcHosts` above deliberately kept it -- reconciliation is not a join.
@@ -437,9 +514,9 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
     });
     if (this.#webrtcTransport && !isLocalDevelopmentApi(invite.apiUrl)) {
       const preview = await this.#webrtcTransport.previewInvite(invite.token);
-      if (preview.hostId !== invite.serverId) throw new Error("The invitation host does not match its token.");
+      if (preview.hostId !== invite.serverId) throw new Error(sourceText("error.remote.inviteHostMismatch"));
       if (!preview.devicePublicKey || fingerprint(preview.devicePublicKey) !== invite.fingerprint) {
-        throw new Error("The invitation host identity does not match its token.");
+        throw new Error(sourceText("error.remote.inviteIdentityMismatch"));
       }
       return {
         serverId: preview.hostId,
@@ -448,6 +525,7 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
         role: preview.role,
         expiresAt: new Date(preview.expiresAt).toISOString(),
         emailBound: preview.emailBound,
+        permanent: preview.permanent,
       };
     }
     const identity = await this.#client.verifyIdentity(invite.apiUrl, invite.serverId, invite.fingerprint);
@@ -525,7 +603,7 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
       : "error";
     try {
       if (server.transport === "webrtc-v2") {
-        if (!this.#webrtcTransport) throw new Error("The WebRTC transport is unavailable.");
+        if (!this.#webrtcTransport) throw new Error(sourceText("error.remote.webRtcUnavailable"));
         // The user retrying is what lifts the suspension a protocol or credential failure left
         // behind. Without this the connection comes up and the next disconnect never reconnects,
         // because `scheduleReconnect` still sees the host paused -- the HTTPS arm below gets the
@@ -539,7 +617,10 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
         // one still running. Retrying a host whose channel had never actually dropped therefore
         // left it reading as reconnecting until it next went offline for real.
         if (this.#connections.stateFor(serverId) === "connecting" && this.#webrtcTransport.isConnected(serverId)) {
+          // The same session continues, so the host does not send its restart state again.
+          const hostRestart = this.#connections.hostRestartFor(serverId);
           this.#connections.markConnected(serverId);
+          this.#connections.setHostRestart(serverId, hostRestart);
           this.#emitChanged();
         }
         return requiredServerSummary(this.list(), serverId);
@@ -556,16 +637,27 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
   }
 
   async remove(serverId: string): Promise<void> {
-    if (serverId === LOCAL_SERVER_ID) throw new Error("The local server cannot be removed.");
+    if (serverId === LOCAL_SERVER_ID) throw new Error(sourceText("error.remote.localServerRemove"));
     const server = this.#store.find(serverId);
     // An owner cannot leave their own host, so the account service keeps listing it. Hiding it is
     // what makes the removal survive the next directory sync.
     let hideHost = false;
     if (server?.transport === "webrtc-v2") {
-      if (!this.#webrtcTransport) throw new Error("The WebRTC transport is unavailable.");
+      if (!this.#webrtcTransport) throw new Error(sourceText("error.remote.webRtcUnavailable"));
       if (server.role === "owner") hideHost = true;
       else await this.#webrtcTransport.leaveHost(serverId);
       await this.#webrtcTransport.disconnect(serverId).catch(() => undefined);
+    } else if (server && this.#connections.compatibilityFor(serverId)?.negotiatedProtocol) {
+      // An HTTP host with `member-leave-v1` removes the membership as an admin removal does. An
+      // older host has no such route, so logging out is the most it can do: this computer's token
+      // stops working, and the membership stays for an admin to remove. Only a host that has already
+      // answered the negotiation is asked, so leaving never waits for one still being negotiated,
+      // and a failure is ignored, as the WebRTC disconnect is: a host that is gone for good must not
+      // keep the server in the list.
+      const path = this.supportsCapability(serverId, TEAM_MEMBER_LEAVE_CAPABILITY)
+        ? TEAM_API_ROUTES.team.leave
+        : TEAM_API_ROUTES.auth.logout;
+      await this.request(serverId, path, decodeVoid, { method: "POST" }).catch(() => undefined);
     }
     this.#clearServerConnectionState(serverId);
     await this.#store.remove(serverId, { hideHost });
@@ -578,6 +670,7 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
     this.#connections.forget(serverId);
     this.#client.forget(serverId);
     this.#presence.forget(serverId);
+    this.#attachments.forget(serverId);
   }
 
   // The server comes first because every caller knows which one it means, and the decoder sits next
@@ -707,7 +800,10 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
     return this.#team.revokeInvite(serverId, inviteId);
   }
 
-  createInvite(serverId: string, input: { role: "admin" | "member"; email?: string }): Promise<InviteSummary> {
+  createInvite(
+    serverId: string,
+    input: { role: "admin" | "member"; email?: string; permanent?: boolean },
+  ): Promise<InviteSummary> {
     return this.#team.createInvite(serverId, input);
   }
 
@@ -773,13 +869,31 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
     });
   }
 
+  checkRemoteDesktopSetup(serverId: string) {
+    if (!this.supportsCapability(serverId, REMOTE_DESKTOP_SETUP_CAPABILITY))
+      throw new Error(sourceText("error.remote.desktopSetupHostUpdate"));
+    return this.request(serverId, TEAM_API_ROUTES.remoteScreen.setup, decodeRemoteDesktopSetupFromHost, {
+      method: "POST",
+      body: {},
+    });
+  }
+
+  testRemoteDesktop(input: RemoteDesktopTestInput) {
+    if (!this.supportsCapability(input.serverId, REMOTE_DESKTOP_SETUP_CAPABILITY))
+      throw new Error(sourceText("error.remote.desktopTestHostUpdate"));
+    return this.request(input.serverId, TEAM_API_ROUTES.remoteScreen.test, decodeRemoteDesktopTestFromHost, {
+      method: "POST",
+      body: { sessionId: input.sessionId, action: input.action },
+    });
+  }
+
   async createRemoteDesktopSession(serverId: string): Promise<RemoteDesktopSession> {
     const session = await this.request(serverId, TEAM_API_ROUTES.remoteScreen.sessions, decodeRemoteDesktopSession, {
       method: "POST",
       body: {},
     });
     if (this.#store.require(serverId).transport !== "webrtc-v2") return session;
-    if (!this.#remoteViewerProxy) throw new Error("The local remote viewer proxy is unavailable.");
+    if (!this.#remoteViewerProxy) throw new Error(sourceText("error.remote.viewerProxyUnavailable"));
     return {
       ...session,
       viewerUrl: await this.#remoteViewerProxy.viewerUrl(serverId, TEAM_API_ROUTES.remoteScreen.viewer(session.id)),
@@ -788,8 +902,39 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
 
   async fetchRemoteViewerResource(serverId: string, path: string, init: RequestInit): Promise<Response> {
     const server = this.#store.require(serverId);
-    if (server.transport !== "webrtc-v2") throw new Error("The remote viewer transport is invalid.");
+    if (server.transport !== "webrtc-v2") throw new Error(sourceText("error.remote.viewerTransportInvalid"));
     return this.#client.fetch(server, new URL(path, server.apiUrl), init, false);
+  }
+
+  /**
+   * Asks a host for a live view of one tab and answers where its frames are. A WebRTC host has no
+   * address the client can reach, so the socket goes through the same local proxy the remote screen
+   * uses; a host on the network is opened directly, with the member's token as the subprotocol.
+   */
+  async openBrowserViewStream(
+    serverId: string,
+    tabId: string,
+  ): Promise<{ sessionId: string; url: string; protocols: string[] }> {
+    const server = this.#store.require(serverId);
+    const session = await this.request(
+      serverId,
+      TEAM_API_ROUTES.browser.viewSessions,
+      decodeBrowserViewSessionResponse,
+      { method: "POST", body: { tabId } },
+    );
+    if (server.transport === "webrtc-v2") {
+      if (!this.#remoteViewerProxy) throw new Error(sourceText("error.remote.viewerProxyUnavailable"));
+      const url = new URL(await this.#remoteViewerProxy.viewerUrl(serverId, session.streamPath));
+      url.protocol = "ws:";
+      return { sessionId: session.id, url: url.toString(), protocols: [] };
+    }
+    const url = new URL(session.streamPath, server.apiUrl);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    return { sessionId: session.id, url: url.toString(), protocols: [`openbot-token.${this.#store.token(server)}`] };
+  }
+
+  closeBrowserViewSession(serverId: string, sessionId: string): Promise<void> {
+    return this.request(serverId, TEAM_API_ROUTES.browser.viewSession(sessionId), decodeVoid, { method: "DELETE" });
   }
 
   closeRemoteDesktopSession(serverId: string, sessionId: string): Promise<void> {
@@ -879,23 +1024,19 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
     return { bytes, mimeType };
   }
 
-  async downloadAttachment(
-    attachmentId: string,
-    serverId = this.#store.activeServerId,
-  ): Promise<{
-    bytes: Uint8Array;
-    name: string;
-    mimeType: string;
-  }> {
+  async downloadAttachment(attachmentId: string, serverId = this.#store.activeServerId): Promise<RemoteAttachment> {
     const server = this.#store.require(serverId);
-    const response = await this.#client.fetch(server, new URL(TEAM_API_ROUTES.attachment(attachmentId), server.apiUrl));
-    const disposition = response.headers.get("content-disposition") ?? "";
-    const encodedName = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
-    return {
-      bytes: new Uint8Array(await response.arrayBuffer()),
-      name: encodedName ? decodeURIComponent(encodedName) : attachmentId,
-      mimeType: response.headers.get("content-type") ?? "application/octet-stream",
-    };
+    return this.#attachments.get(server.id, attachmentId, async () => {
+      const response = await this.#client.fetch(
+        server,
+        new URL(TEAM_API_ROUTES.attachment(attachmentId), server.apiUrl),
+      );
+      return {
+        bytes: new Uint8Array(await response.arrayBuffer()),
+        name: contentDispositionFileName(response.headers.get("content-disposition"), attachmentId),
+        mimeType: response.headers.get("content-type") ?? "application/octet-stream",
+      };
+    });
   }
 
   async downloadSharedFile(
@@ -906,11 +1047,9 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
     const url = new URL(TEAM_API_ROUTES.sharedFiles, server.apiUrl);
     url.searchParams.set("path", sharedPath);
     const response = await this.#client.fetch(server, url);
-    const disposition = response.headers.get("content-disposition") ?? "";
-    const encodedName = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
     return {
       bytes: new Uint8Array(await response.arrayBuffer()),
-      name: encodedName ? decodeURIComponent(encodedName) : "shared-file",
+      name: contentDispositionFileName(response.headers.get("content-disposition"), basename(sharedPath)),
     };
   }
 
@@ -925,11 +1064,9 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
     url.searchParams.set("botId", agentId);
     url.searchParams.set("path", workspacePath);
     const response = await this.#client.fetch(server, url);
-    const disposition = response.headers.get("content-disposition") ?? "";
-    const encodedName = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
     return {
       bytes: new Uint8Array(await response.arrayBuffer()),
-      name: encodedName ? decodeURIComponent(encodedName) : "workspace-file",
+      name: contentDispositionFileName(response.headers.get("content-disposition"), basename(workspacePath)),
     };
   }
 
@@ -937,11 +1074,19 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
     this.#events.stop();
     this.#refresh.clear();
     this.#client.clear();
+    this.#attachments.clear();
     await this.#remoteViewerProxy?.stop().catch(() => undefined);
     await this.#webrtcTransport?.stop().catch(() => undefined);
   }
 
+  /** Whether a client-side file transfer is moving right now, either direction. */
+  hasActiveTransfers(): boolean {
+    return this.#webrtcTransport?.hasActiveTransfers() ?? false;
+  }
+
   async disconnectRemoteSessions(): Promise<void> {
+    // A copy skips the host's check of the account, so the next account must not see it.
+    this.#attachments.clear();
     if (!this.#webrtcTransport) return;
     await Promise.all(
       this.#store.servers
@@ -983,7 +1128,24 @@ export class RemoteServerManager extends EventEmitter<RemoteServerEvents> {
       this.#presence.accept(serverId, event.snapshot);
     } else if (event.type === "team-direct-message") this.emit("directMessage", serverId, event);
     else if (event.type === "team-direct-typing") this.emit("directTyping", serverId, event);
+    else if (event.type === "host-restart") this.#applyHostRestart(serverId, event);
     else this.#refresh.forward(serverId, event);
+  }
+
+  /** A host that restarts into an update is away for a short time: it keeps the fast retry for a limited time. */
+  #awaitsHostRestart(serverId: string): boolean {
+    if (!this.#connections.hostRestartFor(serverId)) return false;
+    const now = Date.now();
+    const since = this.#hostRestartAway.get(serverId) ?? now;
+    this.#hostRestartAway.set(serverId, since);
+    if (now - since < HOST_RESTART_RETRY_MS) return true;
+    this.#hostRestartAway.delete(serverId);
+    if (this.#connections.setHostRestart(serverId, null)) this.#emitChanged();
+    return false;
+  }
+
+  #applyHostRestart(serverId: string, { state, version }: HostRestartEvent): void {
+    if (this.#connections.setHostRestart(serverId, state === "none" ? null : { state, version })) this.#emitChanged();
   }
 
   #applyServerIdentity(serverId: string, identity: { serverName: string; logoVersion: string | null }): void {

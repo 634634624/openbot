@@ -1,9 +1,10 @@
 import { TEAM_AGENT_CREATE_MODEL_CAPABILITY } from "@openbot/contracts/team-protocol/current";
+import { toast } from "@openbot/ui";
+import type { FirstAgentDraft } from "@openbot/ui/features/agents/FirstAgentSetup";
+import { currentText } from "@openbot/ui/text";
 import { desktopAnalytics } from "../../analytics";
 import { toAgentProfile, withoutAgent } from "../../app-message-projection";
 import { createStoredProfile } from "../../app-stored-values";
-import { toast } from "../../components/ui";
-import { errorMessage } from "../../error-message";
 import { useNavigation } from "../../navigation";
 import { createScopeGuard } from "../../scope-lifetime";
 import { createSimpleContext } from "../../simple-context";
@@ -15,7 +16,7 @@ import { useServers } from "../servers/servers-context";
 import { useSidebar } from "../sidebar/sidebar-context";
 import { createAgentInitialMessage } from "./agent-initial-message";
 import { useAgents } from "./agents-context";
-import type { FirstAgentDraft } from "./FirstAgentSetup";
+import { agentsPort } from "./agents-port";
 
 /**
  * Creating, editing, duplicating and deleting an agent.
@@ -73,7 +74,7 @@ const AgentActions = createSimpleContext({
         // work. A remote host without the capability drops the pair and starts its own default.
         const createModelSupported =
           activeServer()?.kind !== "remote" || activeServerSupportsCapability(TEAM_AGENT_CREATE_MODEL_CAPABILITY);
-        const stored = await window.openbot.agent.createAgent({
+        const stored = await agentsPort().agent.createAgent({
           name: submitted.name.trim(),
           description: submitted.purpose.trim() || "General-purpose assistant",
           avatarSeed: submitted.avatarSeed,
@@ -91,7 +92,8 @@ const AgentActions = createSimpleContext({
         analytics.track("agent_action", { action: "create", result: "succeeded", ...(properties ?? {}) });
       } catch (error) {
         analytics.track("agent_action", { action: "create", result: "failed", failure_code: "create_failed" });
-        setAgentSetupError(errorMessage(error, "The agent could not be created."));
+        const { t, errorMessage } = currentText();
+        setAgentSetupError(errorMessage(error, t("agent.error.createFailed")));
       } finally {
         setCreatingAgent(false);
       }
@@ -110,7 +112,7 @@ const AgentActions = createSimpleContext({
       const properties = analyticsAgentProperties(agentId);
       setDuplicatingAgentIds((current) => new Set(current).add(agentId));
       try {
-        const result = await window.openbot.agent.duplicateAgent(agentId);
+        const result = await agentsPort().agent.duplicateAgent(agentId);
         if (!scopeIsCurrent()) return;
         const profile = createStoredProfile(toAgentProfile(result.agent));
         setAgentList((current) => [profile, ...current.filter((candidate) => candidate.id !== profile.id)]);
@@ -124,8 +126,9 @@ const AgentActions = createSimpleContext({
           failure_code: "duplicate_failed",
           ...(properties ?? {}),
         });
-        toast.error("Could not duplicate agent", {
-          description: errorMessage(error, "Could not duplicate this agent. Try again."),
+        const { t, errorMessage } = currentText();
+        toast.error(t("agent.error.duplicateTitle"), {
+          description: errorMessage(error, t("agent.error.duplicateFailed")),
         });
         throw error;
       } finally {
@@ -144,7 +147,7 @@ const AgentActions = createSimpleContext({
       const properties = analyticsAgentProperties(agentId);
       const marketplaceAgent = Boolean(agentList().find((agent) => agent.id === agentId)?.marketplaceSource);
       try {
-        await window.openbot.agent.deleteAgent(agentId);
+        await agentsPort().agent.deleteAgent(agentId);
         const remaining = agentList().filter((agent) => agent.id !== agentId);
         setAgentList(remaining);
         setActiveAgentId((current) => (current === agentId ? (remaining[0]?.id ?? "") : current));
@@ -175,7 +178,7 @@ const AgentActions = createSimpleContext({
             failure_code: "uninstall_failed",
           });
         }
-        appendUiError(agentId, error, "Delete failed", serverId);
+        appendUiError(agentId, error, currentText().t("agent.error.deleteFailed"), serverId);
         throw error;
       }
     }

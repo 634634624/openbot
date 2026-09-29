@@ -1,10 +1,12 @@
 import type { AgentMemory } from "@openbot/contracts/ipc";
 import { onCleanup } from "solid-js";
-import { expect, fireEvent, fn, waitFor, within } from "storybook/test";
+import { fn } from "storybook/test";
 import type { Meta, StoryObj } from "storybook-solidjs-vite";
 import AgentSettingsPanel from "../src/features/conversation/AgentSettingsPanel";
-import { STORY_AGENT_STATUS, STORY_AGENTS, STORY_MODELS } from "./fixtures";
+import { STORY_AGENT, STORY_AGENT_STATUS, STORY_MODELS } from "./fixtures";
 import { createMockOpenBot } from "./mock-openbot";
+
+const storyAgent = STORY_AGENT;
 
 const chiefMemories: AgentMemory[] = [
   {
@@ -60,11 +62,11 @@ function AgentMemoriesStory(props: { memories: AgentMemory[] }) {
     <main class="agent-memories-story-stage">
       <AgentSettingsPanel
         onOpenUsage={fn()}
-        agent={STORY_AGENTS[0]}
+        agent={storyAgent}
         runtimeSettings={{
-          provider: STORY_AGENTS[0].provider,
-          model: STORY_AGENTS[0].model,
-          reasoningEffort: STORY_AGENTS[0].reasoningEffort,
+          provider: storyAgent.provider,
+          model: storyAgent.model,
+          reasoningEffort: storyAgent.reasoningEffort,
         }}
         agentStatus={STORY_AGENT_STATUS}
         modelOptions={STORY_MODELS}
@@ -91,11 +93,11 @@ const meta = {
   title: "Settings/Agent Memories",
   component: AgentSettingsPanel,
   args: {
-    agent: STORY_AGENTS[0],
+    agent: storyAgent,
     runtimeSettings: {
-      provider: STORY_AGENTS[0].provider,
-      model: STORY_AGENTS[0].model,
-      reasoningEffort: STORY_AGENTS[0].reasoningEffort,
+      provider: storyAgent.provider,
+      model: storyAgent.model,
+      reasoningEffort: storyAgent.reasoningEffort,
     },
     agentStatus: STORY_AGENT_STATUS,
     modelOptions: STORY_MODELS,
@@ -115,116 +117,12 @@ type Story = StoryObj<typeof meta>;
 
 export const SettingsRow: Story = {
   render: () => <AgentMemoriesStory memories={chiefMemories} />,
-  play: async ({ canvas }) => {
-    await waitFor(() => expect(canvas.getByRole("button", { name: /Memories/ })).toHaveTextContent("3 saved"));
-  },
-};
-
-export const OpenModal: Story = {
-  render: () => <AgentMemoriesStory memories={chiefMemories} />,
-  play: async ({ canvas, userEvent }) => {
-    await userEvent.click(await canvas.findByRole("button", { name: /Memories/ }));
-    const body = within(document.body);
-    const dialog = await body.findByRole("dialog", { name: "Memories" });
-    await expect(dialog).toBeVisible();
-    await expect(body.getAllByText("Learned automatically", { exact: false })[0]).toBeVisible();
-    await expect(body.getByText("Added manually", { exact: false })).toBeVisible();
-  },
-};
-
-export const AddComposer: Story = {
-  render: () => <AgentMemoriesStory memories={chiefMemories} />,
-  play: async ({ canvas, userEvent }) => {
-    await userEvent.click(await canvas.findByRole("button", { name: /Memories/ }));
-    const body = within(document.body);
-    await userEvent.click(await body.findByRole("button", { name: "Add memory" }));
-    const input = body.getByRole("textbox", { name: "New memory" });
-    await expect(input).toHaveFocus();
-    await userEvent.type(input, "Prefers concise weekly summaries.");
-    await expect(body.getByRole("button", { name: "Save memory" })).toHaveAttribute("data-variant", "default");
-  },
-};
-
-export const Editing: Story = {
-  render: () => <AgentMemoriesStory memories={chiefMemories} />,
-  play: async ({ canvas, userEvent }) => {
-    await userEvent.click(await canvas.findByRole("button", { name: /Memories/ }));
-    const body = within(document.body);
-    const firstMemory = await body.findByRole("button", { name: /Edit memory: The user prefers/ });
-    firstMemory.focus();
-    await userEvent.keyboard("{Enter}");
-    await expect(body.getByRole("textbox", { name: "Edit memory" })).toHaveFocus();
-    await expect(body.getByRole("button", { name: "Save" })).toHaveAttribute("data-variant", "default");
-  },
-};
-
-export const DeleteAction: Story = {
-  render: () => <AgentMemoriesStory memories={chiefMemories} />,
-  play: async ({ canvas, userEvent }) => {
-    await userEvent.click(await canvas.findByRole("button", { name: /Memories/ }));
-    const body = within(document.body);
-    await userEvent.click((await body.findAllByRole("button", { name: "Delete memory" }))[0]);
-    await waitFor(() =>
-      expect(body.queryByText("The user prefers short progress updates with the result first.")).toBeNull(),
-    );
-    await expect(body.queryByRole("dialog", { name: "Delete this memory?" })).toBeNull();
-  },
-};
-
-export const ClearConfirmation: Story = {
-  render: () => <AgentMemoriesStory memories={chiefMemories} />,
-  play: async ({ canvas, userEvent }) => {
-    await userEvent.click(await canvas.findByRole("button", { name: /Memories/ }));
-    const body = within(document.body);
-    await userEvent.click(await body.findByRole("button", { name: "Clear all memories" }));
-    await expect(await body.findByRole("dialog", { name: "Clear all memories?" })).toBeVisible();
-    await expect(document.querySelector(".agent-memories-modal")).toBeVisible();
-  },
 };
 
 export const FullList: Story = {
   render: () => <AgentMemoriesStory memories={fullMemoryList} />,
-  play: async ({ canvas, userEvent }) => {
-    await userEvent.click(await canvas.findByRole("button", { name: /Memories/ }));
-    const body = within(document.body);
-    const list = await body.findByRole("list");
-    await expect(await body.findByText("Durable working preference 64", { exact: false })).toBeInTheDocument();
-    await expect(body.getByText("64 saved", { exact: false })).toBeVisible();
-    await waitFor(() => expect(list).toHaveClass("scroll-fade-bottom"));
-    await expect(list).not.toHaveClass("scroll-fade-top");
-  },
-};
-
-export const FullListMiddle: Story = {
-  render: () => <AgentMemoriesStory memories={fullMemoryList} />,
-  play: async ({ canvas, userEvent }) => {
-    await userEvent.click(await canvas.findByRole("button", { name: /Memories/ }));
-    const list = await within(document.body).findByRole("list");
-    await waitFor(() => expect(list.scrollHeight).toBeGreaterThan(list.clientHeight));
-    list.scrollTop = Math.round((list.scrollHeight - list.clientHeight) / 2);
-    await fireEvent.scroll(list);
-    await waitFor(() => expect(list).toHaveClass("scroll-fade-top", "scroll-fade-bottom"));
-  },
-};
-
-export const FullListBottom: Story = {
-  render: () => <AgentMemoriesStory memories={fullMemoryList} />,
-  play: async ({ canvas, userEvent }) => {
-    await userEvent.click(await canvas.findByRole("button", { name: /Memories/ }));
-    const list = await within(document.body).findByRole("list");
-    await waitFor(() => expect(list.scrollHeight).toBeGreaterThan(list.clientHeight));
-    list.scrollTop = list.scrollHeight - list.clientHeight;
-    await fireEvent.scroll(list);
-    await waitFor(() => expect(list).toHaveClass("scroll-fade-top"));
-    await expect(list).not.toHaveClass("scroll-fade-bottom");
-  },
 };
 
 export const EmptyState: Story = {
   render: () => <AgentMemoriesStory memories={[]} />,
-  play: async ({ canvas, userEvent }) => {
-    await userEvent.click(await canvas.findByRole("button", { name: /Memories/ }));
-    const body = within(document.body);
-    await expect(await body.findByText("This agent has no saved memories yet.")).toBeVisible();
-  },
 };

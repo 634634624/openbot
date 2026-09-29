@@ -4,6 +4,42 @@ export const OPENBOT_INVITE_ORIGIN = "https://openbot.run";
 export const OPENBOT_INVITE_PATH = "/join";
 export const OPENBOT_CONTROL_PLANE_ORIGIN = "https://api.openbot.run";
 
+/**
+ * The finite deadline a permanent invitation carries. Invitation expiry travels the
+ * released Team API and D1 schemas as a plain timestamp, so "never expires" is a
+ * Date-compatible maximum rather than null. Matches `PERSISTENT_SESSION_EXPIRES_AT`.
+ */
+export const PERMANENT_INVITE_EXPIRES_AT_MS = 8_640_000_000_000_000;
+
+export function permanentInviteExpiresAt(): string {
+  return new Date(PERMANENT_INVITE_EXPIRES_AT_MS).toISOString();
+}
+
+/**
+ * Whether an expiry timestamp is the never-expires sentinel. The frozen Team API
+ * projections strip the `permanent` flag on the wire, so a client that only sees the
+ * timestamp still recognizes a permanent link by its deadline.
+ */
+export function isNeverExpiringInvite(value: string): boolean {
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && parsed >= PERMANENT_INVITE_EXPIRES_AT_MS;
+}
+
+/**
+ * Whether a decoded invitation is permanent. An older Worker or host sends no `permanent` flag,
+ * and the frozen Team API projections strip it, so the never-expires deadline also counts.
+ * `expiresAt` is epoch milliseconds from the account directory or an ISO date from a host.
+ */
+export function isPermanentInvite(permanent: unknown, expiresAt: number | string): boolean {
+  if (permanent === true) return true;
+  return typeof expiresAt === "number" ? expiresAt >= PERMANENT_INVITE_EXPIRES_AT_MS : isNeverExpiringInvite(expiresAt);
+}
+
+/** The join count of a decoded invitation. A missing or invalid count, from an older sender, is 0. */
+export function inviteUseCount(value: unknown): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
 const INVITE_FIELDS = ["api", "fingerprint", "invite", "server"] as const;
 const BASE64URL_SECRET_PATTERN = /^[A-Za-z0-9_-]{32,64}$/u;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
@@ -36,6 +72,35 @@ export function createOpenBotInviteUrl(payload: InviteLinkPayload, options: Invi
 
 export function toOpenBotInviteUrl(value: string, options: InviteLinkOptions = {}): string {
   return createOpenBotInviteUrl(parseInviteUrl(value, options), options);
+}
+
+/**
+ * The browser client's entry for an invitation: `/app` with the same four fields as `/join`, on the
+ * same origin. The client removes them after it reads them and still asks before it joins.
+ */
+export function createWebAppInvitePath(value: string, options: InviteLinkOptions = {}): string {
+  const url = new URL("/app", OPENBOT_INVITE_ORIGIN);
+  writePayload(url, parseInviteUrl(value, options));
+  return `${url.pathname}${url.search}`;
+}
+
+/** The query fields of an invitation, which the browser client removes from `/app` after it reads them. */
+export const WEB_APP_INVITE_FIELDS: readonly string[] = INVITE_FIELDS;
+
+/**
+ * The canonical invitation link in a `/app` query, or null when the query names none or an invalid
+ * one. Only the four invitation fields are read, so another `/app` parameter does not make it invalid.
+ */
+export function inviteUrlFromWebAppSearch(search: string, options: InviteLinkOptions = {}): string | null {
+  const params = new URLSearchParams(search);
+  if (!INVITE_FIELDS.some((field) => params.has(field))) return null;
+  const url = new URL(OPENBOT_INVITE_PATH, OPENBOT_INVITE_ORIGIN);
+  for (const field of INVITE_FIELDS) for (const value of params.getAll(field)) url.searchParams.append(field, value);
+  try {
+    return createInviteUrl(parseInviteUrl(url.toString(), options), options);
+  } catch {
+    return null;
+  }
 }
 
 export function isCanonicalInviteUrl(value: string, options: InviteLinkOptions = {}): boolean {

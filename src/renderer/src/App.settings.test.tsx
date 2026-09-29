@@ -1,10 +1,17 @@
-import type { AccountUsage, AgentSummary } from "@openbot/contracts/ipc";
+import type {
+  AccountUsage,
+  AgentSummary,
+  ApprovalAutomationPreference,
+  UpdatePreference,
+} from "@openbot/contracts/ipc";
+import { toast } from "@openbot/ui";
 import { fireEvent, render, screen, waitFor, within } from "@solidjs/testing-library";
-import { expect, it, vi } from "vitest";
+import { assert, expect, it, vi } from "vitest";
 import { App } from "./App";
 import { desktopAnalytics } from "./analytics";
 import {
   AGENTS,
+  confirmOnboardingModel,
   emitAgentEvent,
   emitScopedAgentEvent,
   emitUpdateStatus,
@@ -13,7 +20,7 @@ import {
   testServer,
   trackAnalytics,
 } from "./app-test-harness";
-import { SIDEBAR_PINS_STORAGE_KEY } from "./features/sidebar/sidebar-pins";
+import { SIDEBAR_PINS_STORAGE_KEY } from "./features/sidebar/sidebar-pins-storage";
 
 describe("OpenBot connected desktop shell", () => {
   it("opens the marketplace from skill settings and returns to skills", async () => {
@@ -25,13 +32,147 @@ describe("OpenBot connected desktop shell", () => {
     await waitFor(() => expect(window.openbot.agent.listInstalledSkills).toHaveBeenCalled());
     await fireEvent.click(screen.getByRole("button", { name: "View agent settings" }));
     await fireEvent.click(await screen.findByRole("button", { name: /^Skills/ }));
-    await fireEvent.click((await screen.findAllByRole("button", { name: "Add from marketplace" }))[0]);
+    const [addFromMarketplace] = await screen.findAllByRole("button", { name: "Add from marketplace" });
+    assert(addFromMarketplace);
+    // The button stays disabled until the agent's skills load.
+    await waitFor(() => expect(addFromMarketplace).toBeEnabled());
+    await fireEvent.click(addFromMarketplace);
     expect(await screen.findByRole("heading", { name: "Marketplace" })).toBeInTheDocument();
     await fireEvent.click(screen.getByRole("button", { name: "Close marketplace" }));
     expect((await screen.findAllByRole("button", { name: "Add from marketplace" }))[0]).toBeEnabled();
   });
   beforeEach(() => {
     installOpenbotStub();
+  });
+  afterEach(() => toast.dismiss());
+
+  it("reports a failed Turbo disable after Settings closes and restores its enabled state", async () => {
+    const write = Promise.withResolvers<ApprovalAutomationPreference>();
+    vi.mocked(window.openbot.getApprovalAutomation).mockResolvedValue({
+      turbo: true,
+      defaultAutoApprove: false,
+      autoApproveOverrides: {},
+    });
+    vi.mocked(window.openbot.setApprovalAutomation).mockReturnValueOnce(write.promise);
+    render(() => <App />);
+    await fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+    const toggle = await screen.findByRole("switch", { name: "Turbo mode" });
+    await waitFor(() => expect(toggle).toBeChecked());
+    await fireEvent.click(toggle);
+    await waitFor(() => expect(window.openbot.setApprovalAutomation).toHaveBeenCalledWith({ turbo: false }));
+    expect(toggle).toBeDisabled();
+    await fireEvent.click(toggle);
+    expect(window.openbot.setApprovalAutomation).toHaveBeenCalledOnce();
+    await fireEvent.keyDown(screen.getByRole("dialog", { name: "General" }), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "General" })).not.toBeInTheDocument());
+    write.reject(new Error("Write failed"));
+    expect(
+      await screen.findByText("Could not turn off Turbo mode. It is still active. Try again."),
+    ).toBeInTheDocument();
+    await fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    const restored = await screen.findByRole("switch", { name: "Turbo mode" });
+    expect(restored).toBeChecked();
+    expect(restored).toBeEnabled();
+  });
+
+  it.each<ApprovalAutomationPreference & { enabled: boolean }>([
+    { defaultAutoApprove: true, autoApproveOverrides: {}, turbo: false, enabled: true },
+    { defaultAutoApprove: false, autoApproveOverrides: {}, turbo: false, enabled: false },
+    { defaultAutoApprove: true, autoApproveOverrides: { chief: false }, turbo: false, enabled: false },
+    { defaultAutoApprove: true, autoApproveOverrides: { chief: false }, turbo: true, enabled: true },
+  ])("shows the effective auto-approval choice: %j", async ({ enabled, ...preference }) => {
+    vi.mocked(window.openbot.getApprovalAutomation).mockResolvedValue(preference);
+    render(() => <App />);
+    await screen.findByRole("heading", { name: "Chief" });
+    await fireEvent.click(screen.getByRole("button", { name: "Agent model: GPT-5.6 Luna · Medium" }));
+    const toggle = await screen.findByRole("switch", { name: "Auto approve this agent's actions" });
+    if (enabled) expect(toggle).toBeChecked();
+    else expect(toggle).not.toBeChecked();
+    if (preference.turbo) expect(toggle).toBeDisabled();
+    else expect(toggle).toBeEnabled();
+  });
+
+  it("reports a failed model-picker revocation and keeps the grant available for retry", async () => {
+    vi.mocked(window.openbot.getApprovalAutomation).mockResolvedValue({
+      turbo: false,
+      defaultAutoApprove: false,
+      autoApproveOverrides: { chief: true },
+    });
+    vi.mocked(window.openbot.setApprovalAutomation).mockRejectedValueOnce(new Error("Write failed"));
+    render(() => <App />);
+    await screen.findByRole("heading", { name: "Chief" });
+    await fireEvent.click(screen.getByRole("button", { name: "Agent model: GPT-5.6 Luna · Medium" }));
+    const toggle = await screen.findByRole("switch", { name: "Auto approve this agent's actions" });
+    expect(toggle).toBeChecked();
+    await fireEvent.click(toggle);
+    expect(
+      await screen.findByText("Could not revoke the standing approval for Chief. It is still active. Try again."),
+    ).toBeInTheDocument();
+    expect(toggle).toBeChecked();
+    await fireEvent.click(toggle);
+    await waitFor(() => expect(toggle).not.toBeChecked());
+    expect(window.openbot.setApprovalAutomation).toHaveBeenCalledTimes(2);
+  });
+
+  it("answers the original approval after switching agents during a grant write", async () => {
+    vi.mocked(window.openbot.agent.listAgents).mockResolvedValue(
+      AGENTS.map((agent) => ({ ...agent, threadId: `thread-${agent.id}` })),
+    );
+    const write = Promise.withResolvers<ApprovalAutomationPreference>();
+    vi.mocked(window.openbot.setApprovalAutomation).mockReturnValueOnce(write.promise);
+    render(() => <App />);
+    await screen.findByRole("heading", { name: "Chief" });
+    await confirmOnboardingModel();
+    const requestApproval = (agentId: string) => {
+      emitAgentEvent?.({
+        type: "approval",
+        approval: {
+          requestId: `approval-${agentId}`,
+          agentId,
+          threadId: `thread-${agentId}`,
+          turnId: `turn-${agentId}`,
+          kind: "command",
+          command: "bun run lint",
+          cwd: null,
+          reason: null,
+          grantRoot: null,
+          permissions: null,
+        },
+      });
+    };
+    requestApproval("chief");
+    await fireEvent.click(await screen.findByRole("button", { name: "Always allow" }));
+    const dialog = await screen.findByRole("alertdialog");
+    await fireEvent.click(within(dialog).getByRole("button", { name: "Always allow" }));
+    await waitFor(() =>
+      expect(window.openbot.setApprovalAutomation).toHaveBeenCalledWith({ agentId: "chief", autoApprove: true }),
+    );
+    await fireEvent.click(screen.getByRole("button", { name: /Sales Outbound, Outbound specialist/ }));
+    await screen.findByRole("heading", { name: "Sales Outbound" });
+    requestApproval("sales-outbound");
+    await screen.findByRole("button", { name: "Deny" });
+    write.resolve({ turbo: false, defaultAutoApprove: false, autoApproveOverrides: { chief: true } });
+    await waitFor(() => expect(window.openbot.agent.respondToApproval).toHaveBeenCalledOnce());
+    expect(window.openbot.agent.respondToApproval).toHaveBeenCalledWith({
+      requestId: "approval-chief",
+      decision: "accept",
+    });
+    expect(screen.getByRole("button", { name: "Deny" })).toBeEnabled();
+  });
+
+  it("shows Turbo without per-agent approval controls in Settings", async () => {
+    vi.mocked(window.openbot.getApprovalAutomation).mockResolvedValue({
+      turbo: false,
+      defaultAutoApprove: false,
+      autoApproveOverrides: { chief: true, "sales-outbound": true },
+    });
+    render(() => <App />);
+    await screen.findByRole("heading", { name: "Chief" });
+    await fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+    expect(await screen.findByRole("switch", { name: "Turbo mode" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: /Revoke the standing approval/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Revoke all" })).not.toBeInTheDocument();
+    expect(window.openbot.setApprovalAutomation).not.toHaveBeenCalled();
   });
 
   it("refreshes skill suggestions after settings closes", async () => {
@@ -63,7 +204,9 @@ describe("OpenBot connected desktop shell", () => {
     window.getSelection()?.removeAllRanges();
     window.getSelection()?.addRange(range);
     await fireEvent.input(editor);
-    expect(await screen.findByRole("listbox", { name: "Insert skill" })).toHaveTextContent("Smoke checklist");
+    expect(await screen.findByRole("listbox", { name: "Insert skill or MCP server" })).toHaveTextContent(
+      "Smoke checklist",
+    );
   });
 
   it("opens the dock surfaces and closes them from their own controls", async () => {
@@ -107,6 +250,22 @@ describe("OpenBot connected desktop shell", () => {
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "General" })).not.toBeInTheDocument());
   });
 
+  it("re-reads usage on its own while the dock keeps it on screen", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      render(() => <App />);
+      await waitFor(() => expect(window.openbot.agent.getUsage).toHaveBeenCalledTimes(1));
+
+      await vi.advanceTimersByTimeAsync(4 * 60_000);
+      expect(window.openbot.agent.getUsage).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(90_000);
+      await waitFor(() => expect(window.openbot.agent.getUsage).toHaveBeenCalledTimes(2));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("loads usage lazily when the account menu hides it", async () => {
     vi.mocked(window.openbot.getAppInfo).mockResolvedValue({
       name: "OpenBot",
@@ -145,7 +304,8 @@ describe("OpenBot connected desktop shell", () => {
     });
 
     render(() => <App />);
-    const usageButton = await screen.findByRole("button", { name: "Usage, Claude 0% left" });
+    // The active agent runs on ChatGPT, so a spent Claude quota stays out of the chip.
+    const usageButton = await screen.findByRole("button", { name: "Usage, ChatGPT 85% left" });
     await fireEvent.click(usageButton);
     const usageDialog = screen.getByRole("dialog", { name: "Usage" });
     expect(within(usageDialog).getByRole("listitem", { name: /Claude, 0% left/ })).toBeInTheDocument();
@@ -162,7 +322,7 @@ describe("OpenBot connected desktop shell", () => {
       .mockResolvedValueOnce({
         limits: [
           {
-            id: "claude",
+            id: "codex",
             primary: null,
             secondary: { usedPercent: 82, windowDurationMins: 10_080, resetsAt: null },
           },
@@ -177,20 +337,20 @@ describe("OpenBot connected desktop shell", () => {
       usage: {
         limits: [
           {
-            id: "claude",
+            id: "codex",
             primary: null,
             secondary: { usedPercent: 82, windowDurationMins: 10_080, resetsAt: null },
           },
         ],
       },
     });
-    expect(await screen.findByRole("button", { name: "Usage, Claude 18% left" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Usage, ChatGPT 18% left" })).toBeInTheDocument();
     expect(window.openbot.agent.getUsage).toHaveBeenCalledTimes(1);
 
     resolveInitialUsage({
       limits: [
         {
-          id: "codex",
+          id: "claude",
           primary: null,
           secondary: { usedPercent: 41, windowDurationMins: 10_080, resetsAt: null },
         },
@@ -199,7 +359,7 @@ describe("OpenBot connected desktop shell", () => {
     await initialUsageRequest;
     await Promise.resolve();
 
-    expect(screen.getByRole("button", { name: "Usage, Claude 18% left" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Usage, ChatGPT 18% left" })).toBeInTheDocument();
   });
 
   it("replaces an in-flight usage request after usage is invalidated", async () => {
@@ -251,13 +411,18 @@ describe("OpenBot connected desktop shell", () => {
   });
 
   it("persists every settings preference through its own IPC channel", async () => {
-    vi.mocked(window.openbot.update.getPreference).mockResolvedValue({ autoDownload: false });
+    vi.mocked(window.openbot.update.getPreference).mockResolvedValue({
+      autoDownload: false,
+      allowRemoteUpdates: true,
+      autoInstall: false,
+    });
     render(() => <App />);
     await fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
 
     await fireEvent.click(await screen.findByRole("switch", { name: "Share product analytics" }));
     await waitFor(() => expect(window.openbot.setAnalyticsPreference).toHaveBeenCalledWith({ enabled: false }));
 
+    await fireEvent.click(await screen.findByRole("tab", { name: "Dynamic Island" }));
     const notchSwitch = await screen.findByRole("switch", { name: "Show status in the MacBook notch" });
     expect(notchSwitch).toBeChecked();
     await fireEvent.click(notchSwitch);
@@ -267,6 +432,8 @@ describe("OpenBot connected desktop shell", () => {
         hapticsEnabled: true,
         idleVisible: true,
         additionalDisplaysEnabled: true,
+        widthPercent: 100,
+        heightPercent: 100,
       }),
     );
     expect(notchSwitch).not.toBeChecked();
@@ -283,13 +450,13 @@ describe("OpenBot connected desktop shell", () => {
     // The trigger reads its label and its value, so match the start of the name. It also opens on
     // pointer down rather than on click, so a plain click never reaches the list.
     await fireEvent.pointerDown(screen.getByRole("button", { name: /^Language/ }), { pointerType: "mouse", button: 0 });
-    await fireEvent.click(await screen.findByRole("option", { name: "日本語" }));
-    await waitFor(() => expect(window.openbot.setAppLanguagePreference).toHaveBeenCalledWith({ language: "ja" }));
+    await fireEvent.click(await screen.findByRole("option", { name: "Français" }));
+    await waitFor(() => expect(window.openbot.setAppLanguagePreference).toHaveBeenCalledWith({ language: "fr" }));
     // The screen is written in the chosen language at once, with no restart: the tab the user is
-    // looking at is the same tab, now named in Japanese.
-    await screen.findByRole("tab", { name: "一般" });
+    // looking at is the same tab, now named in French.
+    await screen.findByRole("tab", { name: "Général" });
     // The document says which language it is in, so a screen reader speaks it with the right voice.
-    expect(document.documentElement.lang).toBe("ja");
+    expect(document.documentElement.lang).toBe("fr");
   });
 
   it("does not open desktop analytics when the saved preference is disabled", async () => {
@@ -447,7 +614,7 @@ describe("OpenBot connected desktop shell", () => {
   });
 
   it("keeps a toggle made before the stored preference finishes loading", async () => {
-    let resolvePreference: ((value: { autoDownload: boolean }) => void) | undefined;
+    let resolvePreference: ((value: UpdatePreference) => void) | undefined;
     vi.mocked(window.openbot.update.getPreference).mockReturnValueOnce(
       new Promise((resolve) => {
         resolvePreference = resolve;
@@ -463,7 +630,7 @@ describe("OpenBot connected desktop shell", () => {
 
     // The stored read finally lands with the value the user has just replaced. Painting it back would
     // leave the switch disagreeing with both disk and the main process.
-    resolvePreference?.({ autoDownload: true });
+    resolvePreference?.({ autoDownload: true, allowRemoteUpdates: true, autoInstall: false });
     // Let the hydration continuation actually run, otherwise this asserts before it could apply.
     await new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -489,14 +656,11 @@ describe("OpenBot connected desktop shell", () => {
     render(() => <App />);
     await screen.findByRole("heading", { name: "Chief" });
 
-    const trigger = screen.getByRole("button", { name: "Agent model: GPT-5.6 Luna" });
+    const trigger = screen.getByRole("button", { name: "Agent model: GPT-5.6 Luna · Medium" });
     await fireEvent.click(trigger);
     const picker = screen.getByRole("dialog", { name: "Choose agent model" });
     expect(within(picker).getByText("0.144.1 (Codex CLI)")).toBeInTheDocument();
-    expect(within(picker).getByRole("option", { name: "GPT-5.6 Luna, default" })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
+    expect(within(picker).getByRole("option", { name: "GPT-5.6 Luna" })).toHaveAttribute("aria-selected", "true");
 
     await fireEvent.click(within(picker).getByRole("tab", { name: /^Claude:/ }));
     expect(window.openbot.agent.updateAgent).not.toHaveBeenCalled();
@@ -513,7 +677,7 @@ describe("OpenBot connected desktop shell", () => {
     );
     expect(screen.getByRole("dialog", { name: "Choose agent model" })).toBeInTheDocument();
     const claudeTrigger = await screen.findByRole("button", {
-      name: "Agent model: Claude Opus 5",
+      name: "Agent model: Claude Opus 5 · Medium",
     });
     expect(claudeTrigger).toBeEnabled();
   });
@@ -538,16 +702,15 @@ describe("OpenBot connected desktop shell", () => {
     render(() => <App />);
     await screen.findByRole("heading", { name: "Chief" });
 
-    await fireEvent.click(screen.getByRole("button", { name: "Agent model: GPT-5.6 Luna" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Agent model: GPT-5.6 Luna · Medium" }));
     const picker = screen.getByRole("dialog", { name: "Choose agent model" });
     await fireEvent.click(within(picker).getByRole("tab", { name: /^Claude:/ }));
     await fireEvent.click(within(picker).getByRole("option", { name: "Claude Opus 5" }));
-    const effort = within(picker).getByRole("button", { name: /Agent reasoning effort/ });
-    await fireEvent.pointerDown(effort, { pointerType: "mouse", button: 0 });
-    await fireEvent.click(screen.getByRole("option", { name: "High" }));
+    const effort = () => within(within(picker).getByRole("radiogroup", { name: "Agent reasoning effort" }));
+    await fireEvent.click(effort().getByRole("radio", { name: "High" }));
 
     expect(window.openbot.agent.updateAgent).toHaveBeenCalledTimes(1);
-    expect(effort).toHaveTextContent("High");
+    expect(effort().getByRole("radio", { name: "High" })).toBeChecked();
     resolveModelUpdate({
       ...chief,
       provider: "claude",
@@ -578,8 +741,8 @@ describe("OpenBot connected desktop shell", () => {
       reasoningEffort: "high",
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(screen.getByRole("button", { name: "Agent model: Claude Opus 5" })).toBeEnabled();
-    expect(effort).toHaveTextContent("High");
+    expect(screen.getByRole("button", { name: "Agent model: Claude Opus 5 · High" })).toBeEnabled();
+    expect(effort().getByRole("radio", { name: "High" })).toBeChecked();
   });
 
   it("does not send a queued settings save to the server the user switched to", async () => {
@@ -600,11 +763,11 @@ describe("OpenBot connected desktop shell", () => {
     render(() => <App />);
     await screen.findByRole("heading", { name: "Chief" });
 
-    await fireEvent.click(screen.getByRole("button", { name: "Agent model: GPT-5.6 Luna" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Agent model: GPT-5.6 Luna · Medium" }));
     const picker = screen.getByRole("dialog", { name: "Choose agent model" });
     await fireEvent.click(within(picker).getByRole("tab", { name: /^Claude:/ }));
     await fireEvent.click(within(picker).getByRole("option", { name: "Claude Opus 5" }));
-    await fireEvent.click(within(picker).getByRole("option", { name: "Claude Sonnet 5, default" }));
+    await fireEvent.click(within(picker).getByRole("option", { name: "Claude Sonnet 5" }));
     expect(window.openbot.agent.updateAgent).toHaveBeenCalledOnce();
 
     await fireEvent.keyDown(picker, { key: "Escape" });
@@ -637,45 +800,51 @@ describe("OpenBot connected desktop shell", () => {
     render(() => <App />);
     await screen.findByRole("heading", { name: "Chief" });
 
-    await fireEvent.click(screen.getByRole("button", { name: "Agent model: GPT-5.6 Luna" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Agent model: GPT-5.6 Luna · Medium" }));
     const picker = screen.getByRole("dialog", { name: "Choose agent model" });
     await fireEvent.click(within(picker).getByRole("option", { name: "GPT-5.6 Sol" }));
-    const effort = within(picker).getByRole("button", { name: /Agent reasoning effort/ });
-    await fireEvent.pointerDown(effort, { pointerType: "mouse", button: 0 });
-    await fireEvent.click(screen.getByRole("option", { name: "Extra high" }));
+    const effort = () => within(within(picker).getByRole("radiogroup", { name: "Agent reasoning effort" }));
+    await fireEvent.click(effort().getByRole("radio", { name: "Extra high" }));
 
     expect(window.openbot.agent.updateAgent).toHaveBeenCalledTimes(1);
     rejectModelUpdate(new Error("Model failed"));
 
     expect(await screen.findByRole("alert")).toHaveTextContent("Could not change effort. Try again.");
     expect(window.openbot.agent.updateAgent).toHaveBeenCalledTimes(1);
-    expect(screen.getByRole("button", { name: "Agent model: GPT-5.6 Luna" })).toBeEnabled();
-    expect(effort).toHaveTextContent("Medium");
-    await fireEvent.click(screen.getByRole("button", { name: "Agent model: GPT-5.6 Luna" }));
+    expect(screen.getByRole("button", { name: "Agent model: GPT-5.6 Luna · Medium" })).toBeEnabled();
+    expect(effort().getByRole("radio", { name: "Medium" })).toBeChecked();
+    await fireEvent.click(screen.getByRole("button", { name: "Agent model: GPT-5.6 Luna · Medium" }));
   });
 
   it("rolls back a failed header model change and reports the error", async () => {
     vi.mocked(window.openbot.agent.updateAgent).mockRejectedValueOnce(new Error("Provider failed"));
     render(() => <App />);
     await screen.findByRole("heading", { name: "Chief" });
-    await screen.findByRole("button", { name: "Agent model: GPT-5.6 Luna" });
+    await screen.findByRole("button", { name: "Agent model: GPT-5.6 Luna · Medium" });
 
-    await fireEvent.click(screen.getByRole("button", { name: "Agent model: GPT-5.6 Luna" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Agent model: GPT-5.6 Luna · Medium" }));
     await fireEvent.click(screen.getByRole("option", { name: "GPT-5.6 Sol" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent("Could not change model. Try again.");
-    expect(screen.getByRole("button", { name: "Agent model: GPT-5.6 Luna" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Agent model: GPT-5.6 Luna · Medium" })).toBeEnabled();
     expect(
       screen.queryByRole("radiogroup", { name: "What do you want me helping with most?" }),
     ).not.toBeInTheDocument();
     expect(screen.getByLabelText("Message Chief")).toHaveAttribute("contenteditable", "true");
   });
 
-  it("locks the header model picker during active work", async () => {
+  it("permits approval revocation during active work while locking model and effort changes", async () => {
+    vi.mocked(window.openbot.getApprovalAutomation).mockResolvedValue({
+      turbo: false,
+      defaultAutoApprove: false,
+      autoApproveOverrides: { chief: true },
+    });
     render(() => <App />);
     await screen.findByRole("heading", { name: "Chief" });
-    const trigger = screen.getByRole("button", { name: "Agent model: GPT-5.6 Luna" });
+    const trigger = screen.getByRole("button", { name: "Agent model: GPT-5.6 Luna · Medium" });
     await waitFor(() => expect(trigger).toBeEnabled());
+    await fireEvent.click(trigger);
+    await screen.findByRole("option", { name: "GPT-5.6 Sol" });
 
     emitAgentEvent?.({
       type: "turn-started",
@@ -683,7 +852,15 @@ describe("OpenBot connected desktop shell", () => {
       threadId: "thread-chief",
       turnId: "turn-1",
     });
-    await waitFor(() => expect(trigger).toBeDisabled());
+    await waitFor(() => expect(screen.getByRole("option", { name: "GPT-5.6 Sol" })).toBeDisabled());
+    expect(trigger).toBeEnabled();
+    const effort = () => within(screen.getByRole("radiogroup", { name: "Agent reasoning effort" }));
+    expect(effort().getByRole("radio", { name: "Medium" })).toBeDisabled();
+    const approval = screen.getByRole("switch", { name: "Auto approve this agent's actions" });
+    expect(approval).toBeChecked();
+    await fireEvent.click(approval);
+    await waitFor(() => expect(approval).not.toBeChecked());
+    expect(window.openbot.setApprovalAutomation).toHaveBeenCalledWith({ agentId: "chief", autoApprove: false });
 
     emitAgentEvent?.({
       type: "turn-completed",
@@ -692,7 +869,8 @@ describe("OpenBot connected desktop shell", () => {
       turnId: "turn-1",
       status: "completed",
     });
-    await waitFor(() => expect(trigger).toBeEnabled());
+    await waitFor(() => expect(screen.getByRole("option", { name: "GPT-5.6 Sol" })).toBeEnabled());
+    expect(effort().getByRole("radio", { name: "Medium" })).toBeEnabled();
     expect(trackAnalytics).not.toHaveBeenCalledWith("system_turn_started", expect.anything());
     expect(trackAnalytics).not.toHaveBeenCalledWith("system_turn_completed", expect.anything());
   });
@@ -754,6 +932,19 @@ describe("OpenBot connected desktop shell", () => {
     expect(window.openbot.agent.updateAgent).not.toHaveBeenCalledWith(
       expect.objectContaining({ avatarSeed: expect.any(String) }),
     );
+  });
+
+  it("closes only the open popover when Escape is pressed in agent settings", async () => {
+    render(() => <App />);
+    await screen.findByRole("heading", { name: "Chief" });
+    await fireEvent.click(screen.getByRole("button", { name: "View agent settings" }));
+    const settings = await screen.findByRole("complementary", { name: "Agent settings" });
+    await fireEvent.click(within(settings).getByRole("button", { name: "Agent model: GPT-5.6 Luna" }));
+
+    await fireEvent.keyDown(within(settings).getByRole("dialog", { name: "Choose agent model" }), { key: "Escape" });
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Choose agent model" })).not.toBeInTheDocument());
+    expect(screen.getByRole("complementary", { name: "Agent settings" })).toBeInTheDocument();
   });
 
   it("keeps provider choices separate for each agent profile", async () => {

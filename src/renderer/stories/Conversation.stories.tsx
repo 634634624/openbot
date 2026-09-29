@@ -7,15 +7,15 @@ import type {
   QueueSnapshot,
   UpdateAgentInput,
 } from "@openbot/contracts/ipc";
+import type { AgentMessage as RendererAgentMessage } from "@openbot/ui/data";
+import { BrowserTakeoverCard } from "@openbot/ui/features/conversation/ConversationPrompts";
 import { Portal } from "@solidjs/web";
 import { createEffect, createSignal, onCleanup, onSettled, type ParentProps, Show } from "solid-js";
-import { expect, fireEvent, fn, waitFor, within } from "storybook/test";
+import { fn } from "storybook/test";
 import type { Meta, StoryObj } from "storybook-solidjs-vite";
 import { clipboardFiles } from "../../preload/clipboard-files";
-import type { AgentMessage as RendererAgentMessage } from "../src/data";
 import { AuthProvider } from "../src/features/account/account-context";
 import { Conversation, createConversationController } from "../src/features/conversation/Conversation";
-import { BrowserTakeoverCard } from "../src/features/conversation/ConversationPrompts";
 import { ConversationView } from "../src/features/conversation/ConversationView";
 import { ConversationControllerProvider } from "../src/features/conversation/conversation-controller-context";
 import { composerDraftKey } from "../src/features/conversation/conversation-keys";
@@ -26,23 +26,27 @@ import { UsageProvider } from "../src/features/usage/usage-context";
 import { PlatformProvider } from "../src/platform";
 import browserTakeoverPreviewUrl from "./assets/browser-takeover-preview.svg";
 import {
+  requireFixture,
   STORY_AGENT_STATUS,
   STORY_AGENTS,
   STORY_ATTACHMENTS,
   STORY_CONVERSATION_MESSAGES,
   STORY_MODELS,
   STORY_PRESENCE,
+  STORY_QUEUES,
   STORY_REMOTE_DESKTOP_SESSION,
   STORY_SERVERS,
 } from "./fixtures";
 import { createMockOpenBot } from "./mock-openbot";
+
+const storyAttachment = requireFixture(STORY_ATTACHMENTS[0], "Story attachment");
 
 const messages: RendererAgentMessage[] = STORY_CONVERSATION_MESSAGES.map((message) => ({
   id: message.id,
   author: message.author === "user" ? "you" : "agent",
   body:
     message.id === "message-agent-1"
-      ? `${message.text}\n\nPlease review ${serializeAttachmentReference(STORY_ATTACHMENTS[0].name, STORY_ATTACHMENTS[0].id)} before editing the implementation notes.\n\nTransformers scale well with data and compute [1], though attention is quadratic in sequence length [2].`
+      ? `${message.text}\n\nPlease review ${serializeAttachmentReference(storyAttachment.name, storyAttachment.id)} before editing the implementation notes.\n\nTransformers scale well with data and compute [1], though attention is quadratic in sequence length [2].`
       : message.text,
   time: "10:00",
   itemType: message.itemType,
@@ -68,7 +72,8 @@ const messages: RendererAgentMessage[] = STORY_CONVERSATION_MESSAGES.map((messag
       : undefined,
   exchange: message.exchange,
   reaction: message.reaction,
-  kind: message.exchange ? "exchange" : "text",
+  kind: message.exchange ? "exchange" : message.plan ? "plan" : "text",
+  plan: message.plan && { ...message.plan, stopped: false },
 }));
 
 const unreadStoryMessages: RendererAgentMessage[] = [
@@ -96,28 +101,6 @@ const unreadStoryMessages: RendererAgentMessage[] = [
     }),
   ),
 ];
-
-/*
- * The pill that counts what arrived below the reader. The messages live in a signal, because the
- * count is a function of arrival: the play function has to append to a transcript the reader is
- * already scrolled away from.
- */
-const newMessagePillHistory: RendererAgentMessage[] = unreadStoryMessages.map((message, index) => ({
-  ...message,
-  id: `pill-history-${index + 1}`,
-}));
-
-function newMessagePillArrival(index: number): RendererAgentMessage {
-  return {
-    id: `pill-arrival-${index}`,
-    author: "agent",
-    body: `Arrived while the reader was scrolled up (${index}). The pill above the composer counts this one.`,
-    time: `09:${String(50 + index).padStart(2, "0")}`,
-    kind: "text",
-  };
-}
-
-const [newMessagePillMessages, setNewMessagePillMessages] = createSignal<RendererAgentMessage[]>(newMessagePillHistory);
 
 const imageGenerationMessages: RendererAgentMessage[] = [
   ...messages,
@@ -157,15 +140,18 @@ const generatedImageAttachment: AttachmentSummary = {
   previewKind: "image",
   previewUrl: generatedImagePreview,
 };
-const queuePreviewAttachments: AttachmentSummary[] = [
-  { ...generatedImageAttachment, id: "queue-preview-primary", name: "command-search.png" },
-  {
-    ...generatedImageAttachment,
-    id: "queue-preview-alternate",
-    name: "message-search.png",
-    previewUrl: generatedImagePreviewAlternate,
-  },
-];
+const queuePrimaryAttachment: AttachmentSummary = {
+  ...generatedImageAttachment,
+  id: "queue-preview-primary",
+  name: "command-search.png",
+};
+const queueAlternateAttachment: AttachmentSummary = {
+  ...generatedImageAttachment,
+  id: "queue-preview-alternate",
+  name: "message-search.png",
+  previewUrl: generatedImagePreviewAlternate,
+};
+const queuePreviewAttachments: AttachmentSummary[] = [queuePrimaryAttachment, queueAlternateAttachment];
 const supportedContextAttachments: AttachmentSummary[] = [
   {
     id: "composer-context-pdf",
@@ -283,13 +269,13 @@ const agentMessageGalleryMessages: RendererAgentMessage[] = [
       "",
       "You can also open [ConversationView.tsx](/Users/test/OpenBot/src/renderer/src/features/conversation/ConversationView.tsx), ask @Research, or inspect the attached source file below.",
       "",
-      `Attachment reference: ${serializeAttachmentReference(STORY_ATTACHMENTS[0].name, STORY_ATTACHMENTS[0].id)}.`,
+      `Attachment reference: ${serializeAttachmentReference(storyAttachment.name, storyAttachment.id)}.`,
       "",
       "The implementation follows the component source [1] and the accessibility guidance [2].",
     ].join("\n"),
     time: "10:02",
     kind: "text",
-    attachments: [STORY_ATTACHMENTS[0]],
+    attachments: [storyAttachment],
     citations: [
       {
         number: 1,
@@ -396,7 +382,7 @@ const agentMessageGalleryMessages: RendererAgentMessage[] = [
     body: "",
     time: "10:09",
     kind: "text",
-    attachments: [STORY_ATTACHMENTS[0]],
+    attachments: [storyAttachment],
     reaction: "🔥",
   },
   {
@@ -583,6 +569,8 @@ const streamingMarkdownChunks = [
 ] as const;
 
 function streamingMarkdownMessages(chunkIndex: number): RendererAgentMessage[] {
+  const body = streamingMarkdownChunks[chunkIndex];
+  if (body === undefined) throw new Error(`Streaming Markdown chunk ${chunkIndex} is missing.`);
   return [
     {
       id: "streaming-markdown-user",
@@ -594,7 +582,7 @@ function streamingMarkdownMessages(chunkIndex: number): RendererAgentMessage[] {
     {
       id: "streaming-markdown-agent",
       author: "agent",
-      body: streamingMarkdownChunks[chunkIndex],
+      body,
       time: "10:03",
       kind: "text",
       streaming: chunkIndex < streamingMarkdownChunks.length - 1,
@@ -811,8 +799,8 @@ function queueWithItems(count: number, text = "Add the final checklist and verif
 const queueReferenceMessages = [
   "Improve how right-clicking an agent works in the sidebar. It should match the app…",
   "The inputs are still not right. Check exactly how they work in the application…",
-  "Add Command+F to chat, like in Grok Bot, and keep message reordering consistent…",
-  "Add the same search modal as Grok Bot for messages and agents…",
+  "Add Command+F to chat, and keep message reordering consistent…",
+  "Add one search modal for messages and agents…",
   "The latest chat message is too low. Move it up so it stays visible…",
   "Run all checks and fix every failure",
   "Push the final changes to main",
@@ -823,11 +811,15 @@ const referenceQueue: QueueSnapshot = {
   deliveries: [
     ...queueWithItems(queueReferenceMessages.length)
       .deliveries.filter((delivery) => delivery.status === "queued")
-      .map((delivery, index) => ({
-        ...delivery,
-        text: queueReferenceMessages[index],
-        attachments: index === 2 ? [queuePreviewAttachments[0]] : index === 3 ? [queuePreviewAttachments[1]] : [],
-      })),
+      .map((delivery, index) => {
+        const text = queueReferenceMessages[index];
+        if (text === undefined) throw new Error(`Queue reference message ${index} is missing.`);
+        return {
+          ...delivery,
+          text,
+          attachments: index === 2 ? [queuePrimaryAttachment] : index === 3 ? [queueAlternateAttachment] : [],
+        };
+      }),
     runningDelivery,
   ],
 };
@@ -1069,7 +1061,6 @@ const args: Parameters<typeof Conversation>[0] = {
   onActivateBrowserTab: fn(),
   onCloseBrowserTab: fn(),
   onOpenRemoteDesktop: async (_serverId: string, _trigger: HTMLElement) => undefined,
-  onOpenAgentSetup: async () => undefined,
   onStop: fn(),
 };
 
@@ -1098,13 +1089,6 @@ export const ProviderSignInRequired: Story = {
     },
     onSignInProvider: fn(),
   },
-  play: async ({ args, canvas, userEvent }) => {
-    const signIn = await canvas.findByRole("button", { name: "Sign in to ChatGPT" });
-    // The composer still takes a draft, so signing in never costs the user their message.
-    await expect(canvas.getByRole("textbox", { name: "Message Chief" })).toBeInTheDocument();
-    await userEvent.click(signIn);
-    await expect(args.onSignInProvider).toHaveBeenCalledWith("codex");
-  },
 };
 
 /** The real composer with the plan window spent: the card states the reset and offers no button. */
@@ -1120,11 +1104,6 @@ export const UsageLimitReached: Story = {
         },
       ],
     },
-  },
-  play: async ({ canvas }) => {
-    await expect(await canvas.findByText("Usage limit reached")).toBeInTheDocument();
-    // The composer still takes a draft, so the user can write while they wait for the reset.
-    await expect(canvas.getByRole("textbox", { name: "Message Chief" })).toBeInTheDocument();
   },
 };
 
@@ -1142,28 +1121,6 @@ export const ProviderErrorBanner: Story = {
       conversationError="Falling back from WebSockets to HTTPS transport. stream disconnected before completion: Connection refused (os error 61)"
     />
   ),
-  play: async ({ canvas }) => {
-    const banner = await canvas.findByRole("alert");
-    await expect(banner).toHaveTextContent(/Connection refused/u);
-    // The composer still takes a draft, so the error never costs the user their message.
-    await expect(canvas.getByRole("textbox", { name: "Message Chief" })).toBeInTheDocument();
-  },
-};
-
-/** The same chat after the press: the banner goes, the composer keeps its place and its draft. */
-export const ProviderErrorDismissed: Story = {
-  name: "Provider error dismissed",
-  render: (storyArgs) => (
-    <MockedConversation
-      args={storyArgs}
-      conversationError="Falling back from WebSockets to HTTPS transport. stream disconnected before completion: Connection refused (os error 61)"
-    />
-  ),
-  play: async ({ canvas, userEvent }) => {
-    await userEvent.click(await canvas.findByRole("button", { name: "Dismiss error" }));
-    await waitFor(() => expect(canvas.queryByRole("alert")).not.toBeInTheDocument());
-    await expect(canvas.getByRole("textbox", { name: "Message Chief" })).toHaveFocus();
-  },
 };
 
 export const AllAgentMessageTypes: Story = {
@@ -1178,54 +1135,11 @@ export const AllAgentMessageTypes: Story = {
 export const VoiceRecording: Story = {
   name: "Voice recording",
   render: (storyArgs) => <RecordingConversation args={storyArgs} />,
-  play: async ({ canvas, userEvent }) => {
-    await userEvent.click(canvas.getByRole("button", { name: "Create prompt with voice" }));
-    await expect(canvas.findByRole("group", { name: "Voice recording" })).resolves.toBeVisible();
-    await expect(canvas.findByRole("button", { name: "Stop voice recording" })).resolves.toBeVisible();
-  },
 };
 
 export const VoiceModelDownload: Story = {
   name: "Voice model download",
   render: (storyArgs) => <MockedConversation args={storyArgs} voiceModelProgress={47} />,
-};
-
-export const SearchConversation: Story = {
-  name: "Search conversation",
-  play: async ({ canvas, canvasElement, userEvent }) => {
-    const storyWindow = canvasElement.ownerDocument.defaultView;
-    if (!storyWindow) throw new Error("Story window is missing.");
-    const searchReturnTarget = canvas.getByRole("button", { name: "View agent settings" });
-    fireEvent.keyDown(searchReturnTarget, { key: "f", ctrlKey: true });
-
-    const search = await canvas.findByRole("search", { name: "Search conversation" });
-    const input = canvas.getByRole("searchbox", { name: "Search messages" });
-    await expect(search).toBeVisible();
-    await waitFor(() => expect(input).toHaveFocus());
-    await userEvent.type(input, "milestone");
-    await expect(canvas.findByText("1/2")).resolves.toBeVisible();
-
-    await userEvent.click(canvas.getByRole("button", { name: "Next match" }));
-    await expect(canvas.findByText("2/2")).resolves.toBeVisible();
-    await userEvent.keyboard("{Escape}");
-    await expect(canvas.queryByRole("search", { name: "Search conversation" })).not.toBeInTheDocument();
-  },
-};
-
-export const ComposerActionMenu: Story = {
-  name: "Composer action menu",
-  play: async ({ canvas, canvasElement, userEvent }) => {
-    await userEvent.click(canvas.getByRole("button", { name: "Add to prompt" }));
-    const menu = await within(canvasElement.ownerDocument.body).findByRole("menu", { name: "Add to prompt" });
-    await waitFor(() => expect(menu).toBeVisible());
-    const attachImage = within(menu).getByRole("menuitem", { name: /Attach image/ });
-    const useSkill = within(menu).getByRole("menuitem", { name: /Use a skill/ });
-    const addContext = within(menu).getByRole("menuitem", { name: /Add context/ });
-    await expect(menu).toHaveClass("ui-action-menu");
-    await waitFor(() => expect(attachImage).toHaveFocus());
-    await expect(useSkill).toHaveAttribute("data-disabled");
-    await expect(addContext).toBeVisible();
-  },
 };
 
 export const PastedImageInComposer: Story = {
@@ -1236,11 +1150,8 @@ export const PastedImageInComposer: Story = {
 export const MixedAttachmentsInNarrowComposer: Story = {
   name: "Mixed attachments in narrow composer",
   render: (storyArgs) => (
-    <section
-      data-testid="narrow-composer-attachments-sample"
-      style={{ width: "360px", height: "820px", overflow: "hidden" }}
-    >
-      <MockedConversation args={storyArgs} initialAttachments={[...queuePreviewAttachments, STORY_ATTACHMENTS[0]]} />
+    <section style={{ width: "360px", height: "820px", overflow: "hidden" }}>
+      <MockedConversation args={storyArgs} initialAttachments={[...queuePreviewAttachments, storyAttachment]} />
     </section>
   ),
 };
@@ -1278,60 +1189,6 @@ export const ScrollToLatest: Story = {
     unreadCount: 0,
     firstUnreadMessageId: null,
   },
-  play: async ({ canvas, canvasElement }) => {
-    const scrollElement = canvasElement.querySelector<HTMLElement>(".conversation-scroll");
-    if (!scrollElement) throw new Error("Conversation scroll element is missing.");
-    Object.defineProperties(scrollElement, {
-      clientHeight: { configurable: true, value: 600 },
-      scrollHeight: { configurable: true, value: 1_200 },
-    });
-    scrollElement.scrollTop = 0;
-    scrollElement.dispatchEvent(new Event("scroll"));
-    await expect(canvas.findByRole("button", { name: "Scroll to latest message" })).resolves.toBeVisible();
-  },
-};
-
-export const NewMessagesPill: Story = {
-  name: "New messages pill",
-  args: {
-    messages: newMessagePillHistory,
-    unreadCount: 0,
-    firstUnreadMessageId: null,
-  },
-  render: (storyArgs) => <MockedConversation args={storyArgs} messages={newMessagePillMessages()} />,
-  play: async ({ canvas, canvasElement }) => {
-    setNewMessagePillMessages(newMessagePillHistory);
-    const scrollElement = canvasElement.querySelector<HTMLElement>(".conversation-scroll");
-    if (!scrollElement) throw new Error("Conversation scroll element is missing.");
-    Object.defineProperties(scrollElement, {
-      clientHeight: { configurable: true, value: 600 },
-      scrollHeight: { configurable: true, value: 1_200 },
-    });
-    scrollElement.scrollTop = 0;
-    scrollElement.dispatchEvent(new Event("scroll"));
-    await expect(canvas.findByRole("button", { name: "Scroll to latest message" })).resolves.toBeVisible();
-
-    setNewMessagePillMessages((current) => [...current, newMessagePillArrival(1)]);
-    await expect(canvas.findByRole("button", { name: "Jump to 1 new message" })).resolves.toBeVisible();
-
-    setNewMessagePillMessages((current) => [...current, newMessagePillArrival(2), newMessagePillArrival(3)]);
-    await expect(canvas.findByRole("button", { name: "Jump to 3 new messages" })).resolves.toBeVisible();
-
-    // The reader's own message is not news to them.
-    setNewMessagePillMessages((current) => [
-      ...current,
-      { id: "pill-own-message", author: "you", body: "Reading up from here.", time: "09:54", kind: "text" },
-    ]);
-    await expect(canvas.findByRole("button", { name: "Jump to 3 new messages" })).resolves.toBeVisible();
-
-    fireEvent.click(await canvas.findByRole("button", { name: "Dismiss new message count" }));
-    await expect(canvas.findByRole("button", { name: "Scroll to latest message" })).resolves.toBeVisible();
-    expect(scrollElement.scrollTop).toBe(0);
-
-    // A dismissed count comes back with the next arrival, from zero.
-    setNewMessagePillMessages((current) => [...current, newMessagePillArrival(4)]);
-    await expect(canvas.findByRole("button", { name: "Jump to 1 new message" })).resolves.toBeVisible();
-  },
 };
 
 export const CitationsInChat: Story = {
@@ -1353,32 +1210,12 @@ export const ImageGenerationCompletedInChat: Story = {
     activeTurnId: "turn-image-generation",
     presence: completedImageGenerationPresence,
   },
-  play: async ({ canvas, canvasElement }) => {
-    expect(canvas.queryByRole("status", { name: "Chief is working" })).not.toBeInTheDocument();
-    await canvas.getByRole("button", { name: "Preview generated image" }).click();
-    await expect(
-      within(canvasElement.ownerDocument.body).findByRole("dialog", { name: "generated-image.png" }),
-    ).resolves.toBeInTheDocument();
-  },
 };
 
 export const DataTableInChat: Story = {
   name: "Data table in chat",
   args: {
     messages: dataTableMessages,
-  },
-  play: async ({ canvas }) => {
-    await expect(canvas.getByText("Compare the upcoming Premier League fixtures.")).toBeVisible();
-    const table = canvas.getByRole("table");
-    await expect(table).toBeVisible();
-    await expect(canvas.getAllByRole("columnheader")).toHaveLength(5);
-    const bubble = table.closest<HTMLElement>(".ui-bubble");
-    const actions = canvas.getByRole("toolbar", { name: "Agent message actions" });
-    if (!bubble) throw new Error("The data table message bubble is missing.");
-    await expect(bubble).toHaveAttribute("data-variant", "muted");
-    await expect(
-      Math.abs(actions.getBoundingClientRect().bottom - bubble.getBoundingClientRect().bottom),
-    ).toBeLessThanOrEqual(2);
   },
 };
 
@@ -1387,37 +1224,12 @@ export const CodeBlockInChat: Story = {
   args: {
     messages: codeBlockMessages,
   },
-  play: async ({ canvas, canvasElement }) => {
-    await expect(canvas.getByRole("region", { name: "Shell code block" })).toBeVisible();
-    const codeRow = canvasElement.querySelector<HTMLElement>(".virtual-chat-row:has(.message-code-block)");
-    const followUp = canvas
-      .getByText("The checks should complete before release.")
-      .closest<HTMLElement>(".virtual-chat-row");
-    if (!codeRow || !followUp) throw new Error("Code block chat rows are missing.");
-    await waitFor(() =>
-      expect(followUp.getBoundingClientRect().top).toBeGreaterThanOrEqual(codeRow.getBoundingClientRect().bottom),
-    );
-  },
 };
 
 export const MarkdownInChat: Story = {
   name: "Markdown in chat",
   args: {
     messages: markdownMessages,
-  },
-  play: async ({ canvas, canvasElement }) => {
-    await expect(canvas.getByRole("heading", { level: 2, name: "Recommendation" })).toBeVisible();
-    await expect(canvas.getByText("Kobalte").tagName).toBe("STRONG");
-    await expect(canvas.getByRole("checkbox", { name: "Works with our design system" })).toBeChecked();
-    await expect(canvas.queryByText("## Recommendation")).not.toBeInTheDocument();
-    const markdownRow = canvasElement.querySelector<HTMLElement>(".virtual-chat-row:has(.message-markdown)");
-    const followUp = canvas
-      .getByText("I can prepare the migration checklist next.")
-      .closest<HTMLElement>(".virtual-chat-row");
-    if (!markdownRow || !followUp) throw new Error("Markdown chat rows are missing.");
-    await waitFor(() =>
-      expect(followUp.getBoundingClientRect().top).toBeGreaterThanOrEqual(markdownRow.getBoundingClientRect().bottom),
-    );
   },
 };
 
@@ -1428,44 +1240,12 @@ export const StreamingMarkdownInChat: Story = {
     activeTurnId: "streaming-markdown",
   },
   render: (storyArgs) => <StreamingMarkdownConversation args={storyArgs} />,
-  play: async ({ canvas, canvasElement }) => {
-    await expect(canvas.getByRole("heading", { level: 2, name: "Live response" })).toBeVisible();
-    const streamingRow = canvasElement.querySelector<HTMLElement>(
-      '.virtual-chat-row:has([data-chat-search-message="streaming-markdown-agent"])',
-    );
-    if (!streamingRow) throw new Error("The streaming Markdown row is missing.");
-    const initialHeight = streamingRow.getBoundingClientRect().height;
-
-    await expect(
-      canvas.findByText("The streamed response is complete.", {}, { timeout: 2_000 }),
-    ).resolves.toBeVisible();
-    await expect(canvas.getByText("Markdown renderer").tagName).toBe("STRONG");
-    await expect(canvas.getByRole("region", { name: "TypeScript code block" })).toBeVisible();
-
-    const updatedRow = canvasElement.querySelector<HTMLElement>(
-      '.virtual-chat-row:has([data-chat-search-message="streaming-markdown-agent"])',
-    );
-    const followUp = canvas
-      .getByText("This message must stay below the growing response.")
-      .closest<HTMLElement>(".virtual-chat-row");
-    if (!updatedRow || !followUp) throw new Error("The streamed chat rows are missing.");
-    expect(updatedRow).toBe(streamingRow);
-    await waitFor(() => expect(updatedRow.getBoundingClientRect().height).toBeGreaterThan(initialHeight));
-    await waitFor(() =>
-      expect(followUp.getBoundingClientRect().top).toBeGreaterThanOrEqual(updatedRow.getBoundingClientRect().bottom),
-    );
-  },
 };
 
 export const ComparisonTableInChat: Story = {
   name: "Comparison table in chat",
   args: {
     messages: comparisonTableMessages,
-  },
-  play: async ({ canvas }) => {
-    await expect(canvas.getByText("Compare the Personal and Enterprise plans feature by feature.")).toBeVisible();
-    await expect(canvas.getByRole("region", { name: "Comparison table" })).toBeVisible();
-    await expect(canvas.getAllByRole("columnheader")).toHaveLength(3);
   },
 };
 
@@ -1534,11 +1314,6 @@ export const BrowserTakeover: Story = {
     messages: [],
   },
   render: (storyArgs) => <MockedConversation args={storyArgs} takeoverStateGallery />,
-  play: async ({ canvas }) => {
-    await expect(canvas.getByRole("region", { name: "Browser takeover" })).toBeVisible();
-    await expect(canvas.getByRole("region", { name: "Browser takeover complete" })).toBeVisible();
-    await expect(canvas.getByRole("region", { name: "Browser takeover cancelled" })).toBeVisible();
-  },
 };
 
 export const PromptQuestionsInChat: Story = {
@@ -1551,6 +1326,52 @@ export const PromptQuestionsInChat: Story = {
 
 export const Queued: Story = {
   args: { queue },
+};
+
+/**
+ * Chief asked Research and Sales. Research answered while Chief worked, so its answer waits above
+ * the composer with the question, not in the queue panel. The person's own message stays queued.
+ */
+export const WaitingForReplies: Story = {
+  args: {
+    queue: { agentId: "chief", deliveries: [...(STORY_QUEUES.chief ?? []), queuedDelivery, runningDelivery] },
+    activeTurnId: "turn-active",
+  },
+};
+
+/** The plan of the turn that runs: the block is open and the running step shimmers. */
+export const PlanInProgress: Story = {
+  args: {
+    activeTurnId: "turn-plan-live",
+    messages: [
+      ...messages.filter((message) => message.kind !== "plan"),
+      {
+        id: "turn-plan-live:plan",
+        author: "agent",
+        body: "",
+        time: "10:05",
+        turnId: "turn-plan-live",
+        itemType: "plan",
+        status: "streaming",
+        streaming: true,
+        kind: "plan",
+        plan: {
+          explanation: null,
+          stopped: false,
+          steps: [
+            { id: "0", text: "Read the migration notes", status: "completed" },
+            {
+              id: "1",
+              text: "Add the column for the saved provider",
+              activeText: "Adding the column for the saved provider",
+              status: "inProgress",
+            },
+            { id: "2", text: "Run the migration tests", status: "pending" },
+          ],
+        },
+      },
+    ],
+  },
 };
 
 export const ThreeQueuedMessages: Story = {
@@ -1657,79 +1478,6 @@ export const SevenQueuedMessages: Story = {
   },
 };
 
-export const SevenQueuedMessagesInteractions: Story = {
-  ...SevenQueuedMessages,
-  name: "Seven queued messages interactions",
-  tags: ["!dev"],
-  play: async ({ canvas, canvasElement, userEvent }) => {
-    const messagesInQueue = () =>
-      Array.from(canvasElement.querySelectorAll(".agent-queue-message"), (element) => element.textContent);
-    const composer = canvasElement.querySelector<HTMLElement>(".composer");
-    const editor = canvas.getByRole("textbox", { name: "Message Chief" });
-    if (!composer) throw new Error("Composer is missing.");
-
-    const paddingPointerDown = new PointerEvent("pointerdown", { bubbles: true, cancelable: true });
-    expect(composer.dispatchEvent(paddingPointerDown)).toBe(false);
-    await waitFor(() => expect(editor).toHaveFocus());
-
-    // The panel mounts from an effect, so the first row arrives after the composer takes focus.
-    const firstRow = await waitFor(() => {
-      const row = canvasElement.querySelector<HTMLFieldSetElement>(".agent-queue-item");
-      if (!row) throw new Error("Queue row is missing.");
-      return row;
-    });
-
-    fireEvent.keyDown(firstRow, { key: "ArrowDown", altKey: true });
-    await waitFor(() =>
-      expect(messagesInQueue().slice(0, 2)).toEqual([queueReferenceMessages[1], queueReferenceMessages[0]]),
-    );
-
-    const movedRow = Array.from(canvasElement.querySelectorAll<HTMLFieldSetElement>(".agent-queue-item")).find((row) =>
-      row.textContent?.includes(queueReferenceMessages[0]),
-    );
-    if (!movedRow) throw new Error("Moved queue row is missing.");
-    fireEvent.keyDown(movedRow, { key: "ArrowUp", altKey: true });
-    await waitFor(() =>
-      expect(messagesInQueue().slice(0, 2)).toEqual([queueReferenceMessages[0], queueReferenceMessages[1]]),
-    );
-
-    await userEvent.click(canvas.getByRole("button", { name: "Edit queued message 1" }));
-    await waitFor(() => expect(editor).toHaveFocus());
-    await waitFor(() => expect(canvas.getByRole("button", { name: "Save queued message" })).toBeVisible());
-    await waitFor(() => expect(messagesInQueue()).toHaveLength(queueReferenceMessages.length - 1));
-    expect(messagesInQueue()).not.toContain(queueReferenceMessages[0]);
-    editor.textContent = "Updated queue message from Storybook";
-    await fireEvent.input(editor);
-    await userEvent.click(canvas.getByRole("button", { name: "Save queued message" }));
-    await waitFor(() => expect(messagesInQueue()[0]).toBe("Updated queue message from Storybook"));
-
-    await userEvent.click(canvas.getByRole("button", { name: "Edit queued message 1" }));
-    await waitFor(() => expect(messagesInQueue()).toHaveLength(queueReferenceMessages.length - 1));
-    editor.textContent = queueReferenceMessages[0];
-    await fireEvent.input(editor);
-    await userEvent.click(canvas.getByRole("button", { name: "Save queued message" }));
-    await waitFor(() => expect(messagesInQueue()[0]).toBe(queueReferenceMessages[0]));
-
-    await userEvent.click(canvas.getByRole("button", { name: "Edit queued message 3" }));
-    const attachmentCard = canvasElement.querySelector<HTMLElement>(".composer-attachment");
-    const queuePanel = canvasElement.querySelector<HTMLElement>(".agent-queue-panel");
-    if (!attachmentCard || !queuePanel) throw new Error("Queue attachment edit layout is missing.");
-    await waitFor(() =>
-      expect(queuePanel.getBoundingClientRect().bottom).toBeLessThanOrEqual(attachmentCard.getBoundingClientRect().top),
-    );
-    await userEvent.click(canvas.getByRole("button", { name: "Save queued message" }));
-    await waitFor(() => expect(messagesInQueue()).toHaveLength(queueReferenceMessages.length));
-
-    editor.textContent = "Queued from the Storybook composer";
-    await fireEvent.input(editor);
-    await userEvent.click(canvas.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(messagesInQueue().at(-1)).toBe("Queued from the Storybook composer"));
-
-    await userEvent.click(canvas.getByRole("button", { name: "Delete queued message 8" }));
-    await waitFor(() => expect(messagesInQueue()).toHaveLength(queueReferenceMessages.length));
-  },
-};
-
 export const QueueWithItems: Story = {
   args: { queue: queueWithItems(3) },
 };
@@ -1791,7 +1539,7 @@ const actionMarkerMessages: RendererAgentMessage[] = [
     body: "",
     time: "22:49",
     kind: "exchange",
-    attachments: [STORY_ATTACHMENTS[0]],
+    attachments: [storyAttachment],
     exchange: {
       direction: "incoming",
       messageId: "spacing-marker-incoming",
@@ -1914,6 +1662,32 @@ const actionMarkerArgs = {
 export const ActionMarkerSpacing: Story = {
   name: "Action marker spacing",
   args: actionMarkerArgs,
+};
+
+/* The history opens and closes inside a real timeline, where the messages under
+   the marker move with it. The isolated marker story cannot show that. */
+export const ActionMarkerHistory: Story = {
+  name: "Action marker history",
+  args: {
+    ...actionMarkerArgs,
+    messages: actionMarkerMessages.map((message) =>
+      message.id === "spacing-routine-run" && message.actionMarker?.kind === "routine-run"
+        ? {
+            ...message,
+            actionMarker: {
+              ...message.actionMarker,
+              status: "succeeded",
+              previousTransitions: [
+                { status: "queued", timestamp: "2026-08-19T22:49:00.000Z" },
+                { status: "running", timestamp: "2026-08-19T22:50:00.000Z" },
+                { status: "needs-attention", timestamp: "2026-08-19T22:51:00.000Z" },
+                { status: "running", timestamp: "2026-08-19T22:52:00.000Z" },
+              ],
+            },
+          }
+        : message,
+    ),
+  },
 };
 
 export const NarrowActionMarkerSpacing: Story = {

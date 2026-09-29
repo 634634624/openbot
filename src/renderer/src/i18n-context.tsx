@@ -1,5 +1,7 @@
-import { type AppLanguage, DEFAULT_APP_LANGUAGE } from "@openbot/contracts/ipc";
-import { type AppTranslate, resolveLocale, type TranslatedLocale, translateFor } from "@openbot/i18n";
+import { type AppLanguage, DEFAULT_APP_LANGUAGE } from "@openbot/contracts/app-language";
+import { type AppTranslate, formatLocale, resolveLocale, type TranslatedLocale, translateFor } from "@openbot/i18n";
+import { TextProvider } from "@openbot/ui/text";
+import type { JSX } from "@solidjs/web";
 import {
   createContext,
   createEffect,
@@ -9,6 +11,7 @@ import {
   type ParentProps,
   useContext,
 } from "solid-js";
+import { appPort } from "./app-port";
 
 export interface I18nValue {
   language: () => AppLanguage;
@@ -18,19 +21,9 @@ export interface I18nValue {
 }
 
 /**
- * The language the interface reads in.
- *
- * Outermost of the providers, because every screen under it renders text, and because the value it
- * holds is owned by the main process rather than by any one screen: the native menu, the
- * notifications and this window all draw from the same saved setting. The window learns about a
- * change from `onAppLanguagePreference`, so the Dynamic Island - which has no Settings of its own -
- * follows a choice made in the main window.
- *
- * Ungated. `DEFAULT_APP_LANGUAGE` is the system language, which is what the first frame would have
- * shown anyway, so nothing waits for the read below.
- *
- * `t` reads the memo on every call, which is what makes a language change repaint the screen: a
- * component that calls `t("...")` in its JSX subscribes to the memo the same as to any signal.
+ * Interface language, owned by main (native menu, notifications, and this window share one
+ * saved setting). Outermost provider since every screen renders text. `t` reads the memo per
+ * call so a language change repaints subscribers. Ungated: system language is the first frame.
  */
 function createI18nValue(): I18nValue {
   const [language, setLanguage] = createSignal<AppLanguage>(DEFAULT_APP_LANGUAGE);
@@ -69,7 +62,7 @@ function createI18nValue(): I18nValue {
     const request = ++latestRequest;
     pending += 1;
     setLanguage(next);
-    void window.openbot
+    void appPort()
       .setAppLanguagePreference({ language: next })
       .then((preference) => {
         confirmed = preference.language;
@@ -84,7 +77,7 @@ function createI18nValue(): I18nValue {
   }
 
   onSettled(() => {
-    void window.openbot
+    void appPort()
       .getAppLanguagePreference()
       .then((preference) => {
         // A choice made before the read answered is newer than the saved value it reports, which
@@ -94,7 +87,7 @@ function createI18nValue(): I18nValue {
       .catch(() => undefined);
     // The main process is the owner, so what it sends is confirmed by definition - including the
     // echo of a change made in this window.
-    return window.openbot.onAppLanguagePreference((preference) => confirm(preference.language));
+    return appPort().onAppLanguagePreference((preference) => confirm(preference.language));
   });
 
   return { language, locale, t, changeLanguage };
@@ -123,9 +116,54 @@ const FALLBACK: I18nValue = {
 
 const I18nContext = createContext<I18nValue>(FALLBACK, { name: "I18n" });
 
-export function I18nProvider(props: ParentProps) {
+/**
+ * The language setting and the text context shared components read (`useText` from
+ * `@openbot/ui/text`). A screen reads text through `useText`; only the language setting itself
+ * needs `useI18n`.
+ */
+export function I18nProvider(props: ParentProps): JSX.Element {
   const value = createI18nValue();
-  return <I18nContext value={value}>{props.children}</I18nContext>;
+  return (
+    <I18nContext value={value}>
+      <TextProvider locale={value.locale()} formatLocale={formatLocale(value.language(), navigator.language)}>
+        {props.children}
+      </TextProvider>
+    </I18nContext>
+  );
+}
+
+/**
+ * A fixed language, for a surface without the desktop preference: the public web client before
+ * sign-in, and Storybook. Resolve a browser tag with `resolveLocale("system", navigator.language)`.
+ */
+export function StaticI18nProvider(
+  props: ParentProps<{ locale: TranslatedLocale; formatLocale?: string }>,
+): JSX.Element {
+  const value: I18nValue = {
+    language: () => props.locale,
+    locale: () => props.locale,
+    t: (key, ...params) => translateFor(props.locale)(key, ...params),
+    changeLanguage: () => undefined,
+  };
+  // As in `I18nProvider`. The page can outlive this provider (the web client is one route of an
+  // English site), so the previous language comes back when it unmounts.
+  createEffect(
+    () => props.locale,
+    (locale) => {
+      const previous = document.documentElement.lang;
+      document.documentElement.lang = locale;
+      return () => {
+        document.documentElement.lang = previous;
+      };
+    },
+  );
+  return (
+    <I18nContext value={value}>
+      <TextProvider locale={props.locale} formatLocale={props.formatLocale}>
+        {props.children}
+      </TextProvider>
+    </I18nContext>
+  );
 }
 
 export function useI18n(): I18nValue {

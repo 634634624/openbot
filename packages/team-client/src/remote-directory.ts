@@ -1,9 +1,17 @@
 import { sha256 } from "@noble/hashes/sha2.js";
-import { createInviteUrl, parseInviteUrl } from "@openbot/contracts/invite-links";
+import {
+  createInviteUrl,
+  type InviteLinkOptions,
+  inviteUseCount,
+  isPermanentInvite,
+  OPENBOT_CONTROL_PLANE_ORIGIN,
+  OPENBOT_INVITE_ORIGIN,
+  parseInviteUrl,
+} from "@openbot/contracts/invite-links";
 import type { MobileConnectHostBinding } from "@openbot/contracts/mobile-connect";
 import { decodeRemoteSession, decodeRemoteSessionTicket } from "@openbot/contracts/remote-control-plane";
 import { isBoolean, isDynamicRecord, isNumber, isString } from "@openbot/contracts/runtime-values";
-
+import { sourceText } from "@openbot/i18n/source";
 import type { TeamClientFetch } from "./index";
 
 export interface RemoteTeamHost {
@@ -21,6 +29,9 @@ export interface RemoteTeamMember {
   name: string | null;
   role: "owner" | "admin" | "member";
   status: "active" | "revoked";
+  avatarUrl?: string | null;
+  /** Epoch milliseconds. */
+  createdAt?: number;
 }
 
 export interface RemoteTeamInvite {
@@ -30,11 +41,12 @@ export interface RemoteTeamInvite {
   expiresAt: number;
   usedAt: number | null;
   revokedAt: number | null;
+  permanent: boolean;
+  useCount: number;
 }
 
 export interface RemoteTeamBootstrap {
   sessionId: string;
-  expiresAt: number;
   signalUrl: string;
   ticket: string;
 }
@@ -45,6 +57,7 @@ export interface RemoteInvitePreview {
   role: "admin" | "member";
   expiresAt: number;
   emailBound: boolean;
+  permanent: boolean;
   devicePublicKey: string | null;
 }
 
@@ -72,23 +85,29 @@ export class RemoteDirectoryError extends Error {
 
 export class RemoteTeamDirectoryClient {
   readonly #apiUrl: string;
-  readonly #token: string;
+  readonly #authentication: { kind: "bearer"; token: string } | { kind: "browser" };
   readonly #fetch: TeamClientFetch;
   readonly #hostKeys: RemoteHostKeyStore;
   readonly #pairedHost: MobileConnectHostBinding | undefined;
+  readonly #inviteLinks: InviteLinkOptions;
   #pinTail: Promise<void> = Promise.resolve();
 
-  constructor(input: {
-    apiUrl: string;
-    token: string;
-    fetch: TeamClientFetch;
-    hostKeys?: RemoteHostKeyStore;
-    pairedHost?: MobileConnectHostBinding;
-  }) {
+  constructor(
+    input: {
+      apiUrl: string;
+      fetch: TeamClientFetch;
+      hostKeys?: RemoteHostKeyStore;
+      pairedHost?: MobileConnectHostBinding;
+      /** A development client passes `allowLocalDevelopmentApiUrl` to use a local account service. */
+      inviteLinks?: InviteLinkOptions;
+    } & ({ token: string; authentication?: never } | { token?: never; authentication: { kind: "browser" } }),
+  ) {
     this.#apiUrl = input.apiUrl;
-    this.#token = input.token;
+    if (!input.authentication && !input.token) throw new Error(sourceText("error.remote.accountAuthRequired"));
+    this.#authentication = input.authentication ?? { kind: "bearer", token: input.token ?? "" };
     this.#fetch = input.fetch;
     this.#pairedHost = input.pairedHost;
+    this.#inviteLinks = input.inviteLinks ?? {};
     const keys = new Map<string, string>();
     this.#hostKeys = input.hostKeys ?? {
       get: async (hostId) => keys.get(hostId) ?? null,
@@ -116,7 +135,7 @@ export class RemoteTeamDirectoryClient {
         }
         const pinnedKey = await this.#hostKeys.get(candidate.hostId);
         if (pinnedKey && remoteHostFingerprint(candidate.devicePublicKey) !== remoteHostFingerprint(pinnedKey)) {
-          throw new Error("The server identity changed. Refusing to replace the trusted host key.");
+          throw new Error(sourceText("error.remote.serverIdentityChanged"));
         }
         return [
           {
@@ -134,7 +153,7 @@ export class RemoteTeamDirectoryClient {
     if (this.#pairedHost) {
       const paired = directory.find((host) => host.hostId === this.#pairedHost?.hostId);
       if (paired && remoteHostFingerprint(paired.devicePublicKey) !== this.#pairedHost.fingerprint) {
-        throw new Error("The paired desktop identity is missing or changed. Scan a new code from that desktop.");
+        throw new Error(sourceText("error.remote.pairedIdentityChanged"));
       }
       if (paired) await this.#pinHostKey(paired.hostId, paired.devicePublicKey);
     }
@@ -155,16 +174,17 @@ export class RemoteTeamDirectoryClient {
 
   async createInvite(
     host: { hostId: string; devicePublicKey: string },
-    input: { role: "admin" | "member"; email?: string },
+    input: { role: "admin" | "member"; email?: string; permanent?: boolean },
   ): Promise<{ inviteId: string; inviteUrl: string; expiresAt: number }> {
-    // Validate the URL before creating a one-use invitation.
+    if (input.permanent && input.email) throw new Error(sourceText("error.remote.permanentInviteNoEmail"));
+    // Validate the URL before creating an invitation.
     const payload = {
-      apiUrl: new URL(this.#apiUrl).toString(),
+      apiUrl: this.#inviteApiUrl(),
       serverId: host.hostId,
       fingerprint: remoteHostFingerprint(host.devicePublicKey),
       token: "x".repeat(32),
     };
-    createInviteUrl(payload);
+    createInviteUrl(payload, this.#inviteLinks);
     const value = await this.#request(`/v2/remote/hosts/${encodeURIComponent(host.hostId)}/invites`, {
       method: "POST",
       body: input,
@@ -173,7 +193,7 @@ export class RemoteTeamDirectoryClient {
       throw new Error("The invitation is invalid.");
     return {
       inviteId: value.inviteId,
-      inviteUrl: createInviteUrl({ ...payload, token: value.token }),
+      inviteUrl: createInviteUrl({ ...payload, token: value.token }, this.#inviteLinks),
       expiresAt: value.expiresAt,
     };
   }
@@ -218,7 +238,25 @@ export class RemoteTeamDirectoryClient {
     // Keep the identity pin: leaving a team must not silently trust a substituted key on rejoin.
   }
 
-  async createBootstrap(hostId: string, clientPublicKey: string): Promise<RemoteTeamBootstrap> {
+  async createBootstrap(
+    hostId: string,
+    clientPublicKey: string,
+    existingSessionId: string | null = null,
+  ): Promise<RemoteTeamBootstrap> {
+    if (existingSessionId) {
+      try {
+        const ticket = decodeRemoteSessionTicket(
+          await this.#request(`/v2/remote/sessions/${encodeURIComponent(existingSessionId)}/ticket`, {
+            method: "POST",
+            body: { clientPublicKey },
+          }),
+        );
+        return { sessionId: existingSessionId, signalUrl: ticket.signalUrl, ticket: ticket.ticket };
+      } catch (error) {
+        // Only an ended session is replaced. Another failure keeps it, so a retry does not leave it active.
+        if (!(error instanceof RemoteDirectoryError) || (error.status !== 403 && error.status !== 404)) throw error;
+      }
+    }
     const session = decodeRemoteSession(
       await this.#request("/v2/remote/sessions/", { method: "POST", body: { hostId } }),
     );
@@ -231,7 +269,6 @@ export class RemoteTeamDirectoryClient {
       );
       return {
         sessionId: session.sessionId,
-        expiresAt: session.expiresAt,
         signalUrl: ticket.signalUrl,
         ticket: ticket.ticket,
       };
@@ -243,14 +280,33 @@ export class RemoteTeamDirectoryClient {
     }
   }
 
+  /**
+   * The account service an invitation names. The public website serves the same Worker as
+   * `api.openbot.run`, but an invitation must name `api.openbot.run`: the desktop and mobile apps
+   * accept only that address.
+   */
+  #inviteApiUrl(): string {
+    const url = new URL(this.#apiUrl);
+    return this.#authentication.kind === "browser" && url.origin === OPENBOT_INVITE_ORIGIN
+      ? new URL(OPENBOT_CONTROL_PLANE_ORIGIN).toString()
+      : url.toString();
+  }
+
   async endSession(sessionId: string): Promise<void> {
     await this.#request(`/v2/remote/sessions/${encodeURIComponent(sessionId)}/end`, { method: "POST" });
   }
 
   async previewInvite(inviteUrl: string): Promise<RemoteInvitePreview> {
-    const invite = parseInviteUrl(inviteUrl);
-    if (new URL(invite.apiUrl).origin !== new URL(this.#apiUrl).origin) {
-      throw new Error("This invitation belongs to another OpenBot service.");
+    const invite = parseInviteUrl(inviteUrl, this.#inviteLinks);
+    const inviteOrigin = new URL(invite.apiUrl).origin;
+    const origin = new URL(this.#apiUrl).origin;
+    // These production origins serve the same account Worker. Requests still use this client's origin.
+    const publicWebsiteInvite =
+      this.#authentication.kind === "browser" &&
+      origin === "https://openbot.run" &&
+      inviteOrigin === "https://api.openbot.run";
+    if (inviteOrigin !== origin && !publicWebsiteInvite) {
+      throw new Error(sourceText("error.remote.inviteOtherService"));
     }
     const value = await this.#request("/v2/remote/invites/preview", {
       method: "POST",
@@ -259,15 +315,15 @@ export class RemoteTeamDirectoryClient {
     });
     const preview = decodeInvitePreview(value, invite.serverId);
     if (!preview.devicePublicKey || remoteHostFingerprint(preview.devicePublicKey) !== invite.fingerprint) {
-      throw new Error("The invitation host identity does not match its fingerprint.");
+      throw new Error(sourceText("error.remote.inviteFingerprintMismatch"));
     }
     return preview;
   }
 
   async acceptInvite(inviteUrl: string): Promise<RemoteTeamHost> {
-    const invite = parseInviteUrl(inviteUrl);
+    const invite = parseInviteUrl(inviteUrl, this.#inviteLinks);
     const preview = await this.previewInvite(inviteUrl);
-    if (!preview.devicePublicKey) throw new Error("The invitation host key is missing.");
+    if (!preview.devicePublicKey) throw new Error(sourceText("error.remote.inviteHostKeyMissing"));
     // Save the pin before consuming the one-use token, including across app restarts.
     await this.#pinHostKey(invite.serverId, preview.devicePublicKey);
     const accepted = await this.#request("/v2/remote/invites/accept", {
@@ -296,7 +352,7 @@ export class RemoteTeamDirectoryClient {
     const operation = this.#pinTail.then(async () => {
       const pinned = await this.#hostKeys.get(hostId);
       if (pinned && remoteHostFingerprint(pinned) !== remoteHostFingerprint(publicKey)) {
-        throw new Error("The invitation conflicts with the trusted host key.");
+        throw new Error(sourceText("error.remote.inviteKeyConflict"));
       }
       await this.#hostKeys.set(hostId, publicKey);
     });
@@ -311,13 +367,21 @@ export class RemoteTeamDirectoryClient {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 15_000);
     try {
-      const response = await this.#fetch(new URL(path, this.#apiUrl), {
+      const browser = this.#authentication.kind === "browser";
+      const response = await this.#fetch(new URL(browser ? `/api/browser${path}` : path, this.#apiUrl), {
+        ...(browser ? { credentials: "same-origin" as const } : {}),
         method: options.method ?? "GET",
         headers: {
-          ...(options.authenticated === false ? {} : { Authorization: `Bearer ${this.#token}` }),
-          ...(options.body ? { "Content-Type": "application/json" } : {}),
+          ...(this.#authentication.kind === "bearer" && options.authenticated !== false
+            ? { Authorization: `Bearer ${this.#authentication.token}` }
+            : {}),
+          ...(browser
+            ? { "X-OpenBot-Browser": "1", "Content-Type": "application/json" }
+            : options.body
+              ? { "Content-Type": "application/json" }
+              : {}),
         },
-        ...(options.body ? { body: JSON.stringify(options.body) } : {}),
+        ...(options.body || (browser && options.method === "POST") ? { body: JSON.stringify(options.body ?? {}) } : {}),
         signal: controller.signal,
       });
       const value = await response.json().catch(() => null);
@@ -347,6 +411,7 @@ function decodeInvitePreview(value: unknown, expectedHostId: string): RemoteInvi
     role: value.role,
     expiresAt: value.expiresAt,
     emailBound: value.emailBound,
+    permanent: isPermanentInvite(value.permanent, value.expiresAt),
     devicePublicKey: value.devicePublicKey,
   };
 }
@@ -356,7 +421,7 @@ function errorMessage(value: unknown): string {
     if (isString(value.error)) return value.error;
     if (isDynamicRecord(value.error) && isString(value.error.message)) return value.error.message;
   }
-  return "The OpenBot service request failed.";
+  return sourceText("error.remote.serviceRequestFailed");
 }
 
 function decodeMember(value: unknown): RemoteTeamMember {
@@ -375,6 +440,8 @@ function decodeMember(value: unknown): RemoteTeamMember {
     name: value.name,
     role: value.role,
     status: value.status,
+    ...(value.avatarUrl === null || isString(value.avatarUrl) ? { avatarUrl: value.avatarUrl } : {}),
+    ...(isNumber(value.createdAt) ? { createdAt: value.createdAt } : {}),
   };
 }
 
@@ -396,6 +463,8 @@ function decodeInvite(value: unknown): RemoteTeamInvite {
     expiresAt: value.expiresAt,
     usedAt: value.usedAt,
     revokedAt: value.revokedAt,
+    permanent: isPermanentInvite(value.permanent, value.expiresAt),
+    useCount: inviteUseCount(value.useCount),
   };
 }
 

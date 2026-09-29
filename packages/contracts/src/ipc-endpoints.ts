@@ -1,365 +1,933 @@
-// The one channel list, given structure. `ipc-channels.ts` still holds every wire value; this file
-// says which group each channel belongs to and whether it is a request the renderer invokes or an
-// event the main process sends. That is what lets a registrar bind its handlers as an object keyed
-// by endpoint, so a channel with no handler, and a handler for a channel that was never declared,
-// are both compile errors instead of a runtime rejection nobody sees until a user hits the feature.
+// The one channel list. Each endpoint holds its wire value, the group it belongs to, and whether it
+// is a request the renderer invokes or an event the main process sends. That is what lets a
+// registrar bind its handlers as an object keyed by endpoint, so a channel with no handler, and a
+// handler for a channel that was never declared, are both compile errors instead of a runtime
+// rejection nobody sees until a user hits the feature.
 //
 // A group is the unit one registrar implements in full. Where a wire prefix spans several registrars
 // - `agent:` has four - it is split into one group per registrar, because the exhaustiveness a group
 // buys is only worth having when a single object literal can satisfy it.
 
-import { IPC_CHANNELS } from "./ipc-channels";
+//
+// An endpoint also names what crosses the wire: the payload the renderer sends and the result main
+// answers, or the payload of an event. The main binder and the preload read both from here, so a
+// change on one side is a type error on the other. The types are phantom members: they exist only
+// for the checker, and the runtime value is still `{ kind, channel }`.
 
-export interface RequestEndpoint<Channel extends string = string> {
-  readonly kind: "request";
-  readonly channel: Channel;
+import type { ManagedProviderId } from "./agent-providers";
+import type { AppLanguagePreference, SetAppLanguagePreferenceInput } from "./app-language";
+import type { AddedAgent, AgentAdminSettings, UpdateAgentAdminSettingsInput } from "./ipc-agent-admin";
+import type { AgentAnalytics, AgentAnalyticsInput } from "./ipc-agent-analytics";
+import type { AgentIpcRequest, ScopedAgentEvent } from "./ipc-agent-events";
+import type { AgentModelOption } from "./ipc-agent-identity";
+import type { AgentImportPreview, AgentImportResult, ApplyAgentImportInput } from "./ipc-agent-import";
+import type {
+  AgentMemory,
+  CreateAgentMemoryInput,
+  DeleteAgentMemoryInput,
+  UpdateAgentMemoryInput,
+} from "./ipc-agent-memories";
+import type {
+  AgentProfileDraft,
+  GenerateAgentProfileInput,
+  SaveAgentProfileInput,
+  SaveAgentProfileResult,
+} from "./ipc-agent-profile";
+import type {
+  AccountUsage,
+  AgentProviderId,
+  AgentStatus,
+  ProviderApiKeyState,
+  ProviderCodeLoginStart,
+  SetProviderApiKeyInput,
+} from "./ipc-agent-status";
+import type {
+  AgentTemplateDetail,
+  AgentTemplatePreview,
+  AgentTemplatePublication,
+  InstallAgentTemplateInput,
+  InstallAgentTemplateResult,
+  PublishAgentTemplateInput,
+} from "./ipc-agent-templates";
+import type {
+  AgentSummary,
+  AvatarImageInput,
+  CreateAgentInput,
+  DuplicateAgentResult,
+  SetAgentAvatarInput,
+  UpdateAgentInput,
+} from "./ipc-agents";
+import type {
+  AnalyticsPreference,
+  AppInfo,
+  AppSetupState,
+  CentralAuthState,
+  ComputerUseHighlightPlacement,
+  ComputerUsePermissionApp,
+  ComputerUseState,
+  ExportResult,
+  ExternalDestination,
+  HostUpdateSettingsChange,
+  HostUpdateStatus,
+  MacPermissionId,
+  ProviderRuntimeSnapshot,
+  SaveSetupInput,
+  SetAnalyticsPreferenceInput,
+  UpdatePreference,
+  UpdatePreferenceChange,
+  UpdateRestartMode,
+  UpdateStatus,
+  VerifyEmailCodeInput,
+} from "./ipc-app-auth";
+import type {
+  ApprovalAutomationPreference,
+  RespondToApprovalInput,
+  RespondToBrowserTakeoverInput,
+  SetApprovalAutomationInput,
+} from "./ipc-approvals";
+import type {
+  ChooseAttachmentsInput,
+  DownloadAttachmentsInput,
+  DraftAttachment,
+  FilePreview,
+  ImportAttachmentsInput,
+  OpenAttachmentInput,
+  OpenSharedFileInput,
+  OpenWorkspaceFileInput,
+} from "./ipc-attachments";
+import type {
+  BrowserBounds,
+  BrowserControlState,
+  BrowserDisplayState,
+  BrowserLiveViewEvent,
+  BrowserNavigateInput,
+  BrowserOpenInput,
+  BrowserPictureInPictureEvent,
+  BrowserPreview,
+  BrowserTab,
+  BrowserVisibilityInput,
+} from "./ipc-browser";
+import type { RespondToBrowserSecretInput } from "./ipc-browser-secret";
+import type {
+  ChannelMemory,
+  CreateChannelMemoryInput,
+  DeleteChannelMemoryInput,
+  UpdateChannelMemoryInput,
+} from "./ipc-channel-memories";
+import type {
+  ChannelRoutine,
+  ChannelRoutineRun,
+  CreateChannelRoutineInput,
+  DeleteChannelRoutineInput,
+  ListChannelRoutineRunsInput,
+  TestChannelRoutineInput,
+  UpdateChannelRoutineInput,
+} from "./ipc-channel-routines";
+import type { Channel, ChannelCommand, ChannelPage, ChannelReadInput, ChannelSummary } from "./ipc-chat-channels";
+import type {
+  ConversationPage,
+  ConversationReadState,
+  ConversationSearchPage,
+  ConversationWithReadState,
+  MarkConversationReadInput,
+  ReadConversationPageInput,
+  RespondToPromptInput,
+  SearchConversationMessagesInput,
+  SendMessageInput,
+  SetMessageReactionInput,
+} from "./ipc-conversations";
+import type {
+  CheckCustomAgentInput,
+  CustomAgentCheckResult,
+  CustomAgentResult,
+  CustomAgentSummary,
+  DeleteCustomAgentInput,
+  DetectedAcpAgent,
+  SaveCustomAgentInput,
+} from "./ipc-custom-agents";
+import type {
+  CustomProviderResult,
+  CustomProviderSummary,
+  DeleteCustomProviderInput,
+  SaveCustomProviderInput,
+  UpdateCustomProviderInput,
+} from "./ipc-custom-providers";
+import type {
+  DynamicIslandAction,
+  DynamicIslandGeometry,
+  DynamicIslandPreference,
+  DynamicIslandPresentation,
+  SetDynamicIslandInteractiveInput,
+  SetDynamicIslandPreferenceInput,
+} from "./ipc-dynamic-island";
+import type { HostAnalytics, HostAnalyticsInput } from "./ipc-host-analytics";
+import type {
+  DeleteHostedSiteInput,
+  HostedSiteSummary,
+  PublishHostedSiteInput,
+  ReplaceHostedSiteInput,
+} from "./ipc-hosted-sites";
+import type {
+  AgentPublicationPreview,
+  AgentSubmission,
+  InstallMarketplaceAgentInput,
+  InstallMarketplaceAgentResult,
+  MarketplaceAgentDetail,
+  MarketplaceAgentPage,
+  MarketplaceAgentQuery,
+  SubmitMarketplaceAgentInput,
+} from "./ipc-marketplace-agents";
+import type {
+  McpServerConfig,
+  McpTestResult,
+  RemoveMcpServerInput,
+  SaveMcpServerInput,
+  SetMcpServerEnabledInput,
+  TestMcpServerInput,
+} from "./ipc-mcp-servers";
+import type { NotificationOpenedEvent, NotificationPreference } from "./ipc-notifications";
+import type {
+  DetectedModelServer,
+  DiscoverModelsInput,
+  DiscoverModelsResult,
+  ProviderDetectionSettings,
+} from "./ipc-provider-detection";
+import type {
+  AcknowledgeFailedTurnInput,
+  CancelQueuedMessageInput,
+  EditQueuedMessageInput,
+  InterruptTurnInput,
+  QueuedMessageReceipt,
+  QueueSnapshot,
+  ReorderQueueInput,
+  SteerQueuedMessageInput,
+  UpdateQueuedMessageInput,
+} from "./ipc-queue";
+import type {
+  RemoteDesktopSetupAction,
+  RemoteDesktopSetupStatus,
+  RemoteDesktopTestInput,
+  RemoteDesktopTestStatus,
+} from "./ipc-remote-desktop-setup";
+import type {
+  CreateRoutineInput,
+  DeleteRoutineInput,
+  ListRoutineRunsInput,
+  Routine,
+  RoutineRun,
+  TestRoutineInput,
+  UpdateRoutineInput,
+} from "./ipc-routines";
+import type { DeleteSharedTableInput, SharedTable } from "./ipc-shared-tables";
+import type { SidebarLayoutAction, SidebarLayoutSnapshot } from "./ipc-sidebar-layout";
+import type {
+  CreateLocalSkillInput,
+  InstalledSkill,
+  InstallLocalSkillInput,
+  InstallSkillInput,
+  LocalSkillRevisionInput,
+  MarketplaceSkillDetail,
+  MarketplaceSkillPage,
+  MarketplaceSkillQuery,
+  ReviseLocalSkillInput,
+  SetEnabledSkillInput,
+  SkillPackagePreview,
+  SkillSubmission,
+  SubmitSkillInput,
+  UninstallSkillInput,
+} from "./ipc-skills";
+import type {
+  ClearStorageInput,
+  DeleteStoredFileInput,
+  GetStorageUsageInput,
+  OpenStorageLocationInput,
+  OpenStoredFileInput,
+  StorageUsage,
+} from "./ipc-storage";
+import type {
+  ConfigureHostInput,
+  CreateTeamInviteInput,
+  DirectConversationPage,
+  DirectConversationReadState,
+  DirectConversationSnapshot,
+  DirectMessage,
+  DirectThreadSummary,
+  DirectTypingInput,
+  HostStatus,
+  InvitePreview,
+  InviteSummary,
+  JoinServerInput,
+  LoginServerInput,
+  MarkDirectReadInput,
+  ReadDirectConversationPageInput,
+  RemoteDesktopConnectInput,
+  RemoteDesktopConnectResult,
+  RemoteDesktopSelectDisplayInput,
+  RemoteDesktopSession,
+  ReorderServersInput,
+  ScopedDirectMessageEvent,
+  ScopedDirectTypingEvent,
+  ScopedTeamPresenceSnapshot,
+  SendDirectMessageInput,
+  ServerSummary,
+  SetServerMutedInput,
+  SetServerNotificationLevelInput,
+  SetTeamTypingInput,
+  TeamInviteSummary,
+  TeamMemberSummary,
+  TeamPresenceSnapshot,
+  TeamSessionSummary,
+  UpdateHostIdentityInput,
+  UpdateTeamMemberInput,
+} from "./ipc-team-host";
+import type { VoiceModelStatus, VoiceTranscriptionInput, VoiceTranscriptionResult } from "./ipc-voice";
+import type { AccountSession, MobileConnectedDevice, MobileConnectTicket } from "./mobile-connect";
+
+declare const payloadType: unique symbol;
+declare const resultType: unique symbol;
+declare const untypedBrand: unique symbol;
+declare const serverArgument: unique symbol;
+
+/**
+ * The payload and result of an endpoint that has no types. The main binder and the preload accept
+ * anything for it. Only `browserInput.sendLiveViewInput` uses it: see the comment at that endpoint.
+ */
+export interface Untyped {
+  readonly [untypedBrand]: true;
 }
 
-export interface EventEndpoint<Channel extends string = string> {
+/**
+ * How the preload scopes a request to a server. `payload` wraps the first argument as
+ * `AgentIpcRequest.payload`; `empty` sends a `null` payload. The server is the trailing argument, or
+ * the selected server when the caller leaves it out. An unscoped request has no `scope`.
+ */
+export type ServerScope = "payload" | "empty";
+
+/** Whether the renderer must name the server of a scoped request. It is a type only. */
+export type ServerArgument = "optional" | "required";
+
+export interface RequestEndpoint<Channel extends string = string, Payload = unknown, Result = unknown> {
+  readonly kind: "request";
+  readonly channel: Channel;
+  readonly scope?: ServerScope;
+  readonly [payloadType]?: Payload;
+  readonly [resultType]?: Result;
+}
+
+export interface ScopedRequestEndpoint<
+  Channel extends string = string,
+  Inner = unknown,
+  Result = unknown,
+  Server extends ServerArgument = ServerArgument,
+> extends RequestEndpoint<Channel, AgentIpcRequest<Inner>, Result> {
+  readonly scope: ServerScope;
+  readonly [serverArgument]?: Server;
+}
+
+export interface EventEndpoint<Channel extends string = string, Payload = unknown> {
   readonly kind: "event";
   readonly channel: Channel;
+  readonly [payloadType]?: Payload;
 }
 
 export type IpcEndpoint = RequestEndpoint | EventEndpoint;
 export type IpcEndpointGroup = Readonly<Record<string, IpcEndpoint>>;
 
-function request<Channel extends string>(channel: Channel): RequestEndpoint<Channel> {
-  return { kind: "request", channel };
+// Curried, because explicit type arguments turn off inference for the rest: `request<P, R>(channel)`
+// would widen the channel to `string`, and the literal is what shows the wire value in the type.
+// A request with no payload takes `undefined`: main receives that when the preload sends nothing.
+// A server-scoped payload does not compile here: without `scope`, the preload would not wrap it.
+function request<Payload, Result>(): <Channel extends string>(
+  channel: Channel & ([Payload] extends [AgentIpcRequest<unknown>] ? never : unknown),
+) => RequestEndpoint<Channel, Payload, Result> {
+  return (channel) => ({ kind: "request", channel });
 }
 
-function event<Channel extends string>(channel: Channel): EventEndpoint<Channel> {
-  return { kind: "event", channel };
+// Main receives `AgentIpcRequest<Inner>`; the renderer passes `Inner` and, last, a server.
+function scopedRequest<Inner, Result, Server extends ServerArgument = "optional">(): <Channel extends string>(
+  channel: Channel,
+) => ScopedRequestEndpoint<Channel, Inner, Result, Server> {
+  return (channel) => ({ kind: "request", channel, scope: "payload" });
+}
+
+// A scoped request that carries nothing but the server: main receives `AgentIpcRequest<null>`.
+function scopedQuery<Result, Server extends ServerArgument = "optional">(): <Channel extends string>(
+  channel: Channel,
+) => ScopedRequestEndpoint<Channel, null, Result, Server> {
+  return (channel) => ({ kind: "request", channel, scope: "empty" });
+}
+
+function event<Payload>(): <Channel extends string>(channel: Channel) => EventEndpoint<Channel, Payload> {
+  return (channel) => ({ kind: "event", channel });
+}
+
+function untypedRequest<Channel extends string>(channel: Channel): RequestEndpoint<Channel, Untyped, Untyped> {
+  return { kind: "request", channel };
 }
 
 export const IPC_ENDPOINTS = {
   app: {
-    getAppInfo: request(IPC_CHANNELS.getAppInfo),
-    getSetupState: request(IPC_CHANNELS.getSetupState),
-    saveSetup: request(IPC_CHANNELS.saveSetup),
-    getAnalyticsPreference: request(IPC_CHANNELS.getAnalyticsPreference),
-    setAnalyticsPreference: request(IPC_CHANNELS.setAnalyticsPreference),
-    getAppLanguagePreference: request(IPC_CHANNELS.getAppLanguagePreference),
-    setAppLanguagePreference: request(IPC_CHANNELS.setAppLanguagePreference),
+    getAppInfo: request<undefined, AppInfo>()("app:get-info"),
+    getSetupState: request<undefined, AppSetupState>()("app:get-setup-state"),
+    saveSetup: request<SaveSetupInput, AppSetupState>()("app:save-setup"),
+    getAnalyticsPreference: request<undefined, AnalyticsPreference>()("app:get-analytics-preference"),
+    setAnalyticsPreference: request<SetAnalyticsPreferenceInput, AnalyticsPreference>()("app:set-analytics-preference"),
+    getApprovalAutomation: request<undefined, ApprovalAutomationPreference>()("app:get-approval-automation"),
+    setApprovalAutomation: request<SetApprovalAutomationInput, ApprovalAutomationPreference>()(
+      "app:set-approval-automation",
+    ),
+    // A remote owner or admin can change a grant from a phone or the web client, so main tells the
+    // window instead of the window only reading the value at start.
+    approvalAutomation: event<ApprovalAutomationPreference>()("app:approval-automation"),
+    getAppLanguagePreference: request<undefined, AppLanguagePreference>()("app:get-language-preference"),
+    setAppLanguagePreference: request<SetAppLanguagePreferenceInput, AppLanguagePreference>()(
+      "app:set-language-preference",
+    ),
     // Every window draws its own text, so the choice is broadcast rather than returned: the
     // Dynamic Island overlay has no Settings of its own and would otherwise stay in the old
     // language until it was next recreated.
-    appLanguagePreference: event(IPC_CHANNELS.appLanguagePreference),
+    appLanguagePreference: event<AppLanguagePreference>()("app:language-preference"),
     // The native Preferences menu item and its shortcut live in main, while the dialog lives in
     // the renderer, so the menu click is broadcast rather than handled: every window opens its
     // own Settings.
-    openSettings: event(IPC_CHANNELS.openSettings),
-    openExternal: request(IPC_CHANNELS.openExternal),
-    openUrl: request(IPC_CHANNELS.openUrl),
+    openSettings: event<undefined>()("app:open-settings"),
+    openExternal: request<ExternalDestination, void>()("app:open-external"),
+    openUrl: request<string, void>()("app:open-url"),
   },
   maintenance: {
-    exportData: request(IPC_CHANNELS.maintenanceExportData),
-    exportDiagnostics: request(IPC_CHANNELS.maintenanceExportDiagnostics),
+    exportData: request<undefined, ExportResult>()("maintenance:export-data"),
+    exportDiagnostics: request<undefined, ExportResult>()("maintenance:export-diagnostics"),
   },
   providers: {
-    connectProvider: request(IPC_CHANNELS.connectProvider),
-    refreshAgentProviders: request(IPC_CHANNELS.refreshAgentProviders),
-    updateProviderCli: request(IPC_CHANNELS.updateProviderCli),
-    setProviderApiKey: request(IPC_CHANNELS.setProviderApiKey),
-    clearProviderApiKey: request(IPC_CHANNELS.clearProviderApiKey),
-    getProviderApiKeyState: request(IPC_CHANNELS.getProviderApiKeyState),
+    connectProvider: request<AgentProviderId, AgentStatus>()("app:connect-provider"),
+    refreshAgentProviders: request<undefined, AgentStatus>()("app:refresh-agent-providers"),
+    /**
+     * Runs the provider CLI's own updater, for a CLI the user installed themselves. It is their copy,
+     * so the version they end on is whatever that updater fetches, which owes nothing to the version
+     * OpenBot pins for the runtime it manages.
+     */
+    updateProviderCli: request<ManagedProviderId, AgentStatus>()("app:update-provider-cli"),
+    /**
+     * Stores the optional API key a provider's paid catalog needs, and reconnects the provider.
+     *
+     * The key only ever travels towards main. There is no getter for it, and
+     * `getProviderApiKeyState` answers with a status, because a renderer that can read a key back
+     * puts it in every crash report, export and screenshot that follows.
+     */
+    setProviderApiKey: request<SetProviderApiKeyInput, AgentStatus>()("app:set-provider-api-key"),
+    clearProviderApiKey: request<AgentProviderId, AgentStatus>()("app:clear-provider-api-key"),
+    getProviderApiKeyState: request<AgentProviderId, ProviderApiKeyState>()("app:get-provider-api-key-state"),
+    /**
+     * Starts a sign-in the user finishes on another device, for a provider whose descriptor says
+     * `codeSignIn`. Cancel it with `cancelProviderCodeLogin`; leaving it running holds one provider
+     * process open until the code expires.
+     */
+    startProviderCodeLogin: request<AgentProviderId, ProviderCodeLoginStart>()("app:start-provider-code-login"),
+    /** Abandons a code sign-in: the provider is told, the code is dead, and the provider goes idle. */
+    cancelProviderCodeLogin: request<AgentProviderId, AgentStatus>()("app:cancel-provider-code-login"),
   },
   providerRuntimes: {
-    getStatus: request(IPC_CHANNELS.providerRuntimesGetStatus),
-    download: request(IPC_CHANNELS.providerRuntimesDownload),
-    cancel: request(IPC_CHANNELS.providerRuntimesCancel),
-    event: event(IPC_CHANNELS.providerRuntimesEvent),
+    getStatus: request<undefined, ProviderRuntimeSnapshot>()("provider-runtimes:get-status"),
+    download: request<ManagedProviderId, ProviderRuntimeSnapshot>()("provider-runtimes:download"),
+    cancel: request<ManagedProviderId, ProviderRuntimeSnapshot>()("provider-runtimes:cancel"),
+    /** Asks each provider's upstream for its latest release. Rejects when no source answered. */
+    checkForUpdates: request<undefined, ProviderRuntimeSnapshot>()("provider-runtimes:check-for-updates"),
+    event: event<ProviderRuntimeSnapshot>()("provider-runtimes:event"),
   },
   voice: {
-    getModelStatus: request(IPC_CHANNELS.voiceGetModelStatus),
-    prepareModel: request(IPC_CHANNELS.voicePrepareModel),
-    transcribe: request(IPC_CHANNELS.voiceTranscribe),
-    modelStatus: event(IPC_CHANNELS.voiceModelStatus),
+    getModelStatus: request<undefined, VoiceModelStatus>()("voice:get-model-status"),
+    prepareModel: request<undefined, VoiceModelStatus>()("voice:prepare-model"),
+    transcribe: request<VoiceTranscriptionInput, VoiceTranscriptionResult>()("voice:transcribe"),
+    modelStatus: event<VoiceModelStatus>()("voice:model-status"),
   },
   dynamicIsland: {
-    getPreference: request(IPC_CHANNELS.dynamicIslandGetPreference),
-    setPreference: request(IPC_CHANNELS.dynamicIslandSetPreference),
-    publishPresentation: request(IPC_CHANNELS.dynamicIslandPublishPresentation),
-    getPresentation: request(IPC_CHANNELS.dynamicIslandGetPresentation),
-    presentation: event(IPC_CHANNELS.dynamicIslandPresentation),
-    preference: event(IPC_CHANNELS.dynamicIslandPreference),
-    geometry: event(IPC_CHANNELS.dynamicIslandGeometry),
-    performAction: request(IPC_CHANNELS.dynamicIslandPerformAction),
-    performHaptic: request(IPC_CHANNELS.dynamicIslandPerformHaptic),
-    action: event(IPC_CHANNELS.dynamicIslandAction),
-    setInteractive: request(IPC_CHANNELS.dynamicIslandSetInteractive),
+    getPreference: request<undefined, DynamicIslandPreference>()("dynamic-island:get-preference"),
+    setPreference: request<SetDynamicIslandPreferenceInput, DynamicIslandPreference>()("dynamic-island:set-preference"),
+    publishPresentation: request<DynamicIslandPresentation, void>()("dynamic-island:publish-presentation"),
+    getPresentation: request<undefined, DynamicIslandPresentation>()("dynamic-island:get-presentation"),
+    presentation: event<DynamicIslandPresentation>()("dynamic-island:presentation"),
+    preference: event<DynamicIslandPreference>()("dynamic-island:preference"),
+    geometry: event<DynamicIslandGeometry>()("dynamic-island:geometry"),
+    performAction: request<DynamicIslandAction, void>()("dynamic-island:perform-action"),
+    performHaptic: request<undefined, void>()("dynamic-island:perform-haptic"),
+    action: event<DynamicIslandAction>()("dynamic-island:action"),
+    setInteractive: request<SetDynamicIslandInteractiveInput, void>()("dynamic-island:set-interactive"),
   },
   computerUse: {
-    getMacSetupState: request(IPC_CHANNELS.computerUseGetMacSetupState),
-    openMacPermissionSetup: request(IPC_CHANNELS.computerUseOpenMacPermissionSetup),
-    startHelperDrag: request(IPC_CHANNELS.computerUseStartHelperDrag),
-    revealHelper: request(IPC_CHANNELS.computerUseRevealHelper),
-    closeMacPermissionSetup: request(IPC_CHANNELS.computerUseCloseMacPermissionSetup),
+    getState: request<undefined, ComputerUseState>()("computer-use:get-state"),
+    openPermissionPane: request<MacPermissionId, ComputerUseState>()("computer-use:open-permission-pane"),
+    closePermissionHelp: request<undefined, void>()("computer-use:close-permission-help"),
+    getPermissionApp: request<undefined, ComputerUsePermissionApp | null>()("computer-use:get-permission-app"),
+    startPermissionAppDrag: request<undefined, void>()("computer-use:start-permission-app-drag"),
+    revealPermissionApp: request<undefined, void>()("computer-use:reveal-permission-app"),
+    highlightPlacement: event<ComputerUseHighlightPlacement>()("computer-use:highlight-placement"),
   },
   skills: {
-    localList: request(IPC_CHANNELS.skillsLocalList),
-    localGet: request(IPC_CHANNELS.skillsLocalGet),
-    localCreate: request(IPC_CHANNELS.skillsLocalCreate),
-    localRevise: request(IPC_CHANNELS.skillsLocalRevise),
-    localInstall: request(IPC_CHANNELS.skillsLocalInstall),
+    localList: request<undefined, MarketplaceSkillDetail[]>()("skills:local-list"),
+    localGet: request<LocalSkillRevisionInput, MarketplaceSkillDetail>()("skills:local-get"),
+    localCreate: request<CreateLocalSkillInput, MarketplaceSkillDetail>()("skills:local-create"),
+    localRevise: request<ReviseLocalSkillInput, MarketplaceSkillDetail>()("skills:local-revise"),
+    localInstall: request<InstallLocalSkillInput, InstalledSkill>()("skills:local-install"),
 
-    list: request(IPC_CHANNELS.skillsList),
-    get: request(IPC_CHANNELS.skillsGet),
-    listMine: request(IPC_CHANNELS.skillsListMine),
-    choosePackage: request(IPC_CHANNELS.skillsChoosePackage),
-    submit: request(IPC_CHANNELS.skillsSubmit),
-    listInstalled: request(IPC_CHANNELS.skillsListInstalled),
-    install: request(IPC_CHANNELS.skillsInstall),
-    uninstall: request(IPC_CHANNELS.skillsUninstall),
-    setEnabled: request(IPC_CHANNELS.skillsSetEnabled),
+    list: request<MarketplaceSkillQuery | undefined, MarketplaceSkillPage>()("skills:list"),
+    get: request<string, MarketplaceSkillDetail>()("skills:get"),
+    listMine: request<undefined, SkillSubmission[]>()("skills:list-mine"),
+    choosePackage: request<undefined, SkillPackagePreview | null>()("skills:choose-package"),
+    submit: request<SubmitSkillInput, SkillSubmission>()("skills:submit"),
+    listInstalled: request<string, InstalledSkill[]>()("skills:list-installed"),
+    install: request<InstallSkillInput, InstalledSkill>()("skills:install"),
+    uninstall: request<UninstallSkillInput, void>()("skills:uninstall"),
+    setEnabled: request<SetEnabledSkillInput, InstalledSkill>()("skills:set-enabled"),
   },
   // No event channel: the renderer is the only writer, and the models a saved endpoint adds arrive
   // through the ready `status` event the provider restart already emits.
   customProviders: {
-    list: request(IPC_CHANNELS.customProvidersList),
-    save: request(IPC_CHANNELS.customProvidersSave),
-    delete: request(IPC_CHANNELS.customProvidersDelete),
+    list: request<undefined, CustomProviderSummary[]>()("custom-providers:list"),
+    save: request<SaveCustomProviderInput, CustomProviderResult>()("custom-providers:save"),
+    delete: request<DeleteCustomProviderInput, CustomProviderResult>()("custom-providers:delete"),
+    // This computer only. `providerAdmin` has no edit, so a joined admin cannot reach a stored key
+    // through a changed address.
+    update: request<UpdateCustomProviderInput, CustomProviderResult>()("custom-providers:update"),
+  },
+  // Local model servers and ACP agents on this computer. Main makes every request, and a scan sends
+  // no key. A joined host is never scanned.
+  providerDetection: {
+    scanModelServers: request<undefined, DetectedModelServer[]>()("provider-detection:scan-model-servers"),
+    discoverModels: request<DiscoverModelsInput, DiscoverModelsResult>()("provider-detection:discover-models"),
+    getSettings: request<undefined, ProviderDetectionSettings>()("provider-detection:get-settings"),
+    setSettings: request<ProviderDetectionSettings, ProviderDetectionSettings>()("provider-detection:set-settings"),
+    // Looks for known agent command names only. It starts no file.
+    scanAgents: request<undefined, DetectedAcpAgent[]>()("provider-detection:scan-agents"),
+  },
+  // The user's own ACP agents, on this computer only: no Team API route and no `providerAdmin` entry.
+  // Environment values travel only towards main.
+  customAgents: {
+    list: request<undefined, CustomAgentSummary[]>()("custom-agents:list"),
+    save: request<SaveCustomAgentInput, CustomAgentResult>()("custom-agents:save"),
+    delete: request<DeleteCustomAgentInput, CustomAgentResult>()("custom-agents:delete"),
+    check: request<CheckCustomAgentInput, CustomAgentCheckResult>()("custom-agents:check"),
+  },
+  // The providers of the computer that runs the agents. `providers`, `providerRuntimes` and
+  // `customProviders` reach this computer only; these take the server, so a remote admin reaches the
+  // host. As there, a key only travels towards the host, and no result carries one.
+  providerAdmin: {
+    startCodeLogin: scopedRequest<AgentProviderId, ProviderCodeLoginStart, "required">()(
+      "provider-admin:start-code-login",
+    ),
+    cancelCodeLogin: scopedRequest<AgentProviderId, AgentStatus, "required">()("provider-admin:cancel-code-login"),
+    getApiKeyState: scopedRequest<AgentProviderId, ProviderApiKeyState, "required">()(
+      "provider-admin:get-api-key-state",
+    ),
+    setApiKey: scopedRequest<SetProviderApiKeyInput, AgentStatus, "required">()("provider-admin:set-api-key"),
+    clearApiKey: scopedRequest<AgentProviderId, AgentStatus, "required">()("provider-admin:clear-api-key"),
+    getRuntimes: scopedQuery<ProviderRuntimeSnapshot, "required">()("provider-admin:get-runtimes"),
+    downloadRuntime: scopedRequest<ManagedProviderId, ProviderRuntimeSnapshot, "required">()(
+      "provider-admin:download-runtime",
+    ),
+    cancelRuntime: scopedRequest<ManagedProviderId, ProviderRuntimeSnapshot, "required">()(
+      "provider-admin:cancel-runtime",
+    ),
+    checkRuntimeUpdates: scopedQuery<ProviderRuntimeSnapshot, "required">()("provider-admin:check-runtime-updates"),
+    listCustomProviders: scopedQuery<CustomProviderSummary[], "required">()("provider-admin:list-custom-providers"),
+    saveCustomProvider: scopedRequest<SaveCustomProviderInput, CustomProviderResult, "required">()(
+      "provider-admin:save-custom-provider",
+    ),
+    deleteCustomProvider: scopedRequest<DeleteCustomProviderInput, CustomProviderResult, "required">()(
+      "provider-admin:delete-custom-provider",
+    ),
+  },
+  // The server name, logo and app update of one server's host. `host.updateIdentity` and `update`
+  // reach this computer only; these take the server, so a remote admin reaches the host. The
+  // identity result is the server as the list shows it after the change.
+  hostAdmin: {
+    updateIdentity: scopedRequest<UpdateHostIdentityInput, ServerSummary, "required">()("host-admin:update-identity"),
+    getUpdateStatus: scopedQuery<HostUpdateStatus, "required">()("host-admin:get-update-status"),
+    checkForUpdate: scopedQuery<HostUpdateStatus, "required">()("host-admin:check-for-update"),
+    startUpdate: scopedRequest<UpdateRestartMode, HostUpdateStatus, "required">()("host-admin:start-update"),
+    cancelUpdate: scopedQuery<HostUpdateStatus, "required">()("host-admin:cancel-update"),
+    setUpdateSettings: scopedRequest<HostUpdateSettingsChange, HostUpdateStatus, "required">()(
+      "host-admin:set-update-settings",
+    ),
   },
   hostedSites: {
-    list: request(IPC_CHANNELS.hostedSitesList),
-    chooseDirectory: request(IPC_CHANNELS.hostedSitesChooseDirectory),
-    publish: request(IPC_CHANNELS.hostedSitesPublish),
-    replace: request(IPC_CHANNELS.hostedSitesReplace),
-    delete: request(IPC_CHANNELS.hostedSitesDelete),
+    list: request<undefined, HostedSiteSummary[]>()("hosted-sites:list"),
+    chooseDirectory: request<undefined, string | null>()("hosted-sites:choose-directory"),
+    publish: request<PublishHostedSiteInput, HostedSiteSummary>()("hosted-sites:publish"),
+    replace: request<ReplaceHostedSiteInput, HostedSiteSummary>()("hosted-sites:replace"),
+    delete: request<DeleteHostedSiteInput, void>()("hosted-sites:delete"),
   },
   marketplaceAgents: {
-    list: request(IPC_CHANNELS.marketplaceAgentsList),
-    get: request(IPC_CHANNELS.marketplaceAgentsGet),
-    listMine: request(IPC_CHANNELS.marketplaceAgentsListMine),
-    preview: request(IPC_CHANNELS.marketplaceAgentsPreview),
-    submit: request(IPC_CHANNELS.marketplaceAgentsSubmit),
-    install: request(IPC_CHANNELS.marketplaceAgentsInstall),
+    list: request<MarketplaceAgentQuery | undefined, MarketplaceAgentPage>()("marketplace-agents:list"),
+    get: request<string, MarketplaceAgentDetail>()("marketplace-agents:get"),
+    listMine: request<undefined, AgentSubmission[]>()("marketplace-agents:list-mine"),
+    preview: request<string, AgentPublicationPreview>()("marketplace-agents:preview"),
+    submit: request<SubmitMarketplaceAgentInput, AgentSubmission>()("marketplace-agents:submit"),
+    install: request<InstallMarketplaceAgentInput, InstallMarketplaceAgentResult>()("marketplace-agents:install"),
+  },
+  // Link-only agent templates. `takePendingLink` and `openLink` carry an id from an
+  // `openbot://agents/<id>` link; there is no endpoint that installs from a link without the dialog.
+  agentTemplates: {
+    preview: request<string, AgentTemplatePreview>()("agent-templates:preview"),
+    publish: request<PublishAgentTemplateInput, AgentTemplatePublication>()("agent-templates:publish"),
+    unpublish: request<string, void>()("agent-templates:unpublish"),
+    get: request<string, AgentTemplateDetail>()("agent-templates:get"),
+    install: request<InstallAgentTemplateInput, InstallAgentTemplateResult>()("agent-templates:install"),
+    takePendingLink: request<undefined, string | null>()("agent-templates:take-pending-link"),
+    openLink: event<string>()("agent-templates:open-link"),
   },
   auth: {
-    getState: request(IPC_CHANNELS.authGetState),
-    retry: request(IPC_CHANNELS.authRetry),
-    requestEmailCode: request(IPC_CHANNELS.authRequestEmailCode),
-    verifyEmailCode: request(IPC_CHANNELS.authVerifyEmailCode),
-    updateName: request(IPC_CHANNELS.authUpdateName),
-    updateAvatar: request(IPC_CHANNELS.authUpdateAvatar),
-    createMobileConnect: request(IPC_CHANNELS.authCreateMobileConnect),
-    listMobileConnectedDevices: request(IPC_CHANNELS.authListMobileConnectedDevices),
-    listAccountSessions: request(IPC_CHANNELS.authListAccountSessions),
-    revokeAccountSession: request(IPC_CHANNELS.authRevokeAccountSession),
-    revokeMobileConnectedDevice: request(IPC_CHANNELS.authRevokeMobileConnectedDevice),
-    logout: request(IPC_CHANNELS.authLogout),
-    event: event(IPC_CHANNELS.authEvent),
+    getState: request<undefined, CentralAuthState>()("auth:get-state"),
+    retry: request<undefined, CentralAuthState>()("auth:retry"),
+    requestEmailCode: request<string, CentralAuthState>()("auth:request-email-code"),
+    verifyEmailCode: request<VerifyEmailCodeInput, CentralAuthState>()("auth:verify-email-code"),
+    updateName: request<string, CentralAuthState>()("auth:update-name"),
+    updateAvatar: request<AvatarImageInput | null, CentralAuthState>()("auth:update-avatar"),
+    createMobileConnect: request<undefined, MobileConnectTicket>()("auth:create-mobile-connect"),
+    listMobileConnectedDevices: request<undefined, MobileConnectedDevice[]>()("auth:list-mobile-connected-devices"),
+    listAccountSessions: request<undefined, AccountSession[]>()("auth:list-account-sessions"),
+    revokeAccountSession: request<string, void>()("auth:revoke-account-session"),
+    revokeMobileConnectedDevice: request<string, void>()("auth:revoke-mobile-connected-device"),
+    logout: request<undefined, CentralAuthState>()("auth:logout"),
+    event: event<CentralAuthState>()("auth:event"),
   },
   update: {
-    getStatus: request(IPC_CHANNELS.updateGetStatus),
-    check: request(IPC_CHANNELS.updateCheck),
-    download: request(IPC_CHANNELS.updateDownload),
-    install: request(IPC_CHANNELS.updateInstall),
-    getPreference: request(IPC_CHANNELS.updateGetPreference),
-    setPreference: request(IPC_CHANNELS.updateSetPreference),
-    event: event(IPC_CHANNELS.updateEvent),
+    getStatus: request<undefined, UpdateStatus>()("update:get-status"),
+    check: request<undefined, UpdateStatus>()("update:check"),
+    download: request<undefined, UpdateStatus>()("update:download"),
+    install: request<undefined, void>()("update:install"),
+    getPreference: request<undefined, UpdatePreference>()("update:get-preference"),
+    setPreference: request<UpdatePreferenceChange, UpdatePreference>()("update:set-preference"),
+    cancelScheduledRestart: request<undefined, UpdateStatus>()("update:cancel-scheduled-restart"),
+    event: event<UpdateStatus>()("update:event"),
+    // A preference that an admin of a joined server changed on this computer.
+    preference: event<UpdatePreference>()("update:preference-event"),
+  },
+  notifications: {
+    getPreference: request<undefined, NotificationPreference>()("notifications:get-preference"),
+    setPreference: request<NotificationPreference, NotificationPreference>()("notifications:set-preference"),
+    // Shows one OS notification now, even when the window has focus, so the user can check that the
+    // operating system lets OpenBot show them.
+    test: request<undefined, void>()("notifications:test"),
+    // Opens the operating system page where the user allows OpenBot notifications. It rejects on a
+    // system that has no such page.
+    openSettings: request<undefined, void>()("notifications:open-settings"),
+    opened: event<NotificationOpenedEvent>()("notifications:opened-event"),
   },
   agent: {
-    getStatus: request(IPC_CHANNELS.agentGetStatus),
-    getAnalytics: request(IPC_CHANNELS.agentGetAnalytics),
-    getHostAnalytics: request(IPC_CHANNELS.hostGetAnalytics),
-    getUsage: request(IPC_CHANNELS.agentGetUsage),
-    listModels: request(IPC_CHANNELS.agentListModels),
-    list: request(IPC_CHANNELS.agentList),
-    listInstalledSkills: request(IPC_CHANNELS.agentListInstalledSkills),
-    listChannels: request(IPC_CHANNELS.agentListChannels),
-    readChannel: request(IPC_CHANNELS.agentReadChannel),
-    channelCommand: request(IPC_CHANNELS.agentChannelCommand),
-    deleteChannel: request(IPC_CHANNELS.agentDeleteChannel),
-    getSidebarLayout: request(IPC_CHANNELS.agentGetSidebarLayout),
-    mutateSidebarLayout: request(IPC_CHANNELS.agentMutateSidebarLayout),
-    generateProfile: request(IPC_CHANNELS.agentGenerateProfile),
-    saveProfile: request(IPC_CHANNELS.agentSaveProfile),
-    create: request(IPC_CHANNELS.agentCreate),
-    duplicate: request(IPC_CHANNELS.agentDuplicate),
-    update: request(IPC_CHANNELS.agentUpdate),
-    setAvatar: request(IPC_CHANNELS.agentSetAvatar),
-    delete: request(IPC_CHANNELS.agentDelete),
-    readConversation: request(IPC_CHANNELS.agentReadConversation),
-    readConversationPage: request(IPC_CHANNELS.agentReadConversationPage),
-    searchConversationMessages: request(IPC_CHANNELS.agentSearchConversationMessages),
-    listConversationReads: request(IPC_CHANNELS.agentListConversationReads),
-    markConversationRead: request(IPC_CHANNELS.agentMarkConversationRead),
-    sendMessage: request(IPC_CHANNELS.agentSendMessage),
-    setMessageReaction: request(IPC_CHANNELS.agentSetMessageReaction),
-    listQueue: request(IPC_CHANNELS.agentListQueue),
-    acknowledgeFailedTurn: request(IPC_CHANNELS.agentAcknowledgeFailedTurn),
-    cancelQueuedMessage: request(IPC_CHANNELS.agentCancelQueuedMessage),
-    steerQueuedMessage: request(IPC_CHANNELS.agentSteerQueuedMessage),
-    editQueuedMessage: request(IPC_CHANNELS.agentEditQueuedMessage),
-    updateQueuedMessage: request(IPC_CHANNELS.agentUpdateQueuedMessage),
-    reorderQueue: request(IPC_CHANNELS.agentReorderQueue),
-    interrupt: request(IPC_CHANNELS.agentInterrupt),
-    respondToPrompt: request(IPC_CHANNELS.agentRespondToPrompt),
-    respondToApproval: request(IPC_CHANNELS.agentRespondToApproval),
-    respondToBrowserTakeover: request(IPC_CHANNELS.agentRespondToBrowserTakeover),
-    event: event(IPC_CHANNELS.agentEvent),
+    getStatus: scopedQuery<AgentStatus>()("agent:get-status"),
+    getAnalytics: scopedRequest<AgentAnalyticsInput, AgentAnalytics | null, "required">()("agent:get-analytics"),
+    getHostAnalytics: scopedRequest<HostAnalyticsInput, HostAnalytics | null, "required">()("host:get-analytics"),
+    getUsage: scopedRequest<string | undefined, AccountUsage>()("agent:get-usage"),
+    listModels: scopedQuery<AgentModelOption[]>()("agent:list-models"),
+    listAgents: scopedQuery<AgentSummary[]>()("agent:list"),
+    listInstalledSkills: scopedRequest<string, InstalledSkill[]>()("agent:list-installed-skills"),
+    listChannels: scopedQuery<ChannelSummary[]>()("agent:channels:list"),
+    readChannel: scopedRequest<ChannelReadInput, ChannelPage>()("agent:channels:read"),
+    channelCommand: scopedRequest<ChannelCommand, Channel>()("agent:channels:command"),
+    deleteChannel: scopedRequest<string, void>()("agent:channels:delete"),
+    getSidebarLayout: scopedQuery<SidebarLayoutSnapshot>()("agent:get-sidebar-layout"),
+    mutateSidebarLayout: scopedRequest<SidebarLayoutAction, SidebarLayoutSnapshot>()("agent:mutate-sidebar-layout"),
+    generateProfile: scopedRequest<GenerateAgentProfileInput, AgentProfileDraft>()("agent:generate-profile"),
+    saveProfile: scopedRequest<SaveAgentProfileInput, SaveAgentProfileResult>()("agent:save-profile"),
+    createAgent: scopedRequest<CreateAgentInput, AgentSummary>()("agent:create"),
+    duplicateAgent: scopedRequest<string, DuplicateAgentResult>()("agent:duplicate"),
+    updateAgent: scopedRequest<UpdateAgentInput, AgentSummary>()("agent:update"),
+    setAvatar: scopedRequest<SetAgentAvatarInput, AgentSummary>()("agent:set-avatar"),
+    deleteAgent: scopedRequest<string, void>()("agent:delete"),
+    readConversation: scopedRequest<string, ConversationWithReadState>()("agent:read-conversation"),
+    readConversationPage: scopedRequest<ReadConversationPageInput, ConversationPage>()("agent:read-conversation-page"),
+    searchConversationMessages: scopedRequest<SearchConversationMessagesInput, ConversationSearchPage>()(
+      "agent:search-conversation-messages",
+    ),
+    listConversationReads: scopedQuery<Record<string, ConversationReadState>>()("agent:list-conversation-reads"),
+    markConversationRead: scopedRequest<MarkConversationReadInput, ConversationReadState>()(
+      "agent:mark-conversation-read",
+    ),
+    sendMessage: scopedRequest<SendMessageInput, QueuedMessageReceipt>()("agent:send-message"),
+    setMessageReaction: scopedRequest<SetMessageReactionInput, void>()("agent:set-message-reaction"),
+    listQueue: scopedRequest<string, QueueSnapshot>()("agent:list-queue"),
+    acknowledgeFailedTurn: scopedRequest<AcknowledgeFailedTurnInput, void>()("agent:acknowledge-failed-turn"),
+    cancelQueuedMessage: scopedRequest<CancelQueuedMessageInput, void>()("agent:cancel-queued-message"),
+    steerQueuedMessage: scopedRequest<SteerQueuedMessageInput, void>()("agent:steer-queued-message"),
+    editQueuedMessage: scopedRequest<EditQueuedMessageInput, QueueSnapshot>()("agent:edit-queued-message"),
+    updateQueuedMessage: scopedRequest<UpdateQueuedMessageInput, void>()("agent:update-queued-message"),
+    reorderQueue: scopedRequest<ReorderQueueInput, void>()("agent:reorder-queue"),
+    interrupt: scopedRequest<InterruptTurnInput, void>()("agent:interrupt"),
+    clearContext: scopedRequest<string, void>()("agent:clear-context"),
+    respondToPrompt: scopedRequest<RespondToPromptInput, void>()("agent:respond-to-prompt"),
+    respondToApproval: scopedRequest<RespondToApprovalInput, void>()("agent:respond-to-approval"),
+    respondToBrowserSecret: scopedRequest<RespondToBrowserSecretInput, void>()("agent:respond-to-browser-secret"),
+    respondToBrowserTakeover: scopedRequest<RespondToBrowserTakeoverInput, void>()("agent:respond-to-browser-takeover"),
+    scopedEvent: event<ScopedAgentEvent>()("agent:event"),
   },
   agentMemories: {
-    listMemories: request(IPC_CHANNELS.agentListMemories),
-    createMemory: request(IPC_CHANNELS.agentCreateMemory),
-    updateMemory: request(IPC_CHANNELS.agentUpdateMemory),
-    deleteMemory: request(IPC_CHANNELS.agentDeleteMemory),
-    clearMemories: request(IPC_CHANNELS.agentClearMemories),
+    listMemories: scopedRequest<string, AgentMemory[]>()("agent:list-memories"),
+    createMemory: scopedRequest<CreateAgentMemoryInput, AgentMemory>()("agent:create-memory"),
+    updateMemory: scopedRequest<UpdateAgentMemoryInput, AgentMemory>()("agent:update-memory"),
+    deleteMemory: scopedRequest<DeleteAgentMemoryInput, void>()("agent:delete-memory"),
+    clearMemories: scopedRequest<string, void>()("agent:clear-memories"),
   },
   sharedTables: {
-    listTables: request(IPC_CHANNELS.sharedListTables),
-    deleteTable: request(IPC_CHANNELS.sharedDeleteTable),
+    // Shared tables are not scoped to an agent: there is no `agentId` on either call. The list is
+    // every table in the one shared database, and the user's delete is not owner-gated.
+    listTables: scopedQuery<SharedTable[]>()("shared:list-tables"),
+    deleteTable: scopedRequest<DeleteSharedTableInput, void>()("shared:delete-table"),
   },
   agentRoutines: {
-    listRoutines: request(IPC_CHANNELS.agentListRoutines),
-    createRoutine: request(IPC_CHANNELS.agentCreateRoutine),
-    updateRoutine: request(IPC_CHANNELS.agentUpdateRoutine),
-    deleteRoutine: request(IPC_CHANNELS.agentDeleteRoutine),
-    testRoutine: request(IPC_CHANNELS.agentTestRoutine),
-    listRoutineRuns: request(IPC_CHANNELS.agentListRoutineRuns),
+    listRoutines: scopedRequest<string, Routine[]>()("agent:list-routines"),
+    createRoutine: scopedRequest<CreateRoutineInput, Routine>()("agent:create-routine"),
+    updateRoutine: scopedRequest<UpdateRoutineInput, Routine>()("agent:update-routine"),
+    deleteRoutine: scopedRequest<DeleteRoutineInput, void>()("agent:delete-routine"),
+    testRoutine: scopedRequest<TestRoutineInput, RoutineRun>()("agent:test-routine"),
+    listRoutineRuns: scopedRequest<ListRoutineRunsInput, RoutineRun[]>()("agent:list-routine-runs"),
   },
   channelMemories: {
-    listChannelMemories: request(IPC_CHANNELS.agentListChannelMemories),
-    createChannelMemory: request(IPC_CHANNELS.agentCreateChannelMemory),
-    updateChannelMemory: request(IPC_CHANNELS.agentUpdateChannelMemory),
-    deleteChannelMemory: request(IPC_CHANNELS.agentDeleteChannelMemory),
-    clearChannelMemories: request(IPC_CHANNELS.agentClearChannelMemories),
+    listChannelMemories: scopedRequest<string, ChannelMemory[]>()("agent:channel-memories:list"),
+    createChannelMemory: scopedRequest<CreateChannelMemoryInput, ChannelMemory>()("agent:channel-memories:create"),
+    updateChannelMemory: scopedRequest<UpdateChannelMemoryInput, ChannelMemory>()("agent:channel-memories:update"),
+    deleteChannelMemory: scopedRequest<DeleteChannelMemoryInput, void>()("agent:channel-memories:delete"),
+    clearChannelMemories: scopedRequest<string, void>()("agent:channel-memories:clear"),
   },
   channelRoutines: {
-    listChannelRoutines: request(IPC_CHANNELS.agentListChannelRoutines),
-    createChannelRoutine: request(IPC_CHANNELS.agentCreateChannelRoutine),
-    updateChannelRoutine: request(IPC_CHANNELS.agentUpdateChannelRoutine),
-    deleteChannelRoutine: request(IPC_CHANNELS.agentDeleteChannelRoutine),
-    testChannelRoutine: request(IPC_CHANNELS.agentTestChannelRoutine),
-    listChannelRoutineRuns: request(IPC_CHANNELS.agentListChannelRoutineRuns),
+    listChannelRoutines: scopedRequest<string, ChannelRoutine[]>()("agent:channel-routines:list"),
+    createChannelRoutine: scopedRequest<CreateChannelRoutineInput, ChannelRoutine>()("agent:channel-routines:create"),
+    updateChannelRoutine: scopedRequest<UpdateChannelRoutineInput, ChannelRoutine>()("agent:channel-routines:update"),
+    deleteChannelRoutine: scopedRequest<DeleteChannelRoutineInput, void>()("agent:channel-routines:delete"),
+    testChannelRoutine: scopedRequest<TestChannelRoutineInput, ChannelRoutineRun>()("agent:channel-routines:test"),
+    listChannelRoutineRuns: scopedRequest<ListChannelRoutineRunsInput, ChannelRoutineRun[]>()(
+      "agent:channel-routines:runs",
+    ),
   },
   agentAttachments: {
-    chooseAttachments: request(IPC_CHANNELS.agentChooseAttachments),
-    importAttachments: request(IPC_CHANNELS.agentImportAttachments),
-    discardDraftAttachment: request(IPC_CHANNELS.agentDiscardDraftAttachment),
-    downloadAttachments: request(IPC_CHANNELS.agentDownloadAttachments),
-    openAttachment: request(IPC_CHANNELS.agentOpenAttachment),
-    openSharedFile: request(IPC_CHANNELS.agentOpenSharedFile),
-    openWorkspaceFile: request(IPC_CHANNELS.agentOpenWorkspaceFile),
-    previewSharedFile: request(IPC_CHANNELS.agentPreviewSharedFile),
-    previewWorkspaceFile: request(IPC_CHANNELS.agentPreviewWorkspaceFile),
+    chooseAttachments: scopedRequest<ChooseAttachmentsInput, DraftAttachment[]>()("agent:choose-attachments"),
+    discardDraftAttachment: scopedRequest<string, void>()("agent:discard-draft-attachment"),
+    downloadAttachments: scopedRequest<DownloadAttachmentsInput, void>()("agent:download-attachments"),
+    openAttachment: scopedRequest<OpenAttachmentInput, void>()("agent:open-attachment"),
+    openSharedFile: scopedRequest<OpenSharedFileInput, void>()("agent:open-shared-file"),
+    openWorkspaceFile: scopedRequest<OpenWorkspaceFileInput, void>()("agent:open-workspace-file"),
+    previewSharedFile: scopedRequest<OpenSharedFileInput, FilePreview>()("agent:preview-shared-file"),
+    previewWorkspaceFile: scopedRequest<OpenWorkspaceFileInput, FilePreview>()("agent:preview-workspace-file"),
+  },
+  // Not part of `agentAttachments`: the preload sends the paths of dropped and pasted files, and the
+  // renderer must never name a path to import. So this group is never bridged to the renderer.
+  attachmentImports: {
+    importAttachments: scopedRequest<ImportAttachmentsInput, DraftAttachment[]>()("agent:import-attachments"),
   },
   browser: {
-    open: request(IPC_CHANNELS.browserOpen),
-    activate: request(IPC_CHANNELS.browserActivate),
-    navigate: request(IPC_CHANNELS.browserNavigate),
-    reload: request(IPC_CHANNELS.browserReload),
-    close: request(IPC_CHANNELS.browserClose),
-    listTabs: request(IPC_CHANNELS.browserListTabs),
-    getDisplayState: request(IPC_CHANNELS.browserGetDisplayState),
-    getControlState: request(IPC_CHANNELS.browserGetControlState),
-    capturePreview: request(IPC_CHANNELS.browserCapturePreview),
-    setVisible: request(IPC_CHANNELS.browserSetVisible),
-    displayStateEvent: event(IPC_CHANNELS.browserDisplayStateEvent),
-    pictureInPictureOpen: request(IPC_CHANNELS.browserPictureInPictureOpen),
-    pictureInPictureClose: request(IPC_CHANNELS.browserPictureInPictureClose),
-    pictureInPictureDock: request(IPC_CHANNELS.browserPictureInPictureDock),
-    pictureInPictureHide: request(IPC_CHANNELS.browserPictureInPictureHide),
-    pictureInPictureEvent: event(IPC_CHANNELS.browserPictureInPictureEvent),
+    open: request<BrowserOpenInput, BrowserTab>()("browser:open"),
+    activate: request<string, void>()("browser:activate"),
+    navigate: request<BrowserNavigateInput, void>()("browser:navigate"),
+    reload: request<string, void>()("browser:reload"),
+    close: request<string, void>()("browser:close"),
+    listTabs: request<undefined, BrowserTab[]>()("browser:list-tabs"),
+    getDisplayState: request<undefined, BrowserDisplayState>()("browser:get-display-state"),
+    getControlState: request<undefined, BrowserControlState>()("browser:get-control-state"),
+    capturePreview: request<string, BrowserPreview>()("browser:capture-preview"),
+    setVisible: request<BrowserVisibilityInput, void>()("browser:set-visible"),
+    startLiveView: request<string, void>()("browser:start-live-view"),
+    stopLiveView: request<undefined, void>()("browser:stop-live-view"),
+    liveViewEvent: event<BrowserLiveViewEvent>()("browser:live-view-event"),
+    displayState: event<BrowserDisplayState>()("browser:display-state-event"),
+    openPictureInPicture: request<BrowserBounds | undefined, BrowserBounds>()("browser:picture-in-picture-open"),
+    closePictureInPicture: request<undefined, void>()("browser:picture-in-picture-close"),
+    dockPictureInPicture: request<undefined, void>()("browser:picture-in-picture-dock"),
+    hidePictureInPicture: request<undefined, void>()("browser:picture-in-picture-hide"),
+    pictureInPictureEvent: event<BrowserPictureInPictureEvent>()("browser:picture-in-picture-event"),
+  },
+  // Not part of `browser`, so that group can be bridged: this is the one untyped endpoint. The renderer
+  // sends `BrowserLiveViewInput` and main reads the wire `BrowserViewInput`, which differ on purpose
+  // (see `ipc-browser.ts`); main's wire decoder fills the rest.
+  browserInput: {
+    sendLiveViewInput: untypedRequest("browser:send-live-view-input"),
   },
   servers: {
-    list: request(IPC_CHANNELS.serversList),
-    select: request(IPC_CHANNELS.serversSelect),
-    reorder: request(IPC_CHANNELS.serversReorder),
-    setMuted: request(IPC_CHANNELS.serversSetMuted),
-    join: request(IPC_CHANNELS.serversJoin),
-    previewInvite: request(IPC_CHANNELS.serversPreviewInvite),
-    takePendingInvite: request(IPC_CHANNELS.serversTakePendingInvite),
-    login: request(IPC_CHANNELS.serversLogin),
-    retryConnection: request(IPC_CHANNELS.serversRetryConnection),
-    remove: request(IPC_CHANNELS.serversRemove),
-    getPresence: request(IPC_CHANNELS.serversGetPresence),
-    getPresenceFor: request(IPC_CHANNELS.serversGetPresenceFor),
-    refreshIdentity: request(IPC_CHANNELS.serversRefreshIdentity),
-    listMembers: request(IPC_CHANNELS.serversListMembers),
-    updateMember: request(IPC_CHANNELS.serversUpdateMember),
-    removeMember: request(IPC_CHANNELS.serversRemoveMember),
-    listInvites: request(IPC_CHANNELS.serversListInvites),
-    revokeInvite: request(IPC_CHANNELS.serversRevokeInvite),
-    createInvite: request(IPC_CHANNELS.serversCreateInvite),
-    setTyping: request(IPC_CHANNELS.serversSetTyping),
-    presence: event(IPC_CHANNELS.serversPresence),
-    listDirectThreads: request(IPC_CHANNELS.serversListDirectThreads),
-    readDirectConversation: request(IPC_CHANNELS.serversReadDirectConversation),
-    readDirectConversationPage: request(IPC_CHANNELS.serversReadDirectConversationPage),
-    sendDirectMessage: request(IPC_CHANNELS.serversSendDirectMessage),
-    markDirectRead: request(IPC_CHANNELS.serversMarkDirectRead),
-    setDirectTyping: request(IPC_CHANNELS.serversSetDirectTyping),
-    directMessage: event(IPC_CHANNELS.serversDirectMessage),
-    directTyping: event(IPC_CHANNELS.serversDirectTyping),
-    event: event(IPC_CHANNELS.serversEvent),
-    invite: event(IPC_CHANNELS.serversInvite),
+    list: request<undefined, ServerSummary[]>()("servers:list"),
+    select: request<string, ServerSummary[]>()("servers:select"),
+    reorder: request<ReorderServersInput, ServerSummary[]>()("servers:reorder"),
+    setMuted: request<SetServerMutedInput, ServerSummary[]>()("servers:set-muted"),
+    setNotificationLevel: request<SetServerNotificationLevelInput, ServerSummary[]>()("servers:set-notification-level"),
+    join: request<JoinServerInput, ServerSummary>()("servers:join"),
+    previewInvite: request<JoinServerInput, InvitePreview>()("servers:preview-invite"),
+    takePendingInvite: request<undefined, string | null>()("servers:take-pending-invite"),
+    login: request<LoginServerInput, ServerSummary>()("servers:login"),
+    retryConnection: request<string, ServerSummary>()("servers:retry-connection"),
+    remove: request<string, void>()("servers:remove"),
+    getPresence: request<undefined, TeamPresenceSnapshot>()("servers:get-presence"),
+    getPresenceFor: request<string, TeamPresenceSnapshot>()("servers:get-presence-for"),
+    refreshIdentity: request<string, ServerSummary>()("servers:refresh-identity"),
+    listMembers: request<string, TeamMemberSummary[]>()("servers:list-members"),
+    updateMember: scopedRequest<UpdateTeamMemberInput, TeamMemberSummary, "required">()("servers:update-member"),
+    removeMember: scopedRequest<string, void, "required">()("servers:remove-member"),
+    listInvites: request<string, TeamInviteSummary[]>()("servers:list-invites"),
+    revokeInvite: scopedRequest<string, void, "required">()("servers:revoke-invite"),
+    createInvite: scopedRequest<CreateTeamInviteInput, InviteSummary, "required">()("servers:create-invite"),
+    setTyping: request<SetTeamTypingInput, void>()("servers:set-typing"),
+    scopedPresence: event<ScopedTeamPresenceSnapshot>()("servers:presence"),
+    listDirectThreads: request<undefined, DirectThreadSummary[]>()("servers:list-direct-threads"),
+    readDirectConversation: request<string, DirectConversationSnapshot>()("servers:read-direct-conversation"),
+    readDirectConversationPage: request<ReadDirectConversationPageInput, DirectConversationPage>()(
+      "servers:read-direct-conversation-page",
+    ),
+    sendDirectMessage: request<SendDirectMessageInput, DirectMessage>()("servers:send-direct-message"),
+    markDirectRead: request<MarkDirectReadInput, DirectConversationReadState>()("servers:mark-direct-read"),
+    setDirectTyping: request<DirectTypingInput, void>()("servers:set-direct-typing"),
+    scopedDirectMessage: event<ScopedDirectMessageEvent>()("servers:direct-message"),
+    scopedDirectTyping: event<ScopedDirectTypingEvent>()("servers:direct-typing"),
+    event: event<ServerSummary[]>()("servers:event"),
+    invite: event<string>()("servers:invite"),
+  },
+  // Access and auto-approve of one agent, read and written on the computer that runs it. A joined
+  // server answers only an owner or admin, and only when it advertises `agent-admin-v1`.
+  agentAdmin: {
+    getAgentAdminSettings: scopedRequest<string, AgentAdminSettings>()("agent:admin:get-settings"),
+    updateAgentAdminSettings: scopedRequest<UpdateAgentAdminSettingsInput, AgentAdminSettings>()(
+      "agent:admin:update-settings",
+    ),
+    // The skills of one agent, on the computer that runs it. The `skills` group reads and writes
+    // this computer only; these take the server, so a remote admin reaches the host.
+    listAgentSkills: scopedRequest<string, InstalledSkill[], "required">()("agent:admin:list-skills"),
+    installAgentSkill: scopedRequest<InstallSkillInput, InstalledSkill, "required">()("agent:admin:install-skill"),
+    uninstallAgentSkill: scopedRequest<UninstallSkillInput, void, "required">()("agent:admin:uninstall-skill"),
+    setAgentSkillEnabled: scopedRequest<SetEnabledSkillInput, InstalledSkill, "required">()(
+      "agent:admin:set-skill-enabled",
+    ),
+    // A new agent from a marketplace listing or a shared template, added on the computer that runs
+    // it. The `marketplaceAgents` and `agentTemplates` installs stay for this computer.
+    addMarketplaceAgent: scopedRequest<InstallMarketplaceAgentInput, AddedAgent, "required">()(
+      "agent:admin:add-marketplace-agent",
+    ),
+    addTemplateAgent: scopedRequest<InstallAgentTemplateInput, AddedAgent, "required">()(
+      "agent:admin:add-template-agent",
+    ),
   },
   // A separate group, not part of `servers`: a group is what one registrar covers in full, and
   // `servers` is bound against `RemoteServerManager` while these are bound against `AgentService`.
   mcpServers: {
-    list: request(IPC_CHANNELS.serversListMcpServers),
-    save: request(IPC_CHANNELS.serversSaveMcpServer),
-    remove: request(IPC_CHANNELS.serversRemoveMcpServer),
-    setEnabled: request(IPC_CHANNELS.serversSetMcpServerEnabled),
-    test: request(IPC_CHANNELS.serversTestMcpServer),
+    // Every MCP method names its server, because the settings modal can be open for a server the user
+    // has not switched to. Each mutation answers with the whole list, so the panel never merges.
+    listMcpServers: scopedQuery<McpServerConfig[], "required">()("servers:mcp:list"),
+    saveMcpServer: scopedRequest<SaveMcpServerInput, McpServerConfig[], "required">()("servers:mcp:save"),
+    removeMcpServer: scopedRequest<RemoveMcpServerInput, McpServerConfig[], "required">()("servers:mcp:remove"),
+    setMcpServerEnabled: scopedRequest<SetMcpServerEnabledInput, McpServerConfig[], "required">()(
+      "servers:mcp:set-enabled",
+    ),
+    // A test connects once and reports what it found. Nothing is stored, and no agent uses it.
+    testMcpServer: scopedRequest<TestMcpServerInput, McpTestResult, "required">()("servers:mcp:test"),
+  },
+  // Bound against the storage service, not `AgentService`, so it is its own group.
+  storage: {
+    getUsage: scopedRequest<GetStorageUsageInput, StorageUsage | null, "required">()("storage:get-usage"),
+    deleteFile: scopedRequest<DeleteStoredFileInput, void, "required">()("storage:delete-file"),
+    clear: scopedRequest<ClearStorageInput, void, "required">()("storage:clear"),
+    openFile: scopedRequest<OpenStoredFileInput, void, "required">()("storage:open-file"),
+    openLocation: request<OpenStorageLocationInput, void>()("storage:open-location"),
+  },
+  // Bound against the agent import service, which holds the staged archives.
+  agentImport: {
+    choose: request<undefined, AgentImportPreview | null>()("agent-import:choose"),
+    apply: request<ApplyAgentImportInput, AgentImportResult>()("agent-import:apply"),
+    discard: request<string, void>()("agent-import:discard"),
+    // The export skill for a user who sets up the export agent in Grok Bot by hand. Main reads it
+    // from the app's resources, and `saveSkill` asks where to write it.
+    readSkill: request<undefined, string>()("agent-import:read-skill"),
+    saveSkill: request<undefined, ExportResult>()("agent-import:save-skill"),
+  },
+  // The plugin deep link, its own group because its registrar holds the pending link rather than a
+  // service. `takePendingListing` is what a window that finished loading after the link arrived
+  // asks for; `openListing` is the same slug pushed to a window that was already there.
+  plugins: {
+    takePendingListing: request<undefined, string | null>()("plugins:take-pending-listing"),
+    openListing: event<string>()("plugins:open-listing"),
   },
   host: {
-    getStatus: request(IPC_CHANNELS.hostGetStatus),
-    configure: request(IPC_CHANNELS.hostConfigure),
-    updateIdentity: request(IPC_CHANNELS.hostUpdateIdentity),
-    getPresence: request(IPC_CHANNELS.hostGetPresence),
-    start: request(IPC_CHANNELS.hostStart),
-    stop: request(IPC_CHANNELS.hostStop),
-    recheckScreenRecording: request(IPC_CHANNELS.hostRecheckScreenRecording),
-    listMembers: request(IPC_CHANNELS.hostListMembers),
-    createInvite: request(IPC_CHANNELS.hostCreateInvite),
-    listInvites: request(IPC_CHANNELS.hostListInvites),
-    revokeInvite: request(IPC_CHANNELS.hostRevokeInvite),
-    updateMember: request(IPC_CHANNELS.hostUpdateMember),
-    removeMember: request(IPC_CHANNELS.hostRemoveMember),
-    listSessions: request(IPC_CHANNELS.hostListSessions),
-    revokeSession: request(IPC_CHANNELS.hostRevokeSession),
-    event: event(IPC_CHANNELS.hostEvent),
+    getStatus: request<undefined, HostStatus>()("host:get-status"),
+    configure: request<ConfigureHostInput, HostStatus>()("host:configure"),
+    updateIdentity: request<UpdateHostIdentityInput, HostStatus>()("host:update-identity"),
+    getPresence: request<undefined, TeamPresenceSnapshot>()("host:get-presence"),
+    start: request<undefined, HostStatus>()("host:start"),
+    stop: request<undefined, HostStatus>()("host:stop"),
+    /**
+     * Asks the screen sharing runtime again whether the operating system lets it record, and answers
+     * the status that holds the result.
+     *
+     * The refusal is remembered, because the runtime that reported it is dropped so that the next
+     * attempt reads a new grant. Without this call only another member's attempt could clear it, and
+     * the host owner who just gave the grant would keep reading that they had not.
+     */
+    recheckScreenRecording: request<undefined, HostStatus>()("host:recheck-screen-recording"),
+    listMembers: request<undefined, TeamMemberSummary[]>()("host:list-members"),
+    createInvite: request<CreateTeamInviteInput, InviteSummary>()("host:create-invite"),
+    listInvites: request<undefined, TeamInviteSummary[]>()("host:list-invites"),
+    revokeInvite: request<string, void>()("host:revoke-invite"),
+    updateMember: request<UpdateTeamMemberInput, TeamMemberSummary>()("host:update-member"),
+    removeMember: request<string, void>()("host:remove-member"),
+    listSessions: request<undefined, TeamSessionSummary[]>()("host:list-sessions"),
+    revokeSession: request<string, void>()("host:revoke-session"),
+    event: event<HostStatus>()("host:event"),
   },
   remoteDesktop: {
-    list: request(IPC_CHANNELS.remoteDesktopList),
-    connect: request(IPC_CHANNELS.remoteDesktopConnect),
-    selectDisplay: request(IPC_CHANNELS.remoteDesktopSelectDisplay),
-    disconnect: request(IPC_CHANNELS.remoteDesktopDisconnect),
-    event: event(IPC_CHANNELS.remoteDesktopEvent),
+    checkSetup: request<string, RemoteDesktopSetupStatus>()("remote-desktop:check-setup"),
+    openSetup: request<RemoteDesktopSetupAction, void>()("remote-desktop:open-setup"),
+    test: request<RemoteDesktopTestInput, RemoteDesktopTestStatus>()("remote-desktop:test"),
+    list: request<undefined, RemoteDesktopSession[]>()("remote-desktop:list"),
+    connect: request<RemoteDesktopConnectInput, RemoteDesktopConnectResult>()("remote-desktop:connect"),
+    selectDisplay: request<RemoteDesktopSelectDisplayInput, void>()("remote-desktop:select-display"),
+    disconnect: request<string, void>()("remote-desktop:disconnect"),
+    event: event<RemoteDesktopSession[]>()("remote-desktop:event"),
   },
 } as const;
 
-type ChannelsOf<Group extends IpcEndpointGroup> = Group[keyof Group]["channel"];
+export type IpcEndpoints = typeof IPC_ENDPOINTS;
 
-/** Every channel some group declares, request or event. */
-type GroupedChannel = {
-  [Group in keyof typeof IPC_ENDPOINTS]: ChannelsOf<(typeof IPC_ENDPOINTS)[Group]>;
-}[keyof typeof IPC_ENDPOINTS];
+// What a typed endpoint looks like to the renderer. A payload that may be `undefined` is an optional
+// argument. A server-scoped payload loses its scope and takes the server last instead, because the
+// preload builds the scope; left out, it is the selected server. A scope that carries nothing takes
+// only the server.
+type OptionalArgs<Payload> = [Payload] extends [undefined]
+  ? []
+  : undefined extends Payload
+    ? [input?: Exclude<Payload, undefined>]
+    : [input: Payload];
 
-/** Every channel `IPC_CHANNELS` declares. */
-type DeclaredChannel = (typeof IPC_CHANNELS)[keyof typeof IPC_CHANNELS];
+type ServerArgs<Server> = [Server] extends ["required"] ? [serverId: string] : [serverId?: string];
 
-// The two sets have to be equal, and the type checker is what says so, at no runtime cost. A channel
-// added to `IPC_CHANNELS` and left out of every group fails this with the channel named in the
-// diagnostic; the reverse direction cannot happen, because a group reads its value from
-// `IPC_CHANNELS` and a name that is not there is already an error at the reference. Keeping the
-// unreachable direction anyway is what makes the assertion readable as "these are the same set"
-// rather than as a rule about one of them.
-type SameChannels<Left, Right> = [Left] extends [Right]
-  ? [Right] extends [Left]
-    ? true
-    : { channelsMissingFromEveryGroup: Exclude<Right, Left> }
-  : { channelsNoChannelListDeclares: Exclude<Left, Right> };
+type ScopedArgs<Inner, Server> = [Inner] extends [null]
+  ? ServerArgs<Server>
+  : [...OptionalArgs<Inner>, ...ServerArgs<Server>];
 
-// `Coverage` carries no members — `Record<never, Coverage>` is `{}`, so the intersection is the
-// manifest and nothing else. The constraint is the whole assertion: it is checked where the argument
-// is written, one line down, and `IpcEndpoints` still resolves to the manifest when it fails — one diagnostic naming the channel, rather than every registrar in
-// `src/main` breaking at once against an `IpcEndpoints` that had become the failure object. Carrying
-// it here rather than in an alias of its own is also what keeps it off the package surface: an
-// assertion is referenced by nothing by construction, so a private alias would be `TS6196` under
-// `noUnusedLocals` and an exported one would be API that means nothing to an importer.
-type CoveredEndpoints<Coverage extends true> = typeof IPC_ENDPOINTS & Record<never, Coverage>;
+/**
+ * The `OpenBotDesktopApi` signature of a typed request, so a method that passes its input straight
+ * through takes its types from the endpoint instead of repeating them. An untyped endpoint is `never`.
+ */
+export type Invoke<Endpoint> =
+  Endpoint extends ScopedRequestEndpoint<string, infer Inner, infer Result, infer Server>
+    ? (...args: ScopedArgs<Inner, Server>) => Promise<Result>
+    : Endpoint extends RequestEndpoint<string, infer Payload, infer Result>
+      ? [Payload] extends [Untyped]
+        ? never
+        : (...args: OptionalArgs<Payload>) => Promise<Result>
+      : never;
 
-export type IpcEndpoints = CoveredEndpoints<SameChannels<GroupedChannel, DeclaredChannel>>;
+/** The `OpenBotDesktopApi` subscription to a typed event. It answers the unsubscribe call. */
+export type Subscribe<Endpoint> =
+  Endpoint extends EventEndpoint<string, infer Payload>
+    ? (listener: [Payload] extends [undefined] ? () => void : (payload: Payload) => void) => () => void
+    : never;
+
+type MethodName<Key extends string, Endpoint> = Endpoint extends EventEndpoint ? `on${Capitalize<Key>}` : Key;
+
+/**
+ * The `OpenBotDesktopApi` surface of a group whose methods pass straight through: a request keeps
+ * its key, and an event is `on` and the key. The preload builds it with `bridgeGroup`, so a new
+ * endpoint in such a group needs no line in `ipc-desktop-apis.ts`.
+ */
+export type GroupApi<Group extends IpcEndpointGroup> = {
+  -readonly [Key in keyof Group & string as MethodName<Key, Group[Key]>]: Group[Key] extends EventEndpoint
+    ? Subscribe<Group[Key]>
+    : Invoke<Group[Key]>;
+};
+
+/** The runtime twin of `GroupApi`'s method names, for the preload bridge and the test harness. */
+export function groupApiMethodName(key: string, endpoint: IpcEndpoint): string {
+  return endpoint.kind === "event" ? `on${key.charAt(0).toUpperCase()}${key.slice(1)}` : key;
+}

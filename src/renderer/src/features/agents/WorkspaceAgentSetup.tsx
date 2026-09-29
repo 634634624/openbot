@@ -1,13 +1,14 @@
 import { TEAM_AGENT_CREATE_MODEL_CAPABILITY } from "@openbot/contracts/team-protocol/current";
+import { FIRST_AGENT_SUGGESTIONS, FirstAgentSetup } from "@openbot/ui/features/agents/FirstAgentSetup";
 import { createEffect, createMemo, createSignal } from "solid-js";
 import { useProviders } from "../../providers";
+import { useCustomAgents } from "../custom-agents/custom-agents-context";
 import { useCustomProviders } from "../custom-providers/custom-providers-context";
 import { useSetup } from "../onboarding/onboarding-context";
 import { useServers } from "../servers/servers-context";
 import { useAgentActions } from "./agent-actions";
 import { resolveCreationModel } from "./agent-creation-model";
 import { useAgents } from "./agents-context";
-import { FIRST_AGENT_SUGGESTIONS, FirstAgentSetup } from "./FirstAgentSetup";
 
 /**
  * The create-an-agent form, which takes over the conversation pane instead of
@@ -30,6 +31,7 @@ export function WorkspaceAgentSetup() {
   // Not gated on the server: the picker needs these IDs to label a model it is already showing,
   // and a remote server's OpenCode has its own catalogue. Only the write paths are local-only.
   const { customProviders } = useCustomProviders();
+  const { customAgents } = useCustomAgents();
   const { activeServer, activeServerSupportsCapability } = useServers();
   const {
     providerRuntimeStatuses,
@@ -77,6 +79,8 @@ export function WorkspaceAgentSetup() {
       agentStatus={agentStatus()}
       runtimeStatuses={localProviderDownloads() ? providerRuntimeStatuses() : undefined}
       customProviders={customProviders()}
+      // The custom agents are this computer's. A joined host's picker counts its own from its models.
+      customAgents={activeServer()?.kind === "local" ? customAgents() : undefined}
       onDownloadProvider={localProviderDownloads() ? downloadProviderRuntime : undefined}
       onCancelProviderDownload={localProviderDownloads() ? cancelProviderRuntimeDownload : undefined}
       onConnectProvider={localProviderDownloads() ? connectProvider : undefined}

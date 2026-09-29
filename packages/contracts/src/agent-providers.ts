@@ -19,7 +19,7 @@ import { isOneOf } from "./runtime-values";
  * the per-provider argv, palette tokens and runtime-lock schemas, which belong to the driver, the
  * stylesheet and the lock file.
  */
-export const AGENT_PROVIDERS = ["codex", "claude", "grok", "opencode"] as const;
+export const AGENT_PROVIDERS = ["codex", "claude", "grok", "opencode", "antigravity", "acp"] as const;
 export type AgentProviderId = (typeof AGENT_PROVIDERS)[number];
 
 export function isAgentProvider(value: unknown): value is AgentProviderId {
@@ -49,6 +49,27 @@ export interface AgentProviderDescriptor {
   readonly authKind: AgentAuthState["kind"];
   /** Left-to-right order in the model picker and top-to-bottom in the onboarding list. */
   readonly pickerOrder: number;
+  /**
+   * Whether this provider can be signed in with a code typed on another device.
+   *
+   * Declared here rather than beside the backend's sign-in driver because the picker decides
+   * whether to offer the second sign-in before it has asked main anything, and a capability the
+   * renderer guesses at is a button that fails when it is pressed.
+   */
+  readonly codeSignIn: boolean;
+  /**
+   * The workspace skill folders the CLI reads by itself, in its own order. OpenBot writes only
+   * `.agents/skills` and `.claude/skills`, so each list names at least one of them.
+   * Sources: the Codex "build skills" guide, the Claude Code skills guide, the opencode skills guide
+   * and the skill paths in Google's Antigravity ACP server.
+   */
+  readonly skillFolders: readonly [string, ...string[]];
+  /**
+   * How a Workspace only agent is held to its folders. `tool-sandbox`: the client checks each tool
+   * and asks before an edit. `command-sandbox`: the CLI runs each command in a sandbox.
+   * `confined-process`: the CLI runs in a sandboxed process of its own (`process-confinement.ts`).
+   */
+  readonly workspaceEnforcement: "tool-sandbox" | "command-sandbox" | "confined-process";
 }
 
 /**
@@ -63,10 +84,13 @@ const AGENT_PROVIDER_DESCRIPTOR_TABLE = {
     onboardingDescription: "Included with OpenBot",
     signInMessage: "Connect ChatGPT to continue.",
     installGuideLink: null,
-    defaultModel: "gpt-5.6-luna",
+    defaultModel: "gpt-6-luna",
     legacyModelPrefix: null,
     authKind: "chatgpt",
     pickerOrder: 1,
+    codeSignIn: true,
+    skillFolders: [".agents/skills"],
+    workspaceEnforcement: "command-sandbox",
   },
   claude: {
     id: "claude",
@@ -75,10 +99,13 @@ const AGENT_PROVIDER_DESCRIPTOR_TABLE = {
     onboardingDescription: "Included with OpenBot",
     signInMessage: "Connect Claude to continue.",
     installGuideLink: "claude-install",
-    defaultModel: "claude-sonnet-5",
+    defaultModel: "claude-opus-5-5",
     legacyModelPrefix: "claude-",
     authKind: "claude",
     pickerOrder: 0,
+    codeSignIn: false,
+    skillFolders: [".claude/skills"],
+    workspaceEnforcement: "tool-sandbox",
   },
   grok: {
     id: "grok",
@@ -91,6 +118,9 @@ const AGENT_PROVIDER_DESCRIPTOR_TABLE = {
     legacyModelPrefix: "grok-",
     authKind: "grok",
     pickerOrder: 2,
+    codeSignIn: false,
+    skillFolders: [".agents/skills"],
+    workspaceEnforcement: "confined-process",
   },
   opencode: {
     id: "opencode",
@@ -105,6 +135,44 @@ const AGENT_PROVIDER_DESCRIPTOR_TABLE = {
     legacyModelPrefix: null,
     authKind: "opencode",
     pickerOrder: 3,
+    codeSignIn: false,
+    skillFolders: [".opencode/skills", ".agents/skills", ".claude/skills"],
+    workspaceEnforcement: "confined-process",
+  },
+  // Google moved Google AI Pro and Ultra accounts from Gemini CLI to Antigravity on 18 June 2026,
+  // so the plan runs through Google's Antigravity ACP server. The account and the models are Gemini.
+  antigravity: {
+    id: "antigravity",
+    displayName: "Gemini",
+    cliName: "Antigravity ACP server",
+    onboardingDescription: "Google AI Pro or Ultra plan",
+    signInMessage: "Sign in with Google to use Gemini.",
+    installGuideLink: null,
+    defaultModel: "",
+    legacyModelPrefix: null,
+    authKind: "antigravity",
+    pickerOrder: 4,
+    codeSignIn: false,
+    skillFolders: [".gemini/skills", ".agents/skills"],
+    workspaceEnforcement: "confined-process",
+  },
+  // One provider for every Agent Client Protocol agent the user adds by command. The model id names
+  // the agent (`<customAgentId>/<agentModel>`), so one provider row serves them all and the shipped
+  // provider CHECK lists grow by one word only once.
+  acp: {
+    id: "acp",
+    displayName: "Custom agent",
+    cliName: "ACP agent",
+    onboardingDescription: "An agent you run by command",
+    signInMessage: "Sign in with the agent's own command, then try again.",
+    installGuideLink: null,
+    defaultModel: "",
+    legacyModelPrefix: null,
+    authKind: "acp",
+    pickerOrder: 5,
+    codeSignIn: false,
+    skillFolders: [".agents/skills"],
+    workspaceEnforcement: "confined-process",
   },
 } as const satisfies Record<AgentProviderId, AgentProviderDescriptor>;
 
@@ -126,8 +194,13 @@ export function agentProviderCliName(provider: AgentProviderId): string {
   return AGENT_PROVIDER_DESCRIPTOR_TABLE[provider].cliName;
 }
 
-/** Picker and onboarding order, which is not `AGENT_PROVIDERS` order. */
-export const PICKER_PROVIDERS: readonly AgentProviderId[] = AGENT_PROVIDER_DESCRIPTORS.slice()
+/**
+ * Picker and onboarding order, which is not `AGENT_PROVIDERS` order. `acp` is not in it: a custom
+ * agent is the user's own command, listed in the picker's Custom tab and never offered as a default.
+ */
+export const PICKER_PROVIDERS: readonly AgentProviderId[] = AGENT_PROVIDER_DESCRIPTORS.filter(
+  (descriptor) => descriptor.id !== "acp",
+)
   .sort((left, right) => left.pickerOrder - right.pickerOrder)
   .map((descriptor) => descriptor.id);
 
@@ -142,11 +215,76 @@ export const MANAGED_RUNTIME_PROVIDERS = [
   "claude",
   "grok",
   "opencode",
+  "antigravity",
 ] as const satisfies readonly AgentProviderId[];
 export type ManagedProviderId = (typeof MANAGED_RUNTIME_PROVIDERS)[number];
 
 export function isManagedRuntimeProvider(provider: AgentProviderId): provider is ManagedProviderId {
   return isOneOf(MANAGED_RUNTIME_PROVIDERS, provider);
+}
+
+/**
+ * The providers that stay on the computer that runs OpenBot. The Team API does not carry them, so a
+ * joined server's settings do not list them.
+ */
+export const LOCAL_ONLY_PROVIDERS = ["antigravity", "acp"] as const satisfies readonly AgentProviderId[];
+
+export function isLocalOnlyProvider(provider: AgentProviderId): boolean {
+  return isOneOf(LOCAL_ONLY_PROVIDERS, provider);
+}
+
+/**
+ * A custom agent id: the first segment of its model ids. No `_`, which `isAgentModel` refuses, and
+ * no `/`, which separates the agent from its model.
+ */
+export const CUSTOM_AGENT_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,39}$/;
+
+/**
+ * The ids no custom agent could have when custom agents shipped: a provider id or `custom` would read
+ * as another provider's model. Frozen: a provider added later is refused only for a new agent
+ * (`isNewCustomAgentId`), so an agent saved under that name before the upgrade stays readable,
+ * routable and removable.
+ */
+const AGENT_IDS_RESERVED_AT_RELEASE = ["codex", "claude", "grok", "opencode", "antigravity", "acp", "custom"] as const;
+
+/** A saved custom agent id: what the list decoders, a delete and the model router accept. */
+export function isCustomAgentId(value: string): boolean {
+  return CUSTOM_AGENT_ID_PATTERN.test(value) && !isOneOf(AGENT_IDS_RESERVED_AT_RELEASE, value);
+}
+
+/** The id of an agent to save or of a found agent. It must not be the name of a built-in provider. */
+export function isNewCustomAgentId(value: string): boolean {
+  return isCustomAgentId(value) && !isAgentProvider(value);
+}
+
+/** The model a custom agent with no model list runs on. The agent is given no model. */
+export const CUSTOM_AGENT_DEFAULT_MODEL = "default";
+
+/** The custom agent a model id belongs to, or null for an id with no agent segment. */
+export function customAgentIdOfModel(model: string): string | null {
+  const slash = model.indexOf("/");
+  if (slash <= 0) return null;
+  const id = model.slice(0, slash);
+  return isCustomAgentId(id) ? id : null;
+}
+
+/**
+ * The tools OpenBot downloads for the MCP servers rather than for an agent: a JavaScript runtime,
+ * so that `npx some-server` starts on a machine that has never had Node.
+ *
+ * A separate id space, not a fifth managed provider. `ManagedProviderId` is what makes
+ * `ProviderRuntimeSnapshot.providers` a total record of provider CLIs, and every renderer reader
+ * iterates it to draw a provider card; a tool runtime in that tuple would become a provider
+ * everywhere, from the picker to the model list.
+ */
+export const MANAGED_TOOL_RUNTIMES = ["bun"] as const;
+export type ManagedToolRuntimeId = (typeof MANAGED_TOOL_RUNTIMES)[number];
+
+/** Everything the runtime manager downloads, pins and verifies, whoever ends up running it. */
+export type ManagedRuntimeId = ManagedProviderId | ManagedToolRuntimeId;
+
+export function isManagedToolRuntime(id: string): id is ManagedToolRuntimeId {
+  return isOneOf(MANAGED_TOOL_RUNTIMES, id);
 }
 
 /**
@@ -178,4 +316,12 @@ const FREE_TIER_MODEL_IDS = new Set(["opencode/big-pickle"]);
 
 export function isFreeOpencodeModel(id: string, name: string): boolean {
   return FREE_TIER_MODEL_IDS.has(id.trim().toLowerCase()) || isFreeOpencodeModelName(name);
+}
+
+/**
+ * Whether the provider's account quota limits this model. OpenCode reports only the Go quota, and
+ * OpenCode also runs free, custom and own-sign-in models that the Go quota does not limit.
+ */
+export function accountUsageCoversModel(provider: AgentProviderId, model: string | null | undefined): boolean {
+  return provider !== "opencode" || Boolean(model?.toLowerCase().startsWith("opencode-go/"));
 }

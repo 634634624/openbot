@@ -15,22 +15,25 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { avatarFileExtension, isAvatarMimeType, isValidAvatarImage } from "@openbot/contracts/avatar-images";
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import type { AgentProfileDraft } from "@openbot/contracts/ipc";
 import {
   AGENT_PROVIDERS,
+  type AgentAccess,
   type AgentModelId,
   type AgentProviderId,
   type AgentReasoningEffort,
   type AgentSummary,
   type AvatarImageInput,
   type CreateAgentInput,
+  DEFAULT_AGENT_ACCESS,
   type DuplicateAgentResult,
   decodeAgentProfileDraft,
   decodeSaveAgentProfileResult,
   defaultProviderModel,
+  isAgentAccess,
   isAgentModel,
   isAvatarHue,
   isAvatarSeed,
@@ -43,15 +46,22 @@ import {
 } from "@openbot/contracts/ipc";
 import { type DynamicRecord, isBoolean, isNumber, isOneOf, isString } from "@openbot/contracts/runtime-values";
 import { isGeneratedAgentId, isUuidV4, legacyAgentId } from "@openbot/contracts/validation";
+import { sourceText } from "@openbot/i18n/source";
 import { createOpenBotLogger, toLogValue } from "@openbot/logging";
 import { ProfileCreationRecovery } from "./agent/profile-creation-recovery";
+import type { AgentModelChange } from "./database/agent-roster";
 import { OpenBotDatabase, type ProviderSession, stableThreadId } from "./openbot-database";
+import { isPathInside } from "./path-containment";
 import { isRecord } from "./protocol";
 
-type StoredAgent = AgentSummary;
-type PersistedStoredAgent = Omit<StoredAgent, "avatarUrl" | "provider"> & {
+type StoredAgent = AgentSummary & { access: AgentAccess; computerUse: boolean };
+type PersistedStoredAgent = Omit<StoredAgent, "avatarUrl" | "provider" | "access" | "computerUse"> & {
   avatarUrl?: string | null;
   provider?: AgentProviderId;
+  // Absent on every agent stored before the setting existed, which keeps the access it always had.
+  access?: AgentAccess;
+  // Absent on every agent stored before the setting existed, which keeps Computer Use on.
+  computerUse?: boolean;
 };
 type StoredAgentBase = Omit<PersistedStoredAgent, "avatarSeed" | "avatarHue"> & DynamicRecord;
 
@@ -86,8 +96,8 @@ const LEGACY_AVATAR_COLORS = [
   "gray",
 ] as const;
 
-export const NEW_AGENT_PREVIEW = "No messages yet";
-export const DEFAULT_AGENT_MODEL: AgentModelId = "gpt-5.6-luna";
+const NEW_AGENT_PREVIEW = "No messages yet";
+export const DEFAULT_AGENT_MODEL: AgentModelId = "gpt-6-luna";
 export const DEFAULT_AGENT_PROVIDER: AgentProviderId = "codex";
 // A provider CLI reports the effort its own configuration uses -- Codex says `medium` for every
 // GPT-5.6 model -- which is not the one this product leads with: a new agent starts on the fast
@@ -106,6 +116,11 @@ const LEGACY_AGENTS_STATE_KEY = "bots";
 const LEGACY_AGENTS_IMPORT_COMMAND_ID = "legacy-import:bots:v1";
 
 const logger = createOpenBotLogger("agent-store");
+
+// Windows answers `EBUSY` or `EPERM` while a file in the tree is still open: a provider process that
+// is exiting after its session closed, an antivirus scan or the search indexer. Node retries these
+// codes with a growing delay, about 1.5 seconds in total, before the deletion reports a failure.
+const AGENT_FILES_REMOVAL = { recursive: true, force: true, maxRetries: 5 } as const;
 
 export class AgentStore {
   readonly #statePath: string;
@@ -243,7 +258,7 @@ export class AgentStore {
     profileOperationId?: string,
   ): Promise<AgentSummary> {
     if (this.#state.agents.length >= INPUT_LIMITS.agents) {
-      throw new Error(`A host can have up to ${INPUT_LIMITS.agents} agents.`);
+      throw new Error(sourceText("error.agent.hostLimit", { limit: INPUT_LIMITS.agents }));
     }
     const name = requiredText(input.name, "Agent name", INPUT_LIMITS.agentName);
     const description = limitedText(input.description, "Agent description", INPUT_LIMITS.agentDescription);
@@ -284,7 +299,7 @@ export class AgentStore {
       throw new Error("This agent duplication operation is already committed.");
     }
     if (this.#state.agents.length >= INPUT_LIMITS.agents) {
-      throw new Error(`A host can have up to ${INPUT_LIMITS.agents} agents.`);
+      throw new Error(sourceText("error.agent.hostLimit", { limit: INPUT_LIMITS.agents }));
     }
     const source = this.#requireAgent(sourceId);
     const sourceProfileSignature = duplicationProfileSignature(source);
@@ -302,6 +317,8 @@ export class AgentStore {
     record.provider = source.provider;
     record.model = source.model;
     record.reasoningEffort = source.reasoningEffort;
+    record.access = source.access;
+    record.computerUse = source.computerUse;
     record.avatarSeed = source.avatarSeed;
     record.avatarHue = source.avatarHue;
 
@@ -336,11 +353,11 @@ export class AgentStore {
         (stagedAvatarPath ? await fileFingerprint(stagedAvatarPath) : null) !== sourceAvatarSignature ||
         (sourceAvatar ? await fileFingerprint(sourceAvatar.path) : null) !== sourceAvatarSignature
       ) {
-        throw new Error("The agent changed while it was being duplicated. Try again.");
+        throw new Error(sourceText("error.agent.changedWhileDuplicating"));
       }
       await rewriteInternalWorkspaceSymlinks(source.workspacePath, stagedWorkspace, record.workspacePath);
       if (this.#state.agents.length >= INPUT_LIMITS.agents) {
-        throw new Error(`A host can have up to ${INPUT_LIMITS.agents} agents.`);
+        throw new Error(sourceText("error.agent.hostLimit", { limit: INPUT_LIMITS.agents }));
       }
       record.name = duplicateAgentName(source.name, this.#state.agents);
       await rename(stagedWorkspace, record.workspacePath);
@@ -388,7 +405,7 @@ export class AgentStore {
       throw new Error("The agent duplication receipt is invalid.");
     }
     const agent = this.#state.agents.find((candidate) => candidate.id === resultAgent.id);
-    if (!agent) throw new Error("The duplicated agent no longer exists.");
+    if (!agent) throw new Error(sourceText("error.agent.duplicatedAgentGone"));
     return {
       agent: { ...agent },
       layout: structuredClone(resultLayout),
@@ -486,7 +503,8 @@ export class AgentStore {
     }
   }
 
-  async updateAgent(input: UpdateAgentInput): Promise<AgentSummary> {
+  /** `initiatingAgentId` names the agent that asked for the change, for the audit entry of a model change. */
+  async updateAgent(input: UpdateAgentInput, initiatingAgentId?: string): Promise<AgentSummary> {
     const agent = this.#requireAgent(input.agentId);
     const next = { ...agent };
     if (input.name !== undefined) {
@@ -516,6 +534,14 @@ export class AgentStore {
       if (!isReasoningEffort(input.reasoningEffort)) throw new Error("Invalid reasoning effort.");
       next.reasoningEffort = input.reasoningEffort;
     }
+    if (input.access !== undefined) {
+      if (!isAgentAccess(input.access)) throw new Error("Invalid agent access.");
+      next.access = input.access;
+    }
+    if (input.computerUse !== undefined) {
+      if (!isBoolean(input.computerUse)) throw new Error("Invalid Computer Use value.");
+      next.computerUse = input.computerUse;
+    }
     if (input.avatarSeed !== undefined) {
       if (!isAvatarSeed(input.avatarSeed)) throw new Error("Invalid avatar seed.");
       next.avatarSeed = input.avatarSeed;
@@ -526,9 +552,20 @@ export class AgentStore {
     }
     next.updatedAt = new Date().toISOString();
     const previous = { ...agent };
+    const modelChanged =
+      next.provider !== agent.provider || next.model !== agent.model || next.reasoningEffort !== agent.reasoningEffort;
+    const modelChange: AgentModelChange | undefined =
+      initiatingAgentId !== undefined && modelChanged
+        ? {
+            initiatingAgentId,
+            targetAgentId: agent.id,
+            previous: { provider: agent.provider, model: agent.model, reasoningEffort: agent.reasoningEffort },
+            next: { provider: next.provider, model: next.model, reasoningEffort: next.reasoningEffort },
+          }
+        : undefined;
     Object.assign(agent, next);
     try {
-      this.#persist("agent.updated");
+      this.#persist(modelChange ? "agent.model-changed" : "agent.updated", modelChange);
     } catch (error) {
       Object.assign(agent, previous);
       throw error;
@@ -572,7 +609,7 @@ export class AgentStore {
       return { ...agent };
     }
     if (!isValidAvatarImage(image.mimeType, image.bytes)) {
-      throw new Error("Choose a valid PNG, JPEG, or WebP image up to 512 KB.");
+      throw new Error(sourceText("error.team.logoInvalid"));
     }
     const version = randomUUID();
     const extension = avatarFileExtension(image.mimeType);
@@ -618,7 +655,7 @@ export class AgentStore {
       join(this.#agentsRoot, id),
       `${join(this.#agentsRoot, id)}.openbot-stage`,
     ]) {
-      await rm(path, { recursive: true, force: true });
+      await rm(path, AGENT_FILES_REMOVAL);
     }
     await rm(this.#duplicationMarkerPath(id), { force: true });
     // A workspace that could not follow the rename legitimately sits under the pre-rename root, and deleting
@@ -635,7 +672,7 @@ export class AgentStore {
     if (legacyId !== null) {
       legacyPaths.push(join(this.#avatarsRoot, legacyId), join(this.#legacyAgentsRoot, legacyId));
     }
-    for (const path of legacyPaths) await rm(path, { recursive: true, force: true });
+    for (const path of legacyPaths) await rm(path, AGENT_FILES_REMOVAL);
     // Keep the record for retry until every managed path is removed. Publish the new
     // in-memory list only after the database transaction succeeds.
     const remaining = this.#state.agents.filter((candidate) => candidate.id !== id);
@@ -662,7 +699,7 @@ export class AgentStore {
       return { ...existing };
     }
     if (this.#state.agents.length >= INPUT_LIMITS.agents) {
-      throw new Error(`A host can have up to ${INPUT_LIMITS.agents} agents.`);
+      throw new Error(sourceText("error.agent.hostLimit", { limit: INPUT_LIMITS.agents }));
     }
 
     const record = this.#createRecord(id, name ?? titleFromId(id), title ?? "Local teammate");
@@ -1021,10 +1058,10 @@ export class AgentStore {
       const parsed = JSON.parse(await readFile(this.#statePath, "utf8"));
       const stored = isRecord(parsed) ? parsed[LEGACY_AGENTS_STATE_KEY] : null;
       if (!isRecord(parsed) || !isBoolean(parsed.examplesInitialized) || !Array.isArray(stored)) {
-        throw new Error("Agent state is corrupt or from a newer OpenBot version; refusing to overwrite it.");
+        throw new Error(sourceText("error.agent.stateCorrupt"));
       }
       if (stored.some((agent) => isRecord(agent) && "role" in agent)) {
-        throw new Error("Stored agent profiles use the old role field; update the data before starting OpenBot.");
+        throw new Error(sourceText("error.agent.oldRoleField"));
       }
 
       let agents: StoredAgent[];
@@ -1033,10 +1070,10 @@ export class AgentStore {
       } else if (parsed.version === 2 && stored.every(isStoredAgent)) {
         agents = stored.map(normalizeStoredAgent);
       } else {
-        throw new Error("Agent state is corrupt or from a newer OpenBot version; refusing to overwrite it.");
+        throw new Error(sourceText("error.agent.stateCorrupt"));
       }
       if (new Set(agents.map((agent) => agent.id)).size !== agents.length) {
-        throw new Error("Agent state contains duplicate agent ids; refusing to overwrite it.");
+        throw new Error(sourceText("error.agent.duplicateIds"));
       }
       return { version: 2, examplesInitialized: parsed.examplesInitialized, agents };
     } catch (error) {
@@ -1092,8 +1129,8 @@ export class AgentStore {
     logger.warn("Agents were restored to the roster from the event log.", restored.length);
   }
 
-  #persist(eventType: string): void {
-    this.#database.replaceAgents(`agents:${eventType}:${randomUUID()}`, this.#state.agents, eventType);
+  #persist(eventType: string, modelChange?: AgentModelChange): void {
+    this.#database.replaceAgents(`agents:${eventType}:${randomUUID()}`, this.#state.agents, eventType, modelChange);
   }
 
   #createRecord(id: string, name: string, title: string, description = ""): StoredAgent {
@@ -1107,6 +1144,8 @@ export class AgentStore {
       provider: DEFAULT_AGENT_PROVIDER,
       model: DEFAULT_AGENT_MODEL,
       reasoningEffort: DEFAULT_REASONING_EFFORT,
+      access: DEFAULT_AGENT_ACCESS,
+      computerUse: true,
       threadId: null,
       workspacePath: join(this.#agentsRoot, id),
       preview: NEW_AGENT_PREVIEW,
@@ -1119,7 +1158,7 @@ export class AgentStore {
 
   #requireAgent(id: string): StoredAgent {
     const agent = this.#state.agents.find((candidate) => candidate.id === id);
-    if (!agent) throw new Error(`Unknown agent: ${id}`);
+    if (!agent) throw new Error(sourceText("error.agent.unknown", { id }));
     return agent;
   }
 }
@@ -1146,7 +1185,7 @@ function duplicateAgentName(sourceName: string, agents: readonly StoredAgent[]):
     const candidate = `${base.slice(0, Math.max(1, INPUT_LIMITS.agentName - suffix.length)).trimEnd()}${suffix}`;
     if (!existing.has(candidate.toLocaleLowerCase())) return candidate;
   }
-  throw new Error("OpenBot could not create a unique agent copy name.");
+  throw new Error(sourceText("error.agent.copyNameFailed"));
 }
 
 /**
@@ -1185,10 +1224,10 @@ async function rewriteInternalWorkspaceSymlinks(
         let sourceRelativePath: string;
         try {
           const canonicalTarget = await realpath(resolvedSourceTarget);
-          if (!isPathWithin(canonicalSourceRoot, canonicalTarget)) continue;
+          if (!isPathInside(canonicalSourceRoot, canonicalTarget)) continue;
           sourceRelativePath = relative(canonicalSourceRoot, canonicalTarget);
         } catch {
-          if (!isPathWithin(sourceRoot, resolvedSourceTarget)) continue;
+          if (!isPathInside(sourceRoot, resolvedSourceTarget)) continue;
           sourceRelativePath = relative(sourceRoot, resolvedSourceTarget);
         }
         const finalTarget = join(finalRoot, sourceRelativePath);
@@ -1201,11 +1240,6 @@ async function rewriteInternalWorkspaceSymlinks(
     }
   };
   await visit(stagedRoot, sourceRoot, finalRoot);
-}
-
-function isPathWithin(root: string, candidate: string): boolean {
-  const path = relative(resolve(root), resolve(candidate));
-  return path === "" || (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path));
 }
 
 async function workspaceMetadataFingerprint(root: string): Promise<string> {
@@ -1318,6 +1352,8 @@ function isStoredAgent(value: unknown): value is PersistedStoredAgent {
   const record = value;
   return (
     (record.provider === undefined || isOneOf(AGENT_PROVIDERS, record.provider)) &&
+    (record.access === undefined || isAgentAccess(record.access)) &&
+    (record.computerUse === undefined || isBoolean(record.computerUse)) &&
     isAvatarSeed(record.avatarSeed) &&
     (record.avatarHue === null || isAvatarHue(record.avatarHue)) &&
     isMarketplaceSource(record.marketplaceSource)
@@ -1368,6 +1404,10 @@ function readStoredAgent(value: unknown): ReadStoredAgent | UnreadableStoredAgen
   const model = isAgentModel(value.model)
     ? value.model
     : reset("model", provider === undefined ? DEFAULT_AGENT_MODEL : defaultProviderModel(provider));
+  const access =
+    value.access === undefined || isAgentAccess(value.access) ? value.access : reset("access", DEFAULT_AGENT_ACCESS);
+  const computerUse =
+    value.computerUse === undefined || isBoolean(value.computerUse) ? value.computerUse : reset("computerUse", true);
   let marketplaceSource: StoredAgent["marketplaceSource"];
   if (value.marketplaceSource !== undefined) {
     if (isMarketplaceSource(value.marketplaceSource)) {
@@ -1397,6 +1437,8 @@ function readStoredAgent(value: unknown): ReadStoredAgent | UnreadableStoredAgen
     avatarHue: value.avatarHue === null || isAvatarHue(value.avatarHue) ? value.avatarHue : reset("avatarHue", null),
     avatarUrl: isString(value.avatarUrl) ? value.avatarUrl : null,
     ...(provider === undefined ? {} : { provider }),
+    ...(access === undefined ? {} : { access }),
+    ...(computerUse === undefined ? {} : { computerUse }),
     ...(marketplaceSource === undefined ? {} : { marketplaceSource }),
   };
   return { agent, repaired };
@@ -1410,8 +1452,8 @@ function readStoredAgent(value: unknown): ReadStoredAgent | UnreadableStoredAgen
  * this string reaches a dialog, a log and any diagnostics export.
  */
 function unreadableProfileMessage({ unreadable, id }: UnreadableStoredAgent): string {
-  const subject = id === null ? "A stored agent profile" : `Stored agent profile ${id}`;
-  return `${subject} has an unreadable "${unreadable}" value; update the data before starting OpenBot.`;
+  if (id === null) return sourceText("error.agent.storedProfileUnreadable", { field: unreadable });
+  return sourceText("error.agent.storedProfileUnreadableId", { id, field: unreadable });
 }
 
 function isMarketplaceSource(value: unknown): boolean {
@@ -1454,6 +1496,8 @@ function migrateLegacyAgent(agent: LegacyStoredAgent): StoredAgent {
     provider: providerForLegacyModel(agent.model),
     model: agent.model,
     reasoningEffort: agent.reasoningEffort,
+    access: DEFAULT_AGENT_ACCESS,
+    computerUse: true,
     threadId: agent.threadId,
     workspacePath: agent.workspacePath,
     preview: agent.preview,
@@ -1468,6 +1512,8 @@ function normalizeStoredAgent(agent: PersistedStoredAgent): StoredAgent {
   return {
     ...agent,
     provider: agent.provider ?? providerForLegacyModel(agent.model),
+    access: agent.access ?? DEFAULT_AGENT_ACCESS,
+    computerUse: agent.computerUse ?? true,
     avatarUrl: isString(agent.avatarUrl) && parseAgentAvatarUrl(agent.avatarUrl, agent.id) ? agent.avatarUrl : null,
     ...(agent.marketplaceSource === undefined
       ? {}

@@ -107,7 +107,13 @@ function createTransport(
       signalUrl: "wss://signal.example.test/v1/signal",
     }),
     endSession: async () => undefined,
-    createInvite: async () => ({ inviteId: "invite", token: "token", expiresAt: Date.now() + 60_000 }),
+    createInvite: async () => ({
+      inviteId: "invite",
+      token: "token",
+      expiresAt: Date.now() + 60_000,
+      permanent: false,
+      useCount: 0,
+    }),
     listInvites: async () => [],
     previewInvite: async () => ({
       inviteId: "invite",
@@ -116,6 +122,7 @@ function createTransport(
       role: "member",
       expiresAt: Date.now() + 60_000,
       emailBound: false,
+      permanent: false,
       devicePublicKey: null,
     }),
     acceptInvite: async () => ({ hostId: "host-1", membershipId: "member-1", role: "member" }),
@@ -169,7 +176,13 @@ describe("TeamWebRtcClientTransport", () => {
       startSession,
       issueTicket,
       endSession,
-      createInvite: async () => ({ inviteId: "invite", token: "token", expiresAt: 2_000 }),
+      createInvite: async () => ({
+        inviteId: "invite",
+        token: "token",
+        expiresAt: 2_000,
+        permanent: false,
+        useCount: 0,
+      }),
       listInvites: async () => [],
       previewInvite: async () => ({
         inviteId: "invite",
@@ -178,6 +191,7 @@ describe("TeamWebRtcClientTransport", () => {
         role: "member",
         expiresAt: 2_000,
         emailBound: false,
+        permanent: false,
         devicePublicKey: null,
       }),
       acceptInvite: async () => ({ hostId: "host-1", membershipId: "member-1", role: "member" }),
@@ -318,7 +332,13 @@ describe("TeamWebRtcClientTransport", () => {
         signalUrl: "wss://signal.example.test/v1/signal",
       }),
       endSession,
-      createInvite: async () => ({ inviteId: "invite", token: "token", expiresAt: 2_000 }),
+      createInvite: async () => ({
+        inviteId: "invite",
+        token: "token",
+        expiresAt: 2_000,
+        permanent: false,
+        useCount: 0,
+      }),
       listInvites: async () => [],
       previewInvite: async () => ({
         inviteId: "invite",
@@ -327,6 +347,7 @@ describe("TeamWebRtcClientTransport", () => {
         role: "member",
         expiresAt: 2_000,
         emailBound: false,
+        permanent: false,
         devicePublicKey: null,
       }),
       acceptInvite: async () => ({ hostId: "host-1", membershipId: "member-1", role: "member" }),
@@ -375,7 +396,13 @@ describe("TeamWebRtcClientTransport", () => {
         signalUrl: "wss://signal.example.test/v1/signal",
       }),
       endSession,
-      createInvite: async () => ({ inviteId: "invite", token: "token", expiresAt: 2_000 }),
+      createInvite: async () => ({
+        inviteId: "invite",
+        token: "token",
+        expiresAt: 2_000,
+        permanent: false,
+        useCount: 0,
+      }),
       listInvites: async () => [],
       previewInvite: async () => ({
         inviteId: "invite",
@@ -384,6 +411,7 @@ describe("TeamWebRtcClientTransport", () => {
         role: "member",
         expiresAt: 2_000,
         emailBound: false,
+        permanent: false,
         devicePublicKey: null,
       }),
       acceptInvite: async () => ({ hostId: "host-1", membershipId: "member-1", role: "member" }),
@@ -434,7 +462,13 @@ describe("TeamWebRtcClientTransport", () => {
       startSession,
       issueTicket,
       endSession,
-      createInvite: async () => ({ inviteId: "invite", token: "token", expiresAt: now + 60_000 }),
+      createInvite: async () => ({
+        inviteId: "invite",
+        token: "token",
+        expiresAt: now + 60_000,
+        permanent: false,
+        useCount: 0,
+      }),
       listInvites: async () => [],
       previewInvite: async () => ({
         inviteId: "invite",
@@ -443,6 +477,7 @@ describe("TeamWebRtcClientTransport", () => {
         role: "member",
         expiresAt: now + 60_000,
         emailBound: false,
+        permanent: false,
         devicePublicKey: null,
       }),
       acceptInvite: async () => ({ hostId: "host-1", membershipId: "member-1", role: "member" }),
@@ -564,6 +599,7 @@ describe("TeamWebRtcClientTransport", () => {
     for (const [sequence, payload] of [
       { type: "channel-memories-changed", channelId: "channel-1" },
       { type: "channel-routines-changed", channelId: "channel-1" },
+      { type: "skills-changed", agentId: "agent-1" },
     ].entries()) {
       bridge.emit(
         "data",
@@ -587,42 +623,18 @@ describe("TeamWebRtcClientTransport", () => {
     );
     vi.spyOn(bridge, "send").mockResolvedValue();
     vi.spyOn(bridge, "disconnect").mockResolvedValue();
+    const startSession = vi.fn(async () => ({
+      sessionId: "session-1",
+      hostId: "host-1",
+      expiresAt: Date.now() + 86_400_000,
+    }));
+    const issueTicket = vi.fn(async (sessionId: string) => ({
+      ticket: sessionId,
+      expiresAt: Date.now() + 180_000,
+      signalUrl: "wss://signal.example.test/v1/signal",
+    }));
     const endSession = vi.fn().mockResolvedValue(undefined);
-    const transport = new TeamWebRtcClientTransport({
-      bridge,
-      listHosts: async () => [listedHost],
-      startSession: async () => ({
-        sessionId: "session-1",
-        hostId: "host-1",
-        expiresAt: Date.now() + 86_400_000,
-      }),
-      issueTicket: async () => ({
-        ticket: "ticket",
-        expiresAt: Date.now() + 180_000,
-        signalUrl: "wss://signal.example.test/v1/signal",
-      }),
-      endSession,
-      createInvite: async () => ({ inviteId: "invite", token: "token", expiresAt: Date.now() + 60_000 }),
-      listInvites: async () => [],
-      previewInvite: async () => ({
-        inviteId: "invite",
-        hostId: "host-1",
-        hostName: "Host",
-        role: "member",
-        expiresAt: Date.now() + 60_000,
-        emailBound: false,
-        devicePublicKey: null,
-      }),
-      acceptInvite: async () => ({ hostId: "host-1", membershipId: "member-1", role: "member" }),
-      revokeInvite: async () => undefined,
-      listMembers: async () => [],
-      updateMember: async () => undefined,
-      removeMember: async () => undefined,
-      getPrincipalId: () => "user-1",
-      controlPlaneUrl: "https://api.example.test",
-      downloadHostLogo: async () => ({ bytes: new Uint8Array(), mimeType: "image/png" }),
-      transferDirectory: join(tmpdir(), "openbot-webrtc-client-failure-test"),
-    });
+    const transport = createTransport(bridge, { startSession, issueTicket, endSession });
     transport.pinHostKey("host-1", hostKeys.publicKey);
 
     const first = transport.connect("host-1");
@@ -635,7 +647,30 @@ describe("TeamWebRtcClientTransport", () => {
     expect(results.every((result) => result.status === "rejected" && result.reason.message === "bridge failed")).toBe(
       true,
     );
+    // A failed attempt keeps its session, so a retry against an offline host costs one ticket.
+    expect(endSession).not.toHaveBeenCalled();
+    const retry = transport.connect("host-1");
+    await vi.waitFor(() => expect(connectBridge).toHaveBeenCalledTimes(2));
+    rejectBridge(new Error("bridge failed"));
+    await expect(retry).rejects.toThrow("bridge failed");
+    expect(startSession).toHaveBeenCalledOnce();
+    expect(issueTicket).toHaveBeenNthCalledWith(2, "session-1", expect.stringContaining("PUBLIC KEY"));
+    expect(endSession).not.toHaveBeenCalled();
+
+    // A temporary account API failure keeps the session; only an ended session is replaced.
+    const apiError = (status: number) => Object.assign(new Error(`status ${status}`), { status });
+    issueTicket.mockRejectedValueOnce(apiError(503));
+    await expect(transport.connect("host-1")).rejects.toThrow("status 503");
+    expect(startSession).toHaveBeenCalledOnce();
+    expect(endSession).not.toHaveBeenCalled();
+    issueTicket.mockRejectedValueOnce(apiError(403));
+    const replaced = transport.connect("host-1");
+    await vi.waitFor(() => expect(connectBridge).toHaveBeenCalledTimes(3));
+    rejectBridge(new Error("bridge failed"));
+    await expect(replaced).rejects.toThrow("bridge failed");
     expect(endSession).toHaveBeenCalledWith("session-1");
+    expect(startSession).toHaveBeenCalledTimes(2);
+
     await transport.stop();
   });
 });

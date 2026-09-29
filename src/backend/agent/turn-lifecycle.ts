@@ -1,9 +1,12 @@
-import type {
-  AgentEvent,
-  AgentSummary,
-  BrowserControlState,
-  BrowserTab,
-  ConversationSnapshot,
+import {
+  type AgentEvent,
+  type AgentSummary,
+  type BrowserControlState,
+  type BrowserTab,
+  CONVERSATION_PLAN_ITEM_TYPE,
+  type ConversationPlan,
+  type ConversationSnapshot,
+  conversationPlanText,
 } from "@openbot/contracts/ipc";
 import { isString } from "@openbot/contracts/runtime-values";
 import type { AgentClient } from "../agent-client";
@@ -15,6 +18,7 @@ import {
   decodeAccountLoginCompletedResult,
   getRecord,
   getString,
+  isRecord,
   type ThreadItem,
 } from "../protocol";
 import type { AgentMemories } from "./agent-memories";
@@ -26,7 +30,9 @@ import type { DeltaBuffer } from "./delta-buffer";
 import type { ImageGenRuntime } from "./image-gen-runtime";
 import { markIncompleteImageGeneration } from "./image-generation";
 import type { MailboxSync } from "./mailbox-sync";
-import { isUsageLimitDiagnostic, type ProviderRuntime } from "./provider-runtime";
+import { PLAN_UPDATED_METHOD, planFromNotification } from "./plan-updates";
+import { isUsageLimitDiagnostic } from "./provider-diagnostics";
+import type { ProviderRuntime } from "./provider-runtime";
 import { isNonActionableCodexWarning, toolProgressText, toThreadItem } from "./thread-items";
 import { collectProviderUsage } from "./usage-collection";
 
@@ -40,6 +46,8 @@ export interface AgentBrowserHost extends AttentionBrowserHost, BrowserUploadTar
   onDocumentChanged(listener: (tabId: string, documentIds: ReadonlySet<string>) => void): () => void;
   clearControls(): void;
   endControl(threadId: string, turnId: string): void;
+  /** Deleting an agent closes the tabs it owned, which nothing else can reach once it is gone. */
+  close(tabId: string): Promise<void>;
 }
 
 export interface TurnHooks {
@@ -48,6 +56,7 @@ export interface TurnHooks {
   emitRuntimeSnapshot(): void;
   scheduleDrain(agentId: string): void;
   listAgents(): AgentSummary[];
+  redactMcp(text: string): string;
 }
 
 export interface TurnLifecycleOptions {
@@ -90,6 +99,22 @@ export class TurnLifecycle {
   readonly #failedTurns = new Map<string, string>();
   readonly #itemTurns = new Map<string, string>();
   readonly #turnAssociations = new Map<string, Promise<void>>();
+  /**
+   * The last error a provider reported for each running turn. The provider sends it just before
+   * `turn/completed`, which carries only the status, so without this a failed delivery keeps no
+   * reason once the banner that showed it is gone.
+   */
+  readonly #turnErrors = new Map<string, string>();
+  /** The client, provider thread and start time of each running turn, from its `turn/started`. */
+  readonly #runningTurns = new Map<
+    string,
+    { client: AgentClient; agentId: string; threadId: string; startedAt: number }
+  >();
+  /**
+   * The time of the last provider notification for each agent: a delta, a tool item, a usage
+   * update. It is the only clock that moves while a turn works, and it is lost on restart.
+   */
+  readonly #lastEventAt = new Map<string, number>();
 
   constructor(options: TurnLifecycleOptions) {
     this.#store = options.store;
@@ -112,6 +137,17 @@ export class TurnLifecycle {
 
   forgetAgent(agentId: string): void {
     this.#failedTurns.delete(agentId);
+    this.#lastEventAt.delete(agentId);
+  }
+
+  /** When this running turn sent `turn/started`, in epoch milliseconds. Null for a turn that is not running. */
+  turnStartedAt(turnId: string): number | null {
+    return this.#runningTurns.get(turnId)?.startedAt ?? null;
+  }
+
+  /** When the provider last reported anything for this agent since OpenBot started. */
+  lastEventAt(agentId: string): number | null {
+    return this.#lastEventAt.get(agentId) ?? null;
   }
 
   trackItem(itemId: string, turnId: string): void {
@@ -127,12 +163,33 @@ export class TurnLifecycle {
   dispose(): void {
     this.#failedTurns.clear();
     this.#turnAssociations.clear();
+    this.#turnErrors.clear();
+    this.#runningTurns.clear();
+    this.#lastEventAt.clear();
+  }
+
+  /**
+   * Ends each turn a client ran when the runtime stops it for a reason other than an exit: a
+   * sign-out that an account refresh found, or a new client for the same provider. The stopped
+   * process sends no `turn/completed` and `#handleExit` skips it, so without this its turns stay
+   * active, and its deliveries running, until OpenBot restarts.
+   */
+  interruptTurnsOf(client: AgentClient): void {
+    for (const [turnId, turn] of this.#runningTurns) {
+      if (turn.client !== client) continue;
+      this.#runningTurns.delete(turnId);
+      this.#attention.clearForTurn(turn.threadId, turnId);
+      void this.#completeTurn(turn.agentId, turn.threadId, turnId, "interrupted").catch((error) => {
+        this.#hooks.emitError("turn_completion_failed", error, turn.agentId);
+      });
+    }
   }
 
   handleNotification(notification: AppServerNotification, source: AgentClient): void {
     const params = notification.params;
     const threadId = getString(params, "threadId");
     const agentId = threadId ? this.#conversation.agentForThread(threadId) : undefined;
+    if (agentId) this.#lastEventAt.set(agentId, Date.now());
 
     if (
       threadId &&
@@ -165,6 +222,7 @@ export class TurnLifecycle {
         const turnId = getString(turn, "id");
         if (!turnId) return;
         if (this.#compaction.claimTurn(agentId, threadId, turnId)) return;
+        this.#runningTurns.set(turnId, { client: source, agentId, threadId, startedAt: Date.now() });
         const publicThreadId = this.#conversation.publicThreadId(agentId, threadId);
         const snapshot = this.#conversation.ensureSnapshot(agentId, publicThreadId);
         snapshot.activeTurnId = turnId;
@@ -240,6 +298,17 @@ export class TurnLifecycle {
         });
         return;
       }
+      case PLAN_UPDATED_METHOD: {
+        if (!threadId || !agentId) return;
+        const turnId = getString(params, "turnId");
+        const plan = planFromNotification(params);
+        // A plan for a turn that is not running has no row to update, so it is dropped.
+        if (!turnId || !this.#runningTurns.has(turnId)) return;
+        if (plan) this.#applyPlan(agentId, threadId, turnId, plan);
+        // An empty list removes the turn's plan: the agent deleted its last task.
+        else if (isRecord(params) && Array.isArray(params.plan)) this.#clearPlan(agentId, threadId, turnId);
+        return;
+      }
       case "turn/completed": {
         if (!threadId || !agentId) return;
         const turn = getRecord(params, "turn");
@@ -266,12 +335,6 @@ export class TurnLifecycle {
           this.#conversation.unloadThread(threadId);
         return;
       }
-      case "mcpServer/startupStatus/updated": {
-        if (getString(params, "name") !== "computer-use") return;
-        const status = getString(params, "status");
-        this.#providers.setComputerUseCapability(status === "ready" ? "ready" : "setup-required");
-        return;
-      }
       case "account/rateLimits/updated": {
         this.#providers.refreshCodexUsage();
         return;
@@ -282,9 +345,19 @@ export class TurnLifecycle {
         // name used to stand in for it, which put the bare word "error" in front of the user as if
         // it were the report. An empty text lets the renderer's own sentence take its place; the
         // `code` still carries the method for the log.
-        const message = getString(params, "message") ?? "";
+        // Codex nests the report as `{ error: { message, codexErrorInfo }, willRetry }`; the other
+        // clients send a flat `message`. Reading only the flat field turned every Codex failure,
+        // an exhausted plan included, into the renderer's generic sentence under the usage notice.
+        const error = getRecord(params, "error");
+        const message = getString(params, "message") ?? getString(error, "message") ?? "";
         if (notification.method === "warning" && isNonActionableCodexWarning(message)) return;
-        if (isUsageLimitDiagnostic(message)) {
+        // Codex retries on its own and reports the final failure again without `willRetry`.
+        if (isRecord(params) && params.willRetry === true) return;
+        // A usage limit shows no banner, but the failed delivery still keeps it as the reason.
+        const errorTurnId = getString(params, "turnId");
+        if (notification.method === "error" && message && errorTurnId && this.#runningTurns.has(errorTurnId))
+          this.#turnErrors.set(errorTurnId, message);
+        if (error?.codexErrorInfo === "usageLimitExceeded" || isUsageLimitDiagnostic(message)) {
           this.#providers.refreshUsageAfterLimit(source);
           return;
         }
@@ -294,6 +367,9 @@ export class TurnLifecycle {
   }
 
   async #completeTurn(agentId: string, threadId: string, turnId: string, status: string): Promise<void> {
+    this.#runningTurns.delete(turnId);
+    const reportedError = this.#turnErrors.get(turnId);
+    this.#turnErrors.delete(turnId);
     this.#deltas.flushTurn(turnId);
     await this.#images.waitForOperations(threadId, turnId);
     await this.#turnAssociations.get(turnId)?.catch(() => undefined);
@@ -310,6 +386,9 @@ export class TurnLifecycle {
       markIncompleteImageGeneration(message, message.status);
     }
     const deliveries = this.#mailbox.findDeliveriesByTurn(agentId, turnId);
+    if (deliveries.some((delivery) => delivery.delivery.sender.kind === "agent")) {
+      dropPlaceholderAnswers(snapshot, turnId);
+    }
     const latestAssistant = [...snapshot.messages]
       .reverse()
       .find(
@@ -318,22 +397,26 @@ export class TurnLifecycle {
           message.turnId === turnId &&
           message.itemType !== "commentary" &&
           message.itemType !== "question_prompt" &&
+          message.itemType !== CONVERSATION_PLAN_ITEM_TYPE &&
           message.text.trim(),
       );
     if (deliveries.length > 0) {
       const terminal = status === "failed" ? "failed" : status === "interrupted" ? "interrupted" : "completed";
       for (const delivery of deliveries) {
-        await this.#mailbox.markTerminal(delivery.delivery.id, terminal);
+        const reason = terminal === "failed" && reportedError ? this.#hooks.redactMcp(reportedError) : null;
+        await this.#mailbox.markTerminal(delivery.delivery.id, terminal, reason);
         this.#mailboxSync.syncDeliveryMessage(snapshot, delivery.delivery.id);
       }
-      const relayDelivery = deliveries.find((delivery) => delivery.delivery.sender.kind === "agent");
-      if (
-        !this.#conversation.isExecutionThread(snapshot.threadId) &&
-        terminal === "completed" &&
-        latestAssistant &&
-        relayDelivery
-      ) {
-        await this.#relayAgentResult(agentId, turnId, relayDelivery, latestAssistant.text);
+      // A turn can start with the answers of several teammates. `#relayAgentResult` skips each one
+      // that wants no answer, so only a teammate that asked for a result gets one.
+      if (!this.#conversation.isExecutionThread(snapshot.threadId) && terminal === "completed" && latestAssistant) {
+        for (const delivery of deliveries)
+          await this.#relayAgentResult(agentId, turnId, delivery, latestAssistant.text);
+      }
+      // The requester holds the answers of the other teammates until each request has ended, so
+      // this end can release them, also when this turn failed and sends no result.
+      for (const { delivery } of deliveries) {
+        if (delivery.sender.kind === "agent") this.#hooks.scheduleDrain(delivery.sender.agentId);
       }
     }
     if (latestAssistant && !this.#conversation.isExecutionThread(snapshot.threadId)) {
@@ -362,11 +445,13 @@ export class TurnLifecycle {
   }
 
   async #associateStartedTurn(agentId: string, turnId: string, snapshot: ConversationSnapshot): Promise<void> {
-    const delivery = this.#mailbox.startingDeliveryForAgent(agentId);
-    if (!delivery) return;
+    const deliveries = this.#mailbox.startingDeliveriesForAgent(agentId);
+    if (deliveries.length === 0) return;
     try {
-      await this.#mailbox.markRunning(delivery.delivery.id, turnId);
-      this.#mailboxSync.syncDeliveryMessage(snapshot, delivery.delivery.id);
+      for (const { delivery } of deliveries) {
+        await this.#mailbox.markRunning(delivery.id, turnId);
+        this.#mailboxSync.syncDeliveryMessage(snapshot, delivery.id);
+      }
       this.#mailboxSync.emitQueue(agentId);
     } catch (error) {
       this.#hooks.emitError("delivery_turn_association_failed", error, agentId);
@@ -429,6 +514,36 @@ export class TurnLifecycle {
     this.#conversation.emitConversation(snapshot);
   }
 
+  /**
+   * Shows a turn's plan as one message, which each update replaces. The first update places it in
+   * the transcript; the later ones keep that place, so the list does not move while it fills.
+   */
+  #applyPlan(agentId: string, threadId: string, turnId: string, plan: ConversationPlan): void {
+    const snapshot = this.#conversation.ensureSnapshot(agentId, threadId);
+    const id = `${turnId}:plan`;
+    let message = snapshot.messages.find((candidate) => candidate.id === id);
+    if (!message) {
+      message = newAssistantMessage(id, turnId);
+      snapshot.messages.push(message);
+    }
+    message.itemType = CONVERSATION_PLAN_ITEM_TYPE;
+    message.text = conversationPlanText(plan);
+    message.plan = plan;
+    message.status = "streaming";
+    this.#itemTurns.set(id, turnId);
+    this.#conversation.emitConversation(snapshot);
+  }
+
+  #clearPlan(agentId: string, threadId: string, turnId: string): void {
+    const snapshot = this.#conversation.ensureSnapshot(agentId, threadId);
+    const index = snapshot.messages.findIndex((candidate) => candidate.id === `${turnId}:plan`);
+    if (index < 0) return;
+    // The write rewrites the thread, which deletes the projection row of the removed message.
+    snapshot.messages.splice(index, 1);
+    this.#itemTurns.delete(`${turnId}:plan`);
+    this.#conversation.emitConversation(snapshot);
+  }
+
   #emitTurnProgress(agentId: string, threadId: string, turnId: string, text: string): void {
     this.#hooks.emit({
       type: "turn-progress",
@@ -437,5 +552,35 @@ export class TurnLifecycle {
       turnId,
       detail: text,
     });
+  }
+}
+
+/**
+ * Remove a turn's answers that hold nothing for a reader.
+ *
+ * A teammate can start a turn whose work is all internal: the agent answers the teammate and has
+ * nothing left to tell the user. A provider ends a turn with text, so a model in that position
+ * writes a placeholder instead - "∅" was the one seen. That filler is not only a bubble: the turn
+ * takes the last answer as the result it relays to the teammate who asked, and as the agent's
+ * sidebar preview. A message with no letter and no digit carries neither, so it is dropped here.
+ * The turn-completion write rewrites the whole thread, which deletes the projection row of a
+ * message the snapshot no longer holds, so a placeholder already streamed to the database goes too.
+ *
+ * A message that carries an attachment or a generated image is kept whatever its text: the file is
+ * what the user was given, and the text is only its caption.
+ */
+function dropPlaceholderAnswers(snapshot: ConversationSnapshot, turnId: string): void {
+  for (let index = snapshot.messages.length - 1; index >= 0; index -= 1) {
+    const message = snapshot.messages[index];
+    if (message?.author !== "assistant" || message.turnId !== turnId) continue;
+    if (
+      message.itemType === "commentary" ||
+      message.itemType === "question_prompt" ||
+      message.itemType === CONVERSATION_PLAN_ITEM_TYPE
+    )
+      continue;
+    if (message.attachments?.length || message.imageGeneration) continue;
+    if (!message.text.trim() || /[\p{L}\p{N}]/u.test(message.text)) continue;
+    snapshot.messages.splice(index, 1);
   }
 }

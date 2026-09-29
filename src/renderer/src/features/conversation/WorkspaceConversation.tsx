@@ -1,15 +1,20 @@
-import type { CentralAuthUser } from "@openbot/contracts/ipc";
+import type { CentralAuthUser, UpdateAgentInput } from "@openbot/contracts/ipc";
+import { hasVisibleToasts } from "@openbot/ui";
 import { createMemo } from "solid-js";
-import { hasVisibleToasts } from "../../components/ui";
 import { useNavigation } from "../../navigation";
 import { usePlatform } from "../../platform";
 import { useProviders } from "../../providers";
+import { createScopeGuard } from "../../scope-lifetime";
 import { useTurns } from "../../turns";
+import { turnsPort } from "../../turns-port";
 import { useAuth } from "../account/account-context";
 import { useAgents } from "../agents/agents-context";
+import { createRemoteAgentAdmin, updateRemoteAgent } from "../agents/remote-agent-admin";
 import { useBrowserTabs } from "../browser/browser-context";
+import { useCustomAgents } from "../custom-agents/custom-agents-context";
 import { useCustomProviders } from "../custom-providers/custom-providers-context";
 import { useRemoteDesktop } from "../remote-desktop/remote-desktop-context";
+import { serverSupportsCapability } from "../servers/server-capabilities";
 import { useServerSettings } from "../servers/server-settings";
 import { useServers } from "../servers/servers-context";
 import { useSettings } from "../settings/settings-context";
@@ -31,32 +36,43 @@ import { useConversation } from "./conversation-context";
  * rather than captured once.
  */
 export function WorkspaceConversation(props: { account: () => CentralAuthUser }) {
+  const scopeIsCurrent = createScopeGuard();
   const platform = usePlatform();
   const { activeServer, activeServerSupportsCapability, joinServerOpen } = useServers();
   const { serverSettingsOpen } = useServerSettings();
-  const { appSettingsOpen, skillsMarketplaceOpen } = useSettings();
+  const {
+    appSettingsOpen,
+    skillsMarketplaceOpen,
+    setSkillsMarketplaceOpen,
+    setAgentAutoApprove,
+    agentAutoApproves,
+    generalSettings,
+  } = useSettings();
   const {
     providerRuntimeStatuses,
     providerRuntimeDownloadsAvailable,
     downloadProviderRuntime,
     cancelProviderRuntimeDownload,
     connectProvider,
-    openProviderSignInGuide,
+    providerAdminServerId,
   } = useProviders();
   // Not gated on the server: the picker needs these IDs to label a model it is already showing, and
   // a remote server's OpenCode has its own catalogue. Only the write paths are local-only.
   const { customProviders } = useCustomProviders();
+  const { customAgents } = useCustomAgents();
   const { agentStatus, agentList, activeAgent, modelOptions, settingsRequest, updateAgent, setAgentAvatar } =
     useAgents();
   const {
     activeQueue,
     activeRoutineIds,
+    activeRoutines,
     pendingPrompts,
     pendingApprovals,
     activeTurns,
     turnProgress,
     answerPrompt,
     respondToApproval,
+    respondToApprovalRequest,
     respondToBrowserTakeover,
     cancelQueuedMessage,
     steerQueuedMessage,
@@ -112,24 +128,107 @@ export function WorkspaceConversation(props: { account: () => CentralAuthUser })
       : undefined;
   });
 
-  /** Provider downloads are the local machine's business, never a remote host's. */
+  /**
+   * Access and auto-approve of a joined server's agent, read from its host. Null for this
+   * computer's agents, for a member, and for a host without `agent-admin-v1`.
+   */
+  const remoteAgentAdmin = createRemoteAgentAdmin(() => {
+    const server = activeServer();
+    const agent = activeAgent();
+    return server && agent ? { server, agentId: agent.id } : null;
+  });
+  const remoteAgentSettings = remoteAgentAdmin.settings;
+
+  /**
+   * Who may grant an agent standing approval: this computer for its own agents, and an owner or
+   * admin of a joined server whose host has answered. The policy belongs to the computer that runs
+   * the agent, so a remote grant is written on that host.
+   */
+  const autoApproveEditable = () => activeServer()?.kind === "local" || remoteAgentSettings() !== null;
+
+  async function writeAgentAutoApprove(agentId: string, autoApprove: boolean): Promise<void> {
+    if (activeServer()?.kind === "local") return setAgentAutoApprove(agentId, autoApprove);
+    await remoteAgentAdmin.update({ agentId, autoApprove });
+  }
+
+  /** "Always allow", where the grant is the user's to give. */
+  const alwaysAllowApproval = createMemo(() => {
+    const agent = activeAgent();
+    const approval = activeApproval();
+    if (!agent || !approval || !autoApproveEditable()) return undefined;
+    return async () => {
+      await writeAgentAutoApprove(agent.id, true);
+      if (!scopeIsCurrent()) return false;
+      return respondToApprovalRequest(agent.id, approval.requestId, "accept");
+    };
+  });
+
+  /**
+   * The same grant as the approval card's, offered before an approval rather than during one, so an
+   * agent can be trusted without waiting for it to ask.
+   */
+  const setAgentAutoApproveForActiveAgent = createMemo(() => {
+    const agent = activeAgent();
+    if (!agent || !autoApproveEditable()) return undefined;
+    return (autoApprove: boolean) => writeAgentAutoApprove(agent.id, autoApprove);
+  });
+
+  /** A new chat with the active agent, on this computer or on a host that serves `context-reset-v1`. */
+  const clearActiveAgentContext = createMemo(() => {
+    const agent = activeAgent();
+    const server = activeServer();
+    if (!agent || !server || !serverSupportsCapability(server, "context-reset-v1")) return undefined;
+    return () => turnsPort().agent.clearContext(agent.id, server.id);
+  });
+
+  /** The Team API agent summary has no access, so a joined server's agent shows the host's answer. */
+  const conversationAgent = createMemo(() => {
+    const agent = activeAgent();
+    const settings = remoteAgentSettings();
+    return agent && settings ? { ...agent, access: settings.access } : agent;
+  });
+
+  /** Access of a joined server's agent goes to its host; every other field keeps the Team API route. */
+  async function updateConversationAgent(agentId: string, updates: Omit<UpdateAgentInput, "agentId">): Promise<void> {
+    if (activeServer()?.kind === "local") return updateAgent(agentId, updates);
+    await updateRemoteAgent(remoteAgentAdmin, { agentId, ...updates }, ({ agentId: id, ...rest }) =>
+      updateAgent(id, rest),
+    );
+  }
+
+  /**
+   * Provider downloads run on the computer the agents run on: this one, or a host the account
+   * administers over `providers-v1`.
+   */
+  const providerDownloads = createMemo(
+    () =>
+      (activeServer()?.kind === "local" || providerAdminServerId() !== undefined) &&
+      providerRuntimeDownloadsAvailable(),
+  );
+  /** The browser sign-in opens on this computer, so it stays local. */
   const localProviderDownloads = createMemo(
     () => activeServer()?.kind === "local" && providerRuntimeDownloadsAvailable(),
   );
 
   return (
     <Conversation
+      platform={platform.appInfo()?.platform}
+      onOpenMarketplace={() => setSkillsMarketplaceOpen(true)}
+      onOpenUsage={(trigger) => usage.openUsage(activeServer()?.id ?? "local", trigger, activeAgent()?.id)}
       agentStatus={agentStatus()}
       accountUsage={auth.accountUsage()}
-      providerRuntimeStatuses={localProviderDownloads() ? providerRuntimeStatuses() : undefined}
+      providerRuntimeStatuses={providerDownloads() ? providerRuntimeStatuses() : undefined}
       customProviders={customProviders()}
-      onDownloadProvider={localProviderDownloads() ? downloadProviderRuntime : undefined}
-      onCancelProviderDownload={localProviderDownloads() ? cancelProviderRuntimeDownload : undefined}
+      // The custom agents are this computer's. A joined host's picker counts its own from its models.
+      customAgents={activeServer()?.kind === "local" ? customAgents() : undefined}
+      onDownloadProvider={providerDownloads() ? downloadProviderRuntime : undefined}
+      onCancelProviderDownload={providerDownloads() ? cancelProviderRuntimeDownload : undefined}
       onConnectProvider={localProviderDownloads() ? connectProvider : undefined}
-      onSignInProvider={activeServer()?.kind === "local" ? openProviderSignInGuide : undefined}
-      agent={activeAgent()}
+      onSignInProvider={activeServer()?.kind === "local" ? connectProvider : undefined}
+      agent={conversationAgent()}
       agents={agentList()}
       availableRoutineIds={activeRoutineIds()}
+      routines={activeRoutines()}
       modelOptions={modelOptions()}
       messages={activeMessages()}
       messageReferences={activeAgent() ? (conversations[activeAgent()?.id ?? ""]?.references ?? {}) : {}}
@@ -165,6 +264,7 @@ export function WorkspaceConversation(props: { account: () => CentralAuthUser })
       activeTurnId={activeAgent() ? activeTurns()[activeAgent()?.id ?? ""] : null}
       activityDetail={activeAgent() ? turnProgress()[activeAgent()?.id ?? ""]?.detail : undefined}
       skillsMarketplaceOpen={skillsMarketplaceOpen()}
+      mcpSettingsOpen={serverSettingsOpen() || skillsMarketplaceOpen()}
       globalOverlayOpen={
         globalSearchOpen() ||
         joinServerOpen() ||
@@ -176,7 +276,7 @@ export function WorkspaceConversation(props: { account: () => CentralAuthUser })
       settingsRequest={settingsRequest()}
       messageFocusRequest={messageFocusRequest()}
       onSelectAgent={selectAgent}
-      onUpdateAgent={updateAgent}
+      onUpdateAgent={updateConversationAgent}
       onSetAgentAvatar={setAgentAvatar}
       onSendMessage={sendMessage}
       onMarkRead={() => markAgentMessagesRead()}
@@ -194,6 +294,19 @@ export function WorkspaceConversation(props: { account: () => CentralAuthUser })
       onAnswerPrompt={answerPrompt}
       onPromptResolutionPresented={presentPromptResolution}
       onRespondToApproval={respondToApproval}
+      onAlwaysAllowApproval={alwaysAllowApproval()}
+      agentAutoApproves={
+        activeServer()?.kind === "local"
+          ? agentAutoApproves(activeAgent()?.id ?? "")
+          : (remoteAgentSettings()?.autoApprove ?? false)
+      }
+      agentAutoApproveLocked={
+        activeServer()?.kind === "local"
+          ? generalSettings().turboMode
+          : (remoteAgentSettings()?.autoApproveLocked ?? false)
+      }
+      onSetAgentAutoApprove={setAgentAutoApproveForActiveAgent()}
+      onClearAgentContext={clearActiveAgentContext()}
       onRespondToBrowserTakeover={respondToBrowserTakeover}
       onCancelQueuedMessage={cancelQueuedMessage}
       onSteerQueuedMessage={steerQueuedMessage}
@@ -202,7 +315,6 @@ export function WorkspaceConversation(props: { account: () => CentralAuthUser })
       onActivateBrowserTab={activateBrowserTab}
       onCloseBrowserTab={closeBrowserTab}
       onOpenRemoteDesktop={openRemoteDesktopWorkspace}
-      onOpenAgentSetup={() => window.openbot.openExternal("agent-setup")}
       onStop={stopActiveTurn}
     />
   );

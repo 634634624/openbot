@@ -1,12 +1,16 @@
+import { Heading, Text } from "@openbot/ui";
+import type { AgentProfile, ChatActionMarkerModel } from "@openbot/ui/data";
+import { ChatActionMarker } from "@openbot/ui/features/conversation/ChatActionMarker";
 import { createSignal } from "solid-js";
-import { expect, fn } from "storybook/test";
+import { fn } from "storybook/test";
 import type { Meta, StoryObj } from "storybook-solidjs-vite";
-import { Heading, Text } from "../src/components/ui";
-import type { AgentProfile, ChatActionMarkerModel } from "../src/data";
 import { AgentSkillsModal } from "../src/features/conversation/AgentSkillsModal";
-import { ChatActionMarker } from "../src/features/conversation/ChatActionMarker";
 
-const agents: AgentProfile[] = [agent("research", "Research"), agent("sales", "Sales")];
+const agents: AgentProfile[] = [
+  agent("research", "Research"),
+  agent("sales", "Sales"),
+  agent("social", "OpenBot SM manager for very long names"),
+];
 const onSelectAgent = fn();
 const onOpenRoutine = fn();
 const onOpenHostedSite = fn();
@@ -96,14 +100,10 @@ export const AllStates: Story = {
           agents={agents}
           onSelectAgent={onSelectAgent}
         />
+        <ChatActionMarker marker={{ kind: "context-reset", timestamp }} agents={agents} onSelectAgent={onSelectAgent} />
       </section>
     </main>
   ),
-  play: async ({ canvas, userEvent }) => {
-    onOpenRoutine.mockClear();
-    await userEvent.click(canvas.getAllByRole("button", { name: "Open routine Morning brief" })[0]);
-    await expect(onOpenRoutine).toHaveBeenCalledWith({ routineId: "routine-1", name: "Morning brief" });
-  },
 };
 
 export const CompactAndUnavailable: Story = {
@@ -142,6 +142,30 @@ export const CompactAndUnavailable: Story = {
   ),
 };
 
+export const AgentRecipientsMenu: Story = {
+  render: () => (
+    <main class="foundation-story">
+      <Heading as="h1" size="lg">
+        Recipient menu
+      </Heading>
+      <section class="chat-primitives-stage chat-primitives-stage-narrow" aria-label="Chat marker recipient menu">
+        <ChatActionMarker
+          marker={agentMarker(
+            [
+              { agentId: "research", status: "completed" },
+              { agentId: "social", status: "completed" },
+              { agentId: "sales", status: "running" },
+            ],
+            "in-progress",
+          )}
+          agents={agents}
+          onSelectAgent={onSelectAgent}
+        />
+      </section>
+    </main>
+  ),
+};
+
 export const ReducedMotion: Story = {
   render: () => (
     <main class="foundation-story">
@@ -159,6 +183,34 @@ export const ReducedMotion: Story = {
     </main>
   ),
   parameters: { chromatic: { prefersReducedMotion: "reduce" } },
+};
+
+export const RoutineRunSummary: Story = {
+  render: () => (
+    <main class="foundation-story">
+      <Heading as="h1" size="lg">
+        Completed routine run
+      </Heading>
+      <Text tone="secondary">The latest state stays visible. Earlier states are available on demand.</Text>
+      <section class="chat-primitives-stage chat-primitives-stage-narrow" aria-label="Routine run summary">
+        <ChatActionMarker
+          marker={{
+            ...routineMarker("succeeded"),
+            runId: "run-summary",
+            previousTransitions: [
+              { status: "queued", timestamp: "2026-09-01T08:00:00.000Z" },
+              { status: "running", timestamp: "2026-09-01T08:01:00.000Z" },
+              { status: "needs-attention", timestamp: "2026-09-01T08:02:00.000Z" },
+              { status: "running", timestamp: "2026-09-01T08:03:00.000Z" },
+            ],
+          }}
+          agents={agents}
+          onSelectAgent={onSelectAgent}
+          onOpenRoutine={onOpenRoutine}
+        />
+      </section>
+    </main>
+  ),
 };
 
 const timestamp = "2026-09-01T08:00:00.000Z";

@@ -3,7 +3,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { AgentEvent } from "@openbot/contracts/ipc";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AgentProvider } from "../agent-client";
+import { AgentProcessExitError, type AgentProvider } from "../agent-client";
 import type { AgentService } from "../agent-service";
 import {
   CREATE_AGENT_INPUT,
@@ -17,17 +17,20 @@ import {
   FakeAgentClient,
   readTextOrEmpty,
   startAgentTestFixture,
+  startService,
   stopAgentTestFixture,
   stores,
   waitFor,
+  waitForQueue,
 } from "../agent-service-test-harness";
 import type { AgentStore } from "../agent-store";
-
+import { McpServerStore } from "../mcp-server-store";
 import type { CustomProviderConfig } from "../opencode-config";
 import { getString } from "../protocol";
 import { DIAGNOSTIC_TEXT_LIMIT } from "../stderr-diagnostics";
 import { DrainScheduler } from "./drain-scheduler";
-import { isUsageLimitDiagnostic } from "./provider-runtime";
+import { isUsageLimitDiagnostic } from "./provider-diagnostics";
+import { PROVIDER_IDLE_RELEASE_MS, PROVIDER_UNASSIGNED_RELEASE_MS } from "./provider-runtime";
 
 let root: string;
 let service: AgentService | null = null;
@@ -74,14 +77,11 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
 
   it("keeps another provider's live delivery running when OpenCode reconnects", async () => {
     process.env.OPENBOT_OPENCODE_PATH = await createFakeOpencode(root);
-    const { store, mailbox } = stores(root);
-    service = createTestService({
-      store,
-      mailbox,
+    const { service: agentService } = await startService(root, {
+      client: (provider) => new FakeAgentClient(provider, "", false),
       preferredProvider: "codex",
-      clientFactory: (provider) => new FakeAgentClient(provider, "", false),
     });
-    await service.initialize();
+    service = agentService;
     await service.sendMessage({ agentId: "chief", text: "Keep working." });
     const running = service;
     await waitFor(async () => Boolean((await running.readConversation("chief")).activeTurnId));
@@ -144,7 +144,14 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     process.env.OPENBOT_CLAUDE_PATH = await createFakeClaude(root);
     process.env.OPENBOT_GROK_PATH = await createFakeGrok(root);
     const { store, mailbox } = stores(root);
-    const delays: Record<AgentProvider, number> = { codex: 60, claude: 5, grok: 30, opencode: 0 };
+    const delays: Record<AgentProvider, number> = {
+      codex: 60,
+      claude: 5,
+      grok: 30,
+      opencode: 0,
+      antigravity: 0,
+      acp: 0,
+    };
     const availableOrder: AgentProvider[] = [];
     const seen = new Set<AgentProvider>();
     const accountReads = new Set<AgentProvider>();
@@ -190,14 +197,25 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
 
     expect(availableOrder).toEqual(["claude", "grok", "codex"]);
 
-    // The CLI also reports gpt-reserve, gpt-5.5, gpt-5.4-mini and codex-auto-review, the models
-    // this product does not offer.
+    // Every model the CLI reports is offered, newest first. A name with no version goes last, and
+    // the CLI's order stays between models of one version.
     expect(
       service
         .listModels()
         .filter((model) => model.provider === "codex")
         .map((model) => model.id),
-    ).toEqual(["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.4", "gpt-5.3-codex-spark"]);
+    ).toEqual([
+      "gpt-6-luna",
+      "gpt-5.6-luna",
+      "gpt-5.6-terra",
+      "gpt-5.6-sol",
+      "gpt-5.5",
+      "gpt-5.4",
+      "gpt-5.4-mini",
+      "gpt-5.3-codex-spark",
+      "gpt-reserve",
+      "codex-auto-review",
+    ]);
   });
   async function opencodeModelIds(storedKey: string | null, catalog?: string[]): Promise<string[]> {
     process.env.OPENBOT_OPENCODE_PATH = await createFakeOpencode(root);
@@ -257,7 +275,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     // An agent that has chosen no model runs whatever comes first, and OpenCode reports the
     // services the user signed in to before its own. So the order carries four claims: Muse leads,
     // no billed model outranks a free one, OpenCode's own paid models outrank a third-party
-    // sign-in OpenBot cannot refresh, and the CLI's order survives inside one tier.
+    // sign-in OpenBot cannot refresh, and the newest version leads inside one tier.
     expect(
       await opencodeModelIds(null, [
         "openai/gpt-5.3-codex-spark",
@@ -268,23 +286,20 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
       ]),
     ).toEqual([
       "opencode/muse-spark-1.3-contributor-free",
-      "opencode/big-pickle",
       "opencode/nemotron-3.5-lightning-free",
       "opencode/mimo-v2.5-free",
+      "opencode/big-pickle",
       "openai/gpt-5.3-codex-spark",
     ]);
   });
 
   it("keeps the CLI version with sign-in-required and no models when OpenCode reports no account", async () => {
     process.env.OPENBOT_OPENCODE_PATH = await createFakeOpencode(root);
-    const { store, mailbox } = stores(root);
-    service = createTestService({
-      store,
-      mailbox,
+    const { service: agentService } = await startService(root, {
+      client: (provider) => new FakeAgentClient(provider, "DONE", false, provider !== "opencode"),
       preferredProvider: "opencode",
-      clientFactory: (provider) => new FakeAgentClient(provider, "DONE", false, provider !== "opencode"),
     });
-    await service.initialize();
+    service = agentService;
     // The version comes from the resolve step while the models come from the later discovery, so a
     // connected CLI with no account keeps its version on the row while the catalog stays empty.
     expect(service.getStatus().providers).toContainEqual(
@@ -471,7 +486,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         .listModels()
         .filter((model) => model.provider === "codex")
         .map((model) => model.name),
-    ).toEqual(["GPT-5.6 Sol", "GPT-6 Astra"]);
+    ).toEqual(["GPT-6 Astra", "GPT-5.6 Sol"]);
   });
 
   it("names a Claude model by the model, not by the pick Claude Code calls it", async () => {
@@ -498,7 +513,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         .listModels()
         .filter((model) => model.provider === "claude")
         .map((model) => model.name),
-    ).toEqual(["Claude Sonnet 5", "Claude Haiku 4.5", "Claude Fable 5.1 (1M context)", "Next"]);
+    ).toEqual(["Claude Fable 5.1 (1M context)", "Claude Sonnet 5", "Claude Haiku 4.5", "Next"]);
   });
 
   it("collects all ChatGPT pages and keeps the previous catalog when pagination fails", async () => {
@@ -523,7 +538,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         .listModels()
         .filter((model) => model.provider === "codex")
         .map((model) => model.id),
-    ).toEqual(["gpt-5.6-sol", "gpt-6-astra"]);
+    ).toEqual(["gpt-6-astra", "gpt-5.6-sol"]);
     expect(client.requests).toContainEqual({
       method: "model/list",
       params: { limit: 100, includeHidden: true, cursor: "page-2" },
@@ -643,14 +658,11 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
   });
 
   it("restores the connect action when the login page cannot open", async () => {
-    const { store, mailbox } = stores(root);
-    service = createTestService({
-      store,
-      mailbox,
+    const { service: agentService } = await startService(root, {
+      client: (provider) => new FakeAgentClient(provider, "DONE", true, provider !== "codex"),
       preferredProvider: "codex",
-      clientFactory: (provider) => new FakeAgentClient(provider, "DONE", true, provider !== "codex"),
     });
-    await service.initialize();
+    service = agentService;
 
     await expect(
       service.connectProvider("codex", async () => Promise.reject(new Error("browser failed"))),
@@ -658,6 +670,25 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     expect(service.getStatus().providers).toContainEqual(
       expect.objectContaining({ id: "codex", state: "sign-in-required" }),
     );
+  });
+
+  // Computer Use used to come from a Codex `plugin/list` probe, so every activation recomputed it
+  // and a provider that was not Codex set it back to `unavailable`. The driver is now this app's
+  // own child, and no provider knows anything about it.
+  it("keeps the pushed Computer Use capability across a provider connection", async () => {
+    const { store, mailbox } = stores(root);
+    service = createTestService({
+      store,
+      mailbox,
+      preferredProvider: "codex",
+      clientFactory: (provider) => new FakeAgentClient(provider, "DONE", true, true),
+    });
+    await service.initialize();
+    service.setComputerUseCapability("ready");
+
+    await service.connectProvider("codex", async () => undefined);
+
+    expect(service.getStatus().capabilities.computerUse).toBe("ready");
   });
 
   it("cancels a ChatGPT login that does not complete", async () => {
@@ -690,6 +721,111 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         message: expect.stringContaining("timed out"),
       }),
     );
+  });
+
+  /**
+   * The sign-in the user finishes elsewhere. What is asserted here is the contract the dialog is
+   * built on: a code comes back, a deadline comes with it, and the account arrives the same way a
+   * browser sign-in's does - in the provider's status, not in the reply.
+   */
+  it("signs in to ChatGPT with a code typed on another device", async () => {
+    const { store, mailbox } = stores(root);
+    const codexClients: FakeAgentClient[] = [];
+    service = createTestService({
+      store,
+      mailbox,
+      preferredProvider: "codex",
+      clientFactory: (provider) => {
+        const client = new FakeAgentClient(provider, "DONE", true, provider !== "codex");
+        if (provider === "codex") codexClients.push(client);
+        return client;
+      },
+    });
+    await service.initialize();
+
+    const started = await service.startProviderCodeLogin("codex");
+
+    expect(started).toEqual({
+      kind: "code",
+      userCode: "TEST-CODE",
+      verificationUrl: "https://auth.openai.test/device",
+      expiresAt: expect.any(Number),
+    });
+    expect(started.kind === "code" && started.expiresAt).toBeGreaterThan(Date.now());
+    expect(codexClients[1]?.requests).toContainEqual({
+      method: "account/login/start",
+      // No `appBrand`: the device-code variant of this request does not take one.
+      params: { type: "chatgptDeviceCode" },
+    });
+    expect(service.getStatus().providers).toContainEqual(
+      expect.objectContaining({ id: "codex", state: "sign-in-required", connectionState: "connecting" }),
+    );
+
+    codexClients[1]?.completeLogin(true);
+
+    await waitFor(
+      () => service?.getStatus().providers?.find((provider) => provider.id === "codex")?.state === "available",
+    );
+    expect(service.getStatus().providers).toContainEqual(
+      expect.objectContaining({ id: "codex", state: "available", email: "codex@example.com" }),
+    );
+  });
+
+  it("tells ChatGPT to drop the code when the user cancels the sign-in", async () => {
+    const { store, mailbox } = stores(root);
+    const codexClients: FakeAgentClient[] = [];
+    service = createTestService({
+      store,
+      mailbox,
+      preferredProvider: "codex",
+      clientFactory: (provider) => {
+        const client = new FakeAgentClient(provider, "DONE", true, provider !== "codex");
+        if (provider === "codex") codexClients.push(client);
+        return client;
+      },
+    });
+    await service.initialize();
+    await service.startProviderCodeLogin("codex");
+
+    await service.cancelProviderCodeLogin("codex");
+
+    expect(codexClients[1]?.requests).toContainEqual({
+      method: "account/login/cancel",
+      params: { loginId: "login-1" },
+    });
+    expect(codexClients[1]?.running).toBe(false);
+    // Back to the row the user pressed, with nothing left running behind it.
+    const codex = service.getStatus().providers?.find((provider) => provider.id === "codex");
+    expect(codex).toMatchObject({ state: "sign-in-required", message: null });
+    expect(codex?.connectionState).toBeUndefined();
+  });
+
+  it("issues a code for an account already on this computer, so another account can be reached", async () => {
+    const { service: agentService } = await startService(root, {
+      client: (provider) => new FakeAgentClient(provider, "DONE", true, true),
+      preferredProvider: "codex",
+    });
+    service = agentService;
+
+    expect(await service.startProviderCodeLogin("codex")).toEqual({
+      kind: "code",
+      userCode: "TEST-CODE",
+      verificationUrl: "https://auth.openai.test/device",
+      expiresAt: expect.any(Number),
+    });
+    // The account in use is untouched while the new one is being signed in to: a user who gives up
+    // on the code has to be left with the provider they already had.
+    expect(service.getStatus().providers).toContainEqual(expect.objectContaining({ id: "codex", state: "available" }));
+  });
+
+  it("refuses a code sign-in for a provider that has none", async () => {
+    const { service: agentService } = await startService(root, {
+      client: (provider) => new FakeAgentClient(provider, "DONE", true, provider !== "claude"),
+      preferredProvider: "codex",
+    });
+    service = agentService;
+
+    await expect(service.startProviderCodeLogin("claude")).rejects.toThrow("cannot be signed in with a code");
   });
 
   it("runs provider logins independently and Refresh cancels both generations", async () => {
@@ -757,7 +893,7 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     );
   });
 
-  it("keeps the active ChatGPT client until reconnect succeeds", async () => {
+  it("keeps the active ChatGPT client until reconnect succeeds, then expires its requests", async () => {
     const { store, mailbox } = stores(root);
     const codexClients: FakeAgentClient[] = [];
     service = createTestService({
@@ -765,13 +901,26 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
       mailbox,
       preferredProvider: "codex",
       clientFactory: (provider) => {
-        const client = new FakeAgentClient(provider, "DONE", true, provider !== "codex" || codexClients.length === 0);
+        const client = new FakeAgentClient(provider, "DONE", false, provider !== "codex" || codexClients.length === 0);
         if (provider === "codex") codexClients.push(client);
         return client;
       },
     });
+    const events: AgentEvent[] = [];
+    service.on("event", (event) => events.push(event));
     await service.initialize();
     const activeClient = codexClients[0];
+    await service.sendMessage({ agentId: "chief", text: "Ask before the reconnect" });
+    await waitFor(() => events.some((event) => event.type === "turn-started"));
+    const threadId = store.activeProviderSession("chief")?.externalSessionId;
+    const turnId = events.find((event) => event.type === "turn-started")?.turnId;
+    if (!activeClient || !threadId || !turnId) throw new Error("The Codex turn did not start.");
+    activeClient.emit("request", {
+      method: "item/commandExecution/requestApproval",
+      id: "replaced-client-approval",
+      params: { threadId, turnId, command: ["git", "status"], cwd: root, reason: "Inspect the worktree." },
+    });
+    await waitFor(() => events.some((event) => event.type === "approval"));
 
     await service.connectProvider("codex", async () => undefined);
     expect(service.getStatus().providers).toContainEqual(
@@ -793,6 +942,12 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     );
     expect(activeClient?.running).toBe(false);
     expect(codexClients[2]?.running).toBe(true);
+    expect(events).toContainEqual({
+      type: "agent-input-resolved",
+      kind: "approval",
+      requestId: "replaced-client-approval",
+      agentId: "chief",
+    });
   });
 
   it.each(["codex", "claude"] as const)(
@@ -803,14 +958,11 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
         process.env.OPENBOT_FAKE_CLAUDE_LOGIN_LOG = join(root, "pending-claude-login.log");
         process.env.OPENBOT_CLAUDE_PATH = await createPendingFakeClaude(root);
       }
-      const { store, mailbox } = stores(root);
-      service = createTestService({
-        store,
-        mailbox,
+      const { service: agentService } = await startService(root, {
+        client: (provider) => new FakeAgentClient(provider),
         preferredProvider: target,
-        clientFactory: (provider) => new FakeAgentClient(provider),
       });
-      await service.initialize();
+      service = agentService;
       await service.connectProvider(target, async () => undefined);
       const install = vi.fn(async () => managed);
 
@@ -868,6 +1020,51 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     expect(clients[1]?.running).toBe(true);
   });
 
+  it("keeps the updated CLI's client when an account refresh hears back from the replaced one", async () => {
+    const system = await createUpdatableFakeClaude(root, "2.1.250");
+    process.env.OPENBOT_CLAUDE_PATH = system.executable;
+    const { store, mailbox } = stores(root);
+    const clients: FakeAgentClient[] = [];
+    let heldClient: FakeAgentClient | null = null;
+    let releaseRead: () => void = () => undefined;
+    const heldRead = new Promise<void>((resolve) => {
+      releaseRead = resolve;
+    });
+    service = createTestService({
+      store,
+      mailbox,
+      preferredProvider: "claude",
+      clientFactory: (provider) => {
+        const client: FakeAgentClient = new FakeAgentClient(provider, undefined, true, true, {}, async (method) => {
+          if (method === "account/read" && client === heldClient) await heldRead;
+        });
+        if (provider === "claude") clients.push(client);
+        return client;
+      },
+    });
+    await service.initialize();
+    const replaced = clients[0];
+    if (!replaced) throw new Error("Claude did not start.");
+    const readsBefore = replaced.requests.filter((request) => request.method === "account/read").length;
+    heldClient = replaced;
+    const refresh = service.refreshProviders();
+    await waitFor(() => replaced.requests.filter((request) => request.method === "account/read").length > readsBefore);
+
+    const managed = await createFakeClaude(root);
+    await writeFile(managed, (await readFile(managed, "utf8")).replaceAll("2.1.246", "2.1.263"));
+    process.env.OPENBOT_CLAUDE_PATH = join(root, "missing-claude");
+    await service.updateProviderCli("claude", async () => managed);
+    replaced.accountSignedIn = false;
+    releaseRead();
+    const status = await refresh;
+
+    expect(status.providers).toContainEqual(
+      expect.objectContaining({ id: "claude", state: "available", version: "2.1.263", checkError: null }),
+    );
+    expect(clients).toHaveLength(2);
+    expect(clients[1]?.running).toBe(true);
+  });
+
   it("keeps the previous client when the replacement cannot authenticate", async () => {
     const managed = await createFakeClaude(root);
     const { store, mailbox } = stores(root);
@@ -889,6 +1086,75 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     expect(clients[1]?.running).toBe(false);
     expect(service.getStatus().providers).toContainEqual(
       expect.objectContaining({ id: "claude", version: "2.1.246", state: "available" }),
+    );
+  });
+
+  it("reports an updated CLI that stops at start as broken, with its reason, not as signed out", async () => {
+    const managed = await createFakeClaude(root);
+    const { store, mailbox } = stores(root);
+    const exit = new AgentProcessExitError("Claude stopped before it answered (exit code 3).", "Error: bad config");
+    service = createTestService({
+      store,
+      mailbox,
+      preferredProvider: "claude",
+      clientFactory: (provider) =>
+        new FakeAgentClient(provider, "", true, true, {}, async (method, from) => {
+          if (from === "claude" && method === "initialize") throw exit;
+        }),
+      bundledExecutables: { claude: managed },
+    });
+    await service.initialize();
+
+    const message =
+      "OpenBot could not update the Claude CLI. Claude stopped before it answered (exit code 3). Error: bad config";
+    await expect(service.updateProviderCli("claude", async () => managed)).rejects.toThrow(message);
+    expect(service.getStatus().providers).toContainEqual(
+      expect.objectContaining({ id: "claude", state: "error", message }),
+    );
+  });
+
+  it("keeps an MCP secret the stopped CLI quoted out of the update failure", async () => {
+    const managed = await createFakeClaude(root);
+    const { store, mailbox } = stores(root);
+    let claudeClients = 0;
+    service = createTestService({
+      store,
+      mailbox,
+      preferredProvider: "claude",
+      // The running client starts; its replacement stops and quotes the server's secret on stderr.
+      clientFactory: (provider) => {
+        const replacement = provider === "claude" && ++claudeClients > 1;
+        return new FakeAgentClient(provider, "", true, true, {}, async (method) => {
+          if (replacement && method === "initialize") {
+            // Past the shortening, so a cut before redaction would leave a prefix of the secret.
+            throw new AgentProcessExitError(
+              "Claude stopped before it answered (exit code 3).",
+              `${"x".repeat(285)} rejected abcdef123456`,
+            );
+          }
+        });
+      },
+      bundledExecutables: { claude: managed },
+    });
+    await service.initialize();
+    new McpServerStore(store.database).save({
+      id: "",
+      name: "Filesystem",
+      transport: "stdio",
+      enabled: true,
+      command: "/bin/echo",
+      args: [],
+      env: [{ key: "API_KEY", value: "abcdef123456" }],
+      envPassthrough: [],
+      workingDirectory: "",
+      url: "",
+      headers: [],
+    });
+
+    const message = `OpenBot could not update the Claude CLI. Claude stopped before it answered (exit code 3). ${"x".repeat(285)} rejected •••`;
+    await expect(service.updateProviderCli("claude", async () => managed)).rejects.toThrow(message);
+    expect(service.getStatus().providers).toContainEqual(
+      expect.objectContaining({ id: "claude", state: "available", message }),
     );
   });
 
@@ -1186,8 +1452,82 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
 
     // The chat is on Grok and still runs a turn: the export failed, the agent's work did not.
     await service.sendMessage({ agentId: "chief", text: "Continue on Grok." });
-    await waitFor(() => service?.listQueue("chief").deliveries.every((delivery) => delivery.status === "completed"));
+    await waitForQueue(service, "chief", (queue) =>
+      queue.deliveries.every((delivery) => delivery.status === "completed"),
+    );
     expect(service.listAgents().find((agent) => agent.id === "chief")?.provider).toBe("grok");
+  });
+
+  it("keeps Codex's background refresh failures out of the provider error toast", async () => {
+    const { store, mailbox } = stores(root);
+    const clients = new Map<AgentProvider, FakeAgentClient>();
+    service = createTestService({
+      store,
+      mailbox,
+      preferredProvider: "codex",
+      clientFactory: (provider) => {
+        const client = new FakeAgentClient(provider);
+        clients.set(provider, client);
+        return client;
+      },
+    });
+    const events: AgentEvent[] = [];
+    service.on("event", (event) => events.push(event));
+    await service.initialize();
+    const client = clients.get("codex");
+    if (!client) throw new Error("Codex did not start.");
+
+    // As reported in #717: a computer that woke without internet access, one line per retry.
+    client.emit(
+      "diagnostic",
+      "2026-09-23T06:52:48.272320Z ERROR codex_models_manager::manager: failed to refresh available models: timeout waiting for child process to exit",
+    );
+    client.emit("diagnostic", "2026-09-23T06:55:18.925203Z ERROR Settings fetch failed max_attempts=3");
+    // Any other failure stays visible, and its repeats read the same, so the renderer shows it once.
+    client.emit("diagnostic", "2026-09-23T06:56:00.000001Z ERROR codex: the model endpoint could not be reached");
+    client.emit("diagnostic", "2026-09-23T06:57:00.000002Z ERROR codex: the model endpoint could not be reached");
+
+    await waitFor(() => events.filter((event) => event.type === "error").length === 2);
+    expect(events.filter((event) => event.type === "error")).toEqual([
+      expect.objectContaining({ message: "ERROR codex: the model endpoint could not be reached" }),
+      expect.objectContaining({ message: "ERROR codex: the model endpoint could not be reached" }),
+    ]);
+  });
+
+  it("keeps Grok's failed tool call out of the provider error toast", async () => {
+    process.env.OPENBOT_GROK_PATH = await createFakeGrok(root);
+    const { store, mailbox } = stores(root);
+    const clients = new Map<AgentProvider, FakeAgentClient>();
+    service = createTestService({
+      store,
+      mailbox,
+      preferredProvider: "codex",
+      clientFactory: (provider) => {
+        const client = new FakeAgentClient(provider);
+        clients.set(provider, client);
+        return client;
+      },
+    });
+    const events: AgentEvent[] = [];
+    service.on("event", (event) => events.push(event));
+    await service.initialize();
+    await store.getOrCreate("chief");
+    await service.updateAgent({ agentId: "chief", provider: "grok", model: "grok-4.5" });
+    const client = clients.get("grok");
+    if (!client) throw new Error("Grok did not start.");
+
+    // As reported in #692: an embedded-browser click that returned an error, which the agent reads
+    // as the tool's result and can retry.
+    client.emit(
+      "diagnostic",
+      "tool_error: tool_output_error tool_name='use_tool' effective_tool_name='openbot_browser__click' model_id='grok-4.7' error_kind='tool_output_error'",
+    );
+    client.emit("diagnostic", "ERROR grok: the model endpoint could not be reached");
+
+    await waitFor(() => events.some((event) => event.type === "error"));
+    expect(events.filter((event) => event.type === "error")).toEqual([
+      expect.objectContaining({ message: "ERROR grok: the model endpoint could not be reached" }),
+    ]);
   });
 
   it.each([
@@ -1271,6 +1611,50 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     );
   });
 
+  it("reads Codex's nested error report and leaves an exhausted plan to the usage notice", async () => {
+    const { store, mailbox } = stores(root);
+    const clients = new Map<AgentProvider, FakeAgentClient>();
+    service = createTestService({
+      store,
+      mailbox,
+      preferredProvider: "codex",
+      clientFactory: (provider) => {
+        const client = new FakeAgentClient(provider);
+        clients.set(provider, client);
+        return client;
+      },
+    });
+    const events: AgentEvent[] = [];
+    service.on("event", (event) => events.push(event));
+    await service.initialize();
+    const client = clients.get("codex");
+    if (!client) throw new Error("The fake provider did not start.");
+    const usageReadsBefore = client.requests.filter((request) => request.method === "account/rateLimits/read").length;
+    events.length = 0;
+
+    const report = (message: string, codexErrorInfo: unknown, willRetry: boolean) =>
+      client.emit("notification", {
+        method: "error",
+        params: {
+          error: { message, codexErrorInfo, additionalDetails: null, misalignment: null },
+          willRetry,
+          threadId: "thread-1",
+          turnId: "turn-1",
+        },
+      });
+    report("You've hit your usage limit. Try again at 10:34 AM.", "usageLimitExceeded", false);
+    report("Reconnecting... 1/5", { responseStreamDisconnected: { httpStatusCode: null } }, true);
+    report("The model endpoint rejected the request.", "badRequest", false);
+
+    await waitFor(() => events.some((event) => event.type === "error"));
+    expect(events.filter((event) => event.type === "error")).toEqual([
+      expect.objectContaining({ message: "The model endpoint rejected the request." }),
+    ]);
+    expect(client.requests.filter((request) => request.method === "account/rateLimits/read")).toHaveLength(
+      usageReadsBefore + 1,
+    );
+  });
+
   it("refuses to replace a CLI that is running a turn", async () => {
     const { store, mailbox } = stores(root);
     service = createTestService({
@@ -1347,14 +1731,11 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
   });
 
   it("refuses to replace a CLI that is running a channel turn", async () => {
-    const { store, mailbox } = stores(root);
-    service = createTestService({
-      store,
-      mailbox,
+    const { service: agentService, store } = await startService(root, {
+      client: (provider) => new FakeAgentClient(provider, "", false),
       preferredProvider: "codex",
-      clientFactory: (provider) => new FakeAgentClient(provider, "", false),
     });
-    await service.initialize();
+    service = agentService;
     await store.getOrCreate("chief");
     const actor = { id: "human", name: "Alex" };
     await service.channels.command(
@@ -1404,19 +1785,16 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
       releaseTurnStart = resolve;
     });
     let turnStartReached = false;
-    const { store, mailbox } = stores(root);
-    service = createTestService({
-      store,
-      mailbox,
+    const { service: agentService } = await startService(root, {
       preferredProvider: "codex",
-      clientFactory: (provider) =>
+      client: (provider) =>
         new FakeAgentClient(provider, "", false, true, {}, async (method, target) => {
           if (method !== "turn/start" || target !== "codex") return;
           turnStartReached = true;
           await blocked;
         }),
     });
-    await service.initialize();
+    service = agentService;
     void service.sendMessage({ agentId: "chief", text: "Keep working." });
     // The delivery has no turn id yet, and the client it is about to prompt must not be replaced.
     await waitFor(() => turnStartReached);
@@ -1559,14 +1937,11 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
 
   it("keeps the owner of a CLI whose provider is signed out", async () => {
     process.env.OPENBOT_CLAUDE_PATH = await createFakeClaude(root);
-    const { store, mailbox } = stores(root);
-    service = createTestService({
-      store,
-      mailbox,
+    const { service: agentService } = await startService(root, {
+      client: (provider) => new FakeAgentClient(provider, undefined, true, provider !== "claude"),
       preferredProvider: "codex",
-      clientFactory: (provider) => new FakeAgentClient(provider, undefined, true, provider !== "claude"),
     });
-    await service.initialize();
+    service = agentService;
 
     // Signed out, the provider keeps no client, so the row would name no owner - and an unowned CLI
     // is read as the managed copy, which sends the user's own install to a download.
@@ -1577,15 +1952,12 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
 
   it("reports installation failure without replacing the working client", async () => {
     const managed = await createFakeClaude(root);
-    const { store, mailbox } = stores(root);
-    service = createTestService({
-      store,
-      mailbox,
+    const { service: agentService } = await startService(root, {
+      client: (provider) => new FakeAgentClient(provider),
       preferredProvider: "claude",
-      clientFactory: (provider) => new FakeAgentClient(provider),
       bundledExecutables: { claude: managed },
     });
-    await service.initialize();
+    service = agentService;
     await expect(
       service.updateProviderCli("claude", async () => {
         throw new Error("Runtime verification failed.");
@@ -1711,5 +2083,66 @@ describe.sequential("ProviderRuntime: custom provider reload", () => {
     // Signed out, OpenCode keeps no client. A save must not read as a failure: the next spawn - the
     // next Connect press - reads the config.
     await expect(running.reloadOpenCodeConfig()).resolves.toBe("not-running");
+  });
+});
+
+describe.sequential("ProviderRuntime: idle release", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("stops an idle provider process and resumes the same thread on the next message", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+    const started = await startService(root, { provider: "codex", output: "DONE" });
+    service = started.service;
+    const running = service;
+    const first = started.client;
+    await service.sendMessage({ agentId: "chief", text: "First task." });
+    await waitFor(() => running.listQueue("chief").deliveries[0]?.status === "completed");
+    expect(first.requests.map((request) => request.method)).toContain("thread/start");
+    const session = started.store.activeProviderSession("chief")?.externalSessionId;
+    expect(session).toBeTruthy();
+
+    await vi.advanceTimersByTimeAsync(PROVIDER_IDLE_RELEASE_MS + 2 * 60_000);
+    await waitFor(() => !first.running);
+    const firstRequests = first.requests.length;
+    expect(service.getStatus().providers?.find((row) => row.id === "codex")?.state).toBe("available");
+    expect(service.getStatus().phase).toBe("ready");
+
+    // The fake hands out the same client object again, so only the requests after the restart count.
+    const afterRelease = () => first.requests.slice(firstRequests).map((request) => request.method);
+    await service.sendMessage({ agentId: "chief", text: "Second task." });
+    await waitFor(() => afterRelease().includes("turn/start"));
+    expect(started.clients.filter((made) => made.provider === "codex")).toHaveLength(2);
+    const resumed = first.requests.slice(firstRequests).find((request) => request.method === "thread/resume");
+    expect(getString(resumed?.params, "threadId")).toBe(session);
+    expect(afterRelease()).not.toContain("thread/start");
+  });
+
+  it("stops a provider no agent is set to well before one an agent uses", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+    process.env.OPENBOT_OPENCODE_PATH = await createFakeOpencode(root);
+    const started = await startService(root, { provider: "codex", output: "DONE" });
+    service = started.service;
+    expect((await started.store.getOrCreate("chief")).provider).toBe("codex");
+    const opencode = started.clientFor("opencode");
+    expect(opencode?.running).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(PROVIDER_UNASSIGNED_RELEASE_MS + 2 * 60_000);
+    await waitFor(() => opencode?.running === false);
+    expect(started.client.running).toBe(true);
+    expect(service.getStatus().providers?.find((row) => row.id === "opencode")?.state).toBe("available");
+  });
+
+  it("keeps a provider process that is running a turn", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+    const started = await startService(root, { provider: "codex", output: "", autoComplete: false });
+    service = started.service;
+    const running = service;
+    await service.sendMessage({ agentId: "chief", text: "Keep working." });
+    await waitFor(async () => Boolean((await running.readConversation("chief")).activeTurnId));
+
+    await vi.advanceTimersByTimeAsync(PROVIDER_IDLE_RELEASE_MS + 2 * 60_000);
+    expect(started.client.running).toBe(true);
   });
 });

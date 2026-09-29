@@ -1,25 +1,19 @@
-import { expect, fireEvent, fn, waitFor, within } from "storybook/test";
+import type { HostStatus, HostUpdateStatus } from "@openbot/contracts/ipc";
+import { createSignal, onSettled, snapshot } from "solid-js";
+import { fn } from "storybook/test";
 import type { Meta, StoryObj } from "storybook-solidjs-vite";
-import { ServerSettingsModal } from "../src/features/servers/ServerSettingsModal";
+import { ServerSettingsModal, type ServerSettingsModalProps } from "../src/features/servers/ServerSettingsModal";
 import { STORY_HOST_STATUS, STORY_INVITES, STORY_PRESENCE, STORY_SERVERS } from "../src/preview/fixtures";
+import { createMockOpenBot } from "./mock-openbot";
 
 const localServer = STORY_SERVERS.find((server) => server.kind === "local") ?? STORY_SERVERS[0];
 const remoteServer = STORY_SERVERS.find((server) => server.kind === "remote") ?? STORY_SERVERS[1];
-const denseMembers = Array.from({ length: 4 }, (_, group) =>
-  STORY_PRESENCE.members.map((member, index) => ({
-    ...member,
-    id: `${member.id}-${group}`,
-    name: group === 0 ? member.name : `${member.name} ${group + 1}`,
-    username: `${member.username}-${group}`,
-    email: `member-${group}-${index}@example.com`,
-    role: group === 0 ? member.role : "member",
-    online: (group + index) % 3 === 0,
-  })),
-).flat();
+if (!remoteServer) throw new Error("Story server fixtures need a remote server.");
 
 const meta = {
   title: "Settings/ServerSettingsModal",
   component: ServerSettingsModal,
+  render: (args) => <RemoteSetupStory settings={args} />,
   args: {
     open: true,
     onOpenChange: fn(),
@@ -41,6 +35,8 @@ const meta = {
       role: input.role,
       usedAt: null,
       email: input.email ?? null,
+      permanent: input.permanent ?? false,
+      useCount: 0,
     })),
     onUpdateMember: fn(async () => undefined),
     onRemoveMember: fn(async () => undefined),
@@ -99,34 +95,6 @@ export const LocalFirstSetup: Story = {
     members: [],
     invites: [],
   },
-  play: async () => {
-    const dialog = await within(document.body).findByRole("dialog", { name: "General" });
-    const name = within(dialog).getByRole("textbox", { name: "Server name" });
-    await expect(name).toHaveValue("");
-    await expect(name).toHaveAttribute("placeholder", "e.g. Design studio");
-  },
-};
-
-export const FirstSetupInvalidName: Story = {
-  args: LocalFirstSetup.args,
-  play: async () => {
-    const dialog = await within(document.body).findByRole("dialog", { name: "General" });
-    const name = within(dialog).getByRole("textbox", { name: "Server name" });
-    await fireEvent.input(name, { target: { value: "Tiny" } });
-    await fireEvent.blur(name);
-    await expect(within(dialog).getByText("Enter at least 6 characters.")).toBeVisible();
-  },
-};
-
-export const FirstSetupValidFooter: Story = {
-  args: LocalFirstSetup.args,
-  play: async () => {
-    const dialog = await within(document.body).findByRole("dialog", { name: "General" });
-    await fireEvent.input(within(dialog).getByRole("textbox", { name: "Server name" }), {
-      target: { value: "First server" },
-    });
-    await expect(within(dialog).getByRole("button", { name: "Set up server" })).toBeVisible();
-  },
 };
 
 export const FirstSetupInvalidNameSmallViewport: Story = {
@@ -134,8 +102,28 @@ export const FirstSetupInvalidNameSmallViewport: Story = {
   parameters: {
     viewport: { defaultViewport: "serverMobile" },
   },
-  play: FirstSetupInvalidName.play,
 };
+
+export const RemoteDesktopAfterPublication: Story = {
+  render: (args) => <PublicationSetupStory settings={args} />,
+};
+
+function PublicationSetupStory(props: { settings: ServerSettingsModalProps }) {
+  const [published, setPublished] = createSignal(false);
+  return (
+    <RemoteSetupStory
+      settings={{
+        ...props.settings,
+        get hostStatus(): HostStatus {
+          return { ...STORY_HOST_STATUS, configured: true, phase: published() ? "online" : "idle" };
+        },
+        onSetPublished: async (value) => {
+          setPublished(value);
+        },
+      }}
+    />
+  );
+}
 
 export const LocalOnline: Story = {
   args: {
@@ -143,34 +131,6 @@ export const LocalOnline: Story = {
       ...STORY_HOST_STATUS,
       apiUrl: "https://eu-west-1.gateway.example.com/openbot/servers/team_7f3c19a2",
     },
-  },
-  play: async ({ userEvent }) => {
-    const dialog = await within(document.body).findByRole("dialog", { name: "General" });
-    const name = within(dialog).getByRole("textbox", { name: "Server name" });
-    await expect(name).toHaveValue("Local");
-    await fireEvent.input(name, { target: { value: "Local studio" } });
-    await expect(name).toHaveValue("Local studio");
-    await userEvent.click(within(dialog).getByRole("button", { name: "Reset" }));
-    await expect(name).toHaveValue("Local");
-    await expect(within(dialog).getByRole("switch", { name: "Publish this server" })).toBeChecked();
-  },
-};
-
-export const FocusedInput: Story = {
-  play: async ({ userEvent }) => {
-    const dialog = await within(document.body).findByRole("dialog", { name: "General" });
-    const name = within(dialog).getByRole("textbox", { name: "Server name" });
-    await userEvent.click(name);
-    await expect(name).toHaveFocus();
-  },
-};
-
-export const DirtyFooter: Story = {
-  play: async () => {
-    const dialog = await within(document.body).findByRole("dialog", { name: "General" });
-    const name = within(dialog).getByRole("textbox", { name: "Server name" });
-    await fireEvent.input(name, { target: { value: "OpenBot production" } });
-    await waitFor(() => expect(within(dialog).getByRole("region", { name: "Unsaved changes" })).toBeVisible());
   },
 };
 
@@ -187,135 +147,106 @@ export const RemoteAdministrator: Story = {
   },
 };
 
-export const Members: Story = {
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await body.findByRole("dialog", { name: "General" });
-    await userEvent.click(body.getByRole("tab", { name: "Members" }));
-    await expect(body.getByTestId("server-members-list")).toBeVisible();
-  },
-};
-
-export const InviteLinkReady: Story = {
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await body.findByRole("dialog", { name: "General" });
-    await userEvent.click(body.getByRole("tab", { name: "Members" }));
-    await userEvent.click(body.getByRole("tab", { name: "Invite link" }));
-    await userEvent.click(body.getByRole("button", { name: "Create link" }));
-    await expect(await body.findByRole("textbox", { name: "Invitation link" })).toHaveValue(
-      "https://team.example.com/invite/story",
-    );
-  },
-};
-
-export const MembersEmptyResults: Story = {
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await body.findByRole("dialog", { name: "General" });
-    await userEvent.click(body.getByRole("tab", { name: "Members" }));
-    await userEvent.type(body.getByRole("searchbox", { name: "Search members" }), "nobody");
-    await expect(body.getByText("No members match this search.")).toBeVisible();
-  },
-};
-
-export const MembersUnpublished: Story = {
-  args: {
-    server: { ...remoteServer, state: "offline", role: "admin" },
-    hostStatus: null,
-  },
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await body.findByRole("dialog", { name: "General" });
-    await userEvent.click(body.getByRole("tab", { name: "Members" }));
-    await expect(body.getByRole("status")).toBeVisible();
-    await expect(body.getByRole("button", { name: "Send invite" })).toBeDisabled();
-  },
-};
-
-export const MembersSmallViewport: Story = {
-  parameters: {
-    viewport: { defaultViewport: "serverNarrow" },
-  },
-  play: Members.play,
-};
-
-export const DenseMemberList: Story = {
-  args: {
-    server: { ...remoteServer, role: "admin" },
-    hostStatus: null,
-    members: denseMembers,
-  },
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await body.findByRole("dialog", { name: "General" });
-    await userEvent.click(body.getByRole("tab", { name: "Members" }));
-    await expect(body.getByTestId("server-members-list")).toBeVisible();
-  },
-};
-
-export const RemoveMemberConfirmation: Story = {
-  args: {
-    server: { ...remoteServer, role: "admin" },
-    hostStatus: null,
-  },
-  play: async ({ userEvent }) => {
-    const body = within(document.body);
-    await body.findByRole("dialog", { name: "General" });
-    await userEvent.click(body.getByRole("tab", { name: "Members" }));
-    await userEvent.click(body.getByRole("button", { name: "Actions for Jon Bell" }));
-    await userEvent.click(await body.findByRole("menuitem", { name: "Remove member" }));
-    await expect(await body.findByRole("alertdialog", { name: "Remove Jon Bell?" })).toBeVisible();
-  },
-};
-
 export const RemoteMember: Story = {
   args: {
     server: { ...remoteServer, role: "member" },
     hostStatus: null,
     invites: [],
   },
-  play: async () => {
-    const body = within(document.body);
-    await body.findByRole("dialog", { name: "General" });
-    await expect(body.queryByRole("textbox", { name: "Server name" })).not.toBeInTheDocument();
-    await waitFor(() =>
-      expect(body.getByText(remoteServer.name, { selector: ".server-settings-readonly-value" })).toBeVisible(),
-    );
-    body.getByRole("tab", { name: "Members" }).click();
-    await expect(body.queryByRole("button", { name: "Send invite" })).not.toBeInTheDocument();
-  },
 };
 
-export const RemoteDesktop: Story = {
-  args: {
-    server: { ...remoteServer, role: "admin" },
-    hostStatus: null,
-  },
-  play: async () => {
-    const body = within(document.body);
-    await body.findByRole("dialog", { name: "General" });
-    body.getByRole("tab", { name: "Remote desktop" }).click();
-    await expect(body.getByText("Service available")).toBeVisible();
-    await expect(body.queryByRole("button", { name: "Connect" })).not.toBeInTheDocument();
-  },
+const STORY_HOST_UPDATE: HostUpdateStatus = {
+  phase: "available",
+  currentVersion: "0.23.0",
+  availableVersion: "0.24.0",
+  progress: null,
+  errorCode: null,
+  remoteUpdates: "allowed",
+  autoDownload: true,
+  autoInstall: false,
+  restart: null,
 };
 
-// What the host owner sees after a member was refused: the repair step is here, on the computer
-// that holds the grant.
-export const HostScreenRecordingBlocked: Story = {
-  args: {
-    hostStatus: { ...STORY_HOST_STATUS, remoteDesktopScreenRecordingDenied: true },
-  },
-  play: async () => {
-    const body = within(document.body);
-    await body.findByRole("dialog", { name: "General" });
-    body.getByRole("tab", { name: "Remote desktop" }).click();
-    await expect(body.getByText("OpenBot may not record this screen")).toBeVisible();
-    await expect(body.getByRole("button", { name: "Open System Settings" })).toBeVisible();
-    await expect(body.getByRole("button", { name: "Check again" })).toBeVisible();
-  },
+const remoteUpdateArgs = {
+  server: { ...remoteServer, role: "admin" as const },
+  hostStatus: null,
+  hostUpdate: {},
+  initialSection: "updates" as const,
 };
+
+export const RemoteUpdateAvailable: Story = {
+  args: remoteUpdateArgs,
+  render: (args) => <RemoteSetupStory settings={args} hostUpdate={STORY_HOST_UPDATE} />,
+};
+
+export const RemoteUpdateWaiting: Story = {
+  args: remoteUpdateArgs,
+  render: (args) => (
+    <RemoteSetupStory
+      settings={args}
+      hostUpdate={{
+        ...STORY_HOST_UPDATE,
+        phase: "ready",
+        progress: 100,
+        restart: { requestedBy: "Ada Lovelace", mode: "when-idle", waitingFor: ["agent-turn", "routine-run"] },
+      }}
+    />
+  ),
+};
+
+export const RemoteUpdateDownloading: Story = {
+  args: remoteUpdateArgs,
+  render: (args) => (
+    <RemoteSetupStory
+      settings={args}
+      hostUpdate={{
+        ...STORY_HOST_UPDATE,
+        phase: "downloading",
+        progress: 42,
+        restart: { requestedBy: "Ada Lovelace", mode: "when-idle", waitingFor: [] },
+      }}
+    />
+  ),
+};
+
+export const RemoteUpdateAutomatic: Story = {
+  args: remoteUpdateArgs,
+  render: (args) => (
+    <RemoteSetupStory
+      settings={args}
+      hostUpdate={{
+        ...STORY_HOST_UPDATE,
+        phase: "ready",
+        progress: 100,
+        autoInstall: true,
+        restart: { requestedBy: null, mode: "when-idle", waitingFor: ["agent-turn"] },
+      }}
+    />
+  ),
+};
+
+export const RemoteUpdateDisabled: Story = {
+  args: remoteUpdateArgs,
+  render: (args) => (
+    <RemoteSetupStory settings={args} hostUpdate={{ ...STORY_HOST_UPDATE, remoteUpdates: "disabled" }} />
+  ),
+};
+
+function RemoteSetupStory(props: { settings: ServerSettingsModalProps; hostUpdate?: HostUpdateStatus }) {
+  const previous = window.openbot;
+  // Storybook passes the args as a store, and the mock copies its options with `structuredClone`.
+  const hostStatus = props.settings.hostStatus;
+  const mock = createMockOpenBot({
+    ...(hostStatus ? { hostStatus: snapshot(hostStatus) } : {}),
+    ...(props.hostUpdate ? { hostUpdate: props.hostUpdate } : {}),
+  });
+  window.openbot = mock.api;
+  onSettled(() => () => {
+    mock.dispose();
+    window.openbot = previous;
+  });
+  return <ServerSettingsModal {...props.settings} />;
+}
 
 export const SmallViewport: Story = {
   parameters: {

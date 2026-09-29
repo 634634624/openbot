@@ -1,6 +1,5 @@
 // Channel routines: a standing instruction that fires into the channel on a schedule.
 
-import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import {
   decodeChannelRoutine,
   decodeChannelRoutineRun,
@@ -12,16 +11,15 @@ import type { AgentService } from "../../backend/agent-service";
 import { decodeVoid } from "../remote-host-decoding";
 import type { RemoteServerManager } from "../remote-server-manager";
 import {
-  parseAgentRequest,
+  parseChannelId,
   parseCreateChannelRoutine,
   parseDeleteChannelRoutine,
   parseListChannelRoutineRuns,
   parseTestChannelRoutine,
   parseUpdateChannelRoutine,
 } from "./agent-inputs";
-import { type IpcGroupHandlers, payloadHandler } from "./define-ipc-group";
-import { routeToServer } from "./route-to-server";
-import { requireString } from "./validation";
+import type { IpcGroupHandlers } from "./define-ipc-group";
+import { scopedHandler } from "./scoped-handler";
 
 interface ChannelRoutineIpcDependencies {
   service: AgentService;
@@ -34,71 +32,53 @@ export function channelRoutineIpcHandlers({
 }: ChannelRoutineIpcDependencies): Pick<IpcGroupHandlers, "channelRoutines"> {
   return {
     channelRoutines: {
-      listChannelRoutines: payloadHandler(parseAgentRequest, (scoped) => {
-        const channelId = requireString(scoped.payload, "channelId", INPUT_LIMITS.identifier);
-        return routeToServer(scoped.serverId, {
-          local: () => service.listChannelRoutines(channelId),
-          remote: (serverId) =>
-            remoteServers.request(serverId, CHANNEL_ROUTES.routines, decodeChannelRoutines, {
-              method: "POST",
-              body: { channelId },
-            }),
-        });
+      listChannelRoutines: scopedHandler(parseChannelId, {
+        local: (channelId) => service.listChannelRoutines(channelId),
+        remote: (channelId, serverId) =>
+          remoteServers.request(serverId, CHANNEL_ROUTES.routines, decodeChannelRoutines, {
+            method: "POST",
+            body: { channelId },
+          }),
       }),
-      createChannelRoutine: payloadHandler(parseAgentRequest, (scoped) => {
-        const parsed = parseCreateChannelRoutine(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => service.createChannelRoutine(parsed),
-          remote: (serverId) =>
-            remoteServers.request(serverId, CHANNEL_ROUTES.routineCreate, decodeChannelRoutine, {
-              method: "POST",
-              body: parsed,
-            }),
-        });
+      createChannelRoutine: scopedHandler(parseCreateChannelRoutine, {
+        local: (parsed) => service.createChannelRoutine(parsed),
+        remote: (parsed, serverId) =>
+          remoteServers.request(serverId, CHANNEL_ROUTES.routineCreate, decodeChannelRoutine, {
+            method: "POST",
+            body: parsed,
+          }),
       }),
-      updateChannelRoutine: payloadHandler(parseAgentRequest, (scoped) => {
-        const parsed = parseUpdateChannelRoutine(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => service.updateChannelRoutine(parsed),
-          remote: (serverId) =>
-            remoteServers.request(serverId, CHANNEL_ROUTES.routineUpdate, decodeChannelRoutine, {
-              method: "POST",
-              body: parsed,
-            }),
-        });
+      updateChannelRoutine: scopedHandler(parseUpdateChannelRoutine, {
+        local: (parsed) => service.updateChannelRoutine(parsed),
+        remote: (parsed, serverId) =>
+          remoteServers.request(serverId, CHANNEL_ROUTES.routineUpdate, decodeChannelRoutine, {
+            method: "POST",
+            body: parsed,
+          }),
       }),
-      deleteChannelRoutine: payloadHandler(parseAgentRequest, (scoped) => {
-        const parsed = parseDeleteChannelRoutine(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => service.deleteChannelRoutine(parsed),
-          remote: (serverId) =>
-            remoteServers.request(serverId, CHANNEL_ROUTES.routineDelete, decodeVoid, {
-              method: "POST",
-              body: parsed,
-            }),
-        });
+      deleteChannelRoutine: scopedHandler(parseDeleteChannelRoutine, {
+        local: (parsed) => service.deleteChannelRoutine(parsed),
+        remote: (parsed, serverId) =>
+          remoteServers.request(serverId, CHANNEL_ROUTES.routineDelete, decodeVoid, {
+            method: "POST",
+            body: parsed,
+          }),
       }),
-      testChannelRoutine: payloadHandler(parseAgentRequest, (scoped) => {
-        const parsed = parseTestChannelRoutine(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => service.testChannelRoutine(parsed),
-          remote: (serverId) =>
-            remoteServers.request(serverId, CHANNEL_ROUTES.routineTest, decodeChannelRoutineRun, {
-              method: "POST",
-              body: parsed,
-            }),
-        });
+      testChannelRoutine: scopedHandler(parseTestChannelRoutine, {
+        local: (parsed) => service.testChannelRoutine(parsed),
+        remote: (parsed, serverId) =>
+          remoteServers.request(serverId, CHANNEL_ROUTES.routineTest, decodeChannelRoutineRun, {
+            method: "POST",
+            body: parsed,
+          }),
       }),
-      listChannelRoutineRuns: payloadHandler(parseAgentRequest, (scoped) => {
-        const parsed = parseListChannelRoutineRuns(scoped.payload);
-        return routeToServer(scoped.serverId, {
-          local: () => service.listChannelRoutineRuns(parsed),
-          remote: (serverId) =>
-            remoteServers.request(serverId, CHANNEL_ROUTES.routineRuns, decodeChannelRoutineRuns, {
-              method: "POST",
-              body: parsed,
-            }),
-        });
+      listChannelRoutineRuns: scopedHandler(parseListChannelRoutineRuns, {
+        local: (parsed) => service.listChannelRoutineRuns(parsed),
+        remote: (parsed, serverId) =>
+          remoteServers.request(serverId, CHANNEL_ROUTES.routineRuns, decodeChannelRoutineRuns, {
+            method: "POST",
+            body: parsed,
+          }),
       }),
     },
   };

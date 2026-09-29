@@ -1,4 +1,4 @@
-import { type AgentEvent, isAgentEvent, routineRunConversationEvent } from "@openbot/contracts/ipc";
+import { type AgentEvent, type BrowserTab, isAgentEvent, routineRunConversationEvent } from "@openbot/contracts/ipc";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentProvider } from "./agent-client";
 import type { AgentService } from "./agent-service";
@@ -6,16 +6,29 @@ import {
   createFakeClaude,
   createTestService,
   FakeAgentClient,
+  fakeBrowser,
   firstInputText,
   nextRoutinesChanged,
   notification,
   protocolMessages,
   startAgentTestFixture,
+  startService,
   stopAgentTestFixture,
   stores,
   waitFor,
+  waitForQueue,
 } from "./agent-service-test-harness";
+import { ChannelStore } from "./channel-store";
 import { getString } from "./protocol";
+
+const browserTab = (id: string, ownerAgentId: string | null, ownerThreadId: string | null): BrowserTab => ({
+  id,
+  title: id,
+  url: `https://example.com/${id}`,
+  loading: false,
+  ownerThreadId,
+  ownerAgentId,
+});
 
 let root: string;
 let logPath: string;
@@ -41,7 +54,7 @@ describe.sequential("AgentService: restart", () => {
     });
     await service.initialize();
     await service.sendMessage({ agentId: "chief", text: "Reply to this" });
-    await waitFor(() => service?.listQueue("chief").deliveries[0]?.status === "completed");
+    await waitForQueue(service, "chief", (queue) => queue.deliveries[0]?.status === "completed");
     const snapshot = await service.readConversation("chief");
     const boundary = snapshot.messages.at(-1)?.id;
     if (!boundary) throw new Error("The reply is missing");
@@ -71,7 +84,7 @@ describe.sequential("AgentService: restart", () => {
     service = createTestService({ store, mailbox });
     await service.initialize();
     await service.sendMessage({ agentId: "chief", text: "Remember this" });
-    await waitFor(() => service?.listQueue("chief").deliveries[0]?.status === "running");
+    await waitForQueue(service, "chief", (queue) => queue.deliveries[0]?.status === "running");
     const threadId = (await store.getOrCreate("chief")).threadId;
     await service.stop();
 
@@ -93,12 +106,46 @@ describe.sequential("AgentService: restart", () => {
     expect((await store.getOrCreate("chief")).threadId).toBe(threadId);
   });
 
+  it("keeps a turn that started before provider startup finished", async () => {
+    const { store, mailbox } = stores(root);
+    let releaseModels = () => {};
+    const modelsListed = new Promise<void>((resolve) => {
+      releaseModels = resolve;
+    });
+    const client = new FakeAgentClient("codex", "CODEX_DONE", false, true, {}, async (method) => {
+      if (method === "model/list") await modelsListed;
+    });
+    service = createTestService({ store, mailbox, clientFactory: () => client });
+    // Chat is ready once the CLIs answer; model discovery and the recovery pass run after that.
+    const initialized = service.initialize();
+    await waitFor(() => service?.getStatus().phase === "ready");
+    await service.sendMessage({ agentId: "chief", text: "Start before startup finished" });
+    await waitForQueue(service, "chief", (queue) => queue.deliveries[0]?.status === "running");
+
+    releaseModels();
+    await initialized;
+
+    expect(service.listQueue("chief").deliveries[0]?.status).toBe("running");
+    expect((await service.readConversation("chief")).activeTurnId).not.toBeNull();
+  });
+
+  it("settles the running delivery of a provider that exited", async () => {
+    const { service: agentService, client } = await startService(root, { provider: "codex", autoComplete: false });
+    service = agentService;
+    await service.sendMessage({ agentId: "chief", text: "Work that the crash cuts short" });
+    await waitForQueue(service, "chief", (queue) => queue.deliveries[0]?.status === "running");
+
+    client.emit("exit", new Error("Codex exited."));
+
+    await waitForQueue(service, "chief", (queue) => queue.deliveries[0]?.status === "interrupted");
+  });
+
   it("expires a persisted question prompt after restart", async () => {
     const { store, mailbox } = stores(root);
     service = createTestService({ store, mailbox });
     await service.initialize();
     await service.sendMessage({ agentId: "chief", text: "Start a recoverable turn" });
-    await waitFor(() => service?.listQueue("chief").deliveries[0]?.status === "running");
+    await waitForQueue(service, "chief", (queue) => queue.deliveries[0]?.status === "running");
     const agent = await store.getOrCreate("chief");
     await service.stop();
     const snapshot = store.database.readConversation("chief", agent.threadId);
@@ -183,6 +230,51 @@ describe.sequential("AgentService: restart", () => {
       false,
     );
     expect((await service.readConversation("chief")).messages).toEqual([expect.objectContaining(local)]);
+  });
+
+  it("keeps the provider's reason on a failed delivery after a restart", async () => {
+    const reason = "The selected model is not available on this endpoint.";
+    const { store, mailbox } = stores(root);
+    let client: FakeAgentClient | undefined;
+    service = createTestService({
+      store,
+      mailbox,
+      preferredProvider: "codex",
+      clientFactory: (provider) => {
+        client = new FakeAgentClient(provider, "", false);
+        return client;
+      },
+    });
+    const events: AgentEvent[] = [];
+    service.on("event", (event) => events.push(event));
+    await service.initialize();
+    await service.sendMessage({ agentId: "chief", text: "Say hi" });
+    await waitFor(() => events.some((event) => event.type === "turn-started"));
+    const started = events.find((event) => event.type === "turn-started");
+    const threadId = store.activeProviderSession("chief")?.externalSessionId;
+    if (started?.type !== "turn-started" || !client || !threadId) throw new Error("The fake Codex turn did not start.");
+    client.emit("notification", notification("error", { threadId, turnId: started.turnId, message: reason }));
+    client.emit(
+      "notification",
+      notification("turn/completed", { threadId, turn: { id: started.turnId, status: "failed" } }),
+    );
+    await waitForQueue(service, "chief", (queue) => queue.deliveries.some((delivery) => delivery.status === "failed"));
+    await service.stop();
+    service = null;
+    store.database.close();
+
+    // The banner that showed the reason lives in the window. After a restart the delivery is all that is left.
+    const restored = stores(root);
+    service = createTestService({
+      store: restored.store,
+      mailbox: restored.mailbox,
+      preferredProvider: "codex",
+      clientFactory: (provider) => new FakeAgentClient(provider, "", false),
+    });
+    await service.initialize();
+    expect(service.listQueue("chief").deliveries).toEqual([
+      expect.objectContaining({ status: "failed", turnId: started.turnId, error: reason }),
+    ]);
   });
 
   it("recovers history from sessions retired by an upgrade and retries failed reads without losing local messages", async () => {
@@ -352,7 +444,7 @@ describe.sequential("AgentService: restart", () => {
     service = createService();
     await service.initialize();
     await service.sendMessage({ agentId: "chief", text: "Remember this" });
-    await waitFor(() => service?.listQueue("chief").deliveries[0]?.status === "completed");
+    await waitForQueue(service, "chief", (queue) => queue.deliveries[0]?.status === "completed");
     const before = await service.readConversation("chief");
     await service.stop();
 
@@ -380,7 +472,7 @@ describe.sequential("AgentService: restart", () => {
     service.on("event", (event) => events.push(event));
     await service.initialize();
     await service.sendMessage({ agentId: "chief", text: "Remember this" });
-    await waitFor(() => service?.listQueue("chief").deliveries[0]?.status === "running");
+    await waitForQueue(service, "chief", (queue) => queue.deliveries[0]?.status === "running");
     await store.getOrCreate("chief");
     const externalThreadId = store.activeProviderSession("chief")?.externalSessionId;
     await service.stop();
@@ -389,7 +481,7 @@ describe.sequential("AgentService: restart", () => {
     service.on("event", (event) => events.push(event));
     await service.initialize();
     await service.sendMessage({ agentId: "chief", text: "Continue" });
-    await waitFor(() => service?.listQueue("chief").deliveries[1]?.status === "running");
+    await waitForQueue(service, "chief", (queue) => queue.deliveries[1]?.status === "running");
 
     const requests = await protocolMessages(logPath);
     expect(requests).toEqual(
@@ -417,7 +509,12 @@ describe.sequential("AgentService: restart", () => {
 
   it("deletes idle agents and refuses to orphan active work", async () => {
     const { store, mailbox } = stores(root);
-    service = createTestService({ store, mailbox });
+    let revokeFails = true;
+    const deleteWithRevokedApproval = vi.fn(async (_agentId: string, remove: () => Promise<void>) => {
+      if (revokeFails) throw new Error("Approval revocation failed.");
+      await remove();
+    });
+    service = createTestService({ store, mailbox, deleteWithRevokedApproval });
     await service.initialize();
 
     const deletedAgent = await store.getOrCreate("sales-outbound");
@@ -439,6 +536,11 @@ describe.sequential("AgentService: restart", () => {
       createdAt: "2026-09-01T12:00:00.000Z",
     });
     expect(store.database.pendingHostedSiteTerminalEvents()).toHaveLength(1);
+    await expect(service.deleteAgent("sales-outbound")).rejects.toThrow(
+      "The agent data could not be removed completely.",
+    );
+    expect(service.listAgents().some((agent) => agent.id === "sales-outbound")).toBe(true);
+    revokeFails = false;
     await service.deleteAgent("sales-outbound");
     await expect(service.deleteAgent("sales-outbound")).resolves.toBeUndefined();
     expect(service.listAgents().some((agent) => agent.id === "sales-outbound")).toBe(false);
@@ -461,7 +563,7 @@ describe.sequential("AgentService: restart", () => {
     ).toMatchObject({ count: 0 });
 
     await service.sendMessage({ agentId: "chief", text: "Keep working" });
-    await waitFor(() => service?.listQueue("chief").deliveries[0]?.status === "running");
+    await waitForQueue(service, "chief", (queue) => queue.deliveries[0]?.status === "running");
     await expect(service.deleteAgent("chief")).rejects.toThrow(
       "Stop the agent and cancel its queued messages before deleting it.",
     );
@@ -711,5 +813,82 @@ describe.sequential("AgentService: restart", () => {
     await service.initialize();
 
     expect(service.listRoutineRuns({ agentId: agent.id, routineId: routine.id, limit: 10 })).toHaveLength(1);
+  });
+  it("closes a deleted agent's browser tabs and leaves another agent's tabs open", async () => {
+    const { store, mailbox } = stores(root);
+    const tabs: BrowserTab[] = [];
+    const closed: string[] = [];
+    const browser = fakeBrowser(tabs);
+    browser.close = async (tabId: string) => {
+      closed.push(tabId);
+    };
+    service = createTestService({ store, mailbox, browser });
+    await service.initialize();
+    const deleted = await store.getOrCreate("tab-owner");
+    const kept = await store.getOrCreate("tab-keeper");
+    // A fresh agent holds no thread until its first turn, and the legacy owner rule matches on the
+    // thread id, so give both agents one.
+    const deletedThreadId = store.ensureThreadIdNow(deleted.id);
+    const keptThreadId = store.ensureThreadIdNow(kept.id);
+    tabs.push(
+      browserTab("tab-owned", deleted.id, deletedThreadId),
+      // A tab from a build that stored only the thread id. The renderer still groups it under this
+      // agent, so deleting the agent has to take it too.
+      browserTab("tab-legacy", null, deletedThreadId),
+      browserTab("tab-other", kept.id, keptThreadId),
+    );
+
+    await service.deleteAgent(deleted.id);
+
+    expect(closed).toEqual(["tab-owned", "tab-legacy"]);
+  });
+
+  it("removes deleted agents from channel members at startup and on deletion", async () => {
+    const { store } = stores(root);
+    await store.initialize();
+    await store.getOrCreate("member-a");
+    await store.getOrCreate("member-b");
+    // An older version kept deleted agents in the channel, the lead among them.
+    const channels = new ChannelStore(store.database);
+    channels.update(
+      channels.create("channel-1", {
+        name: "Project",
+        title: "",
+        instructions: "",
+        members: [{ agentId: "gone-1" }, { agentId: "member-a" }, { agentId: "gone-2" }, { agentId: "member-b" }],
+        leadAgentId: "gone-1",
+      }),
+    );
+    store.database.close();
+
+    const restored = stores(root);
+    service = createTestService({ store: restored.store, mailbox: restored.mailbox });
+    await service.initialize();
+    expect(service.channels.store.get("channel-1")).toMatchObject({
+      members: [{ agentId: "member-a" }, { agentId: "member-b" }],
+      leadAgentId: "member-a",
+    });
+
+    await service.deleteAgent("member-a");
+    expect(service.channels.store.get("channel-1")).toMatchObject({
+      members: [{ agentId: "member-b" }],
+      leadAgentId: "member-b",
+    });
+  });
+
+  it("still deletes the agent when closing one of its browser tabs fails", async () => {
+    const { store, mailbox } = stores(root);
+    const tabs: BrowserTab[] = [];
+    const browser = fakeBrowser(tabs);
+    browser.close = async () => {
+      throw new Error("could not close");
+    };
+    service = createTestService({ store, mailbox, browser });
+    await service.initialize();
+    const agent = await store.getOrCreate("tab-close-failure");
+    tabs.push(browserTab("tab-stuck", agent.id, store.ensureThreadIdNow(agent.id)));
+
+    await expect(service.deleteAgent(agent.id)).resolves.toBeUndefined();
+    expect(service.listAgents().some((entry) => entry.id === agent.id)).toBe(false);
   });
 });

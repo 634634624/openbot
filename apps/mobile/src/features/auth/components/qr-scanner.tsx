@@ -1,4 +1,3 @@
-import { userErrorMessage as errorMessage } from "@openbot/user-errors";
 import { CameraView, type CameraViewProps, useCameraPermissions } from "expo-camera";
 import { Stack } from "expo-router";
 import { useIsFocused } from "expo-router/react-navigation";
@@ -9,10 +8,19 @@ import { Camera, ScanLine } from "lucide-react-native";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { AppState, Linking, ScrollView, StyleSheet, useWindowDimensions, View } from "react-native";
 
-import Animated, { ReduceMotion, useAnimatedStyle, useSharedValue, withTiming } from "react-native-reanimated";
+import Animated, {
+  Easing,
+  ReduceMotion,
+  useAnimatedStyle,
+  useReducedMotion,
+  useSharedValue,
+  withTiming,
+} from "react-native-reanimated";
 
 import { mobileAnalytics } from "@/features/analytics/mobile-analytics";
+import { haptics } from "@/shared/lib/haptics";
 import { isAndroid, isIOS } from "@/shared/lib/platform";
+import { useText } from "@/shared/lib/text";
 
 type ScanState =
   | { status: "idle" }
@@ -20,7 +28,16 @@ type ScanState =
   | { status: "error"; source: "camera" | "connection"; message: string };
 const QR_SCANNER_SETTINGS: CameraViewProps["barcodeScannerSettings"] = { barcodeTypes: ["qr"] };
 
-function ScannerStatus({ scanState, onRetry }: { scanState: ScanState; onRetry: () => void }) {
+function ScannerStatus({
+  pairing,
+  scanState,
+  onRetry,
+}: {
+  pairing: boolean;
+  scanState: ScanState;
+  onRetry: () => void;
+}) {
+  const { t } = useText();
   const [foreground, accent] = useThemeColor(["foreground", "accent"]);
 
   if (scanState.status === "error") {
@@ -29,12 +46,14 @@ function ScannerStatus({ scanState, onRetry }: { scanState: ScanState; onRetry: 
         <Alert status="danger">
           <Alert.Indicator />
           <Alert.Content>
-            <Alert.Title>Couldn’t connect</Alert.Title>
+            <Alert.Title>
+              {pairing ? t("mobile.auth.scanner.connectFailed") : t("mobile.auth.scanner.codeFailed")}
+            </Alert.Title>
             <Alert.Description selectable>{scanState.message}</Alert.Description>
           </Alert.Content>
         </Alert>
         <Button size="md" variant="secondary" onPress={onRetry}>
-          <Button.Label>Scan again</Button.Label>
+          <Button.Label>{t("mobile.auth.scanner.scanAgain")}</Button.Label>
         </Button>
       </Card>
     );
@@ -54,12 +73,20 @@ function ScannerStatus({ scanState, onRetry }: { scanState: ScanState; onRetry: 
         )}
         <View className="min-w-0 flex-1 gap-0.5">
           <Card.Title className="font-sans text-body font-semibold">
-            {scanState.status === "connecting" ? "Connecting your phone…" : "Scan the desktop code"}
+            {scanState.status === "connecting"
+              ? pairing
+                ? t("mobile.auth.scanner.connecting")
+                : t("mobile.auth.scanner.readingInvitation")
+              : pairing
+                ? t("mobile.auth.scanner.scanDesktop")
+                : t("mobile.auth.scanner.scanInvitation")}
           </Card.Title>
           <Card.Description className="font-sans text-caption">
             {scanState.status === "connecting"
-              ? "Verifying the one-time code."
-              : "Keep the QR code centered inside the frame."}
+              ? pairing
+                ? t("mobile.auth.scanner.verifying")
+                : t("mobile.auth.scanner.checkingServer")
+              : t("mobile.auth.scanner.keepCentered")}
           </Card.Description>
         </View>
       </Card.Body>
@@ -108,6 +135,7 @@ export function QrScanner({
   onPreviewReady?: () => void;
   renderOverlay?: (camera: boolean) => ReactNode;
 }) {
+  const { t, errorMessage } = useText();
   const scanLocked = useRef(false);
   const completed = useRef(false);
   const scanPending = useRef(false);
@@ -127,6 +155,29 @@ export function QrScanner({
   const [scanState, setScanState] = useState<ScanState>({ status: "idle" });
   const [foregroundColor, accentForeground] = useThemeColor(["foreground", "accent-foreground"]);
   const { width: windowWidth } = useWindowDimensions();
+  const reducedMotion = useReducedMotion();
+  const connecting = useSharedValue(0);
+  const isConnecting = scanState.status === "connecting";
+  useEffect(() => {
+    connecting.set(
+      withTiming(isConnecting ? 1 : 0, {
+        duration: 220,
+        easing: Easing.bezier(0.23, 1, 0.32, 1),
+        reduceMotion: ReduceMotion.Never,
+      }),
+    );
+  }, [connecting, isConnecting]);
+  const frameStyle = useAnimatedStyle(() => ({
+    opacity: 1 - connecting.get(),
+    transform: [{ scale: reducedMotion ? 1 : 1 - connecting.get() * 0.04 }],
+  }));
+  const statusStyle = useAnimatedStyle(() => ({
+    transform: [{ translateY: reducedMotion ? 0 : -16 * connecting.get() }],
+  }));
+  const controlsStyle = useAnimatedStyle(() => ({
+    opacity: 1 - connecting.get(),
+    transform: [{ translateY: reducedMotion ? 0 : -8 * connecting.get() }],
+  }));
   const scannerFrameSize = Math.min(windowWidth - 80, 280);
   useEffect(() => {
     // Permission controls must be visible before the camera can start.
@@ -152,11 +203,13 @@ export function QrScanner({
     try {
       await onScan(data);
       completed.current = true;
+      void haptics.notification("success");
     } catch (error) {
+      void haptics.notification("error");
       setScanState({
         status: "error",
         source: "connection",
-        message: errorMessage(error, "OpenBot could not connect this phone."),
+        message: errorMessage(error, t("mobile.auth.scanner.connectFallback")),
       });
     } finally {
       scanPending.current = false;
@@ -195,12 +248,14 @@ export function QrScanner({
 
               <Card.Body className="gap-2">
                 <Card.Title accessibilityRole="header" className="font-sans text-title font-semibold">
-                  Camera access required
+                  {t("mobile.auth.camera.title")}
                 </Card.Title>
                 <Card.Description className="font-sans text-body leading-6 text-text-secondary">
                   {canRequestPermission
-                    ? "OpenBot uses the camera only to scan the one-time QR code shown in the desktop app."
-                    : "Camera access is blocked. Enable it for OpenBot in device settings, then return here to scan the code."}
+                    ? pairing
+                      ? t("mobile.auth.camera.pairingReason")
+                      : t("mobile.auth.camera.invitationReason")
+                    : t("mobile.auth.camera.blocked")}
                 </Card.Description>
               </Card.Body>
 
@@ -234,7 +289,7 @@ export function QrScanner({
                 >
                   <Camera size={19} color={accentForeground} strokeWidth={2} />
                   <Button.Label className="font-sans font-semibold">
-                    {canRequestPermission ? "Allow camera access" : "Open settings"}
+                    {canRequestPermission ? t("mobile.auth.camera.allow") : t("mobile.auth.camera.openSettings")}
                   </Button.Label>
                 </Button>
               </Card.Footer>
@@ -264,7 +319,7 @@ export function QrScanner({
             key={cameraAttempt}
             onCameraReady={onPreviewReady}
             onMountError={() => {
-              setScanState({ status: "error", source: "camera", message: "Could not start the camera. Try again." });
+              setScanState({ status: "error", source: "camera", message: t("mobile.auth.scanner.cameraFailed") });
               onPreviewReady?.();
             }}
             // Expo enables native scanning from the presence of this callback.
@@ -273,15 +328,23 @@ export function QrScanner({
           />
         ) : null}
 
-        <View pointerEvents="none" className="absolute inset-0 items-center justify-center px-10 pb-24">
+        <Animated.View
+          pointerEvents="none"
+          style={frameStyle}
+          className="absolute inset-0 items-center justify-center px-10 pb-24"
+        >
           <View
             className="rounded-[28px] border-2 border-white"
             style={{ borderCurve: "continuous", height: scannerFrameSize, width: scannerFrameSize }}
           />
-        </View>
+        </Animated.View>
 
-        <View className={embedded ? "absolute inset-x-4 bottom-4" : "absolute inset-x-5 bottom-safe-offset-5"}>
+        <Animated.View
+          style={statusStyle}
+          className={embedded ? "absolute inset-x-4 bottom-4" : "absolute inset-x-5 bottom-safe-offset-5"}
+        >
           <ScannerStatus
+            pairing={pairing}
             scanState={scanState}
             onRetry={() => {
               if (scanState.status === "error" && scanState.source === "camera") {
@@ -291,8 +354,15 @@ export function QrScanner({
               setScanState({ status: "idle" });
             }}
           />
-        </View>
-        {renderOverlay?.(true)}
+        </Animated.View>
+        <Animated.View
+          pointerEvents={isConnecting ? "none" : "box-none"}
+          accessibilityElementsHidden={isConnecting}
+          importantForAccessibility={isConnecting ? "no-hide-descendants" : "auto"}
+          style={[StyleSheet.absoluteFill, controlsStyle]}
+        >
+          {renderOverlay?.(true)}
+        </Animated.View>
       </View>
     </>
   );
