@@ -5,6 +5,7 @@ import type {
   ChannelMessage,
   ChannelRoutingConversationEvent,
   ConversationMessage,
+  ConversationMessageSender,
   ConversationQuestionPrompt,
   ImageGenerationInfo,
   QueueDelivery,
@@ -45,6 +46,8 @@ export type ChatMessage =
       kind: "message";
       author: "agent" | "user";
       speaker?: ChannelMessage["author"];
+      /** Another person who wrote this message in an agent chat. The reader's own messages have none. */
+      sender?: ConversationMessageSender;
       superseded?: boolean;
       body: string;
       streaming: boolean;
@@ -113,7 +116,8 @@ export function presentChatMessages(
   return result;
 }
 
-const projectedBubbles = new WeakMap<ConversationMessage, ChatMessage>();
+// The reader decides whether a user message is their own, so a bubble is kept for one reader.
+const projectedBubbles = new WeakMap<ConversationMessage, { readerKey: string; bubble: ChatMessage }>();
 const projectedExchanges = new WeakMap<ConversationMessage, ChatMessage>();
 const projectedQuestions = new WeakMap<ConversationMessage, ChatMessage>();
 const projectedRoutines = new WeakMap<ConversationMessage, ChatMessage>();
@@ -253,7 +257,23 @@ function sortedConversationMessages(messages: readonly ConversationMessage[]) {
   return sorted;
 }
 
-export function projectChatMessages(messages: ConversationMessage[]): ChatMessage[] {
+/**
+ * `memberId` is the reader's membership on the server. A user message that another member wrote
+ * gets their name. A message with no sender, from before senders
+ * were kept, stays the reader's own, as it always showed.
+ *
+ * `accountUserId` is the reader's account. A host with no membership for its own user stamps
+ * `local-user:<account>`, so that sender is also the reader when they read their own server.
+ */
+export function projectChatMessages(
+  messages: ConversationMessage[],
+  memberId: string | null = null,
+  accountUserId: string | null = null,
+): ChatMessage[] {
+  // A server that is still connecting has an empty membership, which names no reader.
+  const reader = memberId || null;
+  const readerAccount = accountUserId ? `local-user:${accountUserId}` : null;
+  const readerKey = `${reader ?? ""}\n${readerAccount ?? ""}`;
   const result: ChatMessage[] = [];
   const thinkingByTurn = new Map<string, Extract<ChatMessage, { kind: "thinking" }>>();
   const sorted = sortedConversationMessages(messages);
@@ -305,12 +325,18 @@ export function projectChatMessages(messages: ConversationMessage[]): ChatMessag
       }
       thinking.steps.push({ id: message.id, text: message.text });
     } else {
-      let bubble = projectedBubbles.get(message);
+      const cached = projectedBubbles.get(message);
+      let bubble = cached?.readerKey === readerKey ? cached.bubble : undefined;
       if (!bubble) {
+        const sender = message.author === "user" ? message.senderMember : undefined;
+        const otherMember =
+          sender !== undefined && reader !== null && sender.id !== reader && sender.id !== readerAccount;
         bubble = projectPlan(message) ?? {
           id: message.id,
           kind: "message",
+          // Another person's message stays a person's bubble, on the right, and adds their name.
           author: message.author === "user" ? "user" : "agent",
+          ...(otherMember ? { sender } : {}),
           body: message.exchange ? "" : message.text,
           streaming: message.status === "streaming",
           status: message.status,
@@ -318,7 +344,7 @@ export function projectChatMessages(messages: ConversationMessage[]): ChatMessag
           imageGeneration: message.imageGeneration,
           replyToMessageId: message.replyToMessageId,
         };
-        projectedBubbles.set(message, bubble);
+        projectedBubbles.set(message, { readerKey, bubble });
       }
       result.push(bubble);
     }

@@ -20,6 +20,7 @@ import type {
   ChannelRoutine,
   ChannelRoutineRun,
   ConversationMessage,
+  ConversationMessageSender,
   ConversationPage,
   ConversationPageAnchor,
   ConversationReadState,
@@ -294,8 +295,13 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     });
     this.#sidebarLayout = sidebarLayout;
     this.#profileSave = new ProfileSave(store, {
-      create: (input, configure) =>
-        this.createAgent({ ...input.draft, initialMessage: input.initialMessage ?? "" }, configure, input.operationId),
+      create: (input, configure, sender) =>
+        this.createAgent(
+          { ...input.draft, initialMessage: input.initialMessage ?? "" },
+          configure,
+          input.operationId,
+          sender,
+        ),
       changed: (agent) => {
         this.#conversation.unloadAgentThreads(agent.id);
         this.#emit({ type: "agents-changed", agents: this.listAgents() });
@@ -1116,8 +1122,9 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
   saveProfile(
     input: SaveAgentProfileInput,
     sidebar: Pick<SidebarLayoutStore, "getSnapshot" | "withProfileAssignment">,
+    sender?: ConversationMessageSender,
   ): Promise<SaveAgentProfileResult> {
-    return this.#profileSave.save(input, sidebar);
+    return this.#profileSave.save(input, sidebar, sender);
   }
 
   preferredProvider(): AgentProvider {
@@ -1129,10 +1136,12 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     return { provider: this.#providers.preferredProvider(), model: this.#providers.preferredModel() };
   }
 
+  /** `sender` is the person who writes the first message, as `sendMessage` takes it. */
   async createAgent(
     input: CreateAgentInput,
     configure?: (agent: AgentSummary) => Promise<AgentSummary>,
     profileOperationId?: string,
+    sender?: ConversationMessageSender,
   ): Promise<AgentSummary> {
     const initialMessage = input.initialMessage.trim();
     if (!initialMessage) throw new Error(sourceText("error.agent.initialMessageRequired"));
@@ -1166,7 +1175,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
         agent = await this.#landOnStartingChoice(agent, starting);
       }
       if (configure) agent = await configure(agent);
-      await this.sendMessage({ agentId: agent.id, text: initialMessage, attachmentDraftIds: [] });
+      await this.sendMessage({ agentId: agent.id, text: initialMessage, attachmentDraftIds: [] }, sender);
       return this.#store.list().find((candidate) => candidate.id === agent.id) ?? agent;
     } catch (error) {
       let rollbackError: unknown;
@@ -1615,12 +1624,17 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     return this.#queue.cancel(agentId, deliveryId);
   }
 
-  editQueuedMessage(agentId: string, input: QueueEditRequest): Promise<QueueSnapshot> {
-    return this.#queue.edit(agentId, input);
+  /** A saved edit is the editor's text, so `sender` becomes the sender of the message. */
+  editQueuedMessage(
+    agentId: string,
+    input: QueueEditRequest,
+    sender?: ConversationMessageSender,
+  ): Promise<QueueSnapshot> {
+    return this.#queue.edit(agentId, input, sender);
   }
 
-  updateQueuedMessage(input: UpdateQueuedMessageInput): Promise<void> {
-    return this.#queue.update(input);
+  updateQueuedMessage(input: UpdateQueuedMessageInput, sender?: ConversationMessageSender): Promise<void> {
+    return this.#queue.update(input, sender);
   }
 
   reorderQueue(input: ReorderQueueInput): Promise<void> {
@@ -1631,7 +1645,11 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     return this.#queue.steer(input);
   }
 
-  async sendMessage(input: SendMessageInput): Promise<QueuedMessageReceipt> {
+  /**
+   * `sender` is the person the host saw send it. It is not part of `SendMessageInput`: the caller of
+   * that input, a renderer or a Team API body, never names who it is.
+   */
+  async sendMessage(input: SendMessageInput, sender?: ConversationMessageSender): Promise<QueuedMessageReceipt> {
     const validateRecipient = this.#mailbox.prepareDelivery([input.agentId]);
     if (this.#duplication.isPending(input.agentId))
       throw new Error(sourceText("error.agent.unknown", { id: input.agentId }));
@@ -1640,6 +1658,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     validateRecipient();
     const receipt = await this.#mailbox.enqueue({
       sender: { kind: "user" },
+      ...(sender ? { senderMember: sender } : {}),
       recipientAgentIds: [agent.id],
       text: input.text,
       draftIds: input.attachmentDraftIds ?? [],
