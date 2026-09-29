@@ -141,6 +141,7 @@ export function WorkspaceSidebar(props: { peopleEnabled: boolean }) {
               onViewChange: layout.setServerView,
               onSelect: serverActions.select,
               onAdd: serverActions.add,
+              addCreatesServer: serverActions.addCreatesServer(),
               ...serverActions.callbacks,
             }
           : undefined

@@ -18,6 +18,7 @@ import type {
   TeamPresenceSnapshot,
   TeamRealtimeEvent,
 } from "@openbot/contracts/ipc";
+import { WAKE_RECONNECT_DELAY_MS } from "@openbot/team-client/hosted-server-wake";
 import type { RemoteTeamHost } from "@openbot/team-client/remote-directory";
 import { reconcilePendingRequests } from "@openbot/team-client/runtime-attention";
 import { currentText } from "@openbot/ui/text";
@@ -30,6 +31,7 @@ import { defaultSidebarLayout } from "../sidebar/sidebar-sections";
 import { createHostRestartToasts } from "../updates/host-restart-toast";
 import type { WebHostNotice } from "./web-host-connections";
 import type { WebHostState } from "./web-host-lock";
+import { createWebHostedServerWake } from "./web-hosted-server-wake";
 import {
   createWebWorkspaceRuntime,
   WebHostIncompatibleError,
@@ -174,6 +176,8 @@ export function createWebWorkspace(
   const conversationReads = new Map<string, number>();
   const heldDeltas = new Map<string, Array<Extract<AgentEvent, { type: "conversation-delta" }>>>();
   const hostEventListeners = new Set<(event: AgentEvent | TeamRealtimeEvent) => void>();
+  const wakeHostedServer = createWebHostedServerWake(props.accountFetch);
+  let wakeReconnectTimer: number | undefined;
   const hostNoticeListeners = new Set<(hostId: string, event: WebHostNotice, agents: AgentSummary[]) => void>();
   const runtime = (props.createRuntime ?? createWebWorkspaceRuntime)(
     props.accountId,
@@ -251,6 +255,8 @@ export function createWebWorkspace(
             .catch(report);
           return;
         }
+        // A host that announced a restart comes back by itself; a wake is only for a stopped server.
+        if (update.state === "offline" && !update.code && !state.hostRestart) wakeAndReconnect(update.hostId);
         if (update.state === "online") revokedReconnect = false;
         else if (state.hostRestart) retryAfterRestart();
         if (update.state === "online" && update.resync) {
@@ -550,6 +556,17 @@ export function createWebWorkspace(
   function retryHosts(): Promise<void> {
     return refreshHosts().catch(() => undefined);
   }
+  /** A hosted server that the provider stopped is offline until it starts. Ask for a start, then connect again. */
+  function wakeAndReconnect(id: string): void {
+    void wakeHostedServer(id).then((waking) => {
+      if (!waking || disposed || hostId !== id) return;
+      window.clearTimeout(wakeReconnectTimer);
+      wakeReconnectTimer = window.setTimeout(() => {
+        if (!disposed && hostId === id && state.status === "offline") void reconnect().catch(report);
+      }, WAKE_RECONNECT_DELAY_MS);
+    });
+  }
+
   /** `connect` clears `hostRestart`, so the retries count down instead of reading it again. */
   function retryAfterRestart(retries = HOST_RESTART_RETRY_LIMIT): void {
     if (restartRetry || disposed || retries <= 0) return;
@@ -681,7 +698,10 @@ export function createWebWorkspace(
             hostProtocol: { ...error.hostProtocol },
           };
       });
-      if (!(error instanceof WebHostIncompatibleError)) report(error);
+      if (!(error instanceof WebHostIncompatibleError)) {
+        report(error);
+        wakeAndReconnect(host.hostId);
+      }
     }
   }
   async function load(id: string, older = false) {
@@ -1021,6 +1041,7 @@ export function createWebWorkspace(
     return () => {
       disposed = true;
       generation += 1;
+      window.clearTimeout(wakeReconnectTimer);
       acceptedInvite = null;
       if (restartRetry) clearTimeout(restartRetry);
       window.removeEventListener("focus", focus);
