@@ -42,6 +42,7 @@ import { hostedSiteIpcHandlers } from "./ipc/hosted-site-handlers";
 import { marketplaceAgentIpcHandlers } from "./ipc/marketplace-agent-handlers";
 import { mcpServerIpcHandlers } from "./ipc/mcp-server-handlers";
 import { memoryIpcHandlers } from "./ipc/memory-handlers";
+import { messagingIpcHandlers } from "./ipc/messaging-handlers";
 import { notificationIpcHandlers } from "./ipc/notification-handlers";
 import { pluginIpcHandlers } from "./ipc/plugin-handlers";
 import { providerAdminIpcHandlers } from "./ipc/provider-admin-handlers";
@@ -341,6 +342,7 @@ function registerIpcHandlers({
   service,
   providerRuntimes,
   providerCredentials,
+  messaging,
   mailbox,
   browser,
   browserPictureInPicture,
@@ -468,6 +470,7 @@ function registerIpcHandlers({
       customProviders: customProviderChanges,
       remoteServers,
     }),
+    ...messagingIpcHandlers({ messaging, remoteServers }),
     ...mcpServerIpcHandlers({
       service,
       remoteServers,
@@ -821,6 +824,8 @@ if (!hasSingleInstanceLock) {
       screen.on("display-metrics-changed", reconcileDynamicIsland);
       powerMonitor.on("resume", reconcileDynamicIsland);
       powerMonitor.on("resume", () => remoteServers.wake());
+      // A Slack socket can be dead after sleep without knowing it; reconnect instead of waiting for a ping.
+      powerMonitor.on("resume", () => built.messaging.resume());
       const routineWake = new RoutineWake({ routines: service, isOnline: () => net.isOnline() });
       powerMonitor.on("suspend", () => routineWake.suspend());
       powerMonitor.on("resume", () => routineWake.resume());

@@ -394,7 +394,33 @@ Network traffic can also occur when:
   `dl.google.com` (for the download size) for Gemini, and it reads a list of blocked versions from
   `raw.githubusercontent.com/nightly-labs/openbot`. These requests contain no account, agent,
   conversation or file data;
-- a user opens an explicitly labeled external support or setup link.
+- a user opens an explicitly labeled external support or setup link;
+- an agent is connected to Slack. See [Slack connections](#slack-connections).
+
+## Slack connections
+
+An agent that the user connects to Slack uses a Slack app that the user creates in their own Slack
+workspace. OpenBot runs no Slack app of its own and no relay: the computer that runs the agent opens
+a Socket Mode connection to `slack.com` and calls the Slack Web API directly. Nothing goes through an
+OpenBot server.
+
+- **Stored on the host.** The bot token and the app-level token are encrypted by the operating
+  system's secret storage, like provider API keys, and redacted from logs, exports and diagnostics.
+  The database holds the workspace name and ids of the Slack app, and one row per Slack thread or
+  direct message the agent answers. The messages of that thread are kept as a conversation of the
+  agent, with the Slack display name of each author, and files people send are kept with the
+  agent's attachments. Disconnect removes the tokens and keeps the conversations; deleting the agent
+  removes both.
+- **Read from Slack.** The messages that mention the agent, the replies in a thread it answers, its
+  direct messages, the files in them, the display names of their authors, the names of the channels,
+  and up to 30 earlier messages of a thread as context for the agent.
+- **Sent to Slack.** The agent's answers and the files it attaches, short status posts ("Working on
+  it…"), reactions, and approval requests with the command, folder and reason the provider gave,
+  redacted. A failed request posts a fixed sentence, never the provider's error.
+
+Anyone who can post in the Slack workspace, guests and Slack Connect members included, can give the
+agent work. The agent runs on the host with the access the user gave it. A hosted server stays awake
+while a Slack connection is live.
 
 Plugin pages on openbot.run show each listing's own icon. The page asks `openbot.run` for that
 picture, and the website fetches it there from the address the plugin catalog holds, so reading a

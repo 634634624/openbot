@@ -193,6 +193,15 @@ import type {
   SetMcpServerEnabledInput,
   TestMcpServerInput,
 } from "./ipc-mcp-servers";
+import type {
+  ConnectSlackInput,
+  MessagingAgentInput,
+  MessagingOverview,
+  MessagingThread,
+  ReadMessagingThreadInput,
+  SetMessagingEnabledInput,
+  SlackSetup,
+} from "./ipc-messaging";
 import type { NotificationOpenedEvent, NotificationPreference } from "./ipc-notifications";
 import type {
   DetectedModelServer,
@@ -543,6 +552,17 @@ export const IPC_ENDPOINTS = {
     deleteCustomProvider: scopedRequest<DeleteCustomProviderInput, CustomProviderResult, "required">()(
       "provider-admin:delete-custom-provider",
     ),
+  },
+  // The Slack connection of one agent, on the computer that runs it. These take the server, so a
+  // remote admin reaches the host. A token only travels towards the host; no result carries one.
+  messaging: {
+    getOverview: scopedRequest<MessagingAgentInput, MessagingOverview, "required">()("messaging:get-overview"),
+    getSlackSetup: scopedRequest<MessagingAgentInput, SlackSetup, "required">()("messaging:get-slack-setup"),
+    connectSlack: scopedRequest<ConnectSlackInput, MessagingOverview, "required">()("messaging:connect-slack"),
+    reconnect: scopedRequest<MessagingAgentInput, MessagingOverview, "required">()("messaging:reconnect"),
+    setEnabled: scopedRequest<SetMessagingEnabledInput, MessagingOverview, "required">()("messaging:set-enabled"),
+    disconnect: scopedRequest<MessagingAgentInput, MessagingOverview, "required">()("messaging:disconnect"),
+    readThread: scopedRequest<ReadMessagingThreadInput, MessagingThread, "required">()("messaging:read-thread"),
   },
   // The server name, logo and app update of one server's host. `host.updateIdentity` and `update`
   // reach this computer only; these take the server, so a remote admin reaches the host. The

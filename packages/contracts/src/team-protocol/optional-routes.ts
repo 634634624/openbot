@@ -10,6 +10,7 @@ import { AGENT_UPDATE_CODECS } from "./agent-update-v1";
 import { CONTEXT_RESET_CODECS } from "./context-reset-v1";
 import { HOST_ADMIN_CODECS } from "./host-admin-v1";
 import { HOST_UPDATE_CODECS } from "./host-update-v1";
+import { MESSAGING_CODECS } from "./messaging-v1";
 import { PROVIDERS_ADMIN_CODECS } from "./providers-v1";
 import { PROVIDERS_RUNTIMES_V2_CODECS } from "./providers-v2";
 import { SHARED_TABLES_CODECS } from "./shared-tables-v1";
@@ -30,6 +31,7 @@ const CODECS: ReadonlyMap<string, OptionalRouteCodec> = new Map([
   ...CONTEXT_RESET_CODECS,
   ...AGENT_IMPORT_CODECS,
   ...AGENT_PUBLISH_CODECS,
+  ...MESSAGING_CODECS,
 ]);
 
 export function optionalRouteCodec(path: string): OptionalRouteCodec | undefined {

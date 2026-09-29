@@ -39,7 +39,12 @@ export interface ConversationRuntime {
   cancelImportFiles?: () => Promise<void>;
   /** The host admin calls of a client without the desktop port. Absent, skills, tables and publishing are hidden. */
   admin?:
-    | { skills: AgentSkillCalls; sharedTables: SharedTableCalls; agentTemplates: AgentTemplatePublishCalls }
+    | {
+        skills: AgentSkillCalls;
+        sharedTables: SharedTableCalls;
+        agentTemplates: AgentTemplatePublishCalls;
+        messaging: OpenBotDesktopApi["messaging"];
+      }
     | undefined;
 }
 

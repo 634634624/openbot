@@ -99,6 +99,7 @@ import { createMockBrowser, type MockBrowserOptions } from "./mock-browser";
 import { createMockChannels } from "./mock-channels";
 import { createMockHostUpdate, type MockHostUpdateOptions } from "./mock-host-update";
 import { createMockHostedServers } from "./mock-hosted-servers";
+import { createMockMessaging } from "./mock-messaging";
 import { createMockProviderRuntimes, type MockProviderRuntimeOptions } from "./mock-provider-runtimes";
 import { applySidebarLayoutAction } from "./mock-sidebar-layout";
 import { createMockSkills, type MockSkillsOptions } from "./mock-skills";
@@ -657,6 +658,8 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
         return clone(detectionSettings);
       },
     },
+    // Preview has one host, so every server answers for the same agents.
+    messaging: createMockMessaging((agentId) => agents.find((agent) => agent.id === agentId)?.name),
     // Preview has one host, so every server answers from the same providers as this computer.
     providerAdmin: {
       startCodeLogin: (provider) => api.startProviderCodeLogin(provider),

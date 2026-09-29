@@ -51,6 +51,8 @@ import { AgentStore } from "../backend/agent-store";
 import { BrowserHost } from "../backend/browser-host";
 import { MailboxStore } from "../backend/mailbox-store";
 import { McpOAuth } from "../backend/mcp-oauth-provider";
+import { MessagingService } from "../backend/messaging/messaging-service";
+import { slackDriver } from "../backend/messaging/slack/slack-driver";
 import { SidebarLayoutStore } from "../backend/sidebar-layout-store";
 import { StorageUsageScanner, StorageUsageService } from "../backend/storage-usage";
 import { TeamChatStore } from "../backend/team-chat-store";
@@ -120,6 +122,7 @@ import {
 import { ManagedSkillService } from "./managed-skill-service";
 import { startMcpOAuthRedirectServer } from "./mcp-oauth-redirect-server";
 import { McpOAuthStore } from "./mcp-oauth-store";
+import { MessagingCredentialStore } from "./messaging-credential-store";
 import { probeModels } from "./model-server-probe";
 import { NotificationPreferenceStore } from "./notification-preference-store";
 import { ProviderCredentialStore } from "./provider-credential-store";
@@ -180,6 +183,7 @@ const LEGACY_REMOTE_DESKTOP_CREDENTIAL_FILE = "openbot-remote-desktop-credential
 const REMOTE_DESKTOP_RUNTIME_SECRET_FILE = "openbot-remote-desktop-runtime-v1.json";
 const CUSTOM_PROVIDERS_FILE = "openbot-custom-providers-v1.json";
 const PROVIDER_CREDENTIAL_FILE = "openbot-provider-credentials-v1.json";
+const MESSAGING_CREDENTIAL_FILE = "openbot-messaging-credentials-v1.json";
 /** The MCP sign-ins. Separate from the keys above: a key is typed by the user, a token is not. */
 const MCP_OAUTH_FILE = "openbot-mcp-oauth-v1.json";
 
@@ -215,6 +219,8 @@ const TEARDOWN_ORDER = {
   remoteServers: 60,
   voice: 70,
   remoteDesktop: 80,
+  // Before the host and the service: no new external message arrives while they stop.
+  messaging: 85,
   host: 90,
   teamWebRtcBridge: 100,
   mcpOAuthRedirect: 105,
@@ -253,6 +259,8 @@ export interface ApplicationServices {
   service: AgentService;
   providerRuntimes: ProviderRuntimeManager;
   providerCredentials: ProviderCredentialStore;
+  /** The Slack connections of the agents on this host. */
+  messaging: MessagingService;
   /** Reached by the entry point for one thing only: handing a returning grant to its sign-in. */
   mcpOAuth: McpOAuth;
   mailbox: MailboxStore;
@@ -791,6 +799,36 @@ export async function createApplicationServices({
     tables,
   });
   teardown.push(TEARDOWN_ORDER.service, "the agent service", () => service.stop());
+  /*
+   * The Slack connections of the agents. The tokens use the same cipher as every other secret; an
+   * unreadable file is reported, not fatal, and each connection then asks for its tokens again.
+   */
+  const messagingCredentials = new MessagingCredentialStore(
+    join(app.getPath("userData"), MESSAGING_CREDENTIAL_FILE),
+    secretCipher,
+  );
+  const messagingCredentialLoadError = await messagingCredentials.load();
+  if (messagingCredentialLoadError)
+    logger.warn(
+      `OpenBot could not read the messaging token file (${messagingCredentialLoadError.name}). It was left unchanged.`,
+    );
+  const messaging = new MessagingService({
+    threads: service.messaging,
+    agents: {
+      listAgents: () => service.listAgents(),
+      respondToApproval: (input) => service.respondToApproval(input),
+      onEvent: (listener) => {
+        service.on("event", listener);
+        return () => service.off("event", listener);
+      },
+    },
+    credentials: messagingCredentials,
+    drivers: [slackDriver()],
+    downloadsRoot: join(app.getPath("userData"), "messaging-downloads"),
+  });
+  // Not awaited: a connection waits for Slack, and the app does not wait for it.
+  void messaging.start().catch((error) => logger.warn("Messaging connections did not start.", toLogValue(error)));
+  teardown.push(TEARDOWN_ORDER.messaging, "the messaging connections", () => messaging.stop());
   // The capability and the tool list both follow the daemon, and nothing else can tell them: no
   // provider probe reaches the driver, because the driver is this process's child.
   // The held state first: the providers start at `unavailable`, and a listener hears only what
@@ -1003,6 +1041,7 @@ export async function createApplicationServices({
         runtimes: providerRuntimes,
         customProviders: customProviderChanges,
       },
+      messaging,
       update: {
         snapshot: () => scheduledUpdate().snapshot(),
         check: () => scheduledUpdate().check(),
@@ -1365,8 +1404,10 @@ export async function createApplicationServices({
     );
     const hostedServerActivity = new HostedServerActivity({
       hostId: hostedServer.hostId,
+      // A live Slack connection counts: stopped, the server could not hear the next message.
       inUse: () =>
         service.hasActiveWork().length > 0 ||
+        messaging.hasLiveConnection() ||
         host.describeRestartBlockers().length > 0 ||
         (host.connectedClientCount() > 0 && Date.now() - (host.lastClientRequestAt() ?? 0) < CLIENT_USE_WINDOW_MS),
       nextRunAt: () => {
@@ -1396,6 +1437,7 @@ export async function createApplicationServices({
     service,
     providerRuntimes,
     providerCredentials,
+    messaging,
     mcpOAuth,
     mailbox,
     storageUsage,

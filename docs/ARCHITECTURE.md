@@ -1384,6 +1384,45 @@ memory and routine editors share their controls with agent settings and use chan
 Channel settings have no provider or model controls because each member retains its own runtime.
 No account API, Signal, IPC contract, or database migration changes are required for mobile channels.
 
+## Messaging connections
+
+An agent can answer in an external chat platform. Slack is the first platform; [messaging.md](messaging.md)
+has the setup, the limits and how to add a platform. Each agent connects to a Slack app that the user
+creates from a manifest in their own workspace. The host opens a Socket Mode WebSocket to Slack, so it
+needs no public address, and the account API and Signal carry nothing of it.
+
+The code has two halves. `MessagingThreads` (`src/backend/messaging/`) is built by `AgentService`
+beside `ChannelService` and knows no platform. `MessagingService` is built in the main process and
+owns the live connections, through one `MessagingDriver` per platform: an adapter for its API and a
+transport for its events. `messaging-types.ts` is the seam; the core never reads a platform payload.
+
+- **Storage.** Migration 24 adds `projection_messaging_connections` (one per agent and platform) and
+  `projection_messaging_threads` (one per external conversation). Tokens are not in the database:
+  `MessagingCredentialStore` keeps them encrypted by `safeStorage`, keyed by connection, and only
+  their state crosses IPC or the Team API.
+- **Execution threads.** Each Slack thread or direct message is a link with its own execution thread
+  in `projection_threads`, as a channel-agent pair is. `MessagingThreads.event` takes that thread's
+  conversation and turn events, so the public chat, the renderer and Team peers never see them.
+  Approvals still reach the host.
+- **Deliveries.** An external message is a mailbox message from `user` with a `messaging` origin
+  (link, author, platform message). No new sender kind, so the frozen Team protocol codecs are
+  unchanged. The queue and the public chat hide it like channel work. It never starts with teammate
+  answers. `DrainScheduler` asks `MessagingThreads.prepare` for the thread and the prompt, which
+  frames the text as external input and adds up to 30 earlier messages of the conversation.
+- **Order.** The one-turn-per-agent rule is unchanged, so Slack requests wait behind the agent's own
+  work and behind channel work that holds the host. The Slack thread shows a waiting post.
+- **Replies.** `MessagingThreads` reports each turn start and end. `MessagingService` posts a status
+  with a Stop button, replaces it with the answer, uploads the files the agent attached, and sets
+  reactions. It serializes the posts of one conversation, so a fast turn cannot race its status.
+- **Approvals and stop.** An approval of a messaging thread is also posted with buttons. Only the
+  Slack user whose message started the turn can answer or stop it; the host can always answer. The
+  button value is a random token that exists only in memory.
+- **Deduplication.** An in-memory set drops a redelivered event at once; the mailbox idempotency key
+  covers a restart. Events that arrive while no socket is open are lost.
+- **Hosted servers and remote admins.** The optional `messaging-v1` capability lets an owner or
+  admin of a joined server connect an agent from the desktop app or the browser client. A live
+  connection counts as use, so a hosted server does not idle out.
+
 ## Skill folders and MCP configuration
 
 A skill follows the [Agent Skills specification](https://agentskills.io/specification): a folder

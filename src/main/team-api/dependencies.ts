@@ -31,6 +31,7 @@ import type { Logger } from "@openbot/logging";
 import type { AgentService } from "../../backend/agent-service";
 import type { BrowserHost } from "../../backend/browser-host";
 import type { MailboxStore } from "../../backend/mailbox-store";
+import type { MessagingService } from "../../backend/messaging/messaging-service";
 import type { SidebarLayoutStore } from "../../backend/sidebar-layout-store";
 import type { StorageUsageService } from "../../backend/storage-usage";
 import type { TeamChatStore } from "../../backend/team-chat-store";
@@ -154,6 +155,11 @@ export interface TeamApiAdmin {
   identity?: TeamApiHostIdentity;
   /** `host-update-v1`: the app update of this computer. Advertised also when the host user turned it off. */
   update?: Pick<RequestedUpdate, "snapshot" | "check" | "start" | "cancel" | "changeSettings">;
+  /** `messaging-v1`: the Slack connection of each agent on this computer. */
+  messaging?: Pick<
+    MessagingService,
+    "overview" | "slackSetup" | "connectSlack" | "reconnect" | "setEnabled" | "disconnect" | "readThread"
+  >;
 }
 
 interface TeamApiHostIdentity {

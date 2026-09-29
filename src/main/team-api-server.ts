@@ -35,6 +35,7 @@ import {
   HOST_UPDATE_CAPABILITY,
   isTeamCurrentCapability,
   MCP_SERVERS_CAPABILITY,
+  MESSAGING_CAPABILITY,
   PROVIDERS_ADMIN_CAPABILITY,
   PROVIDERS_RUNTIMES_V2_CAPABILITY,
   SHARED_TABLES_CAPABILITY,
@@ -105,6 +106,7 @@ import { routeFiles } from "./team-api/route-files";
 import { routeHostAdmin } from "./team-api/route-host-admin";
 import { routeHostUpdate } from "./team-api/route-host-update";
 import { routeMcpServers } from "./team-api/route-mcp";
+import { routeMessaging } from "./team-api/route-messaging";
 import { routeProviders } from "./team-api/route-providers";
 import { routeRemoteScreen } from "./team-api/route-remote-screen";
 import { routeSharedTables } from "./team-api/route-shared-tables";
@@ -626,6 +628,7 @@ export class TeamApiServer {
       if ((await routeAgentInstall(context, this.#options.admin)) === "handled") return;
       if ((await routeAgentPublish(context, this.#options.admin)) === "handled") return;
       if ((await routeProviders(context, this.#options.admin)) === "handled") return;
+      if ((await routeMessaging(context, this.#options.admin)) === "handled") return;
       if ((await routeHostAdmin(context, this.#options.admin)) === "handled") return;
       if ((await routeHostUpdate(context, this.#options.admin)) === "handled") return;
       if ((await routeContextReset(context, this.#options.agents, hidden)) === "handled") return;
@@ -1208,6 +1211,7 @@ export class TeamApiServer {
           return this.#options.admin?.providers !== undefined;
         if (capability === HOST_ADMIN_CAPABILITY) return this.#options.admin?.identity !== undefined;
         if (capability === HOST_UPDATE_CAPABILITY) return this.#options.admin?.update !== undefined;
+        if (capability === MESSAGING_CAPABILITY) return this.#options.admin?.messaging !== undefined;
         if (capability === AGENT_IMPORT_CAPABILITY) return this.#options.agentImport !== undefined;
         return true;
       }),

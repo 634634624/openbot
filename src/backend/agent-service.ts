@@ -129,6 +129,7 @@ import type { BundledProviderExecutables } from "./cli";
 import type { ConversationMarkerExclusions } from "./conversation-read-store";
 import type { MailboxStore } from "./mailbox-store";
 import { McpServerStore } from "./mcp-server-store";
+import { MessagingThreads } from "./messaging/messaging-threads";
 import { decodeRecordResponse } from "./protocol";
 import { NO_PROVIDER_CREDENTIALS, type ProviderClientContext } from "./provider-drivers";
 import { recordAgentRestartActivity } from "./restart-activity";
@@ -203,6 +204,7 @@ export interface AgentServiceOptions {
 
 export class AgentService extends EventEmitter<AgentServiceEvents> {
   readonly channels: ChannelService;
+  readonly messaging: MessagingThreads;
   readonly #profileSave: ProfileSave;
   readonly #profileClients = new ProfileClients();
   readonly #store: AgentStore;
@@ -560,10 +562,12 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       threads: this.#threads,
       hooks: {
         emitError: (code, error, agentId) => this.#emitError(code, error, agentId),
-        executionThreads: () => this.channels.store.executionThreads(),
+        executionThreads: () => [...this.channels.store.executionThreads(), ...this.messaging.store.executionThreads()],
         deliveryThreadId: (deliveryId) => {
           const assignment = this.channels.store.assignmentForDelivery(deliveryId);
-          return assignment ? this.channels.store.context(assignment.channelId, assignment.agentId).threadId : null;
+          return assignment
+            ? this.channels.store.context(assignment.channelId, assignment.agentId).threadId
+            : this.messaging.threadForDelivery(deliveryId);
         },
       },
     });
@@ -592,16 +596,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
         const session = agent ? this.#store.database.activeProviderSession(threadId, agent.provider) : null;
         return session ? this.#compaction.contextInputCharacters(session.externalSessionId) : 120_000;
       },
-      forgetThread: async (threadId) => {
-        const sessions = this.#store.database.listProviderSessions(threadId);
-        for (const session of sessions) await this.#threads.deleteProviderSessionFiles(session.externalSessionId);
-        for (const session of sessions) {
-          this.#conversation.unbindThread(session.externalSessionId);
-          this.#conversation.unloadThread(session.externalSessionId);
-          this.#compaction.forgetThread(session.externalSessionId);
-        }
-        this.#conversation.forgetExecutionThread(threadId);
-      },
+      forgetThread: (threadId) => this.#forgetExecutionThread(threadId),
       normalBusy: () =>
         this.#mailbox
           .unresolvedDeliveries()
@@ -661,8 +656,16 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
         excludedChannels: () => new Set(),
       },
     });
+    this.messaging = new MessagingThreads(store.database, mailbox, {
+      schedule: (agentId) => this.#drain.scheduleDrain(agentId),
+      busy: (agentId) =>
+        Boolean(this.#conversation.workingSnapshot(agentId)?.activeTurnId || this.#mailbox.nextQueued(agentId)),
+      interrupt: (agentId, turnId, threadId) => this.interrupt(agentId, turnId, threadId),
+      forgetThread: (threadId) => this.#forgetExecutionThread(threadId),
+    });
     this.#drain = new DrainScheduler({
       channels: this.channels,
+      messaging: this.messaging,
       store,
       mailbox,
       mailboxSync: this.#mailboxSync,
@@ -724,6 +727,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       conversation: this.#conversation,
       browser,
       channels: this.channels,
+      messaging: this.messaging,
       routines: this.#routines,
       duplication: this.#duplication,
       drain: this.#drain,
@@ -1719,7 +1723,19 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
 
   #emit(event: AgentEvent): void {
     recordAgentRestartActivity(event);
-    if (this.channels?.event(event)) return;
+    if (this.channels?.event(event) || this.messaging?.event(event)) return;
     this.emit("event", event);
+  }
+
+  /** Removes live provider state for an execution thread before its durable rows are deleted. */
+  async #forgetExecutionThread(threadId: string): Promise<void> {
+    const sessions = this.#store.database.listProviderSessions(threadId);
+    for (const session of sessions) await this.#threads.deleteProviderSessionFiles(session.externalSessionId);
+    for (const session of sessions) {
+      this.#conversation.unbindThread(session.externalSessionId);
+      this.#conversation.unloadThread(session.externalSessionId);
+      this.#compaction.forgetThread(session.externalSessionId);
+    }
+    this.#conversation.forgetExecutionThread(threadId);
   }
 }

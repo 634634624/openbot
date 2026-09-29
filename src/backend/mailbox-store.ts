@@ -46,8 +46,20 @@ import { isRecord } from "./protocol";
 import { recordRestartActivity } from "./restart-activity";
 
 const MAX_ATTACHMENTS = INPUT_LIMITS.attachments;
+/**
+ * The external conversation a message came from. Such a message runs in the execution thread of
+ * that conversation, so the queue and the public chat do not show it, like channel work.
+ */
+export interface MessagingOrigin {
+  linkId: string;
+  authorId: string;
+  authorName: string;
+  platformMessageId: string;
+}
+
 interface StoredMessage {
   channelId?: string;
+  messaging?: MessagingOrigin;
   id: string;
   sender:
     | { kind: "user" }
@@ -105,6 +117,7 @@ interface StoredReaction {
 
 interface EnqueueInput {
   channelId?: string;
+  messaging?: MessagingOrigin;
   sender: StoredMessage["sender"];
   recipientAgentIds: string[];
   text: string;
@@ -242,6 +255,37 @@ export class MailboxStore {
     return delivery ? this.#context(delivery) : null;
   }
 
+  /** The external conversation this delivery came from, or null for any other delivery. */
+  messagingOrigin(deliveryId: string): MessagingOrigin | null {
+    const delivery = this.#state.deliveries.find((item) => item.id === deliveryId);
+    const message = delivery ? this.#state.messages.find((item) => item.id === delivery.messageId) : undefined;
+    return message?.messaging ? structuredClone(message.messaging) : null;
+  }
+
+  /** The external author of each message of one messaging link, by message id. */
+  messagingAuthors(linkId: string): Map<string, string> {
+    return new Map(
+      this.#state.messages.flatMap((message) =>
+        message.messaging?.linkId === linkId ? [[message.id, message.messaging.authorName] as const] : [],
+      ),
+    );
+  }
+
+  /** The deliveries of one messaging link that have not ended, oldest first. */
+  unresolvedMessagingDeliveries(linkId: string): DeliveryContext[] {
+    const messageIds = new Set(
+      this.#state.messages.filter((message) => message.messaging?.linkId === linkId).map((message) => message.id),
+    );
+    return this.#state.deliveries
+      .filter(
+        (delivery) =>
+          messageIds.has(delivery.messageId) &&
+          (delivery.status === "queued" || delivery.status === "starting" || delivery.status === "running"),
+      )
+      .sort(compareQueueOrder)
+      .map((delivery) => this.#context(delivery));
+  }
+
   async enqueue(input: EnqueueInput): Promise<QueuedMessageReceipt> {
     if (input.idempotencyKey) {
       const existingMessageId = this.#state.idempotency[input.idempotencyKey];
@@ -298,6 +342,7 @@ export class MailboxStore {
     const committedByDraftId = new Map(drafts.map((draft, index) => [draft.id, attachments[index]] as const));
     const message: StoredMessage = {
       channelId: input.channelId,
+      ...(input.messaging ? { messaging: input.messaging } : {}),
       id: messageId,
       sender: input.sender,
       text: rewriteAttachmentReferences(text, (reference) => {
@@ -413,40 +458,41 @@ export class MailboxStore {
    * which reads as lost messages.
    */
   listQueue(agentId: string): QueueSnapshot {
-    const channelMessageIds = this.#channelMessageIds();
+    const executionMessageIds = this.#executionMessageIds();
     const positions = this.#queuedPositions();
     return {
       agentId,
       // Queue order, not storage order: a restart reads the deliveries back sorted by their
       // creation time and identity, which would otherwise reorder rows a client already saw.
       deliveries: [...this.#state.deliveries]
-        .filter((delivery) => delivery.recipientAgentId === agentId && !channelMessageIds.has(delivery.messageId))
+        .filter((delivery) => delivery.recipientAgentId === agentId && !executionMessageIds.has(delivery.messageId))
         .sort(compareQueueOrder)
         .map((delivery) => this.#publicDelivery(delivery, positions)),
     };
   }
 
   /**
-   * The queued channel work of this agent, in queue order. `listQueue` hides it, so a caller that
-   * reorders the queue the user sees has to put these ids back before the mailbox reads the order.
+   * The queued channel and messaging work of this agent, in queue order. `listQueue` hides it, so a
+   * caller that reorders the queue the user sees has to put these ids back before the mailbox reads
+   * the order.
    */
-  queuedChannelDeliveryIds(agentId: string): string[] {
-    const channelMessageIds = this.#channelMessageIds();
+  queuedExecutionDeliveryIds(agentId: string): string[] {
+    const executionMessageIds = this.#executionMessageIds();
     return this.#state.deliveries
       .filter(
         (delivery) =>
           delivery.recipientAgentId === agentId &&
           delivery.status === "queued" &&
-          channelMessageIds.has(delivery.messageId),
+          executionMessageIds.has(delivery.messageId),
       )
       .sort(compareQueueOrder)
       .map((delivery) => delivery.id);
   }
 
   /** Indexed once for a whole read: a queue holds one delivery for each message the agent has. */
-  #channelMessageIds(): Set<string> {
+  #executionMessageIds(): Set<string> {
     const ids = new Set<string>();
-    for (const message of this.#state.messages) if (message.channelId) ids.add(message.id);
+    for (const message of this.#state.messages) if (message.channelId || message.messaging) ids.add(message.id);
     return ids;
   }
 
@@ -502,7 +548,7 @@ export class MailboxStore {
       deliveriesByMessage.set(delivery.messageId, deliveries);
     }
     for (const message of this.#state.messages) {
-      if (message.channelId) continue;
+      if (message.channelId || message.messaging) continue;
       const deliveries = deliveriesByMessage.get(message.id) ?? [];
       if (message.sender.kind === "agent" && message.sender.agentId === agentId) {
         messages.push({
@@ -1780,10 +1826,21 @@ function isStoredDraft(value: unknown): value is StoredDraft {
   );
 }
 
+function isMessagingOrigin(value: unknown): value is MessagingOrigin {
+  return (
+    isRecord(value) &&
+    isString(value.linkId) &&
+    isString(value.authorId) &&
+    isString(value.authorName) &&
+    isString(value.platformMessageId)
+  );
+}
+
 function isStoredMessage(value: unknown): value is StoredMessage {
   return (
     isRecord(value) &&
     (value.channelId === undefined || isString(value.channelId)) &&
+    (value.messaging === undefined || isMessagingOrigin(value.messaging)) &&
     isString(value.id) &&
     isRecord(value.sender) &&
     (value.sender.kind === "user" ||
