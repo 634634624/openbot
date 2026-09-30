@@ -54,6 +54,8 @@ interface CreatedApp {
 }
 
 interface ManagedCredentials {
+  /** Also in the connection's row. Kept here so the app can be deleted after the row is gone. */
+  appId?: string;
   botToken?: string;
   signingSecret: string;
   clientId: string;
@@ -167,6 +169,7 @@ export class SlackManagedApps {
         this.#urlChecks.delete(connectionId);
       }
       await this.#options.credentials.set(connectionId, {
+        appId: created.appId,
         signingSecret: created.signingSecret,
         clientId: created.clientId,
         clientSecret: created.clientSecret,
@@ -340,7 +343,7 @@ export class SlackManagedApps {
   }
 
   async #deleteApp(connectionId: string, managed: ManagedCredentials, knownAppId?: string | null): Promise<void> {
-    const appId = knownAppId ?? this.#options.store.connection(connectionId)?.appId;
+    const appId = knownAppId ?? this.#options.store.connection(connectionId)?.appId ?? managed.appId;
     const token = this.#optionalManagerToken(managed.workspaceId);
     if (!appId || !token) return;
     try {
@@ -374,6 +377,7 @@ export class SlackManagedApps {
     if (!values?.signingSecret || !values.clientId || !values.clientSecret || !values.requestUrl || !values.workspaceId)
       return null;
     return {
+      ...(values.appId ? { appId: values.appId } : {}),
       ...(values.botToken ? { botToken: values.botToken } : {}),
       signingSecret: values.signingSecret,
       clientId: values.clientId,

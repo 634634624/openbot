@@ -13,5 +13,7 @@ export const messages = defineMessages("error.messaging", {
   "error.messaging.slackAppRefused":
     "Slack did not create the app. A workspace admin may need to allow new apps. Try again, or connect with your own Slack app.",
   "error.messaging.slackInstallFailed": "Slack did not finish the install. Open the install page again.",
+  "error.messaging.slackAppNotDeleted":
+    "OpenBot disconnected the agent, but Slack did not delete its app. Delete it in the app settings at api.slack.com/apps.",
   "error.messaging.managedOnHost": "Create the Slack app in OpenBot on the computer that runs the agent.",
 });

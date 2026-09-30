@@ -89,6 +89,7 @@ address, while the token lasts. A packaged build ignores all of these variables.
 | Reconnecting | The host lost the connection. | Nothing, or **Reconnect** after the network is back. |
 | Waiting for install | The agent's Slack app exists, but it is not installed in the workspace. | **Install in Slack**, or ask a workspace admin to approve the app. |
 | Cannot receive events | The app gets its events through Signal, and this computer cannot reach it: it is signed out, has no name, or Signal is down. | Sign in, name this computer in **Server settings**, keep OpenBot open. |
+| "Slack did not delete its app" after **Disconnect** | The agent is disconnected, but Slack refused to delete the app, or the workspace token is gone. | Delete the app at api.slack.com/apps. |
 
 ## Limits
 

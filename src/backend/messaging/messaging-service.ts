@@ -16,7 +16,7 @@ import type {
   RespondToApprovalInput,
 } from "@openbot/contracts/ipc";
 import { MESSAGING_CONNECTION_STATES } from "@openbot/contracts/ipc";
-import { isOneOf } from "@openbot/contracts/runtime-values";
+import { isDynamicRecord, isOneOf, isString } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
 import { createOpenBotLogger, redactText } from "@openbot/logging";
 import type { MessagingOrigin } from "../mailbox-store";
@@ -246,7 +246,15 @@ export class MessagingService {
   async disconnect(agentId: string): Promise<MessagingOverview> {
     const record = this.#requireConnection(agentId);
     await this.#stopConnection(record.connectionId);
-    await this.#managed?.deleteApp(record.connectionId).catch((error) => this.#warn(error));
+    // The connection ends either way. When Slack keeps the app, the person is told, so they can
+    // delete it in Slack: nothing on this computer can reach it after this.
+    const appKept = await this.#managed
+      ?.deleteApp(record.connectionId)
+      .then(() => false)
+      .catch((error) => {
+        this.#warn(error);
+        return true;
+      });
     await this.#credentials.clear(record.connectionId);
     this.#threads.store.updateConnection(record.connectionId, {
       enabled: false,
@@ -256,6 +264,7 @@ export class MessagingService {
       appId: null,
       lastErrorCode: null,
     });
+    if (appKept) throw new Error(sourceText("error.messaging.slackAppNotDeleted"));
     return this.overview(agentId);
   }
 
@@ -758,9 +767,14 @@ export class MessagingService {
     for (const [connectionId, live] of this.#live) {
       if (ids.has(live.record.agentId)) continue;
       await this.#stopConnection(connectionId);
-      await this.#managed?.deleteApp(connectionId, live.record.appId).catch((error) => this.#warn(error));
     }
-    await this.#credentials.retain(this.#retainedKeys());
+    // The rows of a deleted agent's connections are gone with it, installed or not. Their saved
+    // credentials name each app, so the apps are deleted before the credentials are.
+    const retained = this.#retainedKeys();
+    for (const key of this.#credentials.keys()) {
+      if (!retained.has(key)) await this.#managed?.deleteApp(key).catch((error) => this.#warn(error));
+    }
+    await this.#credentials.retain(retained);
   }
 
   /** The credential keys that still belong to something: each connection, and each Slack workspace. */
@@ -814,8 +828,13 @@ export class MessagingService {
   }
 
   #warn(error: unknown): void {
-    // Only the kind of failure: a Slack error can quote message text.
-    logger.warn("A messaging action failed.", { error: error instanceof Error ? error.name : "unknown" });
+    // Only the kind of failure and the platform's error code: a Slack error message can quote
+    // message text, and its code cannot.
+    const code = isDynamicRecord(error) && isString(error.code) ? error.code : undefined;
+    logger.warn("A messaging action failed.", {
+      error: error instanceof Error ? error.name : "unknown",
+      ...(code ? { code } : {}),
+    });
   }
 }
 

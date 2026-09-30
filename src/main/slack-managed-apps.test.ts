@@ -110,6 +110,9 @@ class FakeSignal {
 class FakeSlack {
   readonly calls: Array<{ method: string; params: Record<string, string> }> = [];
   urlCheck: Answer | null = null;
+  /** Slack refuses to delete an app while this is set. */
+  refuseDelete = false;
+  #created = 0;
   #server: Server | null = null;
   #ts = 1000;
   origin = "";
@@ -145,15 +148,18 @@ class FakeSlack {
             timestamp: String(Math.floor(Date.now() / 1_000)),
           });
           if (this.urlCheck.body !== challenge) return fail("invalid_manifest");
+          this.#created += 1;
           return reply({
-            app_id: "A9",
+            app_id: `A${8 + this.#created}`,
             credentials: { client_id: "client-9", client_secret: CLIENT_SECRET, signing_secret: SIGNING_SECRET },
             oauth_authorize_url: "https://slack.com/oauth/v2/authorize?client_id=client-9",
           });
         }
+        case "apps.manifest.delete":
+          if (this.refuseDelete) return fail("internal_error");
+          return token === MANAGER_TOKEN ? reply({}) : fail("invalid_auth");
         case "apps.icon.set":
         case "apps.manifest.update":
-        case "apps.manifest.delete":
         case "auth.revoke":
           return token === MANAGER_TOKEN ? reply({}) : fail("invalid_auth");
         case "oauth.v2.access":
@@ -405,6 +411,18 @@ describe.sequential("Managed Slack app end to end", () => {
     await messaging.disconnect(agent.id);
     expect(slack.of("apps.manifest.delete").map((call) => call.params.app_id)).toEqual(["A9"]);
     expect(credentials.get(connectionId)).toBeNull();
+
+    // An agent whose app was never installed: deleting the agent deletes its app too.
+    const builder = await started.store.getOrCreate("builder");
+    await messaging.createSlackApp({ agentId: builder.id, workspaceId: "T1" });
+    await started.service.deleteAgent(builder.id);
+    await waitFor(() => slack.of("apps.manifest.delete").some((call) => call.params.app_id === "A10"));
+
+    // When Slack keeps an app, Disconnect still ends the connection, and says so.
+    await messaging.createSlackApp({ agentId: agent.id, workspaceId: "T1" });
+    slack.refuseDelete = true;
+    await expect(messaging.disconnect(agent.id)).rejects.toThrow("Slack did not delete its app");
+    expect(messaging.overview(agent.id).connection?.credentials).toBe("missing");
 
     mkdirSync(REPORT_DIR, { recursive: true });
     writeFileSync(

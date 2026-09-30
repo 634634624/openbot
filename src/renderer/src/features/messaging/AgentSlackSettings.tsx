@@ -111,13 +111,17 @@ export function AgentSlackSettings(props: AgentSlackSettingsProps) {
     },
   );
 
-  // The Slack app's icon follows the agent's avatar. Main sends it only when it changed. A failure
-  // leaves Slack's default icon, which is not worth an alert.
+  // The Slack app's icon follows the agent's avatar: drawn once for each agent while the view is
+  // open, and main sends it to Slack only when it changed. The status poll replaces the overview
+  // every few seconds, so the agent it was drawn for is kept here. A failure leaves Slack's default
+  // icon, which is not worth an alert.
+  let iconAgentId: string | null = null;
   createEffect(
     () => (props.port.slackIcon && connected() ? props.agentId : null),
     (agentId) => {
       const slackIcon = props.port.slackIcon;
-      if (!agentId || !slackIcon) return;
+      if (!agentId || !slackIcon || agentId === iconAgentId) return;
+      iconAgentId = agentId;
       void slackIcon(agentId)
         .then((bytes) =>
           props.port.api.setSlackIcon({ agentId, image: { mimeType: "image/png", bytes } }, props.port.serverId),
