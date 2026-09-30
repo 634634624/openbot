@@ -125,27 +125,19 @@ body:has(.dynamic-island-surface),
   height: 100%;
   flex: 0 0 auto;
   border-radius: var(--openbot-radius-xs);
-  transition: border-radius var(--openbot-duration-normal) var(--openbot-ease-out);
+  transition:
+    border-radius var(--openbot-duration-slow) var(--openbot-ease-out),
+    filter var(--openbot-duration-slow) var(--openbot-ease-out);
 }
 
-/* While the island resizes, the logo rounds its corners a little, blurs more than the ear around
-   it, so it reads as a shape in motion, and half closes its eyes. It is sharp and square again as
-   the island settles. The squint scales the eye group, not the eyes, so the blink keeps running. */
+/* While the island moves, the logo rounds its corners a little, blurs more than the ear around it,
+   so it reads as a shape in motion, and half closes its eyes. These are transitions, not a keyframe
+   pulse, so steps of a slider drag keep one steady state. It is sharp and square again as the island
+   settles. The squint scales the eye group, not the eyes, so the blink keeps running. */
 .dynamic-island-shell[data-compact-resize] .dynamic-island-surface-logo {
   --app-logo-eye-squint: 0.35;
   border-radius: var(--openbot-radius-sm);
-  animation: dynamic-island-logo-motion 450ms var(--dynamic-island-shared-ease);
-}
-
-@keyframes dynamic-island-logo-motion {
-  0%,
-  100% {
-    filter: blur(0);
-  }
-
-  40% {
-    filter: blur(2.5px);
-  }
+  filter: blur(2.5px);
 }
 
 .dynamic-island-external.dynamic-island-idle .dynamic-island-surface-logo {

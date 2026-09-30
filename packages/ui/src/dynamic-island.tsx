@@ -78,13 +78,10 @@ const CONTENT_EXIT_DURATION = 280;
 // content shrinking toward the notch after it, makes the panel withdraw instead of being sliced.
 const CONTENT_EXIT_FADE_OFFSET = 0.45;
 const CONTENT_BLUR = 4;
-// The compact content blurs a little while it moves with the surface, and is sharp again as the
-// surface settles.
-const COMPACT_RESIZE_BLUR_KEYFRAMES: Keyframe[] = [
-  { filter: "blur(0px)" },
-  { filter: "blur(1.5px)", offset: 0.3 },
-  { filter: "blur(0px)" },
-];
+// `data-compact-resize` marks the compact content as moving. It stays on while one resize follows
+// another, so a slider drag does not flash the motion styles on and off, and it goes at this part of
+// the spring, where the surface slows down, so the content is sharp again as the surface settles.
+const COMPACT_RESIZE_SETTLE = 0.6;
 const CONTENT_ENTER_DELAY = 90;
 const CONTENT_BLUR_OPEN_DURATION = 460;
 const CONTENT_BLUR_CLOSE_DURATION = 450;
@@ -119,8 +116,6 @@ export function DynamicIsland(props: DynamicIslandProps): JSX.Element {
   let panelContent: HTMLDivElement | undefined;
   let toggleButton: HTMLButtonElement | undefined;
   let notchSafeZone: HTMLSpanElement | undefined;
-  let leadingEar: HTMLSpanElement | undefined;
-  let trailingEar: HTMLSpanElement | undefined;
   let hoverExpandTimer: ReturnType<typeof setTimeout> | undefined;
   let hoverExitTimer: ReturnType<typeof setTimeout> | undefined;
   let panelExitTimer: ReturnType<typeof setTimeout> | undefined;
@@ -264,7 +259,6 @@ export function DynamicIsland(props: DynamicIslandProps): JSX.Element {
     container: () => shell,
     content: () => sizeTarget,
     compactContent: () => [toggleButton, notchSafeZone],
-    compactBlur: () => [leadingEar, trailingEar],
     compactContentEnabled: () => local.compactContentFollowsResize ?? true,
     silhouette: () => ({
       root: silhouetteRoot,
@@ -388,7 +382,7 @@ export function DynamicIsland(props: DynamicIslandProps): JSX.Element {
               toggle(event.detail === 0 ? "keyboard" : "pointer");
             }}
           >
-            <span ref={leadingEar} class="dynamic-island-ear dynamic-island-ear-leading" aria-hidden="true">
+            <span class="dynamic-island-ear dynamic-island-ear-leading" aria-hidden="true">
               <span ref={leadingContent} class="dynamic-island-ear-content">
                 <span ref={hoverLeadingContent} class="dynamic-island-hover-content dynamic-island-hover-leading">
                   {local.compactLeading}
@@ -396,7 +390,7 @@ export function DynamicIsland(props: DynamicIslandProps): JSX.Element {
               </span>
             </span>
             <span ref={notchSafeZone} class="dynamic-island-notch-safe-zone" aria-hidden="true" />
-            <span ref={trailingEar} class="dynamic-island-ear dynamic-island-ear-trailing" aria-hidden="true">
+            <span class="dynamic-island-ear dynamic-island-ear-trailing" aria-hidden="true">
               <span ref={trailingContent} class="dynamic-island-ear-content dynamic-island-trailing-content">
                 <span class="dynamic-island-trailing-compact">
                   <span ref={hoverTrailingContent} class="dynamic-island-hover-content dynamic-island-hover-trailing">
@@ -454,8 +448,6 @@ interface SmoothSizeResizeOptions {
    * the surface on the same spring.
    */
   compactContent: () => (HTMLElement | undefined)[];
-  /** The compact content that blurs a little while it follows the surface. */
-  compactBlur: () => (HTMLElement | undefined)[];
   compactContentEnabled: () => boolean;
   silhouette: () => {
     root: HTMLSpanElement | undefined;
@@ -585,6 +577,13 @@ function createSmoothSizeResize(options: SmoothSizeResizeOptions): void {
   let compactContentEnabled = untrack(options.compactContentEnabled);
   const previousCompactContentSizes = new Map<HTMLElement, { width: number; height: number } | undefined>();
   let compactContentAnimating = false;
+  let compactResizeSettleTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function settleCompactResize(): void {
+    if (compactResizeSettleTimer !== undefined) clearTimeout(compactResizeSettleTimer);
+    compactResizeSettleTimer = undefined;
+    options.container()?.removeAttribute("data-compact-resize");
+  }
 
   createEffect(options.silhouetteTarget, (target) => {
     targetSilhouette = target;
@@ -622,7 +621,7 @@ function createSmoothSizeResize(options: SmoothSizeResizeOptions): void {
     compactContentAnimating = false;
     const container = options.container();
     container?.removeAttribute("data-resizing");
-    container?.removeAttribute("data-compact-resize");
+    settleCompactResize();
   }
 
   onSettled(() => {
@@ -684,7 +683,6 @@ function createSmoothSizeResize(options: SmoothSizeResizeOptions): void {
 
       for (const active of animations) active.cancel();
       compactContentAnimating = false;
-      container.removeAttribute("data-compact-resize");
       // Read after the cancel, so the size is the CSS target and not a frame of the old animation.
       const compactContentTargets = new Map(compactContent.map((element) => [element, readElementSize(element)]));
       for (const [element, size] of compactContentTargets) previousCompactContentSizes.set(element, size);
@@ -749,13 +747,14 @@ function createSmoothSizeResize(options: SmoothSizeResizeOptions): void {
         compactContentAnimating = true;
       }
       if (compactContentAnimating) {
-        // Tells the compact content which way the row moves, so it can react while it grows.
+        // Tells the compact content that it moves, and which way the row goes.
         const row = compactContent[0] && compactContentTargets.get(compactContent[0]);
         const rowStart = compactContent[0] && compactContentStarts.get(compactContent[0]);
         container.dataset.compactResize = row && rowStart && row.width < rowStart.width ? "shrink" : "grow";
-        for (const element of options.compactBlur()) {
-          if (element) current.push(element.animate(COMPACT_RESIZE_BLUR_KEYFRAMES, animationOptions));
-        }
+        if (compactResizeSettleTimer !== undefined) clearTimeout(compactResizeSettleTimer);
+        compactResizeSettleTimer = setTimeout(settleCompactResize, spring.response * 1_000 * COMPACT_RESIZE_SETTLE);
+      } else {
+        settleCompactResize();
       }
       animations = current;
       void Promise.all(current.map((active) => active.finished))

@@ -185,8 +185,14 @@
   transform-origin: center;
   transition:
     color var(--openbot-duration-normal) var(--openbot-ease-out),
+    filter var(--openbot-duration-slow) var(--openbot-ease-out),
     opacity var(--openbot-duration-island-content) cubic-bezier(0.22, 1.08, 0.36, 1),
     transform var(--openbot-duration-island-content) cubic-bezier(0.22, 1.08, 0.36, 1);
+}
+
+/* The compact content blurs a little while it moves with the surface. */
+.dynamic-island-shell[data-compact-resize] .dynamic-island-ear-content {
+  filter: blur(1.5px);
 }
 
 .dynamic-island-hover-content {
