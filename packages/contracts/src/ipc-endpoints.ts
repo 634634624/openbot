@@ -16,6 +16,7 @@
 
 import type { ManagedProviderId } from "./agent-providers";
 import type { AppLanguagePreference, SetAppLanguagePreferenceInput } from "./app-language";
+import type { AppLogoColorPreference, SetAppLogoColorPreferenceInput } from "./app-logo-color";
 import type { BillingPortalRequest, BillingState } from "./billing";
 import type {
   CreateHostedServerInput,
@@ -397,6 +398,13 @@ export const IPC_ENDPOINTS = {
     // Dynamic Island overlay has no Settings of its own and would otherwise stay in the old
     // language until it was next recreated.
     appLanguagePreference: event<AppLanguagePreference>()("app:language-preference"),
+    getAppLogoColorPreference: request<undefined, AppLogoColorPreference>()("app:get-logo-color-preference"),
+    setAppLogoColorPreference: request<SetAppLogoColorPreferenceInput, AppLogoColorPreference>()(
+      "app:set-logo-color-preference",
+    ),
+    // Every window draws the logo, and the Dynamic Island has no Settings of its own, so the choice
+    // is broadcast in the same way as the language.
+    appLogoColorPreference: event<AppLogoColorPreference>()("app:logo-color-preference"),
     // The native Preferences menu item and its shortcut live in main, while the dialog lives in
     // the renderer, so the menu click is broadcast rather than handled: every window opens its
     // own Settings.

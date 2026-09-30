@@ -7,6 +7,7 @@
     "./live-activity-relay": "./src/live-activity-relay.ts",
     "./agent-providers": "./src/agent-providers.ts",
     "./app-language": "./src/app-language.ts",
+    "./app-logo-color": "./src/app-logo-color.ts",
     "./agent-template-links": "./src/agent-template-links.ts",
     "./attachment-files": "./src/attachment-files.ts",
     "./attachment-references": "./src/attachment-references.ts",

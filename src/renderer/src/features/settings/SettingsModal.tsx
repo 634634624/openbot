@@ -395,6 +395,7 @@ export function SettingsModal(props: SettingsModalProps) {
         <Tabs.Content value="general" class="settings-modal-tab-panel" data-tab="general">
           <SettingsGeneralTab
             value={props.value}
+            variant={props.appInfo?.variant ?? "production"}
             onUpdateSetting={updateSetting}
             selectMount={modalElement}
             turboModePending={props.turboModePending}

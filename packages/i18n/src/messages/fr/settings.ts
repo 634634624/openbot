@@ -6,6 +6,23 @@ export const messages = {
   "settings.language.title": "Langue",
   "settings.language.description": "OpenBot affiche les menus, les boutons et les messages dans cette langue.",
   "settings.language.system": "Langue du système",
+  // The logo color setting, General tab.
+  "settings.appearance.title": "Apparence",
+  "settings.logoColor.title": "Couleur du logo",
+  "settings.logoColor.description":
+    "La couleur du logo OpenBot dans le Dock,\nla barre des tâches et la Dynamic Island.",
+  "settings.logoColor.buildNote":
+    "Cette version garde sa propre couleur de logo. Le choix s’applique à l’application publiée.",
+  "settings.logoColor.lavender": "Lavande",
+  "settings.logoColor.green": "Vert",
+  "settings.logoColor.gold": "Or",
+  "settings.logoColor.terracotta": "Terre cuite",
+  "settings.logoColor.blue": "Bleu",
+  "settings.logoColor.rose": "Rose",
+  "settings.logoColor.pink": "Rose bonbon",
+  "settings.logoColor.beige": "Beige",
+  "settings.logoColor.gray": "Gris",
+  "settings.logoColor.white": "Blanc",
   // The Settings window, General tab.
   "settings.providers.title": "Fournisseurs d’IA",
   "settings.appBehavior.title": "Comportement de l’application",
