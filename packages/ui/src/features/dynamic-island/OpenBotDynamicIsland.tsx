@@ -69,7 +69,7 @@ export interface OpenBotDynamicIslandProps {
   presentation: DynamicIslandPresentation;
   state: DynamicIslandViewState;
   displayMode?: "notch" | "island";
-  notchSize?: DynamicIslandNotchSize;
+  notchSize?: DynamicIslandNotchSize | undefined;
   /** The build that draws the island. Its logo color tells a dev or preview build from a release. */
   variant?: AppVariant;
   /** The user-chosen compact width, as a percent of the default. The physical notch never shrinks. */

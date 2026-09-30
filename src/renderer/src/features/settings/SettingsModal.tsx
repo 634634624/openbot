@@ -48,7 +48,7 @@ export interface SettingsModalProps {
   onValueChange: (value: GeneralSettingsValue) => void;
   appInfo: AppInfo | null;
   /** The built-in display's notch, null when it has none, or undefined before main answers. */
-  builtInDisplayGeometry?: DynamicIslandGeometry;
+  builtInDisplayGeometry?: DynamicIslandGeometry | undefined;
   updateStatus: UpdateStatus;
   onUpdateAction: () => Promise<void>;
   onCancelScheduledRestart?: () => Promise<void>;

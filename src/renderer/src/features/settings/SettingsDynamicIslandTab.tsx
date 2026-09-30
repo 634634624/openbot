@@ -28,7 +28,7 @@ export interface SettingsDynamicIslandTabProps {
    * The built-in display's notch, or null when it has none: the built-in preview then draws the
    * island that display shows. Undefined before main answers, and the preview draws a notch.
    */
-  builtInDisplayGeometry?: DynamicIslandGeometry;
+  builtInDisplayGeometry?: DynamicIslandGeometry | undefined;
   onUpdateSetting: <Key extends keyof GeneralSettingsValue>(key: Key, value: GeneralSettingsValue[Key]) => void;
   /** Saves several fields as one change, so a reset writes the preference once. */
   onUpdateSettings: (patch: Partial<GeneralSettingsValue>) => void;
