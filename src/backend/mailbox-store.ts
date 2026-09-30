@@ -60,6 +60,11 @@ export interface MessagingOrigin {
 interface StoredMessage {
   channelId?: string;
   messaging?: MessagingOrigin;
+  /**
+   * A request an agent sent from an external conversation, such as a Slack thread. The teammate's
+   * answer to it goes back to that conversation, not to the agent's own chat. Never sent to a client.
+   */
+  messagingReturn?: MessagingOrigin;
   id: string;
   sender:
     | { kind: "user" }
@@ -118,6 +123,7 @@ interface StoredReaction {
 interface EnqueueInput {
   channelId?: string;
   messaging?: MessagingOrigin;
+  messagingReturn?: MessagingOrigin;
   sender: StoredMessage["sender"];
   recipientAgentIds: string[];
   text: string;
@@ -262,6 +268,20 @@ export class MailboxStore {
     return message?.messaging ? structuredClone(message.messaging) : null;
   }
 
+  /**
+   * The external conversation an agent's answer goes back to: the one the request was sent from,
+   * when the answer goes to the agent that sent it and to no one else. Every delivery of a message
+   * runs in the conversation of its `messaging` origin, so an answer with a second recipient stays
+   * in the chats.
+   */
+  #answerReturn(input: EnqueueInput, recipients: readonly string[]): MessagingOrigin | undefined {
+    if (input.sender.kind !== "agent" || !input.replyToMessageId || recipients.length !== 1) return undefined;
+    const request = this.#state.messages.find((message) => message.id === input.replyToMessageId);
+    if (!request?.messagingReturn || request.sender.kind !== "agent" || request.sender.agentId !== recipients[0])
+      return undefined;
+    return structuredClone(request.messagingReturn);
+  }
+
   /** The external author of each message of one messaging link, by message id. */
   messagingAuthors(linkId: string): Map<string, string> {
     return new Map(
@@ -340,9 +360,11 @@ export class MailboxStore {
       throw error;
     }
     const committedByDraftId = new Map(drafts.map((draft, index) => [draft.id, attachments[index]] as const));
+    const messaging = input.messaging ?? this.#answerReturn(input, recipients);
     const message: StoredMessage = {
       channelId: input.channelId,
-      ...(input.messaging ? { messaging: input.messaging } : {}),
+      ...(messaging ? { messaging } : {}),
+      ...(input.messagingReturn ? { messagingReturn: input.messagingReturn } : {}),
       id: messageId,
       sender: input.sender,
       text: rewriteAttachmentReferences(text, (reference) => {
@@ -549,6 +571,9 @@ export class MailboxStore {
     }
     for (const message of this.#state.messages) {
       if (message.channelId || message.messaging) continue;
+      // A request the agent sent from a Slack thread belongs to that thread, not to its own chat.
+      // The teammate it went to still sees it.
+      if (message.messagingReturn && message.sender.kind === "agent" && message.sender.agentId === agentId) continue;
       const deliveries = deliveriesByMessage.get(message.id) ?? [];
       if (message.sender.kind === "agent" && message.sender.agentId === agentId) {
         messages.push({
@@ -1841,6 +1866,7 @@ function isStoredMessage(value: unknown): value is StoredMessage {
     isRecord(value) &&
     (value.channelId === undefined || isString(value.channelId)) &&
     (value.messaging === undefined || isMessagingOrigin(value.messaging)) &&
+    (value.messagingReturn === undefined || isMessagingOrigin(value.messagingReturn)) &&
     isString(value.id) &&
     isRecord(value.sender) &&
     (value.sender.kind === "user" ||

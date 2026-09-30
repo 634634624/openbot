@@ -15,8 +15,12 @@ export interface MessagingAnswerFile {
 
 export type MessagingTurnStatus = "completed" | "failed" | "interrupted";
 
+/**
+ * `followUp` marks a turn that a teammate's answer started, not an external message: its answer goes
+ * to the conversation, and the external message it follows up keeps its reactions.
+ */
 export type MessagingActivity =
-  | { type: "started"; link: MessagingLink; turnId: string; origin: MessagingOrigin | null }
+  | { type: "started"; link: MessagingLink; turnId: string; origin: MessagingOrigin | null; followUp: boolean }
   | {
       type: "finished";
       link: MessagingLink;
@@ -24,6 +28,7 @@ export type MessagingActivity =
       turnId: string | null;
       status: MessagingTurnStatus;
       origin: MessagingOrigin | null;
+      followUp: boolean;
       answer: string | null;
       files: MessagingAnswerFile[];
     }
@@ -84,7 +89,7 @@ export class MessagingThreads {
   readonly #hooks: MessagingThreadsHooks;
   readonly #listeners = new Set<(activity: MessagingActivity) => void>();
   /** The external message each running turn answers, by turn id. */
-  readonly #turnOrigins = new Map<string, MessagingOrigin | null>();
+  readonly #turnOrigins = new Map<string, { origin: MessagingOrigin | null; followUp: boolean }>();
   #contextSource: ((link: MessagingLink, origin: MessagingOrigin) => Promise<MessagingPromptContext>) | null = null;
 
   constructor(database: OpenBotDatabase, mailbox: MailboxStore, hooks: MessagingThreadsHooks) {
@@ -115,9 +120,11 @@ export class MessagingThreads {
       isDirect: input.isDirect,
       title: input.title.slice(0, MESSAGING_LIMITS.name),
     });
+    // Only external messages count: a teammate's answer to a request from here is the agent's own work.
     const pending = this.store
       .links(input.agentId)
-      .flatMap((candidate) => this.#mailbox.unresolvedMessagingDeliveries(candidate.linkId));
+      .flatMap((candidate) => this.#mailbox.unresolvedMessagingDeliveries(candidate.linkId))
+      .filter((context) => context.delivery.sender.kind === "user");
     const byAuthor = pending.filter(
       (context) => this.#mailbox.messagingOrigin(context.delivery.id)?.authorId === input.origin.authorId,
     );
@@ -153,6 +160,9 @@ export class MessagingThreads {
     if (!origin) return null;
     const link = this.store.link(origin.linkId);
     if (!link) return null;
+    // A teammate's answer to a request the agent sent from this conversation. The delivery framing
+    // presents it as a teammate's reply, and the turn's answer is posted to the conversation.
+    if (context.delivery.sender.kind === "agent") return { threadId: link.threadId, text: context.delivery.text };
     const connection = this.store.connection(link.connectionId);
     const prompt = await this.#promptContext(link, origin);
     if (prompt.cursor) this.store.touch(link.linkId, prompt.cursor);
@@ -217,17 +227,18 @@ export class MessagingThreads {
           .unresolvedMessagingDeliveries(link.linkId)
           .find((context) => context.delivery.status !== "queued");
         const origin = running ? this.#mailbox.messagingOrigin(running.delivery.id) : null;
-        this.#turnOrigins.set(event.turnId, origin);
-        this.#publish({ type: "started", link, turnId: event.turnId, origin });
+        const followUp = running?.delivery.sender.kind === "agent";
+        this.#turnOrigins.set(event.turnId, { origin, followUp });
+        this.#publish({ type: "started", link, turnId: event.turnId, origin, followUp });
         return true;
       }
       case "turn-completed": {
         const link = this.store.linkForThread(event.threadId);
         if (!link) return false;
-        const origin = this.#turnOrigins.get(event.turnId) ?? null;
+        const started = this.#turnOrigins.get(event.turnId) ?? { origin: null, followUp: false };
         this.#turnOrigins.delete(event.turnId);
         this.store.touch(link.linkId);
-        void this.#finished(link, event.turnId, event.status, origin);
+        void this.#finished(link, event.turnId, event.status, started.origin, started.followUp);
         return true;
       }
       default:
@@ -240,7 +251,17 @@ export class MessagingThreads {
     const origin = this.#mailbox.messagingOrigin(deliveryId);
     const link = origin ? this.store.link(origin.linkId) : null;
     if (!origin || !link) return;
-    this.#publish({ type: "finished", link, turnId: null, status: "failed", origin, answer: null, files: [] });
+    const followUp = this.#mailbox.getDelivery(deliveryId)?.delivery.sender.kind === "agent";
+    this.#publish({
+      type: "finished",
+      link,
+      turnId: null,
+      status: "failed",
+      origin,
+      followUp,
+      answer: null,
+      files: [],
+    });
   }
 
   /** The requester of the turn that runs now in this link, if one runs. */
@@ -306,7 +327,13 @@ export class MessagingThreads {
     this.store.deleteForAgent(agentId);
   }
 
-  async #finished(link: MessagingLink, turnId: string, status: string, origin: MessagingOrigin | null): Promise<void> {
+  async #finished(
+    link: MessagingLink,
+    turnId: string,
+    status: string,
+    origin: MessagingOrigin | null,
+    followUp: boolean,
+  ): Promise<void> {
     const messages = this.#turnMessages(link, turnId);
     const answer = [...messages].reverse().find(isAnswer)?.text ?? null;
     const files: MessagingAnswerFile[] = [];
@@ -323,6 +350,7 @@ export class MessagingThreads {
       turnId,
       status: status === "completed" ? "completed" : status === "interrupted" ? "interrupted" : "failed",
       origin,
+      followUp,
       answer,
       files,
     });

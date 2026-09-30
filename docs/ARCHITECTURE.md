@@ -1416,8 +1416,11 @@ transport for its events. `messaging-types.ts` is the seam; the core never reads
   Approvals still reach the host.
 - **Deliveries.** An external message is a mailbox message from `user` with a `messaging` origin
   (link, author, platform message). No new sender kind, so the frozen Team protocol codecs are
-  unchanged. The queue and the public chat hide it like channel work. It never starts with teammate
-  answers. `DrainScheduler` asks `MessagingThreads.prepare` for the thread and the prompt, which
+  unchanged. The queue and the public chat hide it like channel work. It never starts with the
+  teammate answers of the agent's own chat. A request the agent sends from a Slack turn carries
+  `messagingReturn`, the origin of that turn; `MailboxStore.enqueue` gives the answer to it that
+  origin as `messaging`, so the answer runs in the same execution thread, and its turn posts to
+  Slack as a follow-up. `DrainScheduler` asks `MessagingThreads.prepare` for the thread and the prompt, which
   frames the text as external input and adds up to 30 earlier messages of the conversation.
 - **Order.** The one-turn-per-agent rule is unchanged, so Slack requests wait behind the agent's own
   work and behind channel work that holds the host. The Slack thread shows a waiting post.

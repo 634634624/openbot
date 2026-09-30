@@ -580,8 +580,11 @@ export class MessagingService {
           : activity.status === "interrupted"
             ? "stopped"
             : "failed";
-    await adapter.react(target, activity.origin.platformMessageId, "received", false).catch(() => undefined);
-    await adapter.react(target, activity.origin.platformMessageId, reaction, true).catch(() => undefined);
+    // A follow-up turn answers a teammate's reply: the person's message already shows how its own turn ended.
+    if (activity.type === "cancelled" || !activity.followUp) {
+      await adapter.react(target, activity.origin.platformMessageId, "received", false).catch(() => undefined);
+      await adapter.react(target, activity.origin.platformMessageId, reaction, true).catch(() => undefined);
+    }
     if (activity.type === "cancelled" || activity.status === "interrupted") {
       await this.#say(adapter, target, placeholder, sourceText("status.messaging.stopped"));
       return;

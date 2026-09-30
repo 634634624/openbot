@@ -207,9 +207,13 @@ export class DrainScheduler {
     const channelDelivery = this.#channels ? this.#channels.store.assignmentForDelivery(delivery.id) !== null : false;
     const messagingDelivery = this.#messaging?.ownsDelivery(delivery.id) ?? false;
     // The teammate answers that start in this turn too. A channel task and an external message
-    // always run alone. The person's message goes last, so the turn answers it with the answers
+    // always run alone; a teammate's answer in an external conversation takes the other answers to
+    // the same request. The person's message goes last, so the turn answers it with the answers
     // already read.
-    const companions = channelDelivery || messagingDelivery ? [] : this.#mailbox.repliesToStartWith(delivery.id);
+    const companions =
+      channelDelivery || (messagingDelivery && delivery.sender.kind !== "agent")
+        ? []
+        : this.#mailbox.repliesToStartWith(delivery.id);
     let batch = delivery.sender.kind === "user" ? [...companions, context] : [context, ...companions];
     let confirmedTurnId: string | null = null;
     const claimed = this.#deliveryProviders(delivery.recipientAgentId);

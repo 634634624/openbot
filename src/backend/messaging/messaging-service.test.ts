@@ -17,6 +17,7 @@ import type { AgentService } from "../agent-service";
 import {
   type FakeAgentClient,
   inputRecords,
+  notification,
   paramsRecord,
   startAgentTestFixture,
   startService,
@@ -421,6 +422,69 @@ describe.sequential("Slack messaging end to end", () => {
     await waitFor(() => credentials.values.size === 0);
     expect(service?.messaging.store.connections()).toEqual([]);
     report.deletion = { credentialsLeft: credentials.values.size };
+  });
+
+  it("brings a teammate's answer to a request from Slack back to the Slack thread", async () => {
+    const { agent, client, store } = await connected({ autoComplete: false });
+    const research = await store.getOrCreate("research");
+    const started: Array<{ threadId: string; turnId: string }> = [];
+    client.on("notification", (event: { method: string; params: unknown }) => {
+      const params = paramsRecord(event.params);
+      const turn = params && paramsRecord(params.turn);
+      if (event.method === "turn/started" && isString(params?.threadId) && isString(turn?.id))
+        started.push({ threadId: params.threadId, turnId: turn.id });
+    });
+    const finish = (turn: { threadId: string; turnId: string } | undefined, text: string) => {
+      if (!turn) throw new Error("The turn did not start.");
+      const item = { id: `${turn.turnId}:answer`, type: "agentMessage", text };
+      client.emit("notification", notification("item/completed", { ...turn, item }));
+      client.emit(
+        "notification",
+        notification("turn/completed", { threadId: turn.threadId, turn: { id: turn.turnId, status: "completed" } }),
+      );
+    };
+
+    // In Slack, the person asks Chief to have Research do something. Chief asks and ends its turn.
+    await slack.send("events_api", slack.mention("ask research for the news", "700.000"));
+    await waitFor(() => started.length === 1);
+    const slackTurn = started[0];
+    client.emit("request", {
+      method: "item/tool/call",
+      id: "ask-research",
+      params: {
+        ...slackTurn,
+        callId: "ask-research",
+        namespace: "openbot",
+        tool: "send_message",
+        arguments: { recipientAgentIds: [research.id], text: "Check the latest news." },
+      },
+    });
+    await waitFor(() => service?.listQueue(research.id).deliveries.length === 1);
+    finish(slackTurn, "Research is checking.");
+
+    // Research works in its own chat, and its result goes back to the Slack thread.
+    await waitFor(() => started.length === 2);
+    expect(started[1]?.threadId).not.toBe(slackTurn?.threadId);
+    finish(started[1], "Three headlines.");
+    await waitFor(() => started.length === 3);
+    const followUp = started[2];
+    expect(followUp?.threadId).toBe(slackTurn?.threadId);
+    expect(promptOf(turnStarts(client)[2] ?? { params: null })).toContain(
+      "This is a reply to a message you sent earlier.",
+    );
+    finish(followUp, "Research found three headlines.");
+    await waitFor(() => slack.of("chat.update").some((call) => call.params.text === "Research found three headlines."));
+
+    // Chief's own chat shows neither the request nor the answer; Research's chat has the request.
+    expect((await service?.readConversation(agent.id))?.messages ?? []).toEqual([]);
+    const researchChat = (await service?.readConversation(research.id))?.messages ?? [];
+    expect(researchChat.some((message) => message.text.includes("Check the latest news."))).toBe(true);
+    // The person's message shows how its own turn ended, once.
+    const done = slack.calls.filter(
+      (call) => call.method === "reactions.add" && call.params.name === "white_check_mark",
+    );
+    expect(done).toHaveLength(1);
+    report.teammateAnswer = { followUpInSlackThread: true, doneReactions: done.length };
   });
 
   it("writes the report", () => {

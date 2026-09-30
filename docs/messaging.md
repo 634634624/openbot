@@ -107,8 +107,9 @@ address, while the token lasts. A packaged build ignores all of these variables.
   agent work. The agent runs with the access you gave it. With Turbo or **Always allow**, it runs
   commands without asking.
 - A hosted server stays awake while a Slack connection is live.
-- A reply that the agent asks another OpenBot agent for arrives in the agent's own chat, not in
-  Slack.
+- When the agent asks another OpenBot agent for something in a Slack conversation, the reply comes
+  back to that conversation. The agent then posts its answer in the same thread, and the original
+  message keeps its reactions.
 - A question the agent asks is answered on the host, not in Slack.
 
 ## Adding a platform
