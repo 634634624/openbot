@@ -11,6 +11,14 @@ interface TransactionScope {
   readonly commit: (() => void)[];
 }
 
+/**
+ * The chats that main keeps in memory only because something read them. A chat of 2,000 messages
+ * takes about 1 MB, and marking a chat read loads it, so the cache grew with each chat that the user
+ * opened. A chat that goes is read again from the database when it is next needed, the same as a
+ * chat that was not opened since the app started.
+ */
+const READ_SNAPSHOT_LIMIT = 16;
+
 /** Only the caller that opened the transaction holds a scope, so a nested call finds the owner's. */
 const openTransactions = new WeakMap<OpenBotDatabase, TransactionScope>();
 
@@ -108,6 +116,14 @@ export class ConversationRuntime {
    */
   readonly #listAgents: () => AgentSummary[];
   readonly #snapshots = new Map<string, ConversationSnapshot>();
+  /**
+   * The cached chats that `setSnapshot` stored and that no turn code took since, oldest first. Only
+   * these can go. `ensureSnapshot` gives its object to code that can change it across an `await`
+   * before it saves it, so a copy read again from the database could lose that change.
+   */
+  readonly #readSnapshots = new Set<string>();
+  /** The chats that the limit dropped. `snapshotToUpdate` reads them again, so they still get updates. */
+  readonly #droppedSnapshots = new Set<string>();
   readonly #conversationSignatures = new Map<string, string>();
   readonly #threadToAgent = new Map<string, string>();
   readonly #loadedThreads = new Map<string, AgentClient>();
@@ -125,15 +141,48 @@ export class ConversationRuntime {
     return this.#snapshots.get(agentId);
   }
 
+  /**
+   * The chat that a change must publish: the cached one, or one that the limit dropped, read again
+   * from the database. A chat that main never loaded stays unloaded.
+   */
+  snapshotToUpdate(agentId: string): ConversationSnapshot | undefined {
+    const cached = this.#snapshots.get(agentId);
+    if (cached || !this.#droppedSnapshots.has(agentId)) return cached;
+    const agent = this.#store.list().find((candidate) => candidate.id === agentId);
+    const snapshot = this.#store.database.readConversation(agentId, agent?.threadId ?? null);
+    this.#snapshots.set(agentId, snapshot);
+    this.#rememberRead(agentId);
+    return snapshot;
+  }
+
   setSnapshot(agentId: string, snapshot: ConversationSnapshot): void {
     if (snapshot.threadId && this.#forgottenExecutionThreads.has(snapshot.threadId)) return;
     if (snapshot.threadId && snapshot.threadId !== this.#store.list().find((agent) => agent.id === agentId)?.threadId)
       this.#executionSnapshots.set(snapshot.threadId, snapshot);
-    else this.#snapshots.set(agentId, snapshot);
+    else {
+      this.#snapshots.set(agentId, snapshot);
+      this.#rememberRead(agentId);
+    }
+  }
+
+  /** Makes this chat the newest read chat, then drops the oldest read chats past the limit. */
+  #rememberRead(agentId: string): void {
+    this.#droppedSnapshots.delete(agentId);
+    this.#readSnapshots.delete(agentId);
+    this.#readSnapshots.add(agentId);
+    for (const id of this.#readSnapshots) {
+      if (this.#readSnapshots.size <= READ_SNAPSHOT_LIMIT) return;
+      if (this.#snapshots.get(id)?.activeTurnId) continue;
+      this.#readSnapshots.delete(id);
+      this.#snapshots.delete(id);
+      this.#droppedSnapshots.add(id);
+    }
   }
 
   dropSnapshot(agentId: string): void {
     this.#snapshots.delete(agentId);
+    this.#readSnapshots.delete(agentId);
+    this.#droppedSnapshots.delete(agentId);
   }
 
   activeSnapshots(): IterableIterator<[string, ConversationSnapshot]> {
@@ -177,6 +226,8 @@ export class ConversationRuntime {
     } else if (threadId && !snapshot.threadId) {
       snapshot.threadId = threadId;
     }
+    this.#readSnapshots.delete(agentId);
+    this.#droppedSnapshots.delete(agentId);
     return snapshot;
   }
 
@@ -299,6 +350,8 @@ export class ConversationRuntime {
     const threadId = this.#snapshots.get(agentId)?.threadId;
     if (threadId) this.#conversationSignatures.delete(threadId);
     this.#snapshots.delete(agentId);
+    this.#readSnapshots.delete(agentId);
+    this.#droppedSnapshots.delete(agentId);
     this.#conversationSignatures.delete(agentId);
   }
 
@@ -331,6 +384,7 @@ export class ConversationRuntime {
       }
       if (previousSnapshotState) this.#snapshots.set(agentId, previousSnapshotState);
       else this.#snapshots.delete(agentId);
+      this.#readSnapshots.delete(agentId);
     };
     let published: ConversationSnapshot | undefined;
     return withDatabaseTransaction(
@@ -347,6 +401,8 @@ export class ConversationRuntime {
       () => {
         if (!published) return;
         this.#snapshots.set(agentId, published);
+        this.#readSnapshots.delete(agentId);
+        this.#droppedSnapshots.delete(agentId);
         this.publishConversation(published);
       },
     );
