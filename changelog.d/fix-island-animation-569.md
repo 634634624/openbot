@@ -7,6 +7,9 @@
   shows. On a built-in display with no notch, it no longer draws a notch. Each preview scales so
   that the widest width fits its frame, and keeps that scale while the setting changes.
 
+- A lower or higher Dynamic Island now has smaller or larger bottom corners, in proportion to its
+  height, so it keeps the shape of the default island. At 100% height nothing changes.
+
 ### Changed
 
 - The logo and the greeting blur a little while the Dynamic Island changes size, as much as the move

@@ -59,6 +59,8 @@ export interface DynamicIslandProps {
 const HOVER_EXPAND_DELAY = 300;
 const HOVER_EXIT_DELAY = 100;
 const HOVER_WIDTH_GROWTH = 32;
+/** The compact height with no notch and no user size: `--dynamic-island-notch-height` in the CSS. */
+const DEFAULT_COMPACT_HEIGHT = 32;
 const HOVER_HEIGHT_GROWTH = 8;
 const CONTENT_EXIT_LEAD = 90;
 const PANEL_EXIT_DURATION = CONTENT_EXIT_LEAD + 450;
@@ -271,7 +273,8 @@ export function DynamicIsland(props: DynamicIslandProps): JSX.Element {
       leadingShoulder,
       trailingShoulder,
     }),
-    silhouetteTarget: () => islandSilhouetteTarget(viewState(), local.displayMode ?? "notch"),
+    silhouetteTarget: () =>
+      islandSilhouetteTarget(viewState(), local.displayMode ?? "notch", compactHeightScale(local)),
     sharedLeading: () => leadingContent,
     sharedLeadingEnabled: () => Boolean(local.sharedMotion?.leading),
     sharedLeadingTarget: () =>
@@ -475,16 +478,26 @@ interface IslandSilhouetteGeometry {
   capsuleRadius?: number;
 }
 
+/**
+ * The compact height against the height the island has by default. A lower island gets smaller
+ * bottom corners, so a short island keeps the shape of the default one.
+ */
+function compactHeightScale(props: Pick<DynamicIslandProps, "compactHeight" | "notchSize">): number {
+  const base = props.notchSize?.height ?? DEFAULT_COMPACT_HEIGHT;
+  return (props.compactHeight ?? base) / base;
+}
+
 function islandSilhouetteTarget(
   state: DynamicIslandViewState,
   displayMode: DynamicIslandDisplayMode,
+  compactScale: number,
 ): IslandSilhouetteGeometry {
   if (displayMode === "island") {
     if (state === "expanded") return { topRadius: 0, bottomRadius: 0, capsuleRadius: 24 };
-    return { topRadius: 0, bottomRadius: 0, capsuleRadius: 16 };
+    return { topRadius: 0, bottomRadius: 0, capsuleRadius: 16 * compactScale };
   }
   if (state === "expanded") return { topRadius: 19, bottomRadius: 24 };
-  return { topRadius: 6, bottomRadius: 14 };
+  return { topRadius: 6, bottomRadius: 14 * compactScale };
 }
 
 interface SharedElementTransform {
