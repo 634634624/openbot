@@ -12,7 +12,7 @@ import {
   SKILL_EVENT_ITEM_TYPE_PREFIX,
 } from "@openbot/contracts/ipc";
 import { type DynamicRecord, isDynamicRecord, isNumber, isString } from "@openbot/contracts/runtime-values";
-import type { DatabaseCore } from "./database-core";
+import { COLLAPSE_WHITESPACE_FUNCTION, type DatabaseCore } from "./database-core";
 import {
   databaseRow,
   databaseRows,
@@ -273,15 +273,26 @@ export class ConversationQueries {
     const limit = pageLimit(requestedLimit);
     const offset = cursor ? decodeSearchCursor(cursor) : 0;
     const pattern = `%${escapeLike(normalized)}%`;
+    const storedText = "json_extract(message.message_json, '$.text')";
+    const textMatch = `LOWER(${storedText}) LIKE ? ESCAPE '\\'`;
+    const terms = normalized.split(" ");
+    // A query with a space can match across a line break. Only the rows that contain its longest
+    // term pay for the whitespace call.
+    const longestTerm = terms.reduce((longest, term) => (term.length > longest.length ? term : longest));
+    const textFilter =
+      terms.length > 1
+        ? `${textMatch} AND LOWER(${COLLAPSE_WHITESPACE_FUNCTION}(${storedText})) LIKE ? ESCAPE '\\'`
+        : textMatch;
+    const textParameters = terms.length > 1 ? [`%${escapeLike(longestTerm)}%`, pattern] : [pattern];
     const filter = agentId ? "AND thread.agent_id = ?" : "";
-    const parameters = agentId ? [pattern, agentId] : [pattern];
+    const parameters = agentId ? [...textParameters, agentId] : textParameters;
     const countRow = databaseRow(
       this.#core.connection
         .prepare(
           `SELECT COUNT(*) AS count
            FROM projection_thread_messages message
            JOIN projection_threads thread ON thread.thread_id = message.thread_id
-           WHERE LOWER(json_extract(message.message_json, '$.text')) LIKE ? ESCAPE '\\'
+           WHERE ${textFilter}
              AND COALESCE(json_extract(message.message_json, '$.delivery.status'), '') NOT IN ('queued', 'cancelled')
              AND COALESCE(message.item_type, '') != 'commentary'
              AND COALESCE(message.item_type, '') NOT LIKE '${SKILL_EVENT_ITEM_TYPE_PREFIX}%' AND COALESCE(message.item_type, '') NOT LIKE '${ROUTINE_EVENT_ITEM_TYPE_PREFIX}%'
@@ -300,7 +311,7 @@ export class ConversationQueries {
           `SELECT thread.agent_id, message.message_json
            FROM projection_thread_messages message
            JOIN projection_threads thread ON thread.thread_id = message.thread_id
-           WHERE LOWER(json_extract(message.message_json, '$.text')) LIKE ? ESCAPE '\\'
+           WHERE ${textFilter}
              AND COALESCE(json_extract(message.message_json, '$.delivery.status'), '') NOT IN ('queued', 'cancelled')
              AND COALESCE(message.item_type, '') != 'commentary'
              AND COALESCE(message.item_type, '') NOT LIKE '${SKILL_EVENT_ITEM_TYPE_PREFIX}%' AND COALESCE(message.item_type, '') NOT LIKE '${ROUTINE_EVENT_ITEM_TYPE_PREFIX}%'
