@@ -30,6 +30,14 @@ export interface WorkerBindings {
   REMOTE_SIGNAL_URL?: string;
   REMOTE_AUTH_WEBHOOK_URL?: string;
   REMOTE_AUTH_WEBHOOK_SECRET?: string;
+  /** Signs Slack route tokens. Its public key must also be in `REMOTE_TICKET_PUBLIC_JWKS`. */
+  SLACK_ROUTE_PRIVATE_JWK?: string;
+  SLACK_ROUTE_KEY_ID?: string;
+  /** The OpenBot Slack manager app, which creates one Slack app for each agent. */
+  SLACK_MANAGER_CLIENT_ID?: string;
+  SLACK_MANAGER_CLIENT_SECRET?: string;
+  /** Signs the OAuth `state` of the manager app. At least 32 bytes. */
+  SLACK_STATE_SECRET?: string;
   /** A Stripe sandbox (`sk_test_`) key in development and test. */
   STRIPE_SECRET_KEY?: string;
   STRIPE_WEBHOOK_SECRET?: string;

@@ -73,7 +73,8 @@ export class SlackWebApi {
       const response = await fetch(`${this.#origin}/api/${method}`, {
         method: "POST",
         headers: {
-          authorization: `Bearer ${this.#token}`,
+          // `oauth.v2.access` has no token: the client id and secret are in the body.
+          ...(this.#token ? { authorization: `Bearer ${this.#token}` } : {}),
           "content-type": "application/x-www-form-urlencoded; charset=utf-8",
         },
         body,

@@ -12,9 +12,11 @@ import type { RemoteRequestInit } from "../remote-server-client";
 import type { IpcGroupHandlers } from "./define-ipc-group";
 import {
   parseConnectSlackInput,
+  parseCreateSlackAppInput,
   parseMessagingAgentInput,
   parseReadMessagingThreadInput,
   parseSetMessagingEnabledInput,
+  parseSlackWorkspaceInput,
 } from "./messaging-inputs";
 import { scopedHandler } from "./scoped-handler";
 
@@ -26,7 +28,17 @@ interface MessagingRemoteServers {
 interface MessagingIpcDependencies {
   messaging: Pick<
     MessagingService,
-    "overview" | "slackSetup" | "connectSlack" | "reconnect" | "setEnabled" | "disconnect" | "readThread"
+    | "overview"
+    | "slackSetup"
+    | "connectSlack"
+    | "reconnect"
+    | "setEnabled"
+    | "disconnect"
+    | "readThread"
+    | "connectSlackWorkspace"
+    | "disconnectSlackWorkspace"
+    | "createSlackApp"
+    | "openSlackInstall"
   >;
   remoteServers: MessagingRemoteServers;
 }
@@ -39,6 +51,10 @@ export function messagingIpcHandlers({
     if (!remoteServers.supportsCapability(serverId, MESSAGING_CAPABILITY))
       throw new Error(sourceText("error.messaging.unsupported"));
     return remoteServers.request(serverId, path, decoder, { method: "POST", body });
+  }
+
+  function hostOnly(): never {
+    throw new Error(sourceText("error.messaging.managedOnHost"));
   }
 
   return {
@@ -70,6 +86,22 @@ export function messagingIpcHandlers({
       readThread: scopedHandler(parseReadMessagingThreadInput, {
         local: ({ agentId, linkId }) => messaging.readThread(agentId, linkId),
         remote: (input, serverId) => remote(serverId, MESSAGING_ROUTES.thread, input, decodeMessagingThread),
+      }),
+      connectSlackWorkspace: scopedHandler(parseMessagingAgentInput, {
+        local: () => messaging.connectSlackWorkspace(),
+        remote: hostOnly,
+      }),
+      disconnectSlackWorkspace: scopedHandler(parseSlackWorkspaceInput, {
+        local: ({ workspaceId }) => messaging.disconnectSlackWorkspace(workspaceId),
+        remote: hostOnly,
+      }),
+      createSlackApp: scopedHandler(parseCreateSlackAppInput, {
+        local: (input) => messaging.createSlackApp(input),
+        remote: hostOnly,
+      }),
+      openSlackInstall: scopedHandler(parseMessagingAgentInput, {
+        local: ({ agentId }) => messaging.openSlackInstall(agentId),
+        remote: hostOnly,
       }),
     },
   };

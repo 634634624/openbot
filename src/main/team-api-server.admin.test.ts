@@ -710,8 +710,10 @@ describe("Team API messaging-v1", () => {
         missingScopes: [],
         retryAt: null,
         credentials: saved ? ("saved" as const) : ("missing" as const),
+        managed: false,
       },
       threads: [{ linkId: "link-1", title: "#general", isDirect: false, updatedAt: "2026-09-29T12:00:00.000Z" }],
+      slackWorkspaces: [],
     });
     const messaging = {
       overview: () => overview(false),

@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { SLACK_ROUTE_AUDIENCE } from "@openbot/contracts/signal-protocol/slack-route";
 import {
   createLocalJWKSet,
   createRemoteJWKSet,
@@ -27,6 +28,7 @@ const RESUME_AUDIENCE = "openbot-remote-resume";
 export const RESUME_TTL_SECONDS = 10 * 60;
 const MAXIMUM_STALE_RESUME_SECONDS = 24 * 60 * 60;
 const MAXIMUM_TRUSTED_RESUME_TOKENS = 100_000;
+const MAXIMUM_CACHED_SLACK_ROUTES = 1_000;
 const jwksSchema = z.object({ keys: z.array(z.object({ kty: z.string() }).loose()).min(1) });
 const remoteTicketClaimsSchema = z.object({
   aud: z.literal(REMOTE_TICKET_AUDIENCE),
@@ -44,8 +46,24 @@ const remoteTicketClaimsSchema = z.object({
   iat: z.number().int().nonnegative(),
   exp: z.number().int().nonnegative(),
 });
+const identifierSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(/^[A-Za-z0-9_-]+$/u);
+const slackRouteClaimsSchema = z.object({ hid: identifierSchema, cid: identifierSchema });
 
-export class RemoteTokenService {
+/** The host and messaging connection that a Slack request URL names. */
+export interface SlackRoute {
+  hostId: string;
+  connectionId: string;
+}
+
+export interface SlackRouteVerifier {
+  verifySlackRoute(token: string): Promise<SlackRoute>;
+}
+
+export class RemoteTokenService implements SlackRouteVerifier {
   readonly #ticketKey: JWTVerifyGetKey;
   readonly #remoteTicketKey: RemoteJWKSet | null;
   readonly #sessionSecret: Uint8Array;
@@ -58,6 +76,8 @@ export class RemoteTokenService {
     string,
     { expiresAt: number; hostId: string; sessionId: string; authEpoch: number }
   >();
+  // Slack sends every event of an app to the same URL, so one ES256 check per token is enough.
+  readonly #slackRoutes = new Map<string, SlackRoute>();
 
   constructor(
     config: Pick<
@@ -101,6 +121,27 @@ export class RemoteTokenService {
       currentDate: now,
     });
     return decodeTicketClaims(payload, now);
+  }
+
+  /**
+   * Reads the host and connection from a Slack request URL. The token has no expiry: it only
+   * routes, and the host checks Slack's signature on every request it gets.
+   */
+  async verifySlackRoute(token: string): Promise<SlackRoute> {
+    const cached = this.#slackRoutes.get(token);
+    if (cached) return cached;
+    const { payload } = await jwtVerify(token, this.#ticketKey, {
+      audience: SLACK_ROUTE_AUDIENCE,
+      algorithms: ["ES256"],
+    });
+    const claims = slackRouteClaimsSchema.parse(payload);
+    const route = { hostId: claims.hid, connectionId: claims.cid };
+    if (this.#slackRoutes.size >= MAXIMUM_CACHED_SLACK_ROUTES) {
+      const oldest = this.#slackRoutes.keys().next().value;
+      if (oldest) this.#slackRoutes.delete(oldest);
+    }
+    this.#slackRoutes.set(token, route);
+    return route;
   }
 
   validateClaims(claims: RemoteTicketClaims): Promise<boolean> {

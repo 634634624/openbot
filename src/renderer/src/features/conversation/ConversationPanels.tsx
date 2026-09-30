@@ -94,10 +94,16 @@ export function ConversationPanels(panelProps: { onOpenUsage?: (trigger: HTMLBut
     runtime: ConversationRuntime | undefined,
   ): MessagingPort | undefined => {
     if (!serverCanAdminister(server, "messaging-v1")) return undefined;
-    if (!runtime) return desktopMessagingPort(server.id);
+    if (!runtime) return desktopMessagingPort(server.id, server.kind === "local");
     const api = runtime.admin?.messaging;
     return api
-      ? { api, serverId: server.id, openUrl: (url) => runtime.openUrl(url), copyText: writeClipboardText }
+      ? {
+          api,
+          serverId: server.id,
+          managedApps: false,
+          openUrl: (url) => runtime.openUrl(url),
+          copyText: writeClipboardText,
+        }
       : undefined;
   };
   /** Agent settings > Files. */

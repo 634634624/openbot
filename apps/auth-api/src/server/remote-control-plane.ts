@@ -2,6 +2,7 @@ import { memberLimitForPlan } from "@openbot/contracts/billing";
 import type { MobileConnectHostBinding } from "@openbot/contracts/mobile-connect";
 import { type DynamicRecord, isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
 import type { RemoteAuthEvent } from "@openbot/contracts/signal-protocol/auth-events";
+import { SLACK_ROUTE_AUDIENCE, SLACK_ROUTE_PATH_PREFIX } from "@openbot/contracts/signal-protocol/slack-route";
 import {
   REMOTE_TICKET_AUDIENCE,
   REMOTE_TICKET_PROTOCOL_VERSION,
@@ -15,6 +16,7 @@ import { PERSISTENT_SESSION_EXPIRES_AT } from "./session-policy";
 import type { AuthUser, WorkerBindings } from "./types";
 
 const TICKET_TTL_SECONDS = 180;
+const IDENTIFIER_PATTERN = /^[A-Za-z0-9_-]{1,128}$/u;
 const LEGACY_SHA256_HEX_PATTERN = /^[a-f0-9]{64}$/u;
 const AUTH_EVENT_RETRY_MS = 60_000;
 const MAX_OUTSTANDING_INVITES_PER_HOST = 50;
@@ -175,6 +177,40 @@ export class RemoteTicketSigner {
   }
 }
 
+/**
+ * Signs the route token in a managed Slack app's request URL. It uses its own key, which the public
+ * JWKS also lists, so the ticket key can rotate without breaking the URL of every Slack app.
+ */
+export class SlackRouteSigner {
+  readonly #keyId: string;
+  readonly #privateJwk: JWK;
+  #key: Awaited<ReturnType<typeof importJWK>> | null = null;
+
+  constructor(config: TicketSignerConfig) {
+    this.#keyId = requiredIdentifier(config.keyId, "Slack route key ID");
+    parseJwks(config.publicJwks, this.#keyId);
+    this.#privateJwk = parseJwk(config.privateJwk);
+  }
+
+  async issue(input: { hostId: string; connectionId: string; now: number }): Promise<string> {
+    this.#key ??= await importJWK(this.#privateJwk, "ES256");
+    return new SignJWT({ hid: input.hostId, cid: input.connectionId })
+      .setProtectedHeader({ alg: "ES256", typ: "JWT", kid: this.#keyId })
+      .setIssuedAt(Math.floor(input.now / 1_000))
+      .setAudience(SLACK_ROUTE_AUDIENCE)
+      .sign(this.#key);
+  }
+}
+
+/** The public request URL for a route token, on the host that serves `signalUrl`. */
+export function slackRequestUrl(signalUrl: string, routeToken: string): string {
+  const url = new URL(signalUrl);
+  url.protocol = url.protocol === "ws:" ? "http:" : "https:";
+  url.pathname = `${SLACK_ROUTE_PATH_PREFIX}${routeToken}`;
+  url.search = "";
+  return url.toString();
+}
+
 /** One signer for each key: the JWKS parse and the key import are too costly for every request. */
 const ticketSigners = new Map<string, { config: TicketSignerConfig; signer: RemoteTicketSigner }>();
 
@@ -196,6 +232,7 @@ function sharedTicketSigner(config: TicketSignerConfig): RemoteTicketSigner {
 export class RemoteControlPlane {
   readonly #database: D1Database;
   readonly #signer: RemoteTicketSigner;
+  readonly #slackRouteSigner: SlackRouteSigner | null;
   readonly #webhookUrl: string | null;
   readonly #webhookSecret: string | null;
   readonly #fetch: RemoteFetch;
@@ -211,6 +248,8 @@ export class RemoteControlPlane {
       | "REMOTE_TICKET_KEY_ID"
       | "REMOTE_AUTH_WEBHOOK_URL"
       | "REMOTE_AUTH_WEBHOOK_SECRET"
+      | "SLACK_ROUTE_PRIVATE_JWK"
+      | "SLACK_ROUTE_KEY_ID"
     >,
     options: { fetch?: RemoteFetch; now?: () => number; schedule?: (delivery: Promise<void>) => void } = {},
   ) {
@@ -223,6 +262,14 @@ export class RemoteControlPlane {
       publicJwks: bindings.REMOTE_TICKET_PUBLIC_JWKS,
       keyId: bindings.REMOTE_TICKET_KEY_ID,
     });
+    this.#slackRouteSigner =
+      bindings.SLACK_ROUTE_PRIVATE_JWK && bindings.SLACK_ROUTE_KEY_ID
+        ? new SlackRouteSigner({
+            privateJwk: bindings.SLACK_ROUTE_PRIVATE_JWK,
+            publicJwks: bindings.REMOTE_TICKET_PUBLIC_JWKS,
+            keyId: bindings.SLACK_ROUTE_KEY_ID,
+          })
+        : null;
     this.#webhookUrl = bindings.REMOTE_AUTH_WEBHOOK_URL?.trim() || null;
     this.#webhookSecret = bindings.REMOTE_AUTH_WEBHOOK_SECRET?.trim() || null;
     this.#fetch = options.fetch ?? ((input, init) => fetch(input, init));
@@ -1091,10 +1138,7 @@ export class RemoteControlPlane {
   }
 
   async issueHostTicket(hostId: string, machineToken: string) {
-    const host = await this.#host(hostId);
-    if (!host?.machine_token_hash || host.machine_token_hash !== (await sha256(machineToken))) {
-      throw new RemoteControlPlaneError(401, "host_unauthorized", "The host credential is invalid.");
-    }
+    const host = await this.#authenticateHost(hostId, machineToken);
     return this.#signer.issue({
       sessionId: `host-${hostId}`,
       hostId,
@@ -1105,6 +1149,29 @@ export class RemoteControlPlane {
       sessionExpiresAt: PERSISTENT_SESSION_EXPIRES_AT,
       now: this.#now(),
     });
+  }
+
+  /**
+   * A route token for one messaging connection of this host. Every token that this returns stays
+   * valid, so the host keeps the one in its Slack app's manifest and asks again only to repair it.
+   */
+  async issueSlackRoute(hostId: string, machineToken: string, connectionId: string): Promise<string> {
+    if (!this.#slackRouteSigner) {
+      throw new RemoteControlPlaneError(503, "slack_not_configured", "Slack routing is not configured.");
+    }
+    if (!IDENTIFIER_PATTERN.test(connectionId)) {
+      throw new RemoteControlPlaneError(400, "invalid_remote_request", "The messaging connection is invalid.");
+    }
+    await this.#authenticateHost(hostId, machineToken);
+    return this.#slackRouteSigner.issue({ hostId, connectionId, now: this.#now() });
+  }
+
+  async #authenticateHost(hostId: string, machineToken: string): Promise<RemoteHostRow> {
+    const host = await this.#host(hostId);
+    if (!host?.machine_token_hash || host.machine_token_hash !== (await sha256(machineToken))) {
+      throw new RemoteControlPlaneError(401, "host_unauthorized", "The host credential is invalid.");
+    }
+    return host;
   }
 
   async #requireRole(hostId: string, userId: string, roles: RemoteMemberRole[]): Promise<RemoteMembershipRow> {

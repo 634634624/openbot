@@ -42,6 +42,7 @@ import type {
   VoiceModelStatus,
 } from "@openbot/contracts/ipc";
 import { IPC_ENDPOINTS, isManagedToolRuntime, isUpdateBusyPhase } from "@openbot/contracts/ipc";
+import { decodeRecord, requiredString } from "@openbot/contracts/ipc-decoding";
 import { sourceText } from "@openbot/i18n/source";
 import { createOpenBotLogger, toLogValue } from "@openbot/logging";
 import { REMOTE_ACCOUNT_CHECK_INTERVAL_MS } from "@openbot/team-client";
@@ -144,6 +145,7 @@ import {
 } from "./session-configuration";
 import { readSetupState } from "./setup-store";
 import { SkillMarketplaceService } from "./skill-marketplace-service";
+import { SlackIngress } from "./slack-ingress";
 import { TeamStore } from "./team-store";
 import { TeamWebRtcBridge } from "./team-webrtc-bridge";
 import { TeamWebRtcClientTransport } from "./team-webrtc-client-transport";
@@ -221,6 +223,8 @@ const TEARDOWN_ORDER = {
   remoteDesktop: 80,
   // Before the host and the service: no new external message arrives while they stop.
   messaging: 85,
+  // After the connections that hold it.
+  slackIngress: 86,
   host: 90,
   teamWebRtcBridge: 100,
   mcpOAuthRedirect: 105,
@@ -812,6 +816,23 @@ export async function createApplicationServices({
     logger.warn(
       `OpenBot could not read the messaging token file (${messagingCredentialLoadError.name}). It was left unchanged.`,
     );
+  // The Signal socket of the Slack apps that OpenBot manages. The host id is read when the socket
+  // opens, and the team store is built further down, so it starts as "no name yet".
+  let slackIngressHostId: () => string | null = () => null;
+  const slackIngress = new SlackIngress({
+    hostId: () => slackIngressHostId(),
+    signedIn: () => {
+      try {
+        centralAuth.getSignedInUser();
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    issueTicket: (hostId) => centralAuth.issueRemoteHostTicket(hostId),
+    issueRequestUrl: (hostId, connectionId) => centralAuth.issueSlackRequestUrl(hostId, connectionId),
+  });
+  teardown.push(TEARDOWN_ORDER.slackIngress, "the Slack ingress socket", () => slackIngress.dispose());
   const messaging = new MessagingService({
     threads: service.messaging,
     agents: {
@@ -823,8 +844,19 @@ export async function createApplicationServices({
       },
     },
     credentials: messagingCredentials,
-    drivers: [slackDriver()],
+    drivers: [slackDriver({ ingress: slackIngress })],
     downloadsRoot: join(app.getPath("userData"), "messaging-downloads"),
+    ingress: slackIngress,
+    slackManager: {
+      authorize: (input) =>
+        centralAuth.requestAuthorized(
+          "/v2/slack/manager/authorize",
+          { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) },
+          (value) => requiredString(decodeRecord(value, "Slack sign-in"), "authorizeUrl"),
+        ),
+      installRedirectUrl: () => centralAuth.resolveApiUrl("/slack/connect"),
+      openExternal: (url) => shell.openExternal(url),
+    },
   });
   // Not awaited: a connection waits for Slack, and the app does not wait for it.
   void messaging.start().catch((error) => logger.warn("Messaging connections did not start.", toLogValue(error)));
@@ -955,6 +987,8 @@ export async function createApplicationServices({
     join(app.getPath("userData"), TEAM_FILE),
   );
   await teamStore.initialize();
+  slackIngressHostId = () => teamStore.getIdentity()?.serverId ?? null;
+  slackIngress.reconnect();
   // After `teamStore.initialize()` and before `HostService`, which reads the account it activates.
   if (developmentRemoteRole) {
     await applyDevelopmentRemoteAccount({

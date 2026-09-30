@@ -1,7 +1,9 @@
 // The seam between the platform-agnostic messaging core and one chat platform. A platform is one
-// `MessagingDriver`: an adapter for its API and a transport for its inbound events. Slack uses
-// Socket Mode; a Discord driver would use the Gateway and a Telegram driver long polling
-// (`getUpdates`). All three connect out from the host, so no public endpoint is needed.
+// `MessagingDriver`: an adapter for its API and a transport for its inbound events. A Slack app that
+// the user made uses Socket Mode; a Discord driver would use the Gateway and a Telegram driver long
+// polling (`getUpdates`). All of them connect out from the host, so no public endpoint is needed.
+// A Slack app that OpenBot manages uses the Events API instead: Slack posts to Signal, and Signal
+// passes each request to this host over the `MessagingIngress` socket, which the host also opens.
 
 import type { MessagingConnectionState, MessagingPlatform } from "@openbot/contracts/ipc";
 import type { MessagingAnswerFile } from "./messaging-threads";
@@ -126,6 +128,47 @@ export interface MessagingTransport {
   /** Reconnects now, such as after the computer wakes. */
   reconnect(): void;
   stop(): Promise<void>;
+  /** Handles one request that the ingress relay brought, for a transport that gets its events that way. */
+  deliver?(delivery: IngressDelivery): Promise<IngressAnswer>;
+}
+
+/** One HTTP request that a platform sent to this host's request URL, as Signal passed it on. */
+export interface IngressDelivery {
+  kind: "events" | "interactivity";
+  timestamp: string;
+  signature: string;
+  retryNum: number | null;
+  /** The exact bytes the platform signed. */
+  body: Uint8Array;
+}
+
+/** The HTTP answer the platform gets. A body only for a URL check or a button reply. */
+export interface IngressAnswer {
+  status: 200 | 400 | 401 | 404 | 503;
+  contentType?: "application/json" | "text/plain";
+  body?: string;
+}
+
+/** `unavailable` has a reason the user can act on: sign in, name this computer, or wait for Signal. */
+export type IngressState = "online" | "connecting" | "signed_out" | "no_host" | "unavailable";
+
+export type IngressHandler = (connectionId: string, delivery: IngressDelivery) => Promise<IngressAnswer>;
+
+/**
+ * The relay that brings a platform's HTTP requests to this host: Signal's `ingress` socket, which
+ * the main process owns. It is open while anything holds it.
+ */
+export interface MessagingIngress {
+  /** Keeps the relay open until the returned function runs. */
+  acquire(): () => void;
+  state(): IngressState;
+  onState(listener: (state: IngressState) => void): () => void;
+  /** Sets the one handler of the requests the relay receives, or removes it. */
+  handle(handler: IngressHandler | null): void;
+  /** Opens the socket again, such as after the computer wakes. */
+  reconnect(): void;
+  /** The public request URL that routes to this host, for one connection. */
+  requestUrl(connectionId: string): Promise<string>;
 }
 
 export interface MessagingDriverOptions {

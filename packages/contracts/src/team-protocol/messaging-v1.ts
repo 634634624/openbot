@@ -8,8 +8,10 @@
 //
 // Tokens are write-only. They travel only in the connect request body, towards the host. No response
 // carries one: the credential state is `missing`, `saved` or `unreadable`. A thread message longer
-// than 20000 characters is cut by the host before it is sent. Widening any of it needs a second
-// capability string.
+// than 20000 characters is cut by the host before it is sent. The overview also says whether the
+// agent's Slack app is one that OpenBot manages and which workspaces the host connected, by id and
+// name only; creating a managed app needs the host's own desktop, so no route does it. Widening any
+// of it needs a second capability string.
 import {
   adminRoute,
   boolean,
@@ -53,16 +55,20 @@ const connection = fields({
     "socket_mode_off",
     "secret_storage_unavailable",
     "error",
+    "awaiting_install",
+    "relay_unavailable",
   ),
   workspaceName: nullable(name),
   botUserId: nullable(name),
   missingScopes: list(string(64), 32),
   retryAt: nullable(time),
   credentials: oneOf("missing", "saved", "unreadable"),
+  managed: boolean,
 });
 const overview = fields({
   connection: nullable(connection),
   threads: list(fields({ linkId: identifier, title: name, isDirect: boolean, updatedAt: time }), 200),
+  slackWorkspaces: list(fields({ workspaceId: identifier, name }), 50),
 });
 const thread = fields({
   linkId: identifier,

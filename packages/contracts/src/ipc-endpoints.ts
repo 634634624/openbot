@@ -195,12 +195,14 @@ import type {
 } from "./ipc-mcp-servers";
 import type {
   ConnectSlackInput,
+  CreateSlackAppInput,
   MessagingAgentInput,
   MessagingOverview,
   MessagingThread,
   ReadMessagingThreadInput,
   SetMessagingEnabledInput,
   SlackSetup,
+  SlackWorkspaceInput,
 } from "./ipc-messaging";
 import type { NotificationOpenedEvent, NotificationPreference } from "./ipc-notifications";
 import type {
@@ -563,6 +565,14 @@ export const IPC_ENDPOINTS = {
     setEnabled: scopedRequest<SetMessagingEnabledInput, MessagingOverview, "required">()("messaging:set-enabled"),
     disconnect: scopedRequest<MessagingAgentInput, MessagingOverview, "required">()("messaging:disconnect"),
     readThread: scopedRequest<ReadMessagingThreadInput, MessagingThread, "required">()("messaging:read-thread"),
+    // Managed Slack apps. Only the host's own desktop can start these: each one opens a Slack page
+    // in this computer's browser, and the page returns to this computer's `openbot://` link.
+    connectSlackWorkspace: scopedRequest<MessagingAgentInput, void, "required">()("messaging:connect-slack-workspace"),
+    disconnectSlackWorkspace: scopedRequest<SlackWorkspaceInput, void, "required">()(
+      "messaging:disconnect-slack-workspace",
+    ),
+    createSlackApp: scopedRequest<CreateSlackAppInput, MessagingOverview, "required">()("messaging:create-slack-app"),
+    openSlackInstall: scopedRequest<MessagingAgentInput, void, "required">()("messaging:open-slack-install"),
   },
   // The server name, logo and app update of one server's host. `host.updateIdentity` and `update`
   // reach this computer only; these take the server, so a remote admin reaches the host. The

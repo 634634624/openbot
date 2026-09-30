@@ -337,6 +337,21 @@ export class CentralAuthManager extends EventEmitter<CentralAuthEvents> {
     );
   }
 
+  /** The request URL of one managed Slack app, which routes its events to this host through Signal. */
+  issueSlackRequestUrl(hostId: string, connectionId: string): Promise<string> {
+    const machineToken = this.#teamHostTokens.get(hostId.toLowerCase());
+    if (!machineToken) throw new Error(sourceText("error.auth.hostCredentialUnavailable"));
+    return this.#request(
+      `/v2/remote/hosts/${encodeURIComponent(hostId)}/slack-route`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ machineToken, connectionId }),
+      },
+      (value) => requiredString(decodeRecord(value, "Slack request URL"), "requestUrl"),
+    );
+  }
+
   async startRemoteSession(hostId: string): Promise<RemoteSession> {
     return this.#authorizedRequest(
       "/v2/remote/sessions/",

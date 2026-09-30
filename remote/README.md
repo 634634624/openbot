@@ -1,7 +1,8 @@
 # OpenBot Remote
 
-This directory holds our own control plane for WebRTC connections. The Remote API relays SDP and ICE only.
-Files, chats, commands and video never pass through the Remote API or Cloudflare.
+This directory holds our own control plane for WebRTC connections. The Remote API relays SDP and ICE.
+Team files, chats, commands and video never pass through the Remote API or Cloudflare. The one exception
+is a managed Slack app: see [Slack requests](#slack-requests).
 
 ## Flow
 
@@ -27,6 +28,18 @@ Ending a session and changing access both write a revocation event to a durable 
 to deliver it to Signal immediately. If Signal is unreachable, the Worker retries the delivery from cron. An
 ordinary reconnect still does not ask Cloudflare. Ended and expired sessions are removed after the 10-minute
 validation window.
+
+## Slack requests
+
+A Slack app that OpenBot creates for an agent has the request URL
+`https://signal.openbot.run/v1/slack/events/<route token>`. The route token is an ES256 JWT with the
+audience `openbot-slack-route`, signed by the Worker with `SLACK_ROUTE_PRIVATE_JWK` (key id
+`SLACK_ROUTE_KEY_ID`). Its public key must be in the ticket JWKS that Signal loads
+(`REMOTE_TICKET_PUBLIC_JWKS` on the Worker, or `REMOTE_TICKET_PUBLIC_KEYS` here). It names the host and
+the messaging connection. Signal checks the token, then passes the exact request body to that host's
+`ingress` socket and returns the host's answer, or 503 when the host does not answer in 2.5 seconds.
+Slack then sends the request again. Signal does not store, log, or check the body; only the host has the
+app's signing secret. Nginx does not log the `/v1/slack/` path, because it holds the route token.
 
 ## Production requirements
 

@@ -7,10 +7,16 @@ import { createMockMessaging } from "../src/preview/mock-messaging";
 
 const STORY_TOKENS = { agentId: "chief", botToken: "xoxb-preview-token", appToken: "xapp-preview-token" };
 
-/** The preview host, with the connection already made and then changed by `connection`. */
-function storyPort(connection?: Partial<MessagingConnection>): MessagingPort {
+/**
+ * The preview host, with the connection already made and then changed by `connection`. `workspace`
+ * connects the preview Slack workspace first, for the managed app path.
+ */
+function storyPort(connection?: Partial<MessagingConnection>, workspace = false): MessagingPort {
   const api: MessagingDesktopApi = createMockMessaging((agentId) => (agentId === "chief" ? "Chief" : undefined));
-  const ready = connection ? api.connectSlack(STORY_TOKENS, "local") : Promise.resolve();
+  const ready = (async () => {
+    if (workspace) await api.connectSlackWorkspace({ agentId: "chief" }, "local");
+    if (connection) await api.connectSlack(STORY_TOKENS, "local");
+  })();
   return {
     api: {
       ...api,
@@ -23,12 +29,13 @@ function storyPort(connection?: Partial<MessagingConnection>): MessagingPort {
       },
     },
     serverId: "local",
+    managedApps: true,
     openUrl: async () => undefined,
     copyText: async () => undefined,
   };
 }
 
-function SlackStory(props: { connection?: Partial<MessagingConnection> }) {
+function SlackStory(props: { connection?: Partial<MessagingConnection>; workspace?: boolean }) {
   return (
     <main
       style={{
@@ -40,7 +47,7 @@ function SlackStory(props: { connection?: Partial<MessagingConnection> }) {
       }}
     >
       <AgentSlackSettings
-        port={storyPort(props.connection)}
+        port={storyPort(props.connection, props.workspace)}
         agentId="chief"
         agentName="Chief"
         onBack={fn()}
@@ -59,6 +66,14 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const Setup: Story = {};
+
+export const WorkspaceConnected: Story = { args: { workspace: true } };
+
+export const AwaitingInstall: Story = {
+  args: { workspace: true, connection: { state: "awaiting_install", managed: true, botUserId: null } },
+};
+
+export const RelayUnavailable: Story = { args: { connection: { state: "relay_unavailable", managed: true } } };
 
 export const Connected: Story = { args: { connection: {} } };
 

@@ -1,7 +1,7 @@
 import { createHmac } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import { exportJWK, generateKeyPair, importJWK, jwtVerify } from "jose";
+import { decodeJwt, exportJWK, generateKeyPair, importJWK, jwtVerify } from "jose";
 import { describe, expect, it, vi } from "vitest";
 import { AuthService } from "../src/server/auth-service";
 import { sha256 } from "../src/server/crypto";
@@ -523,6 +523,8 @@ describe("RemoteControlPlane", () => {
       REMOTE_TICKET_KEY_ID: "test-key",
       REMOTE_AUTH_WEBHOOK_URL: "https://signal.example.test/internal/auth-events",
       REMOTE_AUTH_WEBHOOK_SECRET: "s".repeat(32),
+      SLACK_ROUTE_PRIVATE_JWK: JSON.stringify({ ...privateJwk, kid: "test-key", alg: "ES256" }),
+      SLACK_ROUTE_KEY_ID: "test-key",
     };
     const controlPlane = new RemoteControlPlane(bindings, {
       now: () => 1_000,
@@ -572,6 +574,13 @@ describe("RemoteControlPlane", () => {
     await expect(controlPlane.issueHostTicket("host-1", firstRegistration.machineToken)).rejects.toMatchObject({
       code: "host_unauthorized",
     });
+    // A Slack request URL routes Slack messages to a host, so only that host's credential gets one.
+    await expect(
+      controlPlane.issueSlackRoute("host-1", firstRegistration.machineToken, "messaging-1"),
+    ).rejects.toMatchObject({ code: "host_unauthorized" });
+    expect(
+      decodeJwt(await controlPlane.issueSlackRoute("host-1", registration.machineToken, "messaging-1")),
+    ).toMatchObject({ aud: "openbot-slack-route", hid: "host-1", cid: "messaging-1" });
     expect(database.prepare("SELECT membership_id FROM remote_memberships WHERE user_id = 'owner'").get()).toEqual({
       membership_id: "host-1:owner",
     });

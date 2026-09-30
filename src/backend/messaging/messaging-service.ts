@@ -7,6 +7,7 @@ import type {
   AgentEvent,
   AgentSummary,
   ConnectSlackInput,
+  CreateSlackAppInput,
   MessagingConnection,
   MessagingConnectionState,
   MessagingCredentialState,
@@ -27,23 +28,31 @@ import {
   type ConnectionIdentity,
   type InboundAction,
   type InboundMessage,
+  type IngressAnswer,
+  type IngressDelivery,
   type MessageTarget,
   type MessagingAdapter,
   MessagingConnectionError,
   type MessagingDriver,
+  type MessagingIngress,
   type MessagingTransport,
 } from "./messaging-types";
+import { SlackManagedApps, type SlackManagerPort } from "./slack/slack-managed-apps";
 import { slackSetup } from "./slack/slack-manifest";
 
 const logger = createOpenBotLogger("messaging");
 
-/** The tokens of each connection, kept by the main process in encrypted storage. */
+/**
+ * The tokens of each connection, kept by the main process in encrypted storage. A key is a
+ * connection id, or `slack-workspace:<id>` for the manager token of a Slack workspace.
+ */
 export interface MessagingCredentials {
+  keys(): string[];
   status(connectionId: string): MessagingCredentialState;
   get(connectionId: string): Record<string, string> | null;
   set(connectionId: string, values: Record<string, string>): Promise<void>;
   clear(connectionId: string): Promise<void>;
-  /** Removes the tokens of every connection that is not listed. */
+  /** Removes the tokens of every key that is not listed. */
   retain(connectionIds: ReadonlySet<string>): Promise<void>;
 }
 
@@ -60,6 +69,11 @@ export interface MessagingServiceOptions {
   drivers: readonly MessagingDriver[];
   /** A private folder for files that arrive, until the mailbox has copied them. */
   downloadsRoot: string;
+  /** The Signal relay for managed Slack apps. Without it and `slackManager`, only Socket Mode apps connect. */
+  ingress?: MessagingIngress;
+  slackManager?: SlackManagerPort;
+  /** Only tests change this. */
+  slackOrigin?: string;
 }
 
 interface LiveConnection {
@@ -120,6 +134,8 @@ export class MessagingService {
   readonly #chains = new Map<string, Promise<void>>();
   readonly #recent = new Set<string>();
   readonly #unsubscribe: Array<() => void> = [];
+  readonly #ingress: MessagingIngress | null;
+  readonly #managed: SlackManagedApps | null;
   #started = false;
 
   constructor(options: MessagingServiceOptions) {
@@ -128,6 +144,21 @@ export class MessagingService {
     this.#credentials = options.credentials;
     this.#drivers = new Map(options.drivers.map((driver) => [driver.platform, driver]));
     this.#downloadsRoot = options.downloadsRoot;
+    this.#ingress = options.ingress ?? null;
+    this.#managed =
+      options.ingress && options.slackManager
+        ? new SlackManagedApps({
+            store: options.threads.store,
+            credentials: options.credentials,
+            ingress: options.ingress,
+            manager: options.slackManager,
+            connections: {
+              restart: (connectionId) => this.#restart(connectionId),
+              stop: (connectionId) => this.#stopConnection(connectionId),
+            },
+            origin: options.slackOrigin,
+          })
+        : null;
   }
 
   async start(): Promise<void> {
@@ -138,8 +169,9 @@ export class MessagingService {
       this.#agents.onEvent((event) => this.#agentEvent(event)),
     );
     this.#threads.setContextSource((link, origin) => this.#promptContext(link, origin));
+    this.#ingress?.handle((connectionId, delivery) => this.deliverSlack(connectionId, delivery));
     const records = this.#threads.store.connections();
-    await this.#credentials.retain(new Set(records.map((record) => record.connectionId)));
+    await this.#credentials.retain(this.#retainedKeys());
     const agents = new Set(this.#agents.listAgents().map((agent) => agent.id));
     await Promise.all(
       records
@@ -152,12 +184,14 @@ export class MessagingService {
     this.#started = false;
     for (const unsubscribe of this.#unsubscribe.splice(0)) unsubscribe();
     this.#threads.setContextSource(null);
+    this.#ingress?.handle(null);
     await Promise.all([...this.#live.values()].map((live) => live.transport?.stop()));
     this.#live.clear();
   }
 
   /** After the computer wakes, every socket may be dead without knowing it. */
   resume(): void {
+    this.#ingress?.reconnect();
     for (const live of this.#live.values()) live.transport?.reconnect();
   }
 
@@ -168,7 +202,11 @@ export class MessagingService {
   overview(agentId: string): MessagingOverview {
     this.#requireAgent(agentId);
     const record = this.#threads.store.connectionFor(agentId, "slack");
-    return { connection: record ? this.#summary(record) : null, threads: this.#threads.list(agentId) };
+    return {
+      connection: record ? this.#summary(record) : null,
+      threads: this.#threads.list(agentId),
+      slackWorkspaces: this.#managed?.workspaces() ?? [],
+    };
   }
 
   slackSetup(agentId: string): SlackSetup {
@@ -194,6 +232,7 @@ export class MessagingService {
     }
     const record = this.#threads.store.ensureConnection(input.agentId, "slack");
     await this.#stopConnection(record.connectionId);
+    await this.#managed?.deleteApp(record.connectionId).catch((error) => this.#warn(error));
     await this.#credentials.set(record.connectionId, credentials);
     this.#threads.store.updateConnection(record.connectionId, { enabled: true, lastErrorCode: null });
     const updated = this.#threads.store.connection(record.connectionId);
@@ -219,10 +258,14 @@ export class MessagingService {
     return this.overview(agentId);
   }
 
-  /** Removes the tokens and stops the connection. The conversations stay, for reading and for a later connect. */
+  /**
+   * Removes the tokens and stops the connection. A Slack app that OpenBot manages is deleted too,
+   * because nothing else can use it. The conversations stay, for reading and for a later connect.
+   */
   async disconnect(agentId: string): Promise<MessagingOverview> {
     const record = this.#requireConnection(agentId);
     await this.#stopConnection(record.connectionId);
+    await this.#managed?.deleteApp(record.connectionId).catch((error) => this.#warn(error));
     await this.#credentials.clear(record.connectionId);
     this.#threads.store.updateConnection(record.connectionId, {
       enabled: false,
@@ -235,12 +278,62 @@ export class MessagingService {
     return this.overview(agentId);
   }
 
+  // Managed Slack apps.
+
+  /** Opens the OpenBot manager app's consent in the browser. A deep link to `completeSlackWorkspace` ends it. */
+  async connectSlackWorkspace(): Promise<void> {
+    await this.#requireManaged().startWorkspace();
+  }
+
+  /** False for a link that this run did not start. */
+  completeSlackWorkspace(nonce: string, grant: string): Promise<boolean> {
+    return this.#requireManaged().completeWorkspace(nonce, grant);
+  }
+
+  async disconnectSlackWorkspace(workspaceId: string): Promise<void> {
+    await this.#requireManaged().disconnectWorkspace(workspaceId);
+  }
+
+  /** Creates the agent's own Slack app in the workspace and opens its install page. */
+  async createSlackApp(input: CreateSlackAppInput): Promise<MessagingOverview> {
+    const managed = this.#requireManaged();
+    const agent = this.#requireAgent(input.agentId);
+    const record = this.#threads.store.ensureConnection(input.agentId, "slack");
+    await managed.createApp(record.connectionId, agent, input.workspaceId);
+    return this.overview(input.agentId);
+  }
+
+  async openSlackInstall(agentId: string): Promise<void> {
+    await this.#requireManaged().openInstall(this.#requireConnection(agentId).connectionId);
+  }
+
+  /** False for a link that this run did not start. */
+  completeSlackInstall(state: string, code: string): Promise<boolean> {
+    return this.#requireManaged().completeInstall(state, code);
+  }
+
+  /**
+   * One request that Slack sent to a managed app's request URL. A paused connection answers 200, so
+   * Slack does not send it again, and does nothing. An unknown one answers 404.
+   */
+  async deliverSlack(connectionId: string, delivery: IngressDelivery): Promise<IngressAnswer> {
+    const check = this.#managed?.answerUrlCheck(connectionId, delivery);
+    if (check) return check;
+    const record = this.#threads.store.connection(connectionId);
+    if (!record) return { status: 404 };
+    if (!record.enabled) return { status: 200 };
+    const transport = this.#live.get(connectionId)?.transport;
+    if (!transport?.deliver) return { status: 503 };
+    return transport.deliver(delivery);
+  }
+
   // Connection lifecycle.
 
   async #startConnection(record: MessagingConnectionRecord): Promise<void> {
     const credentials = this.#credentials.get(record.connectionId);
     const driver = this.#drivers.get(record.platform);
-    if (!credentials || !driver) return;
+    // A managed app that is not installed yet has no bot token: it waits for `completeSlackInstall`.
+    if (!credentials || !driver || !credentials.botToken) return;
     const live: LiveConnection = {
       record,
       adapter: driver.createAdapter(credentials, {
@@ -312,12 +405,16 @@ export class MessagingService {
   #summary(record: MessagingConnectionRecord): MessagingConnection {
     const live = this.#live.get(record.connectionId);
     const credentials = this.#credentials.status(record.connectionId);
+    const values = credentials === "saved" ? this.#credentials.get(record.connectionId) : null;
+    const managed = SlackManagedApps.isManaged(values);
     const stored = isOneOf(MESSAGING_CONNECTION_STATES, record.lastErrorCode) ? record.lastErrorCode : null;
     const state: MessagingConnectionState = !record.enabled
       ? "paused"
       : credentials === "unreadable"
         ? "secret_storage_unavailable"
-        : (live?.state ?? stored ?? "connecting");
+        : managed && !values?.botToken
+          ? "awaiting_install"
+          : (live?.state ?? stored ?? "connecting");
     return {
       agentId: record.agentId,
       platform: record.platform,
@@ -328,6 +425,7 @@ export class MessagingService {
       missingScopes: live?.identity?.missingScopes ?? [],
       retryAt: state === "rate_limited" ? (live?.retryAt ?? null) : null,
       credentials,
+      managed,
     };
   }
 
@@ -528,7 +626,9 @@ export class MessagingService {
     else if (event.type === "prompt")
       void this.#question(event.threadId, event.agentId).catch((error) => this.#warn(error));
     else if (event.type === "agents-changed")
-      void this.#forgetDeletedAgents(event.agents).catch((error) => this.#warn(error));
+      void this.#forgetDeletedAgents(event.agents)
+        .then(() => this.#managed?.sync(new Map(event.agents.map((agent) => [agent.id, agent]))))
+        .catch((error) => this.#warn(error));
   }
 
   async #approval(approval: AgentApproval): Promise<void> {
@@ -643,12 +743,31 @@ export class MessagingService {
     await adapter.edit(pending.target, pending.messageId, { text: `${pending.text}\n${outcome}` });
   }
 
-  /** A deleted agent's links are already gone with it. This stops its socket and removes its tokens. */
+  /**
+   * A deleted agent's links are already gone with it. This stops its socket, deletes a Slack app
+   * that OpenBot managed for it, and removes its tokens.
+   */
   async #forgetDeletedAgents(agents: readonly AgentSummary[]): Promise<void> {
     const ids = new Set(agents.map((agent) => agent.id));
-    for (const [connectionId, live] of this.#live)
-      if (!ids.has(live.record.agentId)) await this.#stopConnection(connectionId);
-    await this.#credentials.retain(new Set(this.#threads.store.connections().map((record) => record.connectionId)));
+    for (const [connectionId, live] of this.#live) {
+      if (ids.has(live.record.agentId)) continue;
+      await this.#stopConnection(connectionId);
+      await this.#managed?.deleteApp(connectionId, live.record.appId).catch((error) => this.#warn(error));
+    }
+    await this.#credentials.retain(this.#retainedKeys());
+  }
+
+  /** The credential keys that still belong to something: each connection, and each Slack workspace. */
+  #retainedKeys(): Set<string> {
+    return new Set([
+      ...this.#threads.store.connections().map((record) => record.connectionId),
+      ...(this.#managed?.workspaceKeys() ?? []),
+    ]);
+  }
+
+  #requireManaged(): SlackManagedApps {
+    if (!this.#managed) throw new Error(sourceText("error.messaging.unsupported"));
+    return this.#managed;
   }
 
   // Helpers.

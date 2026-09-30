@@ -3,9 +3,11 @@
 
 import type {
   ConnectSlackInput,
+  CreateSlackAppInput,
   MessagingAgentInput,
   ReadMessagingThreadInput,
   SetMessagingEnabledInput,
+  SlackWorkspaceInput,
 } from "@openbot/contracts/ipc";
 import { MESSAGING_LIMITS } from "@openbot/contracts/ipc";
 import { isBoolean, isString } from "@openbot/contracts/runtime-values";
@@ -27,6 +29,19 @@ export function parseConnectSlackInput(value: unknown): ConnectSlackInput {
     agentId: requireString(value.agentId, "Agent id"),
     botToken: token(value.botToken, sourceText("error.messaging.botTokenInvalid")),
     appToken: token(value.appToken, sourceText("error.messaging.appTokenInvalid")),
+  };
+}
+
+export function parseSlackWorkspaceInput(value: unknown): SlackWorkspaceInput {
+  if (!isObject(value)) throw new Error("A messaging request is invalid.");
+  return { workspaceId: requireString(value.workspaceId, "Workspace id") };
+}
+
+export function parseCreateSlackAppInput(value: unknown): CreateSlackAppInput {
+  if (!isObject(value)) throw new Error("A messaging request is invalid.");
+  return {
+    agentId: requireString(value.agentId, "Agent id"),
+    workspaceId: requireString(value.workspaceId, "Workspace id"),
   };
 }
 

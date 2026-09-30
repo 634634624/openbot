@@ -1,8 +1,10 @@
 // The Signal wire protocol: the frames a peer and the Signal service exchange over `WSS /v1/signal`.
 //
 // Signal (`remote/api`) relays SDP and ICE between a host and its clients and hands out resume
-// tokens and TURN credentials. It never sees a chat, a file or a command - those travel on the
-// WebRTC data channels it helped negotiate, and their protocol is `../team-protocol` instead.
+// tokens and TURN credentials. Team chats, files and commands never pass through it - those travel
+// on the WebRTC data channels it helped negotiate, and their protocol is `../team-protocol` instead.
+// The one exception is Slack: a managed Slack app posts its events to Signal, and Signal passes
+// each request body to the host's `ingress` socket in transit, without storing or logging it.
 //
 // Three parties speak this and none of them ships together: the service
 // (`remote/api/src/signal-service.ts`), the shared client that mobile and the future web client run
@@ -43,8 +45,22 @@ export const SIGNAL_TURN_CREDENTIAL_TTL_SECONDS = 60 * 60;
 // working for everyone except the users behind a symmetric NAT.
 export const SIGNAL_TURN_REFRESH_INTERVAL_MS = Math.floor(SIGNAL_TURN_CREDENTIAL_TTL_SECONDS * 0.75) * 1_000;
 
-// Which side of the relay a socket is. Only a host may set `multiplex`.
-export type SignalPeer = "host" | "client";
+// Which side of the relay a socket is. Only a host may set `multiplex`. An `ingress` socket belongs
+// to a host too, but it only receives Slack deliveries: Signal never attaches a client to it, so it
+// can stay open while the host is not published.
+export type SignalPeer = "host" | "client" | "ingress";
+
+// The largest Slack request body Signal passes to a host. Signal refuses a larger one with 413.
+export const SLACK_DELIVERY_BODY_BYTES_LIMIT = 64 * 1024;
+
+// The largest response body a host returns for a Slack request: a `url_verification` challenge or
+// an interactivity reply.
+export const SLACK_DELIVERY_RESPONSE_BYTES_LIMIT = 4 * 1024;
+
+// The Slack request that a delivery carries. Slack sends events as JSON and button presses as a form.
+export type SlackDeliveryKind = "events" | "interactivity";
+
+export type SlackDeliveryStatus = 200 | 400 | 401 | 404 | 503;
 
 // Which negotiation a relayed frame belongs to. One socket carries both.
 export type SignalChannel = "team" | "remote-desktop";
@@ -102,6 +118,16 @@ export type SignalClientMessage =
       token: string;
       multiplex?: boolean;
     }
+  // An `ingress` socket's answer to one `slack-delivery`. Signal returns it to Slack as the HTTP
+  // response, so `body` is only the `url_verification` challenge or an interactivity reply.
+  | {
+      type: "slack-delivery-result";
+      version: SignalProtocolVersion;
+      requestId: string;
+      status: SlackDeliveryStatus;
+      contentType?: "application/json" | "text/plain";
+      body?: string;
+    }
   | SignalRelayMessage;
 
 export type SignalServerMessage =
@@ -134,4 +160,19 @@ export type SignalServerMessage =
   // service it does not ship with, and a code a newer Signal has added is still a code it has to
   // surface. The service narrows its own emissions where it builds the frame.
   | { type: "error"; version: SignalProtocolVersion; code: string; message: string; connectionId?: string }
+  // One Slack request for a messaging connection of this host, sent only to an `ingress` socket.
+  // The body is base64 so the host checks Slack's signature over the exact bytes Slack signed.
+  // Signal does not check that signature: only the host has the app's signing secret.
+  | {
+      type: "slack-delivery";
+      version: SignalProtocolVersion;
+      requestId: string;
+      connectionId: string;
+      kind: SlackDeliveryKind;
+      timestamp: string;
+      signature: string;
+      retryNum: number | null;
+      retryReason: string | null;
+      bodyBase64: string;
+    }
   | SignalRelayMessage;

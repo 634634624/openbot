@@ -2,8 +2,13 @@ import type { RemoteAuthEvent } from "@openbot/contracts/signal-protocol/auth-ev
 import { Elysia } from "elysia";
 import { z } from "zod";
 import type { RemoteApiConfig } from "./config";
-import type { SignalService, SignalSocket } from "./signal-service";
-import { verifyWebhookSignature } from "./tokens";
+import { SLACK_DELIVERY_BODY_BYTES_LIMIT, type SlackDeliveryKind } from "./protocol";
+import type { SignalService, SignalSocket, SlackDeliveryResponse } from "./signal-service";
+import { type SlackRouteVerifier, verifyWebhookSignature } from "./tokens";
+
+const SLACK_SIGNATURE_PATTERN = /^v0=[0-9a-f]{64}$/u;
+const SLACK_TIMESTAMP_TOLERANCE_SECONDS = 5 * 60;
+const SLACK_RETRY_REASON_PATTERN = /^[a-z0-9_]{1,64}$/u;
 
 const authEventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("account-profile-changed"), userId: z.string().min(1) }),
@@ -20,7 +25,7 @@ const authEventSchema = z.discriminatedUnion("type", [
   }),
 ]) satisfies z.ZodType<RemoteAuthEvent>;
 
-export function createRemoteApiApp(config: RemoteApiConfig, signal: SignalService) {
+export function createRemoteApiApp(config: RemoteApiConfig, signal: SignalService, routes: SlackRouteVerifier) {
   const app = new Elysia()
     .get("/health/live", () => ({ service: "openbot-remote-api", status: "live" }))
     .get("/health/ready", () => ({ service: "openbot-remote-api", status: "ready" }))
@@ -43,6 +48,54 @@ export function createRemoteApiApp(config: RemoteApiConfig, signal: SignalServic
       else signal.revokeSession(event.sessionId);
       return new Response(null, { status: 204 });
     })
+    // A managed Slack app's request URL, for events and button presses. Signal checks only what it
+    // can check cheaply, finds the host from the route token, and passes the exact body to that
+    // host's ingress socket. The host checks Slack's signature. Nothing here logs the path, which
+    // holds the route token, or the body.
+    .post(
+      "/v1/slack/events/:route",
+      async ({ request, params, server }) => {
+        const declaredLength = Number(request.headers.get("content-length") ?? "0");
+        if (!Number.isFinite(declaredLength) || declaredLength > SLACK_DELIVERY_BODY_BYTES_LIMIT) {
+          return slackResponse({ status: 413 });
+        }
+        const kind = slackDeliveryKind(request.headers.get("content-type"));
+        if (!kind) return slackResponse({ status: 415 });
+        const timestamp = request.headers.get("x-slack-request-timestamp") ?? "";
+        const signature = request.headers.get("x-slack-signature") ?? "";
+        if (!freshSlackTimestamp(timestamp) || !SLACK_SIGNATURE_PATTERN.test(signature)) {
+          return slackResponse({ status: 401 });
+        }
+        let route: Awaited<ReturnType<SlackRouteVerifier["verifySlackRoute"]>>;
+        try {
+          route = await routes.verifySlackRoute(params.route);
+        } catch {
+          const address = signalClientIp(
+            server?.requestIP(request)?.address,
+            request.headers.get("x-forwarded-for"),
+            config.trustProxy,
+          );
+          return slackResponse({ status: signal.acceptSlackRequest(`address:${address}`) ? 404 : 429 });
+        }
+        if (!signal.acceptSlackRequest(`route:${route.connectionId}`)) return slackResponse({ status: 429 });
+        const body = new Uint8Array(await request.arrayBuffer());
+        if (body.byteLength > SLACK_DELIVERY_BODY_BYTES_LIMIT) return slackResponse({ status: 413 });
+        const retryNum = Number(request.headers.get("x-slack-retry-num") ?? "");
+        const retryReason = request.headers.get("x-slack-retry-reason");
+        return slackResponse(
+          await signal.deliverSlack(route.hostId, {
+            connectionId: route.connectionId,
+            kind,
+            timestamp,
+            signature,
+            retryNum: Number.isInteger(retryNum) && retryNum >= 0 && retryNum < 100 ? retryNum : null,
+            retryReason: retryReason && SLACK_RETRY_REASON_PATTERN.test(retryReason) ? retryReason : null,
+            body,
+          }),
+        );
+      },
+      { parse: "none" },
+    )
     .ws("/v1/signal", {
       idleTimeout: 120,
       maxPayloadLength: 64 * 1024,
@@ -102,6 +155,28 @@ export function signalClientIp(
   return forwarded || remoteAddress || "unknown";
 }
 
+function slackDeliveryKind(contentType: string | null): SlackDeliveryKind | null {
+  const mediaType = contentType?.split(";", 1)[0]?.trim().toLowerCase();
+  if (mediaType === "application/json") return "events";
+  if (mediaType === "application/x-www-form-urlencoded") return "interactivity";
+  return null;
+}
+
+// A cheap filter only. The host checks the timestamp again, with the signature that covers it.
+function freshSlackTimestamp(timestamp: string, nowSeconds = Math.floor(Date.now() / 1_000)): boolean {
+  if (!/^[0-9]{1,12}$/u.test(timestamp)) return false;
+  return Math.abs(nowSeconds - Number(timestamp)) <= SLACK_TIMESTAMP_TOLERANCE_SECONDS;
+}
+
+function slackResponse(response: SlackDeliveryResponse | { status: 413 | 415 | 429 | 401 | 404 }): Response {
+  const headers: Record<string, string> = { "Cache-Control": "no-store" };
+  if ("contentType" in response && response.contentType && response.body !== undefined) {
+    headers["Content-Type"] = response.contentType;
+    return new Response(response.body, { status: response.status, headers });
+  }
+  return new Response(null, { status: response.status, headers });
+}
+
 function decodeAuthEvent(body: string): RemoteAuthEvent | null {
   try {
     const result = authEventSchema.safeParse(JSON.parse(body));
@@ -124,6 +199,10 @@ export function prometheusMetrics(signal: SignalService): string {
     `openbot_remote_auth_failures_total ${metrics.authenticationFailures}`,
     "# TYPE openbot_remote_protocol_failures_total counter",
     `openbot_remote_protocol_failures_total ${metrics.protocolFailures}`,
+    "# TYPE openbot_remote_slack_deliveries_total counter",
+    `openbot_remote_slack_deliveries_total ${metrics.slackDeliveries}`,
+    "# TYPE openbot_remote_slack_deliveries_unavailable_total counter",
+    `openbot_remote_slack_deliveries_unavailable_total ${metrics.slackDeliveriesUnavailable}`,
     "",
   ].join("\n");
 }

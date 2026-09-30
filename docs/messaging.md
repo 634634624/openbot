@@ -5,6 +5,30 @@ An agent can answer in an external chat platform. Slack is supported today. The 
 
 ## Connect an agent to Slack
 
+There are two ways. Both give the agent its own Slack app and its own bot user, so people can
+mention it and send it direct messages, and each agent in a workspace is a separate app.
+
+### Let OpenBot create the app
+
+This is the default on the computer that runs the agent. It needs an OpenBot account, and a name for
+this computer (**Server settings**), because Slack sends the app's events to OpenBot's Signal service,
+which passes them to this computer.
+
+1. Open the agent, then **Agent settings → Slack**.
+2. Select **Connect a Slack workspace**. Slack opens in the browser and asks to let the OpenBot
+   manager app create and change apps. Allow it. You do this one time for each workspace.
+3. Select **Add to** the workspace. OpenBot creates a Slack app with the agent's name and opens its
+   install page. Select **Allow**. If the workspace needs an admin to approve new apps, the
+   connection shows **Waiting for install** until the admin approves; then select **Install in
+   Slack** again.
+4. In Slack, invite the agent to a channel with `/invite @name`, then mention it.
+
+When the agent is renamed, OpenBot renames its Slack app. **Disconnect**, or deleting the agent,
+deletes the app. **Forget workspace** removes the manager token from this computer and revokes it;
+the apps that exist keep working.
+
+### Use your own Slack app
+
 1. Open the agent, then **Agent settings → Slack**.
 2. Select **Create Slack app**. Slack opens with a manifest that OpenBot filled in: the agent's name,
    the bot scopes, the events, interactivity and Socket Mode. Pick the workspace and create the app.
@@ -18,7 +42,8 @@ An agent can answer in an external chat platform. Slack is supported today. The 
 6. In Slack, invite the agent to a channel with `/invite @name`, then mention it.
 
 On a joined server, an owner or admin can do the same from their own computer or the browser client
-at `/app`. The host must advertise `messaging-v1`.
+at `/app`. The host must advertise `messaging-v1`. A managed app can be created only on the host's
+own desktop, because Slack returns to that computer's browser.
 
 ## What the agent does in Slack
 
@@ -46,6 +71,8 @@ at `/app`. The host must advertise `messaging-v1`.
 | Waiting for Slack | Slack rate-limited the app. | Nothing. The host tries again at the time shown. |
 | Tokens unreadable | The host cannot decrypt the stored tokens. | Disconnect, then connect again. |
 | Reconnecting | The host lost the connection. | Nothing, or **Reconnect** after the network is back. |
+| Waiting for install | A managed app exists, but it is not installed in the workspace. | **Install in Slack**, or ask a workspace admin to approve the app. |
+| Cannot receive events | A managed app gets its events through Signal, and this computer cannot reach it: it is signed out, has no name, or Signal is down. | Sign in, name this computer in **Server settings**, keep OpenBot open. |
 
 ## Limits
 
@@ -55,6 +82,10 @@ at `/app`. The host must advertise `messaging-v1`.
   and one person at most 2.
 - Use one Slack app per agent and per host. Two hosts with the same app token split Slack's events
   between them.
+- A free Slack workspace allows at most 10 apps, and each agent uses one. Slack does not document a
+  limit for paid plans. A workspace can also require an admin to approve each new app.
+- A managed app gets its events from Slack through Signal. When this computer does not answer, Slack
+  sends an event again after about 1 and 5 minutes, then drops it.
 - Anyone who can post in the workspace, guests and Slack Connect members included, can give the
   agent work. The agent runs with the access you gave it. With Turbo or **Always allow**, it runs
   commands without asking.
@@ -76,7 +107,7 @@ core changes:
 
 | Platform | Transport | Conversation key | Notes |
 | --- | --- | --- | --- |
-| Slack | Socket Mode WebSocket | `thread_ts`, or `direct` for a DM | Implemented. |
+| Slack | Socket Mode WebSocket, or the Events API through Signal for a managed app | `thread_ts`, or `direct` for a DM | Implemented. |
 | Discord | Gateway WebSocket (`@discordjs/ws` style: heartbeat, resume) | The thread channel id, or the message id that starts a thread | Needs the Message Content intent. Reactions map directly. |
 | Telegram | Long polling with `getUpdates` and an offset | `message_thread_id` in a forum, else the chat id | No history API: store what the bot sees for context. |
 

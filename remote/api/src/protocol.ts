@@ -7,7 +7,11 @@
 // The re-exports below are what the rest of this workspace imports, so moving the types out did not
 // churn `signal-service.ts` or `tokens.ts`.
 
-import type { SignalClientMessage, SignalServerMessage } from "@openbot/contracts/signal-protocol/messages";
+import {
+  type SignalClientMessage,
+  type SignalServerMessage,
+  SLACK_DELIVERY_RESPONSE_BYTES_LIMIT,
+} from "@openbot/contracts/signal-protocol/messages";
 import { z } from "zod";
 
 export type {
@@ -15,10 +19,14 @@ export type {
   SignalClientMessage,
   SignalErrorCode,
   SignalServerMessage,
+  SlackDeliveryKind,
+  SlackDeliveryStatus,
 } from "@openbot/contracts/signal-protocol/messages";
 export {
   SIGNAL_MESSAGE_BYTES_LIMIT,
   SIGNAL_TURN_CREDENTIAL_TTL_SECONDS,
+  SLACK_DELIVERY_BODY_BYTES_LIMIT,
+  SLACK_DELIVERY_RESPONSE_BYTES_LIMIT,
 } from "@openbot/contracts/signal-protocol/messages";
 export type { RemoteTicketClaims } from "@openbot/contracts/signal-protocol/ticket";
 export {
@@ -40,12 +48,13 @@ const signalMessageTypeSchema = z.enum([
   "ice-restart",
   "turn-refresh",
   "disconnect",
+  "slack-delivery-result",
 ]);
 const signalClientMessageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("hello"),
     version: z.literal(1),
-    peer: z.enum(["host", "client"]),
+    peer: z.enum(["host", "client", "ingress"]),
     token: z.string().min(1).max(8_192),
     multiplex: z.boolean().optional(),
   }),
@@ -80,6 +89,14 @@ const signalClientMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("disconnect"),
     version: z.literal(1),
     connectionId: identifierSchema,
+  }),
+  z.object({
+    type: z.literal("slack-delivery-result"),
+    version: z.literal(1),
+    requestId: identifierSchema,
+    status: z.union([z.literal(200), z.literal(400), z.literal(401), z.literal(404), z.literal(503)]),
+    contentType: z.enum(["application/json", "text/plain"]).optional(),
+    body: z.string().max(SLACK_DELIVERY_RESPONSE_BYTES_LIMIT).optional(),
   }),
 ]) satisfies z.ZodType<SignalClientMessage>;
 

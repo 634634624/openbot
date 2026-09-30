@@ -11,9 +11,11 @@ import type {
   MessagingAdapter,
   MessagingDriver,
   MessagingDriverOptions,
+  MessagingIngress,
   StatusReaction,
 } from "../messaging-types";
 import { plainText, SLACK_ACTION_IDS, SLACK_DIRECT_THREAD_KEY } from "./slack-events";
+import { SlackEventsTransport } from "./slack-events-transport";
 import { SLACK_BOT_SCOPES } from "./slack-manifest";
 import { slackChunks, slackMrkdwn } from "./slack-render";
 import { SlackSocketMode } from "./slack-socket-mode";
@@ -21,6 +23,7 @@ import { SlackApiError, SlackWebApi } from "./slack-web-api";
 
 const BOT_TOKEN = /^xoxb-[A-Za-z0-9-]{10,250}$/;
 const APP_TOKEN = /^xapp-[A-Za-z0-9-]{10,250}$/;
+const SIGNING_SECRET = /^[0-9a-f]{32,64}$/;
 /** Slack's own limit for one uploaded file is 1 GB; the host holds its uploads to this. */
 const UPLOAD_BYTES = 100 * 1024 * 1024;
 const HISTORY_LIMIT = 100;
@@ -285,19 +288,37 @@ export class SlackAdapter implements MessagingAdapter {
 export interface SlackDriverOptions {
   /** Only tests change this. */
   origin?: string;
+  /** The relay that brings a managed app's events. Without it, only Socket Mode apps connect. */
+  ingress?: MessagingIngress;
 }
 
+/**
+ * A connection with a signing secret is an app that OpenBot manages, and it gets its events through
+ * the ingress relay. Any other connection is an app the user made, and it uses Socket Mode.
+ */
 export function slackDriver(options: SlackDriverOptions = {}): MessagingDriver {
   return {
     platform: "slack",
     validateCredentials(credentials) {
       if (!BOT_TOKEN.test(credentials.botToken ?? "")) throw new Error(sourceText("error.messaging.botTokenInvalid"));
+      if (credentials.signingSecret !== undefined) {
+        if (!SIGNING_SECRET.test(credentials.signingSecret)) throw new Error(sourceText("error.messaging.unsupported"));
+        return;
+      }
       if (!APP_TOKEN.test(credentials.appToken ?? "")) throw new Error(sourceText("error.messaging.appTokenInvalid"));
     },
     createAdapter(credentials, driverOptions) {
       return new SlackAdapter(credentials.botToken ?? "", { ...driverOptions, origin: options.origin });
     },
     createTransport(credentials, identity) {
+      if (credentials.signingSecret !== undefined) {
+        if (!options.ingress) throw new Error(sourceText("error.messaging.unsupported"));
+        return new SlackEventsTransport({
+          signingSecret: credentials.signingSecret,
+          identity,
+          ingress: options.ingress,
+        });
+      }
       return new SlackSocketMode({ appToken: credentials.appToken ?? "", identity, origin: options.origin });
     },
   };

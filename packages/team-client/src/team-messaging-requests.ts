@@ -10,6 +10,7 @@ import {
   type MessagingDesktopApi,
 } from "@openbot/contracts/ipc";
 import { MESSAGING_ROUTES } from "@openbot/contracts/team-protocol/messaging-v1";
+import { sourceText } from "@openbot/i18n/source";
 import type { TeamApiRequest } from "./team-api-requests";
 
 /** The desktop `messaging` group, answered over the Team API of a host. */
@@ -33,5 +34,14 @@ export function teamMessagingRequests(request: (serverId?: string) => TeamApiReq
       request(serverId)("POST", MESSAGING_ROUTES.disconnect, decodeMessagingOverview, { agentId }),
     readThread: async ({ agentId, linkId }, serverId) =>
       request(serverId)("POST", MESSAGING_ROUTES.thread, decodeMessagingThread, { agentId, linkId }),
+    // A managed Slack app opens Slack in the host's own browser, so no route creates one.
+    connectSlackWorkspace: hostOnly,
+    disconnectSlackWorkspace: hostOnly,
+    createSlackApp: hostOnly,
+    openSlackInstall: hostOnly,
   };
+}
+
+async function hostOnly(): Promise<never> {
+  throw new Error(sourceText("error.messaging.managedOnHost"));
 }

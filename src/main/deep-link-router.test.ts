@@ -78,6 +78,23 @@ describe("the deep link router", () => {
       expect(parseDeepLink(value)).toBeNull();
     });
 
+    /* A Slack install code and a sealed manager token are secrets too. They are their own kinds, which
+       `index.ts` keeps in main, and never another scheme or a half link. */
+    it("reads the Slack sign-in links as their own kinds", () => {
+      expect(parseDeepLink("openbot://slack-install?code=code-1&state=state-1")).toEqual({
+        kind: "slack-install",
+        state: "state-1",
+        code: "code-1",
+      });
+      expect(parseDeepLink("openbot://slack-workspace?nonce=nonce-1&grant=sealed")).toEqual({
+        kind: "slack-workspace",
+        nonce: "nonce-1",
+        grant: "sealed",
+      });
+      expect(parseDeepLink("openbot://slack-install?code=code-1")).toBeNull();
+      expect(parseDeepLink("https://openbot.run/slack-install?code=code-1&state=state-1")).toBeNull();
+    });
+
     /* A plugin link carries no query, so the host it owns cannot be reached with a grant on it -
        which is what keeps the grant out of the one kind that is forwarded to a renderer. */
     it("never reads a plugin link as a grant", () => {

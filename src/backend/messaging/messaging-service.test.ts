@@ -196,6 +196,9 @@ class FakeSlack {
 
 class MemoryCredentials implements MessagingCredentials {
   readonly values = new Map<string, Record<string, string>>();
+  keys() {
+    return [...this.values.keys()];
+  }
   status(connectionId: string) {
     return this.values.has(connectionId) ? ("saved" as const) : ("missing" as const);
   }

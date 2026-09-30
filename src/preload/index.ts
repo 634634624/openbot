@@ -587,6 +587,10 @@ const openbotApi: OpenBotDesktopApi = {
     setEnabled: decodeMessagingOverviewReply,
     disconnect: decodeMessagingOverviewReply,
     readThread: decodeMessagingThreadReply,
+    connectSlackWorkspace: decodeVoid,
+    disconnectSlackWorkspace: decodeVoid,
+    createSlackApp: decodeMessagingOverviewReply,
+    openSlackInstall: decodeVoid,
   }),
   hostAdmin: bridgeGroup(IPC_ENDPOINTS.hostAdmin, {
     updateIdentity: decodeServer,

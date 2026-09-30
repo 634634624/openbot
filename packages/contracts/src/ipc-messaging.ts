@@ -22,6 +22,11 @@ export const MESSAGING_CONNECTION_STATES = [
   "socket_mode_off",
   "secret_storage_unavailable",
   "error",
+  // A managed Slack app exists, and the user has not installed it in the workspace yet.
+  "awaiting_install",
+  // A managed Slack app gets its events through Signal, and this host cannot reach it: it is signed
+  // out, has no name yet, or Signal is down.
+  "relay_unavailable",
 ] as const;
 export type MessagingConnectionState = (typeof MESSAGING_CONNECTION_STATES)[number];
 
@@ -39,6 +44,7 @@ export const MESSAGING_LIMITS = {
   messageText: 20_000,
   manifest: 16_000,
   url: 32_000,
+  workspaces: 50,
 } as const;
 
 export interface MessagingConnection {
@@ -53,6 +59,14 @@ export interface MessagingConnection {
   /** When the connection tries again after a rate limit, as an ISO time. */
   retryAt: string | null;
   credentials: MessagingCredentialState;
+  /** True for a Slack app that OpenBot created for the agent through the manager app. */
+  managed: boolean;
+}
+
+/** A Slack workspace where the OpenBot manager app can create an app for each agent. */
+export interface SlackWorkspace {
+  workspaceId: string;
+  name: string;
 }
 
 /** One external conversation that the agent answers in its own execution thread. */
@@ -66,6 +80,8 @@ export interface MessagingThreadSummary {
 export interface MessagingOverview {
   connection: MessagingConnection | null;
   threads: MessagingThreadSummary[];
+  /** The workspaces connected on this host. Empty on a host that cannot create managed apps. */
+  slackWorkspaces: SlackWorkspace[];
 }
 
 export interface MessagingThreadMessage {
@@ -100,6 +116,15 @@ export interface ConnectSlackInput {
   appToken: string;
 }
 
+export interface CreateSlackAppInput {
+  agentId: string;
+  workspaceId: string;
+}
+
+export interface SlackWorkspaceInput {
+  workspaceId: string;
+}
+
 export interface SetMessagingEnabledInput {
   agentId: string;
   enabled: boolean;
@@ -129,7 +154,14 @@ export function isMessagingConnection(value: unknown): value is MessagingConnect
     isNullableBoundedString(value.botUserId, MESSAGING_LIMITS.name) &&
     isScopeList(value.missingScopes) &&
     isNullableBoundedString(value.retryAt, 64) &&
-    isOneOf(MESSAGING_CREDENTIAL_STATES, value.credentials)
+    isOneOf(MESSAGING_CREDENTIAL_STATES, value.credentials) &&
+    isBoolean(value.managed)
+  );
+}
+
+export function isSlackWorkspace(value: unknown): value is SlackWorkspace {
+  return (
+    isDynamicRecord(value) && isIdentifier(value.workspaceId) && isBoundedString(value.name, MESSAGING_LIMITS.name)
   );
 }
 
@@ -149,7 +181,10 @@ export function isMessagingOverview(value: unknown): value is MessagingOverview 
     (value.connection === null || isMessagingConnection(value.connection)) &&
     Array.isArray(value.threads) &&
     value.threads.length <= MESSAGING_LIMITS.threads &&
-    value.threads.every(isMessagingThreadSummary)
+    value.threads.every(isMessagingThreadSummary) &&
+    Array.isArray(value.slackWorkspaces) &&
+    value.slackWorkspaces.length <= MESSAGING_LIMITS.workspaces &&
+    value.slackWorkspaces.every(isSlackWorkspace)
   );
 }
 

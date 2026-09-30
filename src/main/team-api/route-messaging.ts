@@ -18,6 +18,7 @@ import { readJson, requireAdmin } from "./request-helpers";
 const WIRE_NAME = 256;
 const WIRE_TEXT = 20_000;
 const WIRE_THREADS = 200;
+const WIRE_WORKSPACES = 50;
 const WIRE_MESSAGES = 200;
 
 /**
@@ -87,6 +88,9 @@ function wireOverview(overview: MessagingOverview): MessagingOverview {
     threads: overview.threads
       .slice(0, WIRE_THREADS)
       .map((thread) => ({ ...thread, title: thread.title.slice(0, WIRE_NAME) })),
+    slackWorkspaces: overview.slackWorkspaces
+      .slice(0, WIRE_WORKSPACES)
+      .map((workspace) => ({ ...workspace, name: workspace.name.slice(0, WIRE_NAME) })),
   };
 }
 

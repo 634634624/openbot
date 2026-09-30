@@ -1,5 +1,7 @@
-// The tokens of the messaging connections (a Slack bot token and app-level token per agent),
-// encrypted at rest by the operating system.
+// The tokens of the messaging connections (a Slack bot token and app-level token per agent, or the
+// credentials of a managed Slack app), and the manager token of each connected Slack workspace,
+// encrypted at rest by the operating system. Every value is registered for redaction, including the
+// few that are not secret, such as a workspace name: none of them belongs in a log.
 
 import { readFile, rm } from "node:fs/promises";
 import type { MessagingCredentialState } from "@openbot/contracts/ipc";
@@ -59,6 +61,11 @@ export class MessagingCredentialStore implements MessagingCredentials {
     if (!this.#loaded) throw new Error("The messaging credential store is not loaded.");
     const values = this.#values.get(connectionId);
     return values ? { ...values } : null;
+  }
+
+  keys(): string[] {
+    if (!this.#loaded) throw new Error("The messaging credential store is not loaded.");
+    return [...this.#values.keys()];
   }
 
   status(connectionId: string): MessagingCredentialState {
