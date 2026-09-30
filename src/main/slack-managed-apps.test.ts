@@ -348,6 +348,7 @@ describe.sequential("Managed Slack app end to end", () => {
     const install = new URL(opened.at(-1) ?? "");
     const state = install.searchParams.get("state") ?? "";
     expect(install.searchParams.get("client_id")).toBe("client-9");
+    expect(install.searchParams.get("team")).toBe("T1");
 
     expect(await messaging.completeSlackInstall("another-state", "code-1")).toBe(false);
     expect(await messaging.completeSlackInstall(state, "code-1")).toBe(true);

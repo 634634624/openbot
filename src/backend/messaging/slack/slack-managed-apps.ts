@@ -204,6 +204,10 @@ export class SlackManagedApps {
     url.searchParams.set("scope", SLACK_BOT_SCOPES.join(","));
     url.searchParams.set("redirect_uri", this.#options.manager.installRedirectUrl());
     url.searchParams.set("state", state);
+    // The app exists only in the workspace that created it. Without this, Slack opens the install in
+    // whichever workspace the browser is signed in to, and refuses it there with
+    // `invalid_team_for_non_distributed_app`. With it, Slack asks the person to sign in to this one.
+    url.searchParams.set("team", managed.workspaceId);
     await this.#options.manager.openExternal(url.toString());
   }
 
