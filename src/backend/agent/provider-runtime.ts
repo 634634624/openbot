@@ -46,6 +46,7 @@ import {
 } from "./../provider-drivers";
 import { recordRestartActivity } from "../restart-activity";
 import { shortenDiagnostic } from "./../stderr-diagnostics";
+import { stopProcessTree } from "../windows-process-tree";
 import { withTimeout } from "../with-timeout";
 import { normalizeAccountUsage } from "./account-usage";
 import { type CliCodeLogin, startCliCodeLogin } from "./cli-code-login";
@@ -94,7 +95,7 @@ const PROVIDER_IDLE_CHECK_MS = 60_000;
  * The providers whose shared process reads the agent environment only when it starts. Claude reads
  * it at each session start, and Codex with each thread's config.
  */
-const SPAWN_ENVIRONMENT_PROVIDERS: readonly AgentProvider[] = ["grok", "opencode", "antigravity", "acp"];
+const SPAWN_ENVIRONMENT_PROVIDERS: readonly AgentProvider[] = ["grok", "opencode", "antigravity", "cursor", "acp"];
 
 /**
  * True once a window of a kept reading has passed its reset time, so the reading is stale. Only
@@ -203,6 +204,7 @@ const INITIAL_STATUS: AgentStatus = {
     { id: "grok", state: "not-started", version: null, message: null },
     { id: "opencode", state: "not-started", version: null, message: null },
     { id: "antigravity", state: "not-started", version: null, message: null },
+    { id: "cursor", state: "not-started", version: null, message: null },
     { id: "acp", state: "not-started", version: null, message: null },
   ],
   capabilities: {
@@ -1169,7 +1171,7 @@ export class ProviderRuntime implements ProviderPort {
     this.#cliLogins.clear();
     this.#providerConnectionCommands.clear();
     for (const login of cliLogins) {
-      if (login.child.exitCode === null) login.child.kill("SIGTERM");
+      stopProcessTree(login.child);
     }
     const clients = [
       ...this.#clients.values(),
@@ -1591,7 +1593,7 @@ export class ProviderRuntime implements ProviderPort {
   async #failCliLogin(provider: AgentProvider, pending: PendingCliLogin, error: unknown): Promise<void> {
     if (this.#cliLogins.get(provider) !== pending) return;
     this.#cliLogins.delete(provider);
-    if (pending.child.exitCode === null) pending.child.kill("SIGTERM");
+    stopProcessTree(pending.child);
     this.#setProviderConnectionFailure(provider, error, pending.cli.version);
   }
 
@@ -1599,7 +1601,7 @@ export class ProviderRuntime implements ProviderPort {
     const pending = this.#cliLogins.get(provider);
     if (!pending) return;
     this.#cliLogins.delete(provider);
-    if (pending.child.exitCode === null) pending.child.kill("SIGTERM");
+    stopProcessTree(pending.child);
     await pending.task?.catch(() => undefined);
     if (message) this.#setProviderConnectionFailure(provider, new Error(message), pending.cli.version);
     else this.#clearProviderConnectionState(provider);

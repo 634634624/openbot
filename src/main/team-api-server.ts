@@ -33,6 +33,7 @@ import {
   CHANNEL_DELETE_CAPABILITY,
   HOST_ADMIN_CAPABILITY,
   HOST_UPDATE_CAPABILITY,
+  HOSTED_SITES_CAPABILITY,
   isTeamCurrentCapability,
   LIVE_ACTIVITY_PUSH_CAPABILITY,
   MCP_SERVERS_CAPABILITY,
@@ -81,7 +82,12 @@ import { LifecycleGate } from "./lifecycle-gate";
 import { RemoteScreenError } from "./remote-screen-gateway";
 import type { TeamApiOptions, TeamApiSidebarLayout } from "./team-api/dependencies";
 import { HttpError } from "./team-api/http-error";
-import { hiddenAgentView, hiddenProviderAgentIds, legacyProviderView } from "./team-api/provider-visibility";
+import {
+  hiddenAgentView,
+  hiddenProviderAgentIds,
+  isPeerHiddenProvider,
+  legacyProviderView,
+} from "./team-api/provider-visibility";
 import type { RouteOutcome, TeamApiRequestContext } from "./team-api/request-context";
 import {
   bearerToken,
@@ -106,6 +112,7 @@ import { routeDirect } from "./team-api/route-direct";
 import { routeFiles } from "./team-api/route-files";
 import { routeHostAdmin } from "./team-api/route-host-admin";
 import { routeHostUpdate } from "./team-api/route-host-update";
+import { routeHostedSites } from "./team-api/route-hosted-sites";
 import { routeLiveActivityPush } from "./team-api/route-live-activity-push";
 import { routeMcpServers } from "./team-api/route-mcp";
 import { routeProviders } from "./team-api/route-providers";
@@ -594,6 +601,11 @@ export class TeamApiServer {
       ) {
         throw new HttpError(404, sourceText("error.team.agentNotFound"));
       }
+      // A template, a marketplace agent and an imported one start where a new agent does.
+      const newAgentHidden = () => {
+        const provider = this.#options.agents.newAgentProvider();
+        return provider !== null && isPeerHiddenProvider(provider, context.protocol);
+      };
 
       // First module that does not say "unmatched" wins, and the dispatcher then does nothing at
       // all - work after a `writeHead` is an `ERR_HTTP_HEADERS_SENT` thrown into the catch below,
@@ -616,16 +628,17 @@ export class TeamApiServer {
       )
         return;
       if ((await routeStorage(context, this.#options.storage)) === "handled") return;
-      if ((await routeAgentAdmin(context, this.#options.admin)) === "handled") return;
-      if ((await routeSkillsAdmin(context, this.#options.admin)) === "handled") return;
+      if ((await routeHostedSites(context, this.#options.hostedSites)) === "handled") return;
+      if ((await routeAgentAdmin(context, this.#options.admin, hidden)) === "handled") return;
+      if ((await routeSkillsAdmin(context, this.#options.admin, hidden)) === "handled") return;
       if ((await routeSharedTables(context, this.#options.admin)) === "handled") return;
-      if ((await routeAgentInstall(context, this.#options.admin)) === "handled") return;
-      if ((await routeAgentPublish(context, this.#options.admin)) === "handled") return;
+      if ((await routeAgentInstall(context, this.#options.admin, hidden, newAgentHidden)) === "handled") return;
+      if ((await routeAgentPublish(context, this.#options.admin, hidden)) === "handled") return;
       if ((await routeProviders(context, this.#options.admin)) === "handled") return;
       if ((await routeHostAdmin(context, this.#options.admin)) === "handled") return;
       if ((await routeHostUpdate(context, this.#options.admin)) === "handled") return;
       if ((await routeContextReset(context, this.#options.agents, hidden)) === "handled") return;
-      if ((await routeAgentImport(context, this.#options.agentImport)) === "handled") return;
+      if ((await routeAgentImport(context, this.#options.agentImport, newAgentHidden)) === "handled") return;
       if (
         (await routeLiveActivityPush(context, this.#options.liveActivityPush, () =>
           this.#hiddenAgentIds(context.protocol, context.capabilities),
@@ -740,7 +753,7 @@ export class TeamApiServer {
     capabilities: ReadonlySet<string>,
     options: { preserveSemanticTags?: boolean } = {},
   ): string | null {
-    const protocol = capabilities.has(TEAM_LOCAL_PROVIDERS_CAPABILITY) ? 5 : capabilities.has("opencode") ? 4 : 1;
+    const protocol = eventProtocol(capabilities);
     const hidden = hiddenProviderAgentIds(this.#options.agents.listAgents(), protocol);
     const visible = protocol === 1 ? legacyProviderView(event, hidden) : hiddenAgentView(event, hidden, protocol);
     if (!isAgentEvent(visible) && !isTeamRealtimeEvent(visible)) return null;
@@ -780,6 +793,14 @@ export class TeamApiServer {
       // `eventCapability` above has already kept an optional event from a client without its capability.
       const optional = optionalTeamEvent(event);
       if (optional) {
+        // The base events go through the provider view; an optional event that names a hidden agent is left out.
+        if (
+          "agentId" in optional &&
+          hiddenProviderAgentIds(this.#options.agents.listAgents(), eventProtocol(connection.capabilities)).has(
+            optional.agentId,
+          )
+        )
+          continue;
         outgoing = JSON.stringify(optional);
       } else if (event.type === "conversation" && supportsRuntimeSnapshots) {
         conversationInvalidation ??=
@@ -1218,6 +1239,7 @@ export class TeamApiServer {
           return this.#options.remoteScreen?.checkSetup !== undefined && this.#options.remoteScreen?.test !== undefined;
         if (capability === MCP_SERVERS_CAPABILITY) return this.#options.mcpServers !== undefined;
         if (capability === STORAGE_CAPABILITY) return this.#options.storage !== undefined;
+        if (capability === HOSTED_SITES_CAPABILITY) return this.#options.hostedSites !== undefined;
         if (capability === AGENT_ADMIN_CAPABILITY) return this.#options.admin?.agents !== undefined;
         if (capability === SKILLS_ADMIN_CAPABILITY) return this.#options.admin?.skills !== undefined;
         if (capability === SKILLS_EVENTS_CAPABILITY) return this.#options.skills !== undefined;
@@ -1343,6 +1365,11 @@ function unavailableSidebarLayout(): TeamApiSidebarLayout {
     on: () => undefined,
     off: () => undefined,
   };
+}
+
+/** The protocol that an event connection's capabilities describe, as `#encodeProviderEvent` encodes it. */
+function eventProtocol(capabilities: ReadonlySet<string>): 1 | 4 | 5 {
+  return capabilities.has(TEAM_LOCAL_PROVIDERS_CAPABILITY) ? 5 : capabilities.has("opencode") ? 4 : 1;
 }
 
 function eventCapability(event: AgentEvent): TeamCurrentCapability | null {

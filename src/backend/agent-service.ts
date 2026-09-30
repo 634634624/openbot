@@ -19,6 +19,7 @@ import type {
   ChannelMemory,
   ChannelRoutine,
   ChannelRoutineRun,
+  ConversationFileSearchPage,
   ConversationMessage,
   ConversationMessageSender,
   ConversationPage,
@@ -1131,6 +1132,15 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     return this.#providers.preferredProvider();
   }
 
+  /**
+   * The provider that `createAgent` or `createAgentProfile` puts a new agent on: the one of the model
+   * or provider that `input` names, else the starting choice. `null` when nothing lists a model, and
+   * the record keeps the built-in default.
+   */
+  newAgentProvider(input: Pick<CreateAgentInput, "provider" | "model"> = {}): AgentProvider | null {
+    return (creationModel(input, this.#endpoints.available()) ?? this.#startingChoice())?.provider ?? null;
+  }
+
   /** The provider and model setup or Settings recorded. */
   #preference(): ProviderPreference {
     return { provider: this.#providers.preferredProvider(), model: this.#providers.preferredModel() };
@@ -1575,6 +1585,10 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
 
   searchConversationMessages(query: string, agentId?: string, cursor?: string, limit?: number): ConversationSearchPage {
     return this.#reader.search(query, agentId, cursor, limit);
+  }
+
+  searchConversationFiles(query: string, cursor?: string, limit?: number): ConversationFileSearchPage {
+    return this.#reader.searchFiles(query, cursor, limit);
   }
 
   listConversationReads(

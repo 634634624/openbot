@@ -114,8 +114,10 @@ checks it for secrets and publishes it with the account signed in on the host; t
 the share card from the preview. An agent that the host added from a
 listing gets Update when the host serves `agent-update-v1`; the host downloads the current version.
 `web-provider-admin.ts` answers the desktop `providerAdmin` group over the `providers-v1` routes, so
-the Providers tab of `ServerSettingsModal` uses the same runtime, key, custom provider, and code
-sign-in logic (`provider-code-login.ts`, `ProviderSettingsSection.tsx`) as desktop Settings. The
+the Providers section of `ServerSettingsModal` uses the same runtime, key, custom provider, and code
+sign-in logic (`provider-code-login.ts`, `ProviderSettingsSection.tsx`) as the desktop app. On
+desktop the section shows the providers of the active server only, because provider state exists
+only for that server; for another server it offers to switch. The
 browser applies host `status` events, and reads the status every 3 seconds while a code sign-in waits.
 A provider key stays in the dialog input until it is sent to the host.
 
@@ -336,13 +338,15 @@ would refuse.
 The runtime manager offers the latest upstream release of each provider CLI. It checks at startup,
 every hour, and when the user selects `Check for updates` (`provider-runtime-releases.ts`): GitHub
 `releases/latest` for Codex, the npm `latest` tag for Claude and OpenCode, `x.ai/cli/stable`
-for Grok, and the ACP registry entry `antigravity-acp` for Gemini. The version in `native-runtime.lock.json` is what a first install uses before a check has
+for Grok, and the ACP registry entries `antigravity-acp` for Gemini and `cursor` for Cursor. The version in `native-runtime.lock.json` is what a first install uses before a check has
 answered, and Bun, which is a tool runtime and not a provider, stays on it.
 
 Every upstream download is checked against its source's own hash: the GitHub asset `digest` for
 Codex and npm `dist.integrity` for Claude and OpenCode. x.ai and the ACP registry publish no hash,
-so a Grok or Gemini release is trusted on TLS alone. A Gemini release must stay on
-`dl.google.com/agy-extensions/releases` and keep the pinned command name. An upstream install writes `openbot-install.json` with the SHA-256 of each
+so a Grok, Gemini or Cursor release is trusted on TLS alone. A Gemini release must stay on
+`dl.google.com/agy-extensions/releases` and keep the pinned command name. A Cursor release must use
+the pinned `downloads.cursor.com/lab` path for its target, with a build that starts with the
+registry date, and keep the pinned command. An upstream install writes `openbot-install.json` with the SHA-256 of each
 file it installed, and every start verifies that record and the binary's `--version` before the
 install is used. The newest version in the store that verifies is the one that runs.
 
@@ -421,9 +425,9 @@ that it is not supported instead of offering a download. An older managed instal
 metadata until the offered runtime passes the existing download and install checks. Runtime snapshots carry the previous version and an optional `availableVersion` through the
 preload decoder. Cancellation and failure preserve the previous installation and its update offer.
 
-Settings starts the shared renderer runtime store. The store announces each provider that gains an
-offer as one notification, from an effect over both the runtime snapshot and the agent status,
-because the two arrive separately and either one can complete an offer. An explicit update opens
+`ProvidersProvider` starts the shared renderer runtime store for the active server. The store
+announces each provider that gains an offer as one notification, from an effect over both the
+runtime snapshot and the agent status, because the two arrive separately and either one can complete an offer. An explicit update opens
 the same notification; revisioned snapshots move it through progress, failure, retry, and
 completion. Only the crossing into "update available" is announced, so a dismissed notification
 stays dismissed until the offer changes. Closing the notification does not cancel the download,
@@ -1096,6 +1100,26 @@ renderer hides those controls from a member. The wire carries no absolute paths,
 download files travel only as category totals. A host without the capability reads as null, and the
 surface asks for an update; a change is refused before any request.
 
+### Hosted sites per server
+
+A hosted site belongs to the server that published it (`hosted_sites.server_id`, D1 `0024`). The user
+stays the accountable owner, for abuse reports, blocks and account deletion. The desktop sends
+`OpenBot-Host-Id` and `OpenBot-Host-Token` (the machine token of `/v2/remote/hosts/register`) on each
+`/v1/sites` request when it is a registered server. The Worker checks the hash and that the host owner
+is the request user; a wrong token is refused with 401, never counted as unlinked. The active-site
+limit comes from the server's plan (`siteLimitForPlan`: none 1, Starter 3, Standard 10, Pro 50). A
+request with no server headers creates only into the account's unlinked bucket (limit 1,
+`server_id IS NULL`); with no `?scope=unlinked`, it still lists and deletes every site of the account,
+the released meaning of `/v1/sites`. Replace and delete in a server scope refuse a site of another
+bucket with 409 `site_other_server`. A downgrade deletes nothing: a server above its limit cannot
+create a site, but it can replace one, and the extra sites end at their expiry. Removing a server moves its sites to the owner's unlinked bucket, so the owner's desktop can still delete them. A registered server updates a site that it published before registration in the unlinked scope.
+
+`hostedSites.list` and `hostedSites.delete` IPC are server-scoped; publish and replace stay local. The
+optional `hosted-sites-v1` capability exposes `POST /v1/hosted-sites/list` for every member and
+`POST /v1/hosted-sites/delete` for an owner or admin, with the frozen codec in
+`team-protocol/hosted-sites-v1.ts`. The host answers with its own account and credential, and only with the server's own sites: the owner's unlinked sites never reach a member, and the Team API has no fallback to delete one. Sites are
+managed in Server settings > Sites, on the desktop and in the browser.
+
 ### Leaving a server
 
 Leaving a joined server has the same effect as an admin removal: the membership and every session of
@@ -1271,6 +1295,33 @@ sign-in state from peers on those versions, and the `providers-v1` routes omit i
 carries Gemini, and the `providers-v2` runtime routes let an owner or admin download or cancel the
 host's Gemini runtime. Gemini signs in through a browser on the host, so no peer route signs it in.
 
+### Cursor
+
+The Cursor provider (id `cursor`) starts the Cursor CLI with `cursor-agent acp`. Cursor's terms do
+not allow redistribution, so the runtime manager downloads the archive on the user's computer.
+`extractZipTree` in `src/main/provider-runtime-archive.ts` extracts the Windows zip and accepts only
+entries in its `dist-package` folder; staging renames that folder to `bin`. The CLI's `--version`
+is not usable on Windows, where the launcher is a `.cmd` file, so staging writes
+`cursor-package.json` and `verifyInstalledRuntime` reads the version from it. A lock install also
+checks the SHA-256 of each file in `files`. `resolveCursorCli` looks for `cursor-agent` on `PATH`,
+never `cursor`, which starts the Cursor editor.
+
+Sign in is an ACP `authenticate` call with `cursor_login`, in a separate process, as for Gemini.
+`CURSOR_API_KEY` in the environment also signs the CLI in. A confined Cursor process gets
+`CURSOR_CONFIG_DIR=~/.cursor/openbot-confined` (`cursorConfinedEnv`): the CLI writes
+`cli-config.json` when a session starts and fails when it cannot, and that file also holds the
+user's permissions. `cursorStatePaths` lets it write `~/.cursor` and protects the user's settings,
+hooks, rules, MCP and permission files there and in the CLI config folder, and the
+`.workspace-trusted` and `mcp-approvals.json` files in each folder in `projects`. Migration 24 adds
+`cursor` to `projection_provider_sessions`.
+
+No Team API protocol knows `cursor`. The host hides Cursor agents, models, status, and sign-in
+state from every peer, and the `providers-v1` and `providers-v2` routes omit it. A route that reads
+an agent ID from the body answers 404 for a hidden agent (`requireVisibleBodyAgent`). A peer cannot
+create an agent, or add one from a template, the marketplace or an import, when the host would start
+it on a hidden provider (`newAgentProvider`). A custom endpoint saved with the id `cursor` before the
+provider existed stays visible.
+
 Team API v4 has its own frozen provider-aware schema and adapters. Versions 1–3 remain registered
 with their released provider vocabulary. The host filters OpenCode agents, models, status,
 sidebar references, and runtime events before encoding an older client's response. Requests for
@@ -1443,16 +1494,17 @@ A skill follows the [Agent Skills specification](https://agentskills.io/specific
 
 | Folder | Written by | Read by |
 | --- | --- | --- |
-| `<workspace>/.agents/skills/` | OpenBot, the user, the agent | Codex, Grok, OpenCode, Gemini |
-| `<workspace>/.claude/skills/` | OpenBot, the user, the agent | Claude Code, OpenCode |
+| `<workspace>/.agents/skills/` | OpenBot, the user, the agent | Codex, Grok, OpenCode, Gemini, Cursor |
+| `<workspace>/.claude/skills/` | OpenBot, the user, the agent | Claude Code, OpenCode, Cursor |
 | `<workspace>/.opencode/skills/` | the user, the agent | OpenCode |
 | `<workspace>/.gemini/skills/` | the user, the agent | Gemini |
+| `<workspace>/.cursor/skills/` | the user, the agent | Cursor |
 | `~/.agents/skills/` | the user | Codex, Grok, OpenCode |
 | `~/.claude/skills/` | the user | Claude Code, OpenCode |
 | `~/.codex/skills/`, `~/.config/opencode/skills/` | the user | Codex, OpenCode |
 
-A confined agent (Grok, OpenCode or Gemini, not in Full access) cannot write the four workspace
-folders: `src/backend/process-confinement.ts` protects them as project settings.
+A confined agent (Grok, OpenCode, Gemini or Cursor, not in Full access) cannot write the workspace
+skill folders: `src/backend/process-confinement.ts` protects them as project settings.
 
 OpenBot writes each skill that it installs to both `.agents/skills/<slug>` and
 `.claude/skills/<slug>`, because Claude Code does not read `.agents/skills`. It copies the files and
@@ -1460,7 +1512,7 @@ does not make links. `.openbot/skills-lock.json` in the workspace records the fi
 `.openbot/skills-disabled/` holds disabled skills. A bundled skill has an `.openbot-managed.json`
 marker.
 
-`src/main/skill-folder-discovery.ts` lists all other skills in the four workspace folders as
+`src/main/skill-folder-discovery.ts` lists all other skills in the five workspace folders as
 `workspace` skills. The list is read-only: OpenBot never writes, moves or deletes these folders, and
 they do not count toward the agent's skill limit. A folder without `SKILL.md` is not a skill. A
 skill gets a `problem` when its `SKILL.md` does not follow the specification, or when it is in a

@@ -11,10 +11,13 @@ account Worker. The browser keeps chat pages, drafts, search results, and file p
 it does not create a persistent offline chat cache. Files that the user downloads are saved by
 their browser. The host must stay online. An owner or admin can manage members and invitations from
 the browser; these requests go to the account Worker, as they do from the desktop app. A signed-in
-user can also change the display name and avatar, disconnect account sessions, and list and delete
-the account's hosted sites from the browser; these requests and the avatar image go to the same
-account Worker as from the desktop app. Host settings,
-such as MCP servers, travel through the encrypted host connection.
+user can also change the display name and avatar and disconnect account sessions from the browser;
+these requests and the avatar image go to the same account Worker as from the desktop app. Host
+settings, such as MCP servers and the server's hosted sites, travel through the encrypted host
+connection. A hosted site belongs to the server that published it. When the computer that runs
+OpenBot is a registered server, its site requests to the account Worker also send that server's id and
+machine token. The account Worker already holds both, and uses them only to find the server and its
+plan's site limit.
 A Grok Bot export that a member imports into a joined server, from the desktop app or the browser, goes
 to the computer that runs that server through the same encrypted host connection, not through the
 account Worker. The host keeps the file only until the import ends, is cancelled, or expires.
@@ -415,8 +418,9 @@ Network traffic can also occur when:
 - OpenBot checks for new provider CLI releases when it starts, once an hour, and when you select
   `Check for updates`. It asks `api.github.com` for Codex, `registry.npmjs.org` for Claude and
   OpenCode, `x.ai/cli` for Grok, and `raw.githubusercontent.com/agentclientprotocol/registry` and
-  `dl.google.com` (for the download size) for Gemini, and it reads a list of blocked versions from
-  `raw.githubusercontent.com/nightly-labs/openbot`. These requests contain no account, agent,
+  `dl.google.com` (for the download size) for Gemini, and the same registry and
+  `downloads.cursor.com` (for the download size) for Cursor, and it reads a list of blocked
+  versions from `raw.githubusercontent.com/nightly-labs/openbot`. These requests contain no account, agent,
   conversation or file data;
 - a user opens an explicitly labeled external support or setup link.
 
@@ -535,9 +539,23 @@ server keeps its login and session files in `~/.gemini`, or in `$GEMINI_HOME`. O
 read, copy, or upload these files. Google's terms apply: <https://antigravity.google/terms>.
 Gemini agents stay on this computer: OpenBot does not show them to team members.
 
+### Cursor
+
+OpenBot downloads the Cursor CLI from `downloads.cursor.com` when you select Download on the Cursor
+row. Each provider update check also asks `downloads.cursor.com` for the size of the newest
+download, also when you do not use Cursor. OpenBot starts the CLI as a local process. Prompts,
+attachments, and tool results go to that process, and the CLI sends them to Cursor. Sign in opens
+Cursor's sign-in page in your browser, or the CLI uses `CURSOR_API_KEY` from the environment that
+started OpenBot. OpenBot gives that key only to the local CLI, in its environment, and does
+not store it. The CLI keeps its login and session files
+in `~/.cursor` (on Linux, the login is in `~/.config/cursor`). OpenBot does not read, copy, or
+upload these files. Cursor's terms apply: <https://cursor.com/terms-of-service>. Cursor agents stay
+on this computer: OpenBot does not show them to team members.
+
 ### Local model servers
 
-When Settings shows the AI providers tab, and once on the onboarding provider step, OpenBot looks
+When Server settings shows the Providers section of this computer, and once on the onboarding
+provider step, OpenBot looks
 for model servers on this computer. It sends `GET <address>/models` to
 `http://127.0.0.1:11434/v1` (Ollama), `http://127.0.0.1:1234/v1` (LM Studio), and each address you
 add under Local detection. These requests
