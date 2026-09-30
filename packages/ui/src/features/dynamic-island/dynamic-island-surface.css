@@ -128,38 +128,23 @@ body:has(.dynamic-island-surface),
   transition: border-radius var(--openbot-duration-normal) var(--openbot-ease-out);
 }
 
-/* While the island resizes, the logo rounds its corners a little, shrinks a little, blurs more than
-   the ear around it, so it reads as a shape in motion, and half closes its eyes. It is sharp and
-   square again as the island settles. The motion uses `scale`, not `transform`, so it keeps the
-   logo's offset on an external display. The squint scales the eye group, not the eyes, so the blink
-   keeps running. */
+/* While the island resizes, the logo rounds its corners a little, blurs more than the ear around
+   it, so it reads as a shape in motion, and half closes its eyes. It is sharp and square again as
+   the island settles. The squint scales the eye group, not the eyes, so the blink keeps running. */
 .dynamic-island-shell[data-compact-resize] .dynamic-island-surface-logo {
   --app-logo-eye-squint: 0.35;
-  border-radius: var(--openbot-radius-md);
+  border-radius: var(--openbot-radius-sm);
   animation: dynamic-island-logo-motion 450ms var(--dynamic-island-shared-ease);
 }
 
 @keyframes dynamic-island-logo-motion {
   0%,
   100% {
-    scale: 1;
     filter: blur(0);
   }
 
   40% {
-    scale: 0.86;
     filter: blur(2.5px);
-  }
-}
-
-@keyframes dynamic-island-greeting-motion {
-  0%,
-  100% {
-    scale: 1;
-  }
-
-  40% {
-    scale: 0.9;
   }
 }
 
@@ -186,11 +171,6 @@ body:has(.dynamic-island-surface),
   font-family: "Apple Color Emoji", "Segoe UI Emoji", sans-serif;
   font-size: var(--openbot-text-md);
   line-height: 1;
-}
-
-/* The greeting follows the logo's motion, more quietly. */
-.dynamic-island-shell[data-compact-resize] .dynamic-island-surface-idle-greeting {
-  animation: dynamic-island-greeting-motion 450ms var(--dynamic-island-shared-ease);
 }
 
 .dynamic-island-surface-idle-greeting-layer {

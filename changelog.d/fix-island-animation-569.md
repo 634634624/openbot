@@ -9,8 +9,8 @@
 ### Changed
 
 - The logo and the greeting blur while the Dynamic Island changes size. The logo rounds its corners
-  a little, shrinks a little and half closes its eyes, then settles square and sharp. With Reduce
-  motion on, none of this happens.
+  a little and half closes its eyes, then settles square and sharp. With Reduce motion on, none of
+  this happens.
 - Below 100%, the idle Dynamic Island width now changes with each step of the width setting, from
   the smallest island at 20% to the default at 100%. Before, the lowest steps gave the same island.
   On a built-in display with no notch, the smallest idle island is now 82px, with a 16px gap between
