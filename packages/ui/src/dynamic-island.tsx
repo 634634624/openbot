@@ -82,6 +82,11 @@ const CONTENT_BLUR = 4;
 // another, so a slider drag does not flash the motion styles on and off, and it goes at this part of
 // the spring, where the surface slows down, so the content is sharp again as the surface settles.
 const COMPACT_RESIZE_SETTLE = 0.6;
+// How far the compact row still has to go for the full motion styles. `--dynamic-island-compact-motion`
+// is that distance as 0 to 1, so the styles follow the size of the move: one slow slider step barely
+// blurs, and a jump across the range, or a fast drag the surface lags behind, blurs in full.
+const COMPACT_RESIZE_FULL_MOTION_DISTANCE = 120;
+const COMPACT_RESIZE_LARGE_MOTION = 0.5;
 const CONTENT_ENTER_DELAY = 90;
 const CONTENT_BLUR_OPEN_DURATION = 460;
 const CONTENT_BLUR_CLOSE_DURATION = 450;
@@ -582,7 +587,10 @@ function createSmoothSizeResize(options: SmoothSizeResizeOptions): void {
   function settleCompactResize(): void {
     if (compactResizeSettleTimer !== undefined) clearTimeout(compactResizeSettleTimer);
     compactResizeSettleTimer = undefined;
-    options.container()?.removeAttribute("data-compact-resize");
+    const container = options.container();
+    container?.removeAttribute("data-compact-resize");
+    container?.style.removeProperty("--dynamic-island-compact-motion");
+    container?.removeAttribute("data-compact-motion");
   }
 
   createEffect(options.silhouetteTarget, (target) => {
@@ -629,8 +637,7 @@ function createSmoothSizeResize(options: SmoothSizeResizeOptions): void {
       const container = options.container();
       const content = options.content();
       if (!container || !content) return;
-      const contentRect = content.getBoundingClientRect();
-      const nextSize = { width: contentRect.width, height: contentRect.height };
+      const nextSize = layoutSize(content);
       const previous = previousSize;
       const silhouette = options.silhouette();
       const targetGeometry = targetSilhouette;
@@ -751,6 +758,12 @@ function createSmoothSizeResize(options: SmoothSizeResizeOptions): void {
         const row = compactContent[0] && compactContentTargets.get(compactContent[0]);
         const rowStart = compactContent[0] && compactContentStarts.get(compactContent[0]);
         container.dataset.compactResize = row && rowStart && row.width < rowStart.width ? "shrink" : "grow";
+        const travel = row && rowStart ? Math.abs(row.width - rowStart.width) : COMPACT_RESIZE_FULL_MOTION_DISTANCE;
+        const motion = Math.min(1, travel / COMPACT_RESIZE_FULL_MOTION_DISTANCE);
+        container.style.setProperty("--dynamic-island-compact-motion", motion.toFixed(3));
+        // A style that cannot scale, such as a radius token, applies to a large move only. It stays
+        // until the motion settles, so a smaller step inside the same motion does not take it back.
+        if (motion >= COMPACT_RESIZE_LARGE_MOTION) container.dataset.compactMotion = "large";
         if (compactResizeSettleTimer !== undefined) clearTimeout(compactResizeSettleTimer);
         compactResizeSettleTimer = setTimeout(settleCompactResize, spring.response * 1_000 * COMPACT_RESIZE_SETTLE);
       } else {
@@ -774,6 +787,16 @@ function createSmoothSizeResize(options: SmoothSizeResizeOptions): void {
     for (const active of animations) active.cancel();
     finishAnimation();
   });
+}
+
+/**
+ * The element's size before any transform of an ancestor. A consumer can scale the island, as the
+ * Settings preview does to fit a narrow frame, and the shell must still get the unscaled size.
+ */
+function layoutSize(element: HTMLElement): { width: number; height: number } {
+  const rect = element.getBoundingClientRect();
+  const ratio = element.offsetWidth > 0 && rect.width > 0 ? rect.width / element.offsetWidth : 1;
+  return { width: rect.width / ratio, height: rect.height / ratio };
 }
 
 function readElementSize(element: HTMLElement): { width: number; height: number } | undefined {

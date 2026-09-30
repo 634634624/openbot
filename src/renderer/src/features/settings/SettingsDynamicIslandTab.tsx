@@ -175,17 +175,30 @@ function PreviewFit(props: { children: JSX.Element }): JSX.Element {
   let frame: HTMLDivElement | undefined;
   const [scale, setScale] = createSignal(1);
   onSettled(() => {
-    const island = frame?.querySelector<HTMLElement>(".dynamic-island-size-target");
-    if (!frame || !island) return;
+    const root = frame;
+    if (!root) return;
+    // The island inside can mount again, so each measure finds the current one and observes it.
+    let observed: HTMLElement | undefined;
     const measure = () => {
-      const available = (frame?.clientWidth ?? 0) - PREVIEW_FIT_INSET * 2;
-      const width = island.offsetWidth;
+      const island = root.querySelector<HTMLElement>(".dynamic-island-size-target") ?? undefined;
+      if (island !== observed) {
+        if (observed) resize.unobserve(observed);
+        if (island) resize.observe(island);
+        observed = island;
+      }
+      const available = root.clientWidth - PREVIEW_FIT_INSET * 2;
+      const width = island?.offsetWidth ?? 0;
       setScale(width > available && available > 0 ? available / width : 1);
     };
-    const observer = new ResizeObserver(measure);
-    observer.observe(frame);
-    observer.observe(island);
-    return () => observer.disconnect();
+    const resize = new ResizeObserver(measure);
+    const mounts = new MutationObserver(measure);
+    resize.observe(root);
+    mounts.observe(root, { childList: true, subtree: true });
+    measure();
+    return () => {
+      resize.disconnect();
+      mounts.disconnect();
+    };
   });
   return (
     <div ref={frame} class="settings-dynamic-island-preview-bar" inert>
