@@ -7,7 +7,10 @@ import {
   IDLE_DYNAMIC_ISLAND_PRESENTATION,
 } from "@openbot/contracts/ipc";
 import { Button, ItemGroup, SettingsSection, SliderField, SwitchField } from "@openbot/ui";
-import { OpenBotDynamicIsland } from "@openbot/ui/features/dynamic-island/OpenBotDynamicIsland";
+import {
+  OpenBotDynamicIsland,
+  openBotIdleCompactWidth,
+} from "@openbot/ui/features/dynamic-island/OpenBotDynamicIsland";
 import type { GeneralSettingsValue } from "@openbot/ui/features/settings/app-settings";
 import type { JSX } from "@solidjs/web";
 import { createSignal, onSettled } from "solid-js";
@@ -41,6 +44,9 @@ export function SettingsDynamicIslandTab(props: SettingsDynamicIslandTabProps) {
   const i18n = useI18n();
   const widthPercent = () => props.value.macBookNotchWidthPercent;
   const heightPercent = () => props.value.macBookNotchHeightPercent;
+  const widestBuiltInWidth = () =>
+    openBotIdleCompactWidth("notch", builtInNotchSize(), DYNAMIC_ISLAND_SIZE_LIMITS.widthPercent.max);
+  const widestExternalWidth = openBotIdleCompactWidth("island", undefined, DYNAMIC_ISLAND_SIZE_LIMITS.widthPercent.max);
   const builtInNotchSize = (): DynamicIslandNotchSize | undefined =>
     props.builtInDisplayGeometry === null ? undefined : (props.builtInDisplayGeometry ?? PREVIEW_NOTCH_SIZE);
   const isDefaultSize = () =>
@@ -106,7 +112,7 @@ export function SettingsDynamicIslandTab(props: SettingsDynamicIslandTabProps) {
         <ItemGroup class="settings-modal-card settings-dynamic-island-size">
           <div class="settings-dynamic-island-preview">
             <figure class="settings-dynamic-island-preview-display">
-              <PreviewFit>
+              <PreviewFit widestWidth={widestBuiltInWidth()}>
                 <OpenBotDynamicIsland
                   presentation={IDLE_DYNAMIC_ISLAND_PRESENTATION}
                   state="compact"
@@ -124,7 +130,7 @@ export function SettingsDynamicIslandTab(props: SettingsDynamicIslandTabProps) {
               </figcaption>
             </figure>
             <figure class="settings-dynamic-island-preview-display">
-              <PreviewFit>
+              <PreviewFit widestWidth={widestExternalWidth}>
                 <OpenBotDynamicIsland
                   presentation={IDLE_DYNAMIC_ISLAND_PRESENTATION}
                   state="compact"
@@ -168,37 +174,24 @@ export function SettingsDynamicIslandTab(props: SettingsDynamicIslandTabProps) {
 }
 
 /**
- * A preview frame. An island wider than the frame, such as the built-in island with no notch at
- * 130%, scales down to fit, so its shape stays true and it stays inside the frame.
+ * A preview frame. It scales its island so that the widest width setting fits, such as the
+ * built-in island with no notch at 130%. The scale changes only with the frame, not with the
+ * setting, so a slider drag moves the island alone and every width shows at the same scale.
  */
-function PreviewFit(props: { children: JSX.Element }): JSX.Element {
+function PreviewFit(props: { widestWidth: number | undefined; children: JSX.Element }): JSX.Element {
   let frame: HTMLDivElement | undefined;
-  const [scale, setScale] = createSignal(1);
+  const [available, setAvailable] = createSignal(0);
+  const scale = () => {
+    const widest = props.widestWidth ?? 0;
+    const room = available() - PREVIEW_FIT_INSET * 2;
+    return widest > room && room > 0 ? room / widest : 1;
+  };
   onSettled(() => {
     const root = frame;
     if (!root) return;
-    // The island inside can mount again, so each measure finds the current one and observes it.
-    let observed: HTMLElement | undefined;
-    const measure = () => {
-      const island = root.querySelector<HTMLElement>(".dynamic-island-size-target") ?? undefined;
-      if (island !== observed) {
-        if (observed) resize.unobserve(observed);
-        if (island) resize.observe(island);
-        observed = island;
-      }
-      const available = root.clientWidth - PREVIEW_FIT_INSET * 2;
-      const width = island?.offsetWidth ?? 0;
-      setScale(width > available && available > 0 ? available / width : 1);
-    };
-    const resize = new ResizeObserver(measure);
-    const mounts = new MutationObserver(measure);
+    const resize = new ResizeObserver(() => setAvailable(root.clientWidth));
     resize.observe(root);
-    mounts.observe(root, { childList: true, subtree: true });
-    measure();
-    return () => {
-      resize.disconnect();
-      mounts.disconnect();
-    };
+    return () => resize.disconnect();
   });
   return (
     <div ref={frame} class="settings-dynamic-island-preview-bar" inert>

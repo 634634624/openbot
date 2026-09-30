@@ -4,8 +4,8 @@
   island, on the same curve and at the same distance from each edge. Before, they got to their new
   place first and showed outside the island while it grew.
 - Settings → Dynamic Island → Size: the built-in display preview now draws the island that display
-  shows. On a built-in display with no notch, it no longer draws a notch. A preview island wider
-  than its frame scales down to fit, so it stays inside the frame.
+  shows. On a built-in display with no notch, it no longer draws a notch. Each preview scales so
+  that the widest width fits its frame, and keeps that scale while the setting changes.
 
 ### Changed
 

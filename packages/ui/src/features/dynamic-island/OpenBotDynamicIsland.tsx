@@ -337,6 +337,40 @@ function scaleCompactWidth(width: number, floor: number, percent: number, minimu
 }
 
 /**
+ * The idle compact width for a width setting, or undefined for the default width. The Settings
+ * preview reads it to scale the widest setting into its frame.
+ */
+export function openBotIdleCompactWidth(
+  displayMode: "notch" | "island" | undefined,
+  notchSize: DynamicIslandNotchSize | undefined,
+  percent: number,
+): number | undefined {
+  if (percent === DEFAULT_DYNAMIC_ISLAND_PREFERENCE.widthPercent) return undefined;
+  if (displayMode === "island") {
+    if (percent < DEFAULT_DYNAMIC_ISLAND_PREFERENCE.widthPercent) {
+      return interpolateIdleWidth(STATUS_COMPACT_ISLAND_MIN_WIDTH, IDLE_COMPACT_ISLAND_MIN_WIDTH, percent);
+    }
+    return scaleCompactWidth(STATUS_COMPACT_ISLAND_MIN_WIDTH, 0, percent, IDLE_COMPACT_ISLAND_MIN_WIDTH);
+  }
+  if (!notchSize && percent < DEFAULT_DYNAMIC_ISLAND_PREFERENCE.widthPercent) {
+    return interpolateIdleWidth(
+      STATUS_COMPACT_NOTCH_WIDTH + DYNAMIC_ISLAND_COMPACT_EAR_TRACK_WIDTH * 2,
+      IDLE_COMPACT_NO_NOTCH_MIN_WIDTH,
+      percent,
+    );
+  }
+  // A built-in display with no notch reports no size. Its gap is only a style, so it shrinks with
+  // the width; a physical notch is hardware and keeps its width.
+  const notchWidth = notchSize?.width ?? scaleCompactWidth(STATUS_COMPACT_NOTCH_WIDTH, 0, percent);
+  return scaleCompactWidth(
+    notchWidth + DYNAMIC_ISLAND_COMPACT_EAR_TRACK_WIDTH * 2,
+    notchWidth,
+    percent,
+    notchSize ? notchWidth + IDLE_COMPACT_NOTCH_EAR_MIN_WIDTH * 2 : IDLE_COMPACT_NO_NOTCH_MIN_WIDTH,
+  );
+}
+
+/**
  * An idle width below 100%, on a line from the smallest width at the lowest setting to the default
  * width at 100%. Each step of the setting then changes the island. A scale from zero reached the
  * smallest width at about 30%, so the lowest steps gave the same island.
@@ -423,28 +457,7 @@ export function OpenBotDynamicIsland(props: OpenBotDynamicIslandProps): JSX.Elem
   const compactWidth = () => {
     const geometry = compactGeometry();
     if (geometry) return props.displayMode === "island" ? geometry.island.width : geometry.notch.width;
-    const percent = widthPercent();
-    if (percent === DEFAULT_DYNAMIC_ISLAND_PREFERENCE.widthPercent) return undefined;
-    if (props.displayMode === "island") {
-      if (percent < DEFAULT_DYNAMIC_ISLAND_PREFERENCE.widthPercent) {
-        return interpolateIdleWidth(STATUS_COMPACT_ISLAND_MIN_WIDTH, IDLE_COMPACT_ISLAND_MIN_WIDTH, percent);
-      }
-      return scaleCompactWidth(STATUS_COMPACT_ISLAND_MIN_WIDTH, 0, percent, IDLE_COMPACT_ISLAND_MIN_WIDTH);
-    }
-    if (!props.notchSize && percent < DEFAULT_DYNAMIC_ISLAND_PREFERENCE.widthPercent) {
-      return interpolateIdleWidth(
-        STATUS_COMPACT_NOTCH_WIDTH + DYNAMIC_ISLAND_COMPACT_EAR_TRACK_WIDTH * 2,
-        IDLE_COMPACT_NO_NOTCH_MIN_WIDTH,
-        percent,
-      );
-    }
-    const notchWidth = physicalNotchWidth();
-    return scaleCompactWidth(
-      notchWidth + DYNAMIC_ISLAND_COMPACT_EAR_TRACK_WIDTH * 2,
-      notchWidth,
-      percent,
-      props.notchSize ? notchWidth + IDLE_COMPACT_NOTCH_EAR_MIN_WIDTH * 2 : IDLE_COMPACT_NO_NOTCH_MIN_WIDTH,
-    );
+    return openBotIdleCompactWidth(props.displayMode, props.notchSize, widthPercent());
   };
   const compactHeight = () => {
     const percent = heightPercent();
