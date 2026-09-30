@@ -492,6 +492,7 @@ function AppSettings(props: AccountProps) {
     setAppSettingsOpen,
     appSettingsTab,
     generalSettings,
+    builtInDisplayGeometry,
     updateGeneralSettings,
     appSettingsRestoreTarget,
     turboModePending,
@@ -506,6 +507,7 @@ function AppSettings(props: AccountProps) {
         value={generalSettings()}
         onValueChange={updateGeneralSettings}
         appInfo={platform.appInfo()}
+        builtInDisplayGeometry={builtInDisplayGeometry()}
         updateStatus={updates.status()}
         onUpdateAction={updates.runAction}
         onCancelScheduledRestart={updates.cancelScheduledRestart}

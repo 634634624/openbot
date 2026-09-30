@@ -113,6 +113,11 @@ const STATUS_COMPACT_ISLAND_MIN_WIDTH = 212;
 const STATUS_COMPACT_NAME_MAX_WIDTH = { notch: 72, island: 96 } as const;
 /** The narrowest idle ear beside a notch: the 20px logo, its 16px edge inset and a 4px gap. */
 const IDLE_COMPACT_NOTCH_EAR_MIN_WIDTH = COMPACT_LEADING_SIZE + 20;
+/**
+ * The narrowest idle island on a built-in display with no notch: the 20px logo and the 14px greeting,
+ * each 16px from its edge, with a 16px gap between them.
+ */
+const IDLE_COMPACT_NO_NOTCH_MIN_WIDTH = 16 + COMPACT_LEADING_SIZE + 16 + 14 + 16;
 /** The narrowest idle capsule: the logo and the greeting with their insets and a gap between them. */
 const IDLE_COMPACT_ISLAND_MIN_WIDTH = 72;
 
@@ -379,7 +384,12 @@ export function OpenBotDynamicIsland(props: OpenBotDynamicIslandProps): JSX.Elem
   const islandNotchSize = (): DynamicIslandNotchSize | undefined => {
     if (props.notchSize || props.displayMode === "island") return props.notchSize;
     if (widthPercent() === DEFAULT_DYNAMIC_ISLAND_PREFERENCE.widthPercent) return undefined;
-    return { width: physicalNotchWidth(), height: DYNAMIC_ISLAND_DEFAULT_COMPACT_HEIGHT };
+    // The gap is only a style here, so it gives way before an ear gets narrower than its content.
+    const earRoom = (compactWidth() ?? Number.POSITIVE_INFINITY) - IDLE_COMPACT_NOTCH_EAR_MIN_WIDTH * 2;
+    return {
+      width: Math.max(0, Math.min(physicalNotchWidth(), earRoom)),
+      height: DYNAMIC_ISLAND_DEFAULT_COMPACT_HEIGHT,
+    };
   };
   // The shared motion below is placed from these widths, so the size is applied here rather than
   // in the island primitive: the avatar and badge then land on the resized ears.
@@ -411,7 +421,7 @@ export function OpenBotDynamicIsland(props: OpenBotDynamicIslandProps): JSX.Elem
       notchWidth + DYNAMIC_ISLAND_COMPACT_EAR_TRACK_WIDTH * 2,
       notchWidth,
       percent,
-      notchWidth + IDLE_COMPACT_NOTCH_EAR_MIN_WIDTH * 2,
+      props.notchSize ? notchWidth + IDLE_COMPACT_NOTCH_EAR_MIN_WIDTH * 2 : IDLE_COMPACT_NO_NOTCH_MIN_WIDTH,
     );
   };
   const compactHeight = () => {
@@ -562,6 +572,8 @@ export function OpenBotDynamicIsland(props: OpenBotDynamicIslandProps): JSX.Elem
         onStateChange={changeState}
         compactWidth={compactWidth()}
         compactHeight={compactHeight()}
+        // A mode change moves its own layers from the old place to the new one, in step with the surface.
+        compactContentFollowsResize={!modeTransitioning()}
         sharedMotion={{
           leading: sharedLeading()?.[props.displayMode === "island" ? "island" : "notch"],
           trailing: sharedTrailing()?.[props.displayMode === "island" ? "island" : "notch"],

@@ -2,6 +2,8 @@ import {
   type AppVariant,
   DEFAULT_DYNAMIC_ISLAND_PREFERENCE,
   DYNAMIC_ISLAND_SIZE_LIMITS,
+  type DynamicIslandGeometry,
+  type DynamicIslandNotchSize,
   IDLE_DYNAMIC_ISLAND_PRESENTATION,
 } from "@openbot/contracts/ipc";
 import { Button, ItemGroup, SettingsSection, SliderField, SwitchField } from "@openbot/ui";
@@ -9,10 +11,17 @@ import { OpenBotDynamicIsland } from "@openbot/ui/features/dynamic-island/OpenBo
 import type { GeneralSettingsValue } from "@openbot/ui/features/settings/app-settings";
 import { useI18n } from "../../i18n-context";
 
+const PREVIEW_NOTCH_SIZE: DynamicIslandNotchSize = { width: 192, height: 32 };
+
 export interface SettingsDynamicIslandTabProps {
   value: GeneralSettingsValue;
   /** The previews draw the logo in the color of this build, as the real island does. */
   variant: AppVariant;
+  /**
+   * The built-in display's notch, or null when it has none: the built-in preview then draws the
+   * island that display shows. Undefined before main answers, and the preview draws a notch.
+   */
+  builtInDisplayGeometry?: DynamicIslandGeometry;
   onUpdateSetting: <Key extends keyof GeneralSettingsValue>(key: Key, value: GeneralSettingsValue[Key]) => void;
   /** Saves several fields as one change, so a reset writes the preference once. */
   onUpdateSettings: (patch: Partial<GeneralSettingsValue>) => void;
@@ -28,6 +37,8 @@ export function SettingsDynamicIslandTab(props: SettingsDynamicIslandTabProps) {
   const i18n = useI18n();
   const widthPercent = () => props.value.macBookNotchWidthPercent;
   const heightPercent = () => props.value.macBookNotchHeightPercent;
+  const builtInNotchSize = (): DynamicIslandNotchSize | undefined =>
+    props.builtInDisplayGeometry === null ? undefined : (props.builtInDisplayGeometry ?? PREVIEW_NOTCH_SIZE);
   const isDefaultSize = () =>
     props.value.macBookNotchWidthPercent === DEFAULT_DYNAMIC_ISLAND_PREFERENCE.widthPercent &&
     props.value.macBookNotchHeightPercent === DEFAULT_DYNAMIC_ISLAND_PREFERENCE.heightPercent;
@@ -96,7 +107,7 @@ export function SettingsDynamicIslandTab(props: SettingsDynamicIslandTabProps) {
                   presentation={IDLE_DYNAMIC_ISLAND_PRESENTATION}
                   state="compact"
                   displayMode="notch"
-                  notchSize={{ width: 192, height: 32 }}
+                  notchSize={builtInNotchSize()}
                   variant={props.variant}
                   widthPercent={widthPercent()}
                   heightPercent={heightPercent()}

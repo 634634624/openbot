@@ -467,6 +467,10 @@ export const IPC_ENDPOINTS = {
     presentation: event<DynamicIslandPresentation>()("dynamic-island:presentation"),
     preference: event<DynamicIslandPreference>()("dynamic-island:preference"),
     geometry: event<DynamicIslandGeometry>()("dynamic-island:geometry"),
+    /** The notch of the built-in display, or null when it has none. The Settings preview draws it. */
+    getBuiltInDisplayGeometry: request<undefined, DynamicIslandGeometry>()(
+      "dynamic-island:get-built-in-display-geometry",
+    ),
     performAction: request<DynamicIslandAction, void>()("dynamic-island:perform-action"),
     performHaptic: request<undefined, void>()("dynamic-island:perform-haptic"),
     action: event<DynamicIslandAction>()("dynamic-island:action"),

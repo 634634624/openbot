@@ -287,7 +287,7 @@ describe("app IPC input parsing", () => {
         hapticsEnabled: true,
         idleVisible: true,
         additionalDisplaysEnabled: true,
-        widthPercent: 15,
+        widthPercent: 10,
         heightPercent: 100,
       }),
     ).toThrowError("Dynamic Island preference is required.");
