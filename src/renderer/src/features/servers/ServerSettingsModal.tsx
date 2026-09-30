@@ -36,7 +36,7 @@ import { GitHubConnectorPanel } from "@openbot/ui/features/settings/GitHubConnec
 import { SaveBarDock, SettingsDialogShell } from "@openbot/ui/features/settings/SettingsDialogShell";
 import { useText } from "@openbot/ui/text";
 import { createEffect, createSignal, onCleanup, Show, untrack } from "solid-js";
-import type { GitHubConnectorController } from "../connectors/github-connector";
+import { type GitHubConnectorController, githubPanelProps } from "../connectors/github-connector";
 import { type ServerStorageOptions, ServerStoragePanel } from "../files/ServerStoragePanel";
 import { type HostProviderSettings, HostProviderSettingsPanel } from "../settings/ProviderSettingsSection";
 import type { McpServerConfig, McpTestResult } from "./mcp-servers";
@@ -572,17 +572,7 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
               class="settings-modal-tab-panel server-settings-panel"
               data-tab="connectors"
             >
-              <GitHubConnectorPanel
-                status={github().status()}
-                busy={github().busy()}
-                repositories={github().repositories()}
-                repositoriesError={github().repositoriesError()}
-                onConnect={github().connect}
-                onCancel={github().cancel}
-                onDisconnect={github().disconnect}
-                onOpenVerification={github().openVerification}
-                onOpenInstall={github().openInstall}
-              />
+              <GitHubConnectorPanel {...githubPanelProps(github())} />
             </Tabs.Content>
           )}
         </Show>

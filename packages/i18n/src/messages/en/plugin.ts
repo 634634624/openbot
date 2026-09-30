@@ -6,8 +6,6 @@ export const messages = defineMessages("plugin", {
   "plugin.link.privacyPolicy": "Privacy Policy",
   "plugin.link.terms": "Terms of Service",
   "plugin.copyLink": "Copy link",
-  "plugin.install": "Install plugin",
-  "plugin.uninstall": "Uninstall plugin",
   "plugin.askPrompt": "Ask {name}: {prompt}",
   "plugin.section.apps": "Apps",
   "plugin.section.skills": "Skills",

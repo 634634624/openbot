@@ -6,8 +6,6 @@ export const messages = {
   "plugin.link.privacyPolicy": "プライバシーポリシー",
   "plugin.link.terms": "利用規約",
   "plugin.copyLink": "リンクをコピー",
-  "plugin.install": "プラグインをインストール",
-  "plugin.uninstall": "プラグインをアンインストール",
   "plugin.askPrompt": "{name} に質問：{prompt}",
   "plugin.section.apps": "アプリ",
   "plugin.section.skills": "スキル",

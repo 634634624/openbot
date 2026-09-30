@@ -6,8 +6,6 @@ export const messages = {
   "plugin.link.privacyPolicy": "Politique de confidentialité",
   "plugin.link.terms": "Conditions d’utilisation",
   "plugin.copyLink": "Copier le lien",
-  "plugin.install": "Installer le plugin",
-  "plugin.uninstall": "Désinstaller le plugin",
   "plugin.askPrompt": "Demander à {name} : {prompt}",
   "plugin.section.apps": "Apps",
   "plugin.section.skills": "Compétences",

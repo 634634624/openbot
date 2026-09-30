@@ -102,7 +102,7 @@ routes. A member or role change revokes every session on the host; the browser r
 the directory still lists the host. `ConversationRuntime.admin` carries the skills and shared-table
 calls to the agent settings panel, which shows only Skills and Tables in the browser. Memories,
 routines, and files stay on the desktop. The auto-approve switch writes through the agent-admin
-route. `web-marketplace.ts` gives `SkillsMarketplaceModal` its calls: the public catalog routes of
+route. `web-marketplace.ts` gives `MarketplaceModal` its calls: the public catalog routes of
 the account service that serves `/app` (`@openbot/team-client/marketplace-catalog`), and installs on
 the host over `skills-admin-v1`, `agent-install-v1`, `agent-update-v1`, and `mcp-servers-v1`. Try skill and a plugin
 prompt add a line to the agent's draft, as on desktop. A shared agent page also links
@@ -1736,6 +1736,13 @@ stylesheet is exported as `@openbot/ui/features/conversation/conversation.css`; 
 import it in the same cascade position as the former renderer stylesheet. This file is an ordered
 manifest of component styles in `features/conversation/styles/`. Preserve import order: later
 surface and responsive rules override earlier component rules.
+
+`@openbot/ui/features/marketplace/*` renders the Marketplace window: the Agents, Apps and Skills
+tabs, and a page for each listing. It reads a typed `MarketplaceModel` and holds no data of its
+own. The renderer's `marketplace-controller.ts` builds the model on the injected `MarketplaceCalls`,
+and `MarketplaceModal` adds the connect and uninstall dialogs. `WorkspaceOverlays` creates one
+`GitHubConnectorController`; the GitHub app page and Server settings › Connectors show the same
+`GitHubConnectorPanel` from it.
 
 `AgentSettingsPanel` owns the form draft, ordered save queue, avatar editor, and model controls.
 Its renderer adapter owns persisted width and native memories, routines, skills, and tables,
