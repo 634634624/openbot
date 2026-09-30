@@ -6,6 +6,62 @@ All notable changes to OpenBot will be documented here. The project follows
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-09-30
+
+### Added
+
+- In an agent chat on a team, each message from another person stands on the right, with your messages, and shows their name. Their bubble has their own color, so it does not look like yours. Agent messages look the same as before. Messages sent before this update show as yours.
+- A hosted server updates itself. It downloads a new OpenBot release in the background and starts it at its next start, so an open session does not stop.
+  A server that was set up before this release has no updater, so it stays on its current version.
+  **Upgrade such a server one time by hand, as `docs/hosted-servers.md` says.** The data in its home
+  folder and in `/srv` stays.
+
+### Changed
+
+- A routine run in an agent chat shows as one short line with the routine name and its state. The
+  chat no longer shows the routine instruction as your message. Open the routine to read its
+  instruction. Chat search no longer finds routine instructions.
+- When a hosted server is low on memory, new messages wait in the queue and start when memory is free. The agent shows a notice, and the browser opens no new tab.
+- A hosted server runs at most 4, 8 or 16 agent turns at the same time, from the memory of its plan. Other messages wait in the queue, and a message from a person starts before routine runs and teammate messages.
+- A plan change no longer stops a hosted server that is in use. The server moves to the machine of the new plan when it has no use for 7 minutes, or at its next start.
+- An agent's browser tab that nobody uses for 30 minutes now unloads its page to free memory. The
+  tab stays open with its URL, title and preview, and the page loads again when the agent or you use
+  the tab. On a server that is low on memory, this occurs after 5 minutes.
+
+### Fixed
+
+- In the browser live view of a remote server, Enter submits a form and breaks a line, and Backspace, Delete, Tab and the arrow keys work.
+- With OpenCode, a Computer Use window read adds much less text to the conversation, so long
+  Computer Use sessions stay faster and compact less often. Before, each read of a large window
+  added a list of element tokens about three quarters of the size of the window tree.
+- The Computer Use driver stops when OpenBot stops, also after a crash or an out-of-memory kill. Before, the driver kept running and used memory until you logged out. At the next start, OpenBot also stops the driver that the last crashed run left running.
+- OpenBot uses less memory in long sessions. It no longer keeps a second copy of each conversation, and it releases the data of each finished turn.
+- The picture-in-picture browser controls release their memory when the system closes the window.
+- Antigravity and custom ACP agents stay stopped when they are idle. Before, the usage display started them again every five minutes, and a custom agent router then started the process of each custom agent.
+- On a new hosted server, OpenBot keeps running when the server is out of memory. Before, the system could stop OpenBot, or stop all of OpenBot when one agent process used too much memory. Now an agent process stops first.
+- The Dynamic Island shows new messages again when you have more than 10,000 unread replies. Before, it stopped updating, and OpenBot logged an error each time the island changed.
+- Each Dynamic Island window uses about half the memory. Before, each window loaded the full app. There is one window for each display.
+- OpenBot keeps at most 16 chats in memory that you only read. Before, each chat that you marked read stayed in memory until you quit, about 1 MB for a long chat.
+- On a hosted server that is out of memory, the kernel now stops an agent process before the processes that OpenBot uses to open browser tabs.
+- Sending a message, or a change to a queued message, no longer writes all message history to the
+  database again. Before, each change wrote every message and delivery, so on a server that ran for
+  weeks each change became slower and used more disk.
+- OpenBot stops Codex, OpenCode, Grok or a custom agent when it sends one message larger than 128 MB, and shows the reason. Before, OpenBot kept all of the message in memory with no limit, and the system could stop OpenBot on a hosted server.
+- OpenBot uses less memory when it runs for a long time with many agents. When an agent chat is not used for 10 minutes, OpenBot removes its copy from memory and reads it again from the database when you or the agent use the chat. The chat does not change.
+- A hosted server uses much less memory when a teammate or a remote device downloads or uploads a file. Before, one 100 MB file could use about 200 MB of memory for the full transfer. Now the server sends and receives files from disk. A server receives two attachment uploads at the same time. Other uploads wait for their turn; they do not fail.
+- With Codex (GPT models), an agent now gets the tools of an MCP server whose name has a space or
+  another character that is not a letter, a digit, `_` or `-`, such as "Home Assistant". Before, the
+  connection test passed but the agent got none of the server's tools.
+- `channel_forget_memory` now matches the saved memory text regardless of letter case. Before this
+  fix, forgetting a channel memory with different casing than the saved text (for example asking to
+  forget "use bun for scripts" when the saved text was "Use Bun for scripts") silently failed and
+  left the memory in place.
+- When the live view of a remote host's page ends or fails, the panel now shows the message in the
+  language you selected. Before, it always showed the message in English.
+- With automatic downloads on, one restart now installs the newest OpenBot version. Before, OpenBot stopped checking for updates
+  after a download finished. If a newer version shipped before the restart, OpenBot installed the
+  older download and offered one more update after the restart.
+
 ## [0.25.2] - 2026-09-29
 
 ### Added

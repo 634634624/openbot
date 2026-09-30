@@ -338,10 +338,9 @@ installed version is newer. A staged release that is no longer the latest one, f
 withdrawn release, is removed at the next `stage` run. A server that starts before that run applies
 it. A release without all of its `resources/hosting` files cannot update a server.
 
-A server that has no updater, such as one made from a template before 0.25.3 [not confirmed: the
-first release with this change], needs one upgrade by hand. With a boat key that has command and
-file access: upload `scripts/hosting/` to `/tmp/openbot-upgrade`, run `sudo systemctl stop
-openbot.service`, run `sudo bash /tmp/openbot-upgrade/provision.sh user <AppImage URL> <SHA-256>
+A server that has no updater, such as one made from a template before 0.26.0, needs one upgrade by
+hand. With a boat key that has command and file access: upload `scripts/hosting/` to
+`/tmp/openbot-upgrade`, run `sudo systemctl stop openbot.service`, run `sudo bash /tmp/openbot-upgrade/provision.sh user <AppImage URL> <SHA-256>
 https://api.openbot.run` as a detached command, and start the service again. The data in the home
 folder and in `/srv` stays.
 
