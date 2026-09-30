@@ -9,9 +9,13 @@ import {
 import { Button, ItemGroup, SettingsSection, SliderField, SwitchField } from "@openbot/ui";
 import { OpenBotDynamicIsland } from "@openbot/ui/features/dynamic-island/OpenBotDynamicIsland";
 import type { GeneralSettingsValue } from "@openbot/ui/features/settings/app-settings";
+import type { JSX } from "@solidjs/web";
+import { createSignal, onSettled } from "solid-js";
 import { useI18n } from "../../i18n-context";
 
 const PREVIEW_NOTCH_SIZE: DynamicIslandNotchSize = { width: 192, height: 32 };
+/** The space the preview keeps on each side of an island that it scales down to fit. */
+const PREVIEW_FIT_INSET = 12;
 
 export interface SettingsDynamicIslandTabProps {
   value: GeneralSettingsValue;
@@ -102,7 +106,7 @@ export function SettingsDynamicIslandTab(props: SettingsDynamicIslandTabProps) {
         <ItemGroup class="settings-modal-card settings-dynamic-island-size">
           <div class="settings-dynamic-island-preview">
             <figure class="settings-dynamic-island-preview-display">
-              <div class="settings-dynamic-island-preview-bar" inert>
+              <PreviewFit>
                 <OpenBotDynamicIsland
                   presentation={IDLE_DYNAMIC_ISLAND_PRESENTATION}
                   state="compact"
@@ -114,13 +118,13 @@ export function SettingsDynamicIslandTab(props: SettingsDynamicIslandTabProps) {
                   onStateChange={() => undefined}
                   onAction={() => undefined}
                 />
-              </div>
+              </PreviewFit>
               <figcaption class="settings-dynamic-island-preview-caption">
                 {i18n.t("settings.notch.size.previewNotch")}
               </figcaption>
             </figure>
             <figure class="settings-dynamic-island-preview-display">
-              <div class="settings-dynamic-island-preview-bar" inert>
+              <PreviewFit>
                 <OpenBotDynamicIsland
                   presentation={IDLE_DYNAMIC_ISLAND_PRESENTATION}
                   state="compact"
@@ -131,7 +135,7 @@ export function SettingsDynamicIslandTab(props: SettingsDynamicIslandTabProps) {
                   onStateChange={() => undefined}
                   onAction={() => undefined}
                 />
-              </div>
+              </PreviewFit>
               <figcaption class="settings-dynamic-island-preview-caption">
                 {i18n.t("settings.notch.size.previewIsland")}
               </figcaption>
@@ -160,5 +164,34 @@ export function SettingsDynamicIslandTab(props: SettingsDynamicIslandTabProps) {
         </ItemGroup>
       </SettingsSection>
     </>
+  );
+}
+
+/**
+ * A preview frame. An island wider than the frame, such as the built-in island with no notch at
+ * 130%, scales down to fit, so its shape stays true and it stays inside the frame.
+ */
+function PreviewFit(props: { children: JSX.Element }): JSX.Element {
+  let frame: HTMLDivElement | undefined;
+  const [scale, setScale] = createSignal(1);
+  onSettled(() => {
+    const island = frame?.querySelector<HTMLElement>(".dynamic-island-size-target");
+    if (!frame || !island) return;
+    const measure = () => {
+      const available = (frame?.clientWidth ?? 0) - PREVIEW_FIT_INSET * 2;
+      const width = island.offsetWidth;
+      setScale(width > available && available > 0 ? available / width : 1);
+    };
+    const observer = new ResizeObserver(measure);
+    observer.observe(frame);
+    observer.observe(island);
+    return () => observer.disconnect();
+  });
+  return (
+    <div ref={frame} class="settings-dynamic-island-preview-bar" inert>
+      <div class="settings-dynamic-island-preview-fit" style={{ "--settings-dynamic-island-preview-scale": scale() }}>
+        {props.children}
+      </div>
+    </div>
   );
 }
