@@ -54,7 +54,7 @@ function AgentState(props: { scope: MarketplaceScope; listing: MarketplaceAgentS
 }
 
 /** The whole card opens the agent page. "Add" sits above the hit area and adds at once. */
-export function AgentCard(props: { scope: MarketplaceScope; listing: MarketplaceAgentSummary }) {
+function AgentCard(props: { scope: MarketplaceScope; listing: MarketplaceAgentSummary }) {
   const { t } = useText();
   const installs = useInstalls();
   const id = () => `marketplace-agent-${props.listing.id}`;
@@ -92,7 +92,7 @@ export function AgentCard(props: { scope: MarketplaceScope; listing: Marketplace
   );
 }
 
-export function SkillCard(props: { scope: MarketplaceScope; skill: MarketplaceSkillSummary }) {
+function SkillCard(props: { scope: MarketplaceScope; skill: MarketplaceSkillSummary }) {
   const { t } = useText();
   const installs = useInstalls();
   const id = () => `marketplace-skill-${props.skill.id}`;
