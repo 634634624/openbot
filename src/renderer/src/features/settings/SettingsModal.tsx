@@ -136,6 +136,8 @@ export interface SettingsModalProps {
   restoreFocusTarget?: HTMLElement | null;
   /** The tab shown when the modal is created. Read once; the user moves between tabs after that. */
   initialTab?: SettingsTab;
+  /** The tab shown each time the modal opens. Without it, the modal shows the tab that was open last. */
+  openTab?: SettingsTab | undefined;
 }
 
 export type SettingsTab =
@@ -311,6 +313,16 @@ export function SettingsModal(props: SettingsModalProps) {
       (hostedServers.state.loaded || hostedServers.state.error !== null || !props.hostedServersApi),
     (hidden) => {
       if (hidden) setActiveTab("general");
+    },
+  );
+  // The Hosted servers tab exists only after its list loads. A tab with no trigger falls back to General.
+  createEffect(
+    () => {
+      const tab = props.open ? props.openTab : undefined;
+      return tab === "hosted-servers" && !hostedServersShown() ? undefined : tab;
+    },
+    (tab) => {
+      if (tab) setActiveTab(tab);
     },
   );
   const visibleNavItems = () =>
