@@ -9,18 +9,7 @@ import type {
   MobileConnectTicket,
   UpdateStatus,
 } from "@openbot/contracts/ipc";
-import type { AppTextKey } from "@openbot/i18n";
-import {
-  CircleArrowDown,
-  CreditCard,
-  MousePointer2,
-  PanelTop,
-  Server,
-  Settings,
-  Smartphone,
-  Tabs,
-  UserRound,
-} from "@openbot/ui";
+import { Tabs } from "@openbot/ui";
 import { BillingPanel } from "@openbot/ui/features/billing/BillingPanel";
 import { createBillingStore } from "@openbot/ui/features/billing/billing-store";
 import type { GeneralSettingsValue } from "@openbot/ui/features/settings/app-settings";
@@ -39,6 +28,7 @@ import { useI18n } from "../../i18n-context";
 import { ComputerUseSetup } from "../computer-use/ComputerUseSetup";
 import { SettingsDynamicIslandTab } from "./SettingsDynamicIslandTab";
 import { SettingsGeneralTab } from "./SettingsGeneralTab";
+import { navItem, navItems, type SettingsTab } from "./settings-tabs";
 
 export interface SettingsModalProps {
   open: boolean;
@@ -73,85 +63,6 @@ export interface SettingsModalProps {
   initialTab?: SettingsTab;
   /** The tab shown each time the modal opens. Without it, the modal shows the tab that was open last. */
   openTab?: SettingsTab | undefined;
-}
-
-export type SettingsTab =
-  | "general"
-  | "dynamic-island"
-  | "computer-use"
-  | "profile"
-  | "billing"
-  | "mobile-connect"
-  | "updates"
-  | "hosted-servers";
-
-/**
- * A tab holds the keys of its label and its header text, not the text itself. The list is read at
- * module level, before any component exists to translate it, and a label captured there would keep
- * the language the app started in.
- */
-type SettingsNavItem = {
-  value: SettingsTab;
-  titleKey: AppTextKey;
-  descriptionKey: AppTextKey;
-  icon: typeof Settings;
-};
-
-const navItems: ReadonlyArray<SettingsNavItem> = [
-  {
-    value: "general",
-    titleKey: "settings.tab.general.title",
-    descriptionKey: "settings.tab.general.description",
-    icon: Settings,
-  },
-  {
-    value: "dynamic-island",
-    titleKey: "settings.tab.dynamicIsland.title",
-    descriptionKey: "settings.tab.dynamicIsland.description",
-    icon: PanelTop,
-  },
-  {
-    value: "computer-use",
-    titleKey: "settings.tab.computerUse.title",
-    descriptionKey: "settings.tab.computerUse.description",
-    icon: MousePointer2,
-  },
-  {
-    value: "profile",
-    titleKey: "settings.tab.profile.title",
-    descriptionKey: "settings.tab.profile.description",
-    icon: UserRound,
-  },
-  {
-    value: "billing",
-    titleKey: "settings.tab.billing.title",
-    descriptionKey: "settings.tab.billing.description",
-    icon: CreditCard,
-  },
-  {
-    value: "mobile-connect",
-    titleKey: "settings.tab.mobileConnect.title",
-    descriptionKey: "settings.tab.mobileConnect.description",
-    icon: Smartphone,
-  },
-  {
-    value: "updates",
-    titleKey: "settings.tab.updates.title",
-    descriptionKey: "settings.tab.updates.description",
-    icon: CircleArrowDown,
-  },
-  {
-    value: "hosted-servers",
-    titleKey: "settings.tab.hostedServers.title",
-    descriptionKey: "settings.tab.hostedServers.description",
-    icon: Server,
-  },
-];
-
-function navItem(tab: SettingsTab): SettingsNavItem {
-  const found = navItems.find((item) => item.value === tab);
-  if (!found) throw new Error(`Unknown settings tab: ${tab}`);
-  return found;
 }
 
 /**

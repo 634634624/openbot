@@ -27,6 +27,7 @@ import { useServers } from "./features/servers/servers-context";
 import type { HostProviderSettings } from "./features/settings/ProviderSettingsSection";
 import { useSettings } from "./features/settings/settings-context";
 import { useUpdates } from "./features/updates/updates-context";
+import { useGlobalSearchSources } from "./global-search-sources";
 import { InitialSetup, RemoteDesktopWorkspace, SettingsModal } from "./lazy-views";
 import { useNavigation } from "./navigation";
 import { usePlatform } from "./platform";
@@ -533,20 +534,28 @@ function AppSettings(props: AccountProps) {
   );
 }
 
-/** Search across every conversation on the active server. */
+/** Search across the agents, channels, conversations, routines and commands of the active server. */
 function GlobalMessageSearch() {
   const { agentList } = useAgents();
   const { globalSearchOpen, searchGlobalMessages, setGlobalSearchVisibility, selectAgent, selectGlobalSearchMessage } =
     useNavigation();
+  const sources = useGlobalSearchSources(globalSearchOpen);
 
   return (
     <GlobalSearchOverlay
       open={globalSearchOpen()}
       agents={agentList()}
+      channels={sources.channels()}
+      routines={sources.routines()}
+      routinesLoading={sources.routinesLoading()}
+      actions={sources.actions()}
       onSearchMessages={searchGlobalMessages}
+      onSearchFiles={sources.searchFiles()}
       onOpenChange={setGlobalSearchVisibility}
       onSelectAgent={selectAgent}
+      onSelectChannel={sources.openChannel}
       onSelectMessage={selectGlobalSearchMessage}
+      onSelectRoutine={sources.selectRoutine}
     />
   );
 }

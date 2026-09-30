@@ -9,9 +9,9 @@ import { usePlatform } from "../../platform";
 import { createSimpleContext } from "../../simple-context";
 import { useAuth } from "../account/account-context";
 import { useSetup } from "../onboarding/onboarding-context";
-import type { SettingsTab } from "./SettingsModal";
 import { settingsPort } from "./settings-port";
 import { isOpenSettingsShortcut } from "./settings-shortcut";
+import type { SettingsTab } from "./settings-tabs";
 
 const ANALYTICS_APP_VERSION_STORAGE_KEY = "openbot:analytics-app-version";
 

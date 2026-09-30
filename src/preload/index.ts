@@ -117,6 +117,7 @@ import {
 import {
   decodeAttachments,
   decodeConversation,
+  decodeConversationFileSearchPage,
   decodeConversationPageFromMain,
   decodeConversationSearchPageFromMain,
   decodeFilePreview,
@@ -374,6 +375,7 @@ const agentGroup = bridgeGroup(IPC_ENDPOINTS.agent, {
   readConversation: decodeConversation,
   readConversationPage: decodeConversationPageFromMain,
   searchConversationMessages: decodeConversationSearchPageFromMain,
+  searchConversationFiles: decodeConversationFileSearchPage,
   listConversationReads: decodeReadStates,
   markConversationRead: decodeReadState,
   sendMessage: decodeReceipt,

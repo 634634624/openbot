@@ -4,7 +4,8 @@ import { DEFAULT_GENERAL_SETTINGS } from "@openbot/ui/features/settings/app-sett
 import { createSignal, onCleanup } from "solid-js";
 import { fn } from "storybook/test";
 import type { Meta, StoryObj } from "storybook-solidjs-vite";
-import { SettingsModal, type SettingsTab } from "../src/features/settings/SettingsModal";
+import { SettingsModal } from "../src/features/settings/SettingsModal";
+import type { SettingsTab } from "../src/features/settings/settings-tabs";
 import { createMockBilling } from "../src/preview/mock-billing";
 import { createMockOpenBot } from "./mock-openbot";
 
