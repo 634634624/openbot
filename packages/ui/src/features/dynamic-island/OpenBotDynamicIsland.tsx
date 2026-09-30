@@ -12,6 +12,7 @@ import type {
 import {
   DEFAULT_DYNAMIC_ISLAND_PREFERENCE,
   DYNAMIC_ISLAND_DEFAULT_COMPACT_HEIGHT,
+  DYNAMIC_ISLAND_SIZE_LIMITS,
   dynamicIslandCompactHeight,
 } from "@openbot/contracts/ipc";
 import type { AppTextKey, AppTranslate } from "@openbot/i18n";
@@ -335,6 +336,17 @@ function scaleCompactWidth(width: number, floor: number, percent: number, minimu
   return Math.max(Math.min(minimum, width), Math.ceil((floor + ((width - floor) * percent) / 100) / 2) * 2);
 }
 
+/**
+ * An idle width below 100%, on a line from the smallest width at the lowest setting to the default
+ * width at 100%. Each step of the setting then changes the island. A scale from zero reached the
+ * smallest width at about 30%, so the lowest steps gave the same island.
+ */
+function interpolateIdleWidth(defaultWidth: number, minimum: number, percent: number): number {
+  const lowest = DYNAMIC_ISLAND_SIZE_LIMITS.widthPercent.min;
+  const progress = Math.max(0, (percent - lowest) / (DEFAULT_DYNAMIC_ISLAND_PREFERENCE.widthPercent - lowest));
+  return Math.ceil((minimum + (defaultWidth - minimum) * progress) / 2) * 2;
+}
+
 function clampCompactWidth(width: number, minimum: number, maximum: number): number {
   const evenWidth = Math.ceil(width / 2) * 2;
   return Math.min(maximum, Math.max(minimum, evenWidth));
@@ -414,7 +426,17 @@ export function OpenBotDynamicIsland(props: OpenBotDynamicIslandProps): JSX.Elem
     const percent = widthPercent();
     if (percent === DEFAULT_DYNAMIC_ISLAND_PREFERENCE.widthPercent) return undefined;
     if (props.displayMode === "island") {
+      if (percent < DEFAULT_DYNAMIC_ISLAND_PREFERENCE.widthPercent) {
+        return interpolateIdleWidth(STATUS_COMPACT_ISLAND_MIN_WIDTH, IDLE_COMPACT_ISLAND_MIN_WIDTH, percent);
+      }
       return scaleCompactWidth(STATUS_COMPACT_ISLAND_MIN_WIDTH, 0, percent, IDLE_COMPACT_ISLAND_MIN_WIDTH);
+    }
+    if (!props.notchSize && percent < DEFAULT_DYNAMIC_ISLAND_PREFERENCE.widthPercent) {
+      return interpolateIdleWidth(
+        STATUS_COMPACT_NOTCH_WIDTH + DYNAMIC_ISLAND_COMPACT_EAR_TRACK_WIDTH * 2,
+        IDLE_COMPACT_NO_NOTCH_MIN_WIDTH,
+        percent,
+      );
     }
     const notchWidth = physicalNotchWidth();
     return scaleCompactWidth(
