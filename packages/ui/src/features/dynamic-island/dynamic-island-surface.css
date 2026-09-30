@@ -128,15 +128,15 @@ body:has(.dynamic-island-surface),
   transition: border-radius var(--openbot-duration-normal) var(--openbot-ease-out);
 }
 
-/* While the island resizes, the logo rounds into a ball and turns once: clockwise as the island
-   grows, back as it shrinks. It shrinks a little and blurs more than the ear around it, so it reads as
-   a shape in motion, and half closes its eyes. It is sharp and square again as the island settles.
-   The motion uses `rotate` and `scale`, not `transform`, so it keeps the logo's offset on an external
-   display, and one full turn leaves the eyes upright. The logo is 20px, so the 20px radius makes a
-   circle. The squint scales the eye group, not the eyes, so the blink keeps running. */
+/* While the island resizes, the logo rounds its corners a little and turns once: clockwise as the
+   island grows, back as it shrinks. It shrinks a little and blurs more than the ear around it, so
+   it reads as a shape in motion, and half closes its eyes. It is sharp and square again as the
+   island settles. The motion uses `rotate` and `scale`, not `transform`, so it keeps the logo's
+   offset on an external display, and one full turn leaves the eyes upright. The squint scales the
+   eye group, not the eyes, so the blink keeps running. */
 .dynamic-island-shell[data-compact-resize] .dynamic-island-surface-logo {
   --app-logo-eye-squint: 0.35;
-  border-radius: var(--openbot-radius-xl);
+  border-radius: var(--openbot-radius-md);
   animation: dynamic-island-logo-turn 450ms var(--dynamic-island-shared-ease);
 }
 
