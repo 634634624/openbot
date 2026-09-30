@@ -144,22 +144,23 @@ function ListingPanel(props: {
           </div>
         }
       >
-        <Show when={props.count > 0} fallback={props.empty}>
-          <div class="marketplace-stack">
+        <div class="marketplace-stack">
+          <Show when={props.count > 0} fallback={props.empty}>
             {props.children}
-            <Show when={props.listing.hasMore()}>
-              <Button
-                type="button"
-                variant="outline"
-                class="marketplace-load-more"
-                loading={props.listing.loadingMore()}
-                onClick={props.listing.loadMore}
-              >
-                {t("marketplace.loadMore")}
-              </Button>
-            </Show>
-          </div>
-        </Show>
+          </Show>
+          {/* A filter can hide each loaded row while a later page still holds a match. */}
+          <Show when={props.listing.hasMore()}>
+            <Button
+              type="button"
+              variant="outline"
+              class="marketplace-load-more"
+              loading={props.listing.loadingMore()}
+              onClick={props.listing.loadMore}
+            >
+              {t("marketplace.loadMore")}
+            </Button>
+          </Show>
+        </div>
       </Show>
     </Show>
   );

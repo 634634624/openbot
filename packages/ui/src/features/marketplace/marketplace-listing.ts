@@ -41,14 +41,18 @@ function inCategory<T extends CatalogItem>(items: T[], category: SkillCategory):
  * The overview in one request while the whole catalog fits in one page. A larger catalog can leave a
  * category short of rows, so only those categories then ask for their own first rows.
  */
-async function loadHomePage<T extends CatalogItem>(list: CatalogList<T>): Promise<T[]> {
+async function loadHomePage<T extends CatalogItem>(list: CatalogList<T>): Promise<CatalogPage<T>> {
   const page = await list({ sort: "installs", limit: HOME_PAGE_SIZE });
-  if (!page.nextCursor) return page.items;
+  if (!page.nextCursor) return page;
   const short = SKILL_CATEGORIES.filter((category) => inCategory(page.items, category).length < HOME_ROWS_PER_CATEGORY);
   const pages = await Promise.all(
     short.map((category) => list({ category, sort: "installs", limit: HOME_ROWS_PER_CATEGORY })),
   );
-  return [...page.items, ...pages.flatMap((categoryPage) => categoryPage.items)];
+  /* "Load more" goes on from the first page. A category row that page brings again is dropped as a duplicate. */
+  return {
+    items: [...page.items, ...pages.flatMap((categoryPage) => categoryPage.items)],
+    nextCursor: page.nextCursor,
+  };
 }
 
 /**
@@ -57,9 +61,9 @@ async function loadHomePage<T extends CatalogItem>(list: CatalogList<T>): Promis
  * cache, so a different source never reads it.
  */
 export class MarketplaceHomeCache<T extends CatalogItem> {
-  #entry: { loadedAt: number; page: Promise<T[]> } | null = null;
+  #entry: { loadedAt: number; page: Promise<CatalogPage<T>> } | null = null;
 
-  load(list: CatalogList<T>): Promise<T[]> {
+  load(list: CatalogList<T>): Promise<CatalogPage<T>> {
     if (this.#entry && Date.now() - this.#entry.loadedAt < HOME_CACHE_MS) return this.#entry.page;
     const entry = { loadedAt: Date.now(), page: loadHomePage(list) };
     this.#entry = entry;
@@ -137,11 +141,11 @@ export function createMarketplaceListing<T extends CatalogItem>(options: {
       }
     });
     try {
-      const home = !category && !trimmed;
-      const homeItems = home
+      const home = !category && !trimmed && !cursor;
+      const homePage = home
         ? await (options.homeCache ? options.homeCache.load(options.list) : loadHomePage(options.list))
         : null;
-      const page = homeItems
+      const page = homePage
         ? null
         : await options.list({
             ...(category ? { category } : {}),
@@ -152,7 +156,7 @@ export function createMarketplaceListing<T extends CatalogItem>(options: {
           });
       if (version !== requestVersion) return;
       setState((s) => {
-        const allItems = homeItems ?? page?.items ?? [];
+        const allItems = (homePage ?? page)?.items ?? [];
         const items = allItems
           .filter((item, index) => allItems.findIndex((current) => current.id === item.id) === index)
           /*
@@ -164,7 +168,7 @@ export function createMarketplaceListing<T extends CatalogItem>(options: {
         s.items = cursor
           ? [...s.items, ...items.filter((item) => !s.items.some((current) => current.id === item.id))]
           : items;
-        s.nextCursor = page?.nextCursor ?? null;
+        s.nextCursor = (homePage ?? page)?.nextCursor ?? null;
         s.loadedQuery = trimmed;
       });
     } catch (error) {

@@ -14,8 +14,9 @@ export function MarketplaceSkillPage(props: { scope: MarketplaceScope; listing: 
   const { t, format } = useText();
   const installs = useInstalls();
   const model = () => props.scope.model;
-  const skill = () => props.listing;
   const detail = createDetail(() => model().loadSkill(props.listing.id));
+  /* The loaded detail can be newer than the listing, and the Try card sends its instructions. */
+  const skill = () => detail.value() ?? props.listing;
   // An effect, not `onSettled`: the read goes through the owner's props, and a prop that the
   // owner computes makes a memo, which `onSettled` refuses.
   createEffect(

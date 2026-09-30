@@ -174,7 +174,8 @@ export function AppAction(props: {
         </Show>
       }
     >
-      <Show when={model().canConnectApps()}>
+      {/* A custom server is turned on in Server settings › MCP, not here. */}
+      <Show when={model().canConnectApps() && props.app.kind !== "custom"}>
         <Button
           type="button"
           variant={props.variant ?? (props.size ? "outline" : "default")}
