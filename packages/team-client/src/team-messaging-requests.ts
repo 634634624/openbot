@@ -25,6 +25,7 @@ export function teamMessagingRequests(request: (serverId?: string) => TeamApiReq
     disconnectSlackWorkspace: hostOnly,
     createSlackApp: hostOnly,
     openSlackInstall: hostOnly,
+    setSlackIcon: hostOnly,
   };
 }
 

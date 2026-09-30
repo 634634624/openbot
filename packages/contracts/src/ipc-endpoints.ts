@@ -200,6 +200,7 @@ import type {
   MessagingThread,
   ReadMessagingThreadInput,
   SetMessagingEnabledInput,
+  SetSlackIconInput,
   SlackWorkspaceInput,
 } from "./ipc-messaging";
 import type { NotificationOpenedEvent, NotificationPreference } from "./ipc-notifications";
@@ -569,6 +570,7 @@ export const IPC_ENDPOINTS = {
     ),
     createSlackApp: scopedRequest<CreateSlackAppInput, MessagingOverview, "required">()("messaging:create-slack-app"),
     openSlackInstall: scopedRequest<MessagingAgentInput, void, "required">()("messaging:open-slack-install"),
+    setSlackIcon: scopedRequest<SetSlackIconInput, void, "required">()("messaging:set-slack-icon"),
   },
   // The server name, logo and app update of one server's host. `host.updateIdentity` and `update`
   // reach this computer only; these take the server, so a remote admin reaches the host. The

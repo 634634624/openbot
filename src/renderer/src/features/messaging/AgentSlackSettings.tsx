@@ -111,6 +111,21 @@ export function AgentSlackSettings(props: AgentSlackSettingsProps) {
     },
   );
 
+  // The Slack app's icon follows the agent's avatar. Main sends it only when it changed. A failure
+  // leaves Slack's default icon, which is not worth an alert.
+  createEffect(
+    () => (props.port.slackIcon && connected() ? props.agentId : null),
+    (agentId) => {
+      const slackIcon = props.port.slackIcon;
+      if (!agentId || !slackIcon) return;
+      void slackIcon(agentId)
+        .then((bytes) =>
+          props.port.api.setSlackIcon({ agentId, image: { mimeType: "image/png", bytes } }, props.port.serverId),
+        )
+        .catch(() => undefined);
+    },
+  );
+
   async function act(run: () => Promise<MessagingOverview>): Promise<void> {
     setState((draft) => {
       draft.pending = true;

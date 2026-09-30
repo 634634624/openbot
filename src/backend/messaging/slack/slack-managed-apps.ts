@@ -61,6 +61,7 @@ interface ManagedCredentials {
   requestUrl: string;
   workspaceId: string;
   manifestHash: string;
+  iconHash?: string;
 }
 
 /**
@@ -284,6 +285,25 @@ export class SlackManagedApps {
   }
 
   /**
+   * Sets the app's icon with `apps.icon.set`, which only the manager app that created the app may
+   * call. It takes a square image of 512 to 2000 px. Slack allows about one call a minute, so an
+   * icon with the hash that was sent last is not sent again.
+   */
+  async setIcon(connectionId: string, png: Uint8Array): Promise<void> {
+    const managed = this.#managed(connectionId);
+    const appId = this.#options.store.connection(connectionId)?.appId;
+    if (!managed || !appId) throw new Error(sourceText("error.messaging.notConnected"));
+    const hash = createHash("sha256").update(png).digest("hex");
+    if (hash === managed.iconHash) return;
+    await this.#api(this.#managerToken(managed.workspaceId)).upload(
+      "apps.icon.set",
+      { app_id: appId },
+      { field: "file", name: "icon.png", type: "image/png", bytes: png },
+    );
+    await this.#options.credentials.set(connectionId, { ...managed, iconHash: hash });
+  }
+
+  /**
    * Deletes the connection's Slack app, when the host still has the workspace's manager token.
    * `appId` is for a connection whose row is already gone with its agent.
    */
@@ -361,6 +381,7 @@ export class SlackManagedApps {
       requestUrl: values.requestUrl,
       workspaceId: values.workspaceId,
       manifestHash: values.manifestHash ?? "",
+      ...(values.iconHash ? { iconHash: values.iconHash } : {}),
     };
   }
 

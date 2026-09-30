@@ -5,9 +5,11 @@ import type {
   MessagingAgentInput,
   ReadMessagingThreadInput,
   SetMessagingEnabledInput,
+  SetSlackIconInput,
   SlackWorkspaceInput,
 } from "@openbot/contracts/ipc";
 import { isBoolean } from "@openbot/contracts/runtime-values";
+import { parseAvatarImage } from "./avatar-inputs";
 import { isObject, requireString } from "./validation";
 
 export function parseMessagingAgentInput(value: unknown): MessagingAgentInput {
@@ -26,6 +28,13 @@ export function parseCreateSlackAppInput(value: unknown): CreateSlackAppInput {
     agentId: requireString(value.agentId, "Agent id"),
     workspaceId: requireString(value.workspaceId, "Workspace id"),
   };
+}
+
+export function parseSetSlackIconInput(value: unknown): SetSlackIconInput {
+  if (!isObject(value)) throw new Error("A messaging request is invalid.");
+  const image = parseAvatarImage(value.image);
+  if (image?.mimeType !== "image/png") throw new Error("A messaging request is invalid.");
+  return { agentId: requireString(value.agentId, "Agent id"), image };
 }
 
 export function parseSetMessagingEnabledInput(value: unknown): SetMessagingEnabledInput {

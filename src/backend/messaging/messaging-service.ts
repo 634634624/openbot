@@ -94,7 +94,8 @@ interface PendingApproval {
   requestId: string | number;
   connectionId: string;
   target: MessageTarget;
-  messageId: string;
+  /** Null until Slack answers the post. A button press can arrive first, and it names its message. */
+  messageId: string | null;
   /** The Slack user whose message started the turn. Null when it is not known, then only the host answers. */
   allowedUserId: string | null;
   text: string;
@@ -291,6 +292,11 @@ export class MessagingService {
     await managed.openInstall(record.connectionId);
   }
 
+  /** Sets the agent's avatar as the icon of its Slack app. An icon Slack already has is not sent again. */
+  async setSlackIcon(agentId: string, png: Uint8Array): Promise<void> {
+    await this.#requireManaged().setIcon(this.#requireConnection(agentId).connectionId, png);
+  }
+
   /** False for a link that this run did not start. */
   completeSlackInstall(state: string, code: string): Promise<boolean> {
     return this.#requireManaged().completeInstall(state, code);
@@ -363,7 +369,12 @@ export class MessagingService {
       },
       message: (message) => void this.#receive(live, message).catch((error) => this.#warn(error)),
       action: (action) => void this.#action(live, action).catch((error) => this.#warn(error)),
+      placeCreated: (platformChannelId) =>
+        void live.adapter.joinPlace?.(platformChannelId).catch((error) => this.#warn(error)),
     });
+    // So people can mention the agent in any public channel without inviting it first. Channels
+    // made while the host was off are joined here too.
+    void live.adapter.joinPublicPlaces?.().catch((error) => this.#warn(error));
   }
 
   async #restart(connectionId: string): Promise<void> {
@@ -638,24 +649,31 @@ export class MessagingService {
       .join("\n");
     const accept = token();
     const decline = token();
-    const messageId = await live.adapter.post(target, {
-      text,
-      buttons: [
-        { action: "accept", label: sourceText("status.messaging.approve"), token: accept, style: "primary" },
-        { action: "decline", label: sourceText("status.messaging.deny"), token: decline, style: "danger" },
-      ],
-    });
+    // Known before the post: a person can press a button before Slack's answer to the post arrives.
     const pending: PendingApproval = {
       requestId: approval.requestId,
       connectionId: live.record.connectionId,
       target,
-      messageId,
+      messageId: null,
       allowedUserId: running?.origin.authorId ?? null,
       text,
       answered: false,
     };
     this.#approvals.set(accept, pending);
     this.#approvals.set(decline, pending);
+    try {
+      pending.messageId = await live.adapter.post(target, {
+        text,
+        buttons: [
+          { action: "accept", label: sourceText("status.messaging.approve"), token: accept, style: "primary" },
+          { action: "decline", label: sourceText("status.messaging.deny"), token: decline, style: "danger" },
+        ],
+      });
+    } catch (error) {
+      this.#approvals.delete(accept);
+      this.#approvals.delete(decline);
+      throw error;
+    }
   }
 
   async #approvalResolved(requestId: string | number): Promise<void> {
@@ -664,6 +682,7 @@ export class MessagingService {
     for (const [key] of entries) this.#approvals.delete(key);
     if (!pending || pending.answered) return;
     const live = this.#live.get(pending.connectionId);
+    if (!pending.messageId) return;
     await live?.adapter.edit(pending.target, pending.messageId, {
       text: `${pending.text}\n${sourceText("status.messaging.answeredOnHost")}`,
     });
@@ -722,7 +741,9 @@ export class MessagingService {
       outcome = sourceText("status.messaging.requestInactive");
     }
     for (const [key, candidate] of this.#approvals) if (candidate === pending) this.#approvals.delete(key);
-    await adapter.edit(pending.target, pending.messageId, { text: `${pending.text}\n${outcome}` });
+    await adapter.edit(pending.target, pending.messageId ?? action.platformMessageId, {
+      text: `${pending.text}\n${outcome}`,
+    });
   }
 
   /**

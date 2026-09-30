@@ -423,8 +423,10 @@ on the computer. The agent's answers go from the computer to the Slack Web API d
   removes both.
 - **Read from Slack.** The messages that mention the agent, the replies in a thread it answers, its
   direct messages, the files in them, the display names of their authors, the names of the channels,
-  and up to 30 earlier messages of a thread as context for the agent.
-- **Sent to Slack.** The agent's answers and the files it attaches, short status posts ("Working on
+  and up to 30 earlier messages of a thread as context for the agent. The agent's app joins every
+  public channel of the workspace, and Slack sends it every message of each channel it is in. These
+  pass through Signal to the computer, which keeps only the messages that address the agent.
+- **Sent to Slack.** The agent's avatar as the icon of its app, the agent's answers and the files it attaches, short status posts ("Working on
   it…"), reactions, and approval requests with the command, folder and reason the provider gave,
   redacted. A failed request posts a fixed sentence, never the provider's error.
 

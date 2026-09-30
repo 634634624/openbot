@@ -124,6 +124,9 @@ export function createMockMessaging(agentName: (agentId: string) => string | und
       });
       return overview(agentId);
     },
+    setSlackIcon: async ({ agentId }) => {
+      requireAgent(agentId);
+    },
     openSlackInstall: async ({ agentId }) => {
       change(agentId, { state: "connected", botUserId: "U0PREVIEW" });
     },

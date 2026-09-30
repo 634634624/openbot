@@ -2,6 +2,7 @@
 export const SLACK_BOT_SCOPES = [
   "app_mentions:read",
   "channels:history",
+  "channels:join",
   "channels:read",
   "chat:write",
   "files:read",
@@ -16,7 +17,14 @@ export const SLACK_BOT_SCOPES = [
   "users:read",
 ] as const;
 
-const BOT_EVENTS = ["app_mention", "message.channels", "message.groups", "message.im", "message.mpim"] as const;
+const BOT_EVENTS = [
+  "app_mention",
+  "channel_created",
+  "message.channels",
+  "message.groups",
+  "message.im",
+  "message.mpim",
+] as const;
 /** Events about the app itself. The connection stops when either arrives. */
 const APP_EVENTS = ["app_uninstalled", "tokens_revoked"] as const;
 

@@ -151,6 +151,7 @@ class FakeSlack {
             oauth_authorize_url: "https://slack.com/oauth/v2/authorize?client_id=client-9",
           });
         }
+        case "apps.icon.set":
         case "apps.manifest.update":
         case "apps.manifest.delete":
         case "auth.revoke":
@@ -181,6 +182,16 @@ class FakeSlack {
         case "chat.postMessage":
           this.#ts += 1;
           return reply({ ts: `${this.#ts}.000` });
+        case "conversations.list":
+          return params.cursor
+            ? reply({ channels: [{ id: "C3", is_member: false }], response_metadata: { next_cursor: "" } })
+            : reply({
+                channels: [
+                  { id: "C1", is_member: false },
+                  { id: "C2", is_member: true },
+                ],
+                response_metadata: { next_cursor: "page-2" },
+              });
         default:
           return reply({});
       }
@@ -349,6 +360,26 @@ describe.sequential("Managed Slack app end to end", () => {
     await waitFor(() => slack.of("chat.update").some((call) => call.params.text === "CODEX_DONE"));
     const turns = started.client.requests.filter((request) => request.method === "turn/start");
     expect(turns).toHaveLength(1);
+
+    // The app's icon is the agent's avatar. Slack allows about one icon a minute, so the same one is
+    // not sent again.
+    const icon = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+    await messaging.setSlackIcon(agent.id, icon);
+    await messaging.setSlackIcon(agent.id, icon);
+    expect(slack.of("apps.icon.set")).toHaveLength(1);
+
+    // The agent is in every public channel without an invitation, and in each new one.
+    await waitFor(() => slack.of("conversations.join").length === 2);
+    expect(slack.of("conversations.join").map((call) => call.params.channel)).toEqual(["C1", "C3"]);
+    const channelCreated = JSON.stringify({
+      type: "event_callback",
+      team_id: "T1",
+      api_app_id: "A9",
+      event_id: "Ev2",
+      event: { type: "channel_created", channel: { id: "C4", name: "launch" } },
+    });
+    expect(await signal.deliver({ connectionId, ...signed(channelCreated) })).toEqual({ status: 200 });
+    await waitFor(() => slack.of("conversations.join").some((call) => call.params.channel === "C4"));
 
     // Anything Slack did not sign with this app's secret, or signed too long ago, is refused.
     const forged = await signal.deliver({ connectionId, ...signed(mention, undefined, "f".repeat(32)) });

@@ -2,6 +2,7 @@
 // forwards to a joined host; the web client asks its connected host over the Team API.
 
 import type { MessagingDesktopApi } from "@openbot/contracts/ipc";
+import { renderSlackIcon } from "./slack-icon";
 
 export interface MessagingPort {
   api: MessagingDesktopApi;
@@ -11,8 +12,17 @@ export interface MessagingPort {
    * to Slack, because Slack returns to this computer's browser.
    */
   managedApps: boolean;
+  /** The agent's avatar as a PNG for its Slack app icon. Only where `managedApps` is true. */
+  slackIcon?: (agentId: string) => Promise<Uint8Array>;
 }
 
 export function desktopMessagingPort(serverId: string, managedApps: boolean): MessagingPort {
-  return { api: window.openbot.messaging, serverId, managedApps };
+  return {
+    api: window.openbot.messaging,
+    serverId,
+    managedApps,
+    ...(managedApps
+      ? { slackIcon: (agentId: string) => window.openbot.agentTemplates.preview(agentId).then(renderSlackIcon) }
+      : {}),
+  };
 }

@@ -18,7 +18,12 @@ OpenBot's Signal service, which passes them to this computer.
    install page. Select **Allow**. If the workspace needs an admin to approve new apps, the
    connection shows **Waiting for install** until the admin approves; then select **Install in
    Slack** again.
-4. In Slack, invite the agent to a channel with `/invite @name`, then mention it.
+4. In Slack, mention the agent in any public channel, or send it a direct message.
+
+The agent joins every public channel of the workspace, and each public channel that is created
+later. Slack shows "joined #channel" in each one. A private channel needs an invitation:
+`/invite @name`. The app's icon is the agent's avatar; OpenBot sets it when **Agent settings →
+Slack** is open, and again after the avatar changes.
 
 When the agent is renamed, OpenBot renames its Slack app. **Disconnect**, or deleting the agent,
 deletes the app. **Disconnect workspace** removes the manager token from this computer and revokes
@@ -91,7 +96,10 @@ address, while the token lasts. A packaged build ignores all of these variables.
 - An agent runs one turn at a time. A Slack request waits behind the agent's own work and behind
   channel work, and the thread shows that it waits. One agent keeps at most 5 Slack requests waiting,
   and one person at most 2.
-- A free Slack workspace allows at most 10 apps, and each agent uses one. Slack does not document a
+- A free Slack workspace allows at most 10 apps, and each agent uses one.
+- Slack sends every message of every channel the agent is in to this computer, through Signal. Since
+  the agent is in every public channel, a busy workspace sends many events. The host keeps only the
+  messages that address the agent. Slack does not document a
   limit for paid plans. A workspace can also require an admin to approve each new app.
 - Slack sends the events through Signal. When this computer does not answer, Slack sends an event
   again after about 1 and 5 minutes, then drops it.

@@ -15,6 +15,7 @@ import {
   parseMessagingAgentInput,
   parseReadMessagingThreadInput,
   parseSetMessagingEnabledInput,
+  parseSetSlackIconInput,
   parseSlackWorkspaceInput,
 } from "./messaging-inputs";
 import { scopedHandler } from "./scoped-handler";
@@ -36,6 +37,7 @@ interface MessagingIpcDependencies {
     | "disconnectSlackWorkspace"
     | "createSlackApp"
     | "openSlackInstall"
+    | "setSlackIcon"
   >;
   remoteServers: MessagingRemoteServers;
 }
@@ -90,6 +92,10 @@ export function messagingIpcHandlers({
       }),
       openSlackInstall: scopedHandler(parseMessagingAgentInput, {
         local: ({ agentId }) => messaging.openSlackInstall(agentId),
+        remote: hostOnly,
+      }),
+      setSlackIcon: scopedHandler(parseSetSlackIconInput, {
+        local: ({ agentId, image }) => messaging.setSlackIcon(agentId, image.bytes),
         remote: hostOnly,
       }),
     },

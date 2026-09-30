@@ -4,6 +4,7 @@
  * result carries one.
  */
 
+import type { AvatarImageInput } from "./ipc-agents";
 import { isBoundedString, isIdentifier, isNullableBoundedString } from "./ipc-bounded-values";
 import { isBoolean, isDynamicRecord, isOneOf } from "./runtime-values";
 
@@ -103,6 +104,12 @@ export interface CreateSlackAppInput {
 
 export interface SlackWorkspaceInput {
   workspaceId: string;
+}
+
+/** The agent's avatar as its Slack app icon: a square PNG of 512 px, which the screen draws. */
+export interface SetSlackIconInput {
+  agentId: string;
+  image: AvatarImageInput;
 }
 
 export interface SetMessagingEnabledInput {

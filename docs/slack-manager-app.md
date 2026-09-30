@@ -113,11 +113,14 @@ Routes that this uses:
 
 The host makes these; nothing is manual. For reference:
 
-- Bot scopes: `app_mentions:read`, `channels:history`, `channels:read`, `chat:write`, `files:read`,
+- Bot scopes: `app_mentions:read`, `channels:history`, `channels:join`, `channels:read`, `chat:write`, `files:read`,
   `files:write`, `groups:history`, `groups:read`, `im:history`, `im:read`, `im:write`,
   `mpim:history`, `reactions:write`, `users:read`.
-- Bot events: `app_mention`, `message.channels`, `message.groups`, `message.im`, `message.mpim`,
-  plus `app_uninstalled` and `tokens_revoked`.
+- Bot events: `app_mention`, `channel_created`, `message.channels`, `message.groups`, `message.im`,
+  `message.mpim`, plus `app_uninstalled` and `tokens_revoked`.
+- The icon: the agent's avatar, set with `apps.icon.set` and the manager token. Slack allows this
+  only for an app that the manager app created, so an app made with a development configuration
+  token keeps the default icon.
 - Request URL for events and interactivity: `https://signal.openbot.run/v1/slack/events/<route token>`.
 - Redirect URL: `https://api.openbot.run/slack/connect`.
 - Messages tab on, users can send messages. Socket Mode off. Token rotation off.

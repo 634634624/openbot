@@ -58,6 +58,31 @@ export class SlackWebApi {
     return payload;
   }
 
+  /** A method that takes a file, such as `apps.icon.set`, as a multipart form. */
+  async upload(
+    method: string,
+    params: Record<string, string>,
+    file: { field: string; name: string; type: string; bytes: Uint8Array },
+  ): Promise<SlackResponse> {
+    const body = new FormData();
+    for (const [key, value] of Object.entries(params)) body.set(key, value);
+    body.set(file.field, new Blob([new Uint8Array(file.bytes)], { type: file.type }), file.name);
+    const response = await fetch(`${this.#origin}/api/${method}`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${this.#token}` },
+      body,
+      redirect: "error",
+    });
+    const payload = await response.json().catch(() => null);
+    if (!isDynamicRecord(payload)) throw new SlackApiError(method, `http_${response.status}`);
+    if (payload.ok !== true) {
+      const code = isString(payload.error) ? payload.error : `http_${response.status}`;
+      if (AUTH_ERRORS.has(code)) throw new MessagingConnectionError("invalid_token");
+      throw new SlackApiError(method, code);
+    }
+    return { ...payload, ok: true };
+  }
+
   /** `auth.test` with the granted scopes, which Slack sends only as a response header. */
   async authTest(): Promise<{ payload: SlackResponse; scopes: string[] }> {
     const { payload, response } = await this.#send("auth.test", new URLSearchParams());
