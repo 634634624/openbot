@@ -6,7 +6,6 @@ import type {
   AgentApproval,
   AgentEvent,
   AgentSummary,
-  ConnectSlackInput,
   CreateSlackAppInput,
   MessagingConnection,
   MessagingConnectionState,
@@ -15,7 +14,6 @@ import type {
   MessagingPlatform,
   MessagingThread,
   RespondToApprovalInput,
-  SlackSetup,
 } from "@openbot/contracts/ipc";
 import { MESSAGING_CONNECTION_STATES } from "@openbot/contracts/ipc";
 import { isOneOf } from "@openbot/contracts/runtime-values";
@@ -38,7 +36,6 @@ import {
   type MessagingTransport,
 } from "./messaging-types";
 import { SlackManagedApps, type SlackManagerPort } from "./slack/slack-managed-apps";
-import { slackSetup } from "./slack/slack-manifest";
 
 const logger = createOpenBotLogger("messaging");
 
@@ -69,7 +66,7 @@ export interface MessagingServiceOptions {
   drivers: readonly MessagingDriver[];
   /** A private folder for files that arrive, until the mailbox has copied them. */
   downloadsRoot: string;
-  /** The Signal relay for managed Slack apps. Without it and `slackManager`, only Socket Mode apps connect. */
+  /** The Signal relay of the Slack apps. Without it and `slackManager`, no Slack app can connect. */
   ingress?: MessagingIngress;
   slackManager?: SlackManagerPort;
   /** Only tests change this. */
@@ -104,7 +101,7 @@ interface PendingApproval {
   answered: boolean;
 }
 
-const FATAL_STATES = new Set<MessagingConnectionState>(["invalid_token", "tokens_mismatch", "socket_mode_off"]);
+const FATAL_STATES = new Set<MessagingConnectionState>(["invalid_token"]);
 const LIVE_STATES = new Set<MessagingConnectionState>(["connecting", "connected", "reconnecting", "rate_limited"]);
 const APPROVAL_TEXT_LIMIT = 2_500;
 const CANCEL_TEXT = /^(cancel|stop)$/i;
@@ -180,6 +177,15 @@ export class MessagingService {
     );
   }
 
+  /**
+   * Moves each Slack app to this host's current request URL and install address. The main process
+   * calls it once the host's identity is loaded, because the account service issues the URL for a
+   * named host only.
+   */
+  async syncSlackApps(): Promise<void> {
+    await this.#managed?.sync(this.#agentMap(), true);
+  }
+
   async stop(): Promise<void> {
     this.#started = false;
     for (const unsubscribe of this.#unsubscribe.splice(0)) unsubscribe();
@@ -209,35 +215,9 @@ export class MessagingService {
     };
   }
 
-  slackSetup(agentId: string): SlackSetup {
-    return slackSetup(this.#requireAgent(agentId));
-  }
-
   readThread(agentId: string, linkId: string): MessagingThread {
     this.#requireAgent(agentId);
     return this.#threads.read(agentId, linkId);
-  }
-
-  async connectSlack(input: ConnectSlackInput): Promise<MessagingOverview> {
-    this.#requireAgent(input.agentId);
-    const driver = this.#driver("slack");
-    const credentials = { botToken: input.botToken.trim(), appToken: input.appToken.trim() };
-    driver.validateCredentials(credentials);
-    const adapter = driver.createAdapter(credentials, { rateLimited: () => undefined });
-    try {
-      await adapter.identify();
-    } catch (error) {
-      if (error instanceof MessagingConnectionError) throw new Error(sourceText("error.messaging.botTokenRejected"));
-      throw new Error(sourceText("error.messaging.slackUnavailable"));
-    }
-    const record = this.#threads.store.ensureConnection(input.agentId, "slack");
-    await this.#stopConnection(record.connectionId);
-    await this.#managed?.deleteApp(record.connectionId).catch((error) => this.#warn(error));
-    await this.#credentials.set(record.connectionId, credentials);
-    this.#threads.store.updateConnection(record.connectionId, { enabled: true, lastErrorCode: null });
-    const updated = this.#threads.store.connection(record.connectionId);
-    if (updated) await this.#startConnection(updated);
-    return this.overview(input.agentId);
   }
 
   async reconnect(agentId: string): Promise<MessagingOverview> {
@@ -259,8 +239,8 @@ export class MessagingService {
   }
 
   /**
-   * Removes the tokens and stops the connection. A Slack app that OpenBot manages is deleted too,
-   * because nothing else can use it. The conversations stay, for reading and for a later connect.
+   * Removes the tokens, stops the connection and deletes the agent's Slack app, which nothing else
+   * can use. The conversations stay, for reading and for a later connect.
    */
   async disconnect(agentId: string): Promise<MessagingOverview> {
     const record = this.#requireConnection(agentId);
@@ -303,8 +283,12 @@ export class MessagingService {
     return this.overview(input.agentId);
   }
 
+  /** The app's addresses are brought up to date first: Slack refuses an install to an address it does not list. */
   async openSlackInstall(agentId: string): Promise<void> {
-    await this.#requireManaged().openInstall(this.#requireConnection(agentId).connectionId);
+    const managed = this.#requireManaged();
+    const record = this.#requireConnection(agentId);
+    await managed.sync(this.#agentMap(), true);
+    await managed.openInstall(record.connectionId);
   }
 
   /** False for a link that this run did not start. */
@@ -406,13 +390,12 @@ export class MessagingService {
     const live = this.#live.get(record.connectionId);
     const credentials = this.#credentials.status(record.connectionId);
     const values = credentials === "saved" ? this.#credentials.get(record.connectionId) : null;
-    const managed = SlackManagedApps.isManaged(values);
     const stored = isOneOf(MESSAGING_CONNECTION_STATES, record.lastErrorCode) ? record.lastErrorCode : null;
     const state: MessagingConnectionState = !record.enabled
       ? "paused"
       : credentials === "unreadable"
         ? "secret_storage_unavailable"
-        : managed && !values?.botToken
+        : values && !values.botToken
           ? "awaiting_install"
           : (live?.state ?? stored ?? "connecting");
     return {
@@ -425,7 +408,6 @@ export class MessagingService {
       missingScopes: live?.identity?.missingScopes ?? [],
       retryAt: state === "rate_limited" ? (live?.retryAt ?? null) : null,
       credentials,
-      managed,
     };
   }
 
@@ -765,6 +747,10 @@ export class MessagingService {
     ]);
   }
 
+  #agentMap(): Map<string, AgentSummary> {
+    return new Map(this.#agents.listAgents().map((agent) => [agent.id, agent]));
+  }
+
   #requireManaged(): SlackManagedApps {
     if (!this.#managed) throw new Error(sourceText("error.messaging.unsupported"));
     return this.#managed;
@@ -797,12 +783,6 @@ export class MessagingService {
     const record = this.#threads.store.connectionFor(agentId, "slack");
     if (!record) throw new Error(sourceText("error.messaging.notConnected"));
     return record;
-  }
-
-  #driver(platform: MessagingPlatform): MessagingDriver {
-    const driver = this.#drivers.get(platform);
-    if (!driver) throw new Error(sourceText("error.messaging.unsupported"));
-    return driver;
   }
 
   #agentName(agentId: string): string {

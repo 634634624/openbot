@@ -7,11 +7,10 @@ import {
   Badge,
   Button,
   ConfirmDialog,
-  Input,
   SettingsSection,
   Text,
 } from "@openbot/ui";
-import { SettingsField, SettingsPanelHeader } from "@openbot/ui/components/SettingsPanel";
+import { SettingsPanelHeader } from "@openbot/ui/components/SettingsPanel";
 import { useText } from "@openbot/ui/text";
 import { createEffect, createStore, For, Show } from "solid-js";
 import type { MessagingPort } from "./messaging-port";
@@ -26,9 +25,7 @@ export const MESSAGING_STATE_LABEL = {
   paused: "messaging.state.paused",
   invalid_token: "messaging.state.invalid_token",
   missing_scope: "messaging.state.missing_scope",
-  tokens_mismatch: "messaging.state.tokens_mismatch",
   rate_limited: "messaging.state.rate_limited",
-  socket_mode_off: "messaging.state.socket_mode_off",
   secret_storage_unavailable: "messaging.state.secret_storage_unavailable",
   error: "messaging.state.error",
   awaiting_install: "messaging.state.awaiting_install",
@@ -37,8 +34,6 @@ export const MESSAGING_STATE_LABEL = {
 
 const STATE_HELP: Partial<Record<MessagingConnection["state"], AppTextKey>> = {
   invalid_token: "messaging.help.invalid_token",
-  tokens_mismatch: "messaging.help.tokens_mismatch",
-  socket_mode_off: "messaging.help.socket_mode_off",
   secret_storage_unavailable: "messaging.help.secret_storage_unavailable",
   relay_unavailable: "messaging.help.relay_unavailable",
 };
@@ -57,10 +52,6 @@ interface SlackSettingsState {
   loadError: string | null;
   actionError: string | null;
   pending: boolean;
-  /** The tokens being typed. They are cleared after each connect and are never read back. */
-  botToken: string;
-  appToken: string;
-  copied: boolean;
   confirmDisconnect: boolean;
   /** The conversation open in the transcript view. */
   thread: MessagingThread | null;
@@ -78,10 +69,9 @@ export interface AgentSlackSettingsProps {
 }
 
 /**
- * Agent settings > Slack. On the computer that runs the agent, OpenBot can create the agent's own
- * Slack app in a connected workspace. Anywhere, the user can connect a Slack app they create from a
- * manifest. Shows the connection, and lists the Slack conversations the agent answers. Tokens go to
- * the host and never come back.
+ * Agent settings > Slack. On the computer that runs the agent, OpenBot creates the agent's own Slack
+ * app in the connected workspace. Shows the connection, and lists the Slack conversations the agent
+ * answers. No token reaches this view.
  */
 export function AgentSlackSettings(props: AgentSlackSettingsProps) {
   const { t, format, errorMessage } = useText();
@@ -90,9 +80,6 @@ export function AgentSlackSettings(props: AgentSlackSettingsProps) {
     loadError: null,
     actionError: null,
     pending: false,
-    botToken: "",
-    appToken: "",
-    copied: false,
     confirmDisconnect: false,
     thread: null,
     threadError: null,
@@ -133,8 +120,6 @@ export function AgentSlackSettings(props: AgentSlackSettingsProps) {
       const overview = await run();
       setState((draft) => {
         draft.overview = overview;
-        draft.botToken = "";
-        draft.appToken = "";
         draft.confirmDisconnect = false;
       });
       props.onStateChange?.(overview.connection);
@@ -150,31 +135,6 @@ export function AgentSlackSettings(props: AgentSlackSettingsProps) {
   }
 
   const scoped = { agentId: () => props.agentId, server: () => props.port.serverId };
-  const connect = () =>
-    act(() =>
-      props.port.api.connectSlack(
-        { agentId: scoped.agentId(), botToken: state.botToken, appToken: state.appToken },
-        scoped.server(),
-      ),
-    );
-
-  async function setup(action: "open" | "copy"): Promise<void> {
-    try {
-      const setupValue = await props.port.api.getSlackSetup({ agentId: props.agentId }, props.port.serverId);
-      if (action === "open") await props.port.openUrl(setupValue.createAppUrl);
-      else {
-        await props.port.copyText(setupValue.manifestJson);
-        setState((draft) => {
-          draft.copied = true;
-        });
-      }
-    } catch (error) {
-      setState((draft) => {
-        draft.actionError = errorMessage(error, t("messaging.slack.loadFailed"));
-      });
-    }
-  }
-
   /** A step that opens Slack in the browser. The overview poll shows its result. */
   async function openSlack(run: () => Promise<void>): Promise<void> {
     setState((draft) => {
@@ -194,7 +154,8 @@ export function AgentSlackSettings(props: AgentSlackSettingsProps) {
     }
   }
 
-  const workspaces = () => state.overview?.slackWorkspaces ?? [];
+  /** The connected Slack workspace. An agent is always added to this one. */
+  const workspace = () => state.overview?.slackWorkspaces[0] ?? null;
 
   async function openThread(linkId: string): Promise<void> {
     try {
@@ -269,142 +230,94 @@ export function AgentSlackSettings(props: AgentSlackSettingsProps) {
                   <Text variant="body-sm" tone="secondary">
                     {t("messaging.slack.managed.intro", { name: props.agentName })}
                   </Text>
-                  <ul class="agent-slack-workspaces">
-                    <For each={workspaces()} keyed={(workspace) => workspace.workspaceId}>
-                      {(workspace) => (
-                        <li class="agent-slack-actions">
-                          <Button
-                            size="sm"
-                            disabled={state.pending}
-                            onClick={() =>
-                              void act(() =>
-                                props.port.api.createSlackApp(
-                                  { agentId: scoped.agentId(), workspaceId: workspace().workspaceId },
-                                  scoped.server(),
-                                ),
-                              )
-                            }
-                          >
-                            {t("messaging.slack.managed.create", { workspace: workspace().name })}
-                          </Button>
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            disabled={state.pending}
-                            onClick={() =>
-                              void openSlack(async () => {
-                                await props.port.api.disconnectSlackWorkspace(
-                                  { workspaceId: workspace().workspaceId },
-                                  scoped.server(),
-                                );
-                                await load();
-                              })
-                            }
-                          >
-                            {t("messaging.slack.managed.forget")}
-                          </Button>
-                        </li>
-                      )}
-                    </For>
-                  </ul>
-                  <div class="agent-slack-actions">
-                    <Button
-                      size="sm"
-                      variant={workspaces().length ? "outline" : "default"}
-                      disabled={state.pending}
-                      onClick={() =>
-                        void openSlack(() =>
-                          props.port.api.connectSlackWorkspace({ agentId: scoped.agentId() }, scoped.server()),
-                        )
-                      }
-                    >
-                      {workspaces().length
-                        ? t("messaging.slack.managed.connectAnother")
-                        : t("messaging.slack.managed.connectWorkspace")}
-                    </Button>
-                  </div>
+                  <ol class="agent-slack-steps">
+                    <li>
+                      <Show
+                        when={workspace()}
+                        fallback={
+                          <>
+                            <Text variant="body-sm">{t("messaging.slack.managed.connectStep")}</Text>
+                            <div class="agent-slack-actions">
+                              <Button
+                                size="sm"
+                                disabled={state.pending}
+                                onClick={() =>
+                                  void openSlack(() =>
+                                    props.port.api.connectSlackWorkspace(
+                                      { agentId: scoped.agentId() },
+                                      scoped.server(),
+                                    ),
+                                  )
+                                }
+                              >
+                                {t("messaging.slack.managed.connect")}
+                              </Button>
+                            </div>
+                          </>
+                        }
+                      >
+                        {(current) => (
+                          <>
+                            <Text variant="body-sm">
+                              {t("messaging.slack.managed.connected", { workspace: current().name })}
+                            </Text>
+                            <div class="agent-slack-actions">
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                disabled={state.pending}
+                                onClick={() =>
+                                  void openSlack(async () => {
+                                    await props.port.api.disconnectSlackWorkspace(
+                                      { workspaceId: current().workspaceId },
+                                      scoped.server(),
+                                    );
+                                    await load();
+                                  })
+                                }
+                              >
+                                {t("messaging.slack.managed.disconnectWorkspace")}
+                              </Button>
+                            </div>
+                          </>
+                        )}
+                      </Show>
+                    </li>
+                    <li>
+                      <Text variant="body-sm">{t("messaging.slack.managed.addStep", { name: props.agentName })}</Text>
+                      <div class="agent-slack-actions">
+                        <Button
+                          size="sm"
+                          disabled={state.pending || !workspace()}
+                          onClick={() => {
+                            const current = workspace();
+                            if (!current) return;
+                            void act(() =>
+                              props.port.api.createSlackApp(
+                                { agentId: scoped.agentId(), workspaceId: current.workspaceId },
+                                scoped.server(),
+                              ),
+                            );
+                          }}
+                        >
+                          {t("messaging.slack.managed.add")}
+                        </Button>
+                      </div>
+                    </li>
+                  </ol>
                   <Text variant="caption" tone="muted">
-                    {t("messaging.slack.managed.connectHint")} {t("messaging.slack.managed.limit")}
+                    {t("messaging.slack.managed.limit")}
                   </Text>
                 </SettingsSection>
               </Show>
               <Show
                 when={connected() && connection()}
                 fallback={
-                  <SettingsSection
-                    title={
-                      props.port.managedApps ? t("messaging.slack.setup.ownTitle") : t("messaging.slack.setup.title")
-                    }
-                  >
-                    <ol class="agent-slack-steps">
-                      <li>
-                        <Text variant="body-sm">{t("messaging.slack.setup.create", { name: props.agentName })}</Text>
-                        <div class="agent-slack-actions">
-                          <Button size="sm" onClick={() => void setup("open")}>
-                            {t("messaging.slack.setup.createButton")}
-                          </Button>
-                          <Button size="sm" variant="outline" onClick={() => void setup("copy")}>
-                            {state.copied
-                              ? t("messaging.slack.setup.manifestCopied")
-                              : t("messaging.slack.setup.copyManifest")}
-                          </Button>
-                        </div>
-                      </li>
-                      <li>
-                        <Text variant="body-sm">{t("messaging.slack.setup.install")}</Text>
-                      </li>
-                      <li>
-                        <Text variant="body-sm">{t("messaging.slack.setup.appToken")}</Text>
-                      </li>
-                      <li>
-                        <Text variant="body-sm">{t("messaging.slack.setup.invite", { name: props.agentName })}</Text>
-                      </li>
-                    </ol>
-                    <form
-                      class="agent-slack-form"
-                      onSubmit={(event) => {
-                        event.preventDefault();
-                        void connect();
-                      }}
-                    >
-                      <SettingsField label={t("messaging.slack.setup.botToken")}>
-                        <Input
-                          type="password"
-                          autocomplete="off"
-                          spellcheck={false}
-                          placeholder={t("messaging.slack.setup.botTokenPlaceholder")}
-                          value={state.botToken}
-                          onValueChange={(value) =>
-                            setState((draft) => {
-                              draft.botToken = value;
-                            })
-                          }
-                        />
-                      </SettingsField>
-                      <SettingsField label={t("messaging.slack.setup.appTokenLabel")}>
-                        <Input
-                          type="password"
-                          autocomplete="off"
-                          spellcheck={false}
-                          placeholder={t("messaging.slack.setup.appTokenPlaceholder")}
-                          value={state.appToken}
-                          onValueChange={(value) =>
-                            setState((draft) => {
-                              draft.appToken = value;
-                            })
-                          }
-                        />
-                      </SettingsField>
-                      <Button
-                        type="submit"
-                        disabled={!state.botToken.trim() || !state.appToken.trim()}
-                        loading={state.pending}
-                        loadingLabel={t("messaging.slack.setup.connecting")}
-                      >
-                        {t("messaging.slack.setup.connect")}
-                      </Button>
-                    </form>
-                  </SettingsSection>
+                  <Show when={!props.port.managedApps}>
+                    <Text variant="body-sm" tone="secondary">
+                      {t("messaging.slack.managed.hostOnly", { name: props.agentName })}
+                    </Text>
+                  </Show>
                 }
               >
                 {(current) => (
@@ -587,11 +500,7 @@ export function AgentSlackSettings(props: AgentSlackSettingsProps) {
         open={state.confirmDisconnect}
         tone="destructive"
         title={t("messaging.slack.status.disconnectTitle")}
-        description={
-          connection()?.managed
-            ? t("messaging.slack.status.disconnectManagedDescription")
-            : t("messaging.slack.status.disconnectDescription")
-        }
+        description={t("messaging.slack.status.disconnectDescription")}
         confirmLabel={t("messaging.slack.status.disconnect")}
         pending={state.pending}
         onCancel={() =>

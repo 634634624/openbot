@@ -106,6 +106,7 @@
     "dev:api": "bun scripts/dev-services.ts api",
     "dev:test-client": "bun scripts/dev-services.ts test-client",
     "dev:all": "bun scripts/dev-services.ts all",
+    "dev:slack": "bun scripts/dev-services.ts app --slack",
     "mobile": "bun run --cwd apps/mobile start",
     "mobile:go": "bun run --cwd apps/mobile start:go",
     "mobile:go:tunnel": "bun run --cwd apps/mobile start:go:tunnel",

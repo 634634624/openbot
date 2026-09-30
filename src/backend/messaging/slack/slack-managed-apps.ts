@@ -11,6 +11,9 @@ import { SlackApiError, SlackWebApi } from "./slack-web-api";
 
 export const SLACK_WORKSPACE_KEY_PREFIX = "slack-workspace:";
 
+/** The user of a workspace entry that a development configuration token made, not a Slack sign-in. */
+export const DEVELOPMENT_SLACK_USER = "development";
+
 /** How long a sign-in or an install link stays usable. */
 const PENDING_TTL_MS = 15 * 60_000;
 /** How long the host waits for the ingress socket before it creates an app. */
@@ -79,10 +82,6 @@ export class SlackManagedApps {
     this.#options = options;
   }
 
-  static isManaged(credentials: Record<string, string> | null): boolean {
-    return credentials?.signingSecret !== undefined;
-  }
-
   workspaces(): SlackWorkspace[] {
     return this.workspaceKeys().flatMap((key) => {
       const values = this.#options.credentials.get(key);
@@ -122,13 +121,17 @@ export class SlackManagedApps {
     return true;
   }
 
-  /** Forgets the manager token and asks Slack to revoke it. The agents' apps keep working. */
+  /**
+   * Forgets the manager token and asks Slack to revoke it. The agents' apps keep working. A
+   * development configuration token is only forgotten: the developer made it by hand and uses it
+   * again after a restart.
+   */
   async disconnectWorkspace(workspaceId: string): Promise<void> {
     const key = `${SLACK_WORKSPACE_KEY_PREFIX}${workspaceId}`;
-    const token = this.#options.credentials.get(key)?.accessToken;
+    const values = this.#options.credentials.get(key);
     await this.#options.credentials.clear(key);
-    if (token)
-      await this.#api(token)
+    if (values?.accessToken && values.userId !== DEVELOPMENT_SLACK_USER)
+      await this.#api(values.accessToken)
         .call("auth.revoke")
         .catch(() => undefined);
   }
@@ -246,26 +249,36 @@ export class SlackManagedApps {
     return null;
   }
 
-  /** Brings each managed app's name and description in step with its agent. */
-  async sync(agents: ReadonlyMap<string, { name: string; description: string }>): Promise<void> {
+  /**
+   * Brings each managed app's name and description in step with its agent. With `checkAddress`,
+   * also asks the account service for the request URL, and moves an app whose Signal address
+   * changed: a new Signal host, or a new tunnel in development. Every route token stays valid, so an
+   * app keeps its URL while the address is the same.
+   */
+  async sync(agents: ReadonlyMap<string, { name: string; description: string }>, checkAddress = false): Promise<void> {
     for (const record of this.#options.store.connections()) {
       const managed = this.#managed(record.connectionId);
       const agent = agents.get(record.agentId);
       if (!managed || !agent || !record.appId) continue;
-      const manifest = slackManifest(agent, {
-        requestUrl: managed.requestUrl,
-        redirectUrl: this.#options.manager.installRedirectUrl(),
-      });
-      const hash = manifestHash(manifest);
-      if (hash === managed.manifestHash) continue;
       const token = this.#optionalManagerToken(managed.workspaceId);
       if (!token) continue;
+      let requestUrl = managed.requestUrl;
+      if (checkAddress) {
+        const current = await this.#options.ingress.requestUrl(record.connectionId).catch(() => requestUrl);
+        if (new URL(current).origin !== new URL(requestUrl).origin) requestUrl = current;
+      }
+      const manifest = slackManifest(agent, { requestUrl, redirectUrl: this.#options.manager.installRedirectUrl() });
+      const hash = manifestHash(manifest);
+      if (hash === managed.manifestHash && requestUrl === managed.requestUrl) continue;
+      const release = this.#options.ingress.acquire();
       this.#urlChecks.set(record.connectionId, Date.now() + URL_CHECK_WINDOW_MS);
       try {
+        await this.#waitForIngress();
         await this.#api(token).call("apps.manifest.update", { app_id: record.appId, manifest });
-        await this.#options.credentials.set(record.connectionId, { ...managed, manifestHash: hash });
+        await this.#options.credentials.set(record.connectionId, { ...managed, requestUrl, manifestHash: hash });
       } finally {
         this.#urlChecks.delete(record.connectionId);
+        release();
       }
     }
   }

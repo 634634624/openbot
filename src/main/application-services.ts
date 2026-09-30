@@ -54,6 +54,7 @@ import { MailboxStore } from "../backend/mailbox-store";
 import { McpOAuth } from "../backend/mcp-oauth-provider";
 import { MessagingService } from "../backend/messaging/messaging-service";
 import { slackDriver } from "../backend/messaging/slack/slack-driver";
+import { DEVELOPMENT_SLACK_USER, SLACK_WORKSPACE_KEY_PREFIX } from "../backend/messaging/slack/slack-managed-apps";
 import { SidebarLayoutStore } from "../backend/sidebar-layout-store";
 import { StorageUsageScanner, StorageUsageService } from "../backend/storage-usage";
 import { TeamChatStore } from "../backend/team-chat-store";
@@ -145,6 +146,7 @@ import {
 } from "./session-configuration";
 import { readSetupState } from "./setup-store";
 import { SkillMarketplaceService } from "./skill-marketplace-service";
+import { startSlackDevCallbackServer } from "./slack-dev-callback-server";
 import { SlackIngress } from "./slack-ingress";
 import { TeamStore } from "./team-store";
 import { TeamWebRtcBridge } from "./team-webrtc-bridge";
@@ -816,6 +818,17 @@ export async function createApplicationServices({
     logger.warn(
       `OpenBot could not read the messaging token file (${messagingCredentialLoadError.name}). It was left unchanged.`,
     );
+  // Development only, until Slack enrolls the manager app: a Slack app configuration token stands
+  // in for the manager token of one workspace. `apps.manifest.*` accepts both. It expires in 12 hours.
+  const developmentSlackToken = app.isPackaged ? undefined : process.env.OPENBOT_DEV_SLACK_CONFIG_TOKEN;
+  const developmentSlackWorkspace = app.isPackaged ? undefined : process.env.OPENBOT_DEV_SLACK_WORKSPACE_ID;
+  if (developmentSlackToken && developmentSlackWorkspace)
+    await messagingCredentials.set(`${SLACK_WORKSPACE_KEY_PREFIX}${developmentSlackWorkspace}`, {
+      accessToken: developmentSlackToken,
+      workspaceId: developmentSlackWorkspace,
+      workspaceName: process.env.OPENBOT_DEV_SLACK_WORKSPACE_NAME || developmentSlackWorkspace,
+      userId: DEVELOPMENT_SLACK_USER,
+    });
   // The Signal socket of the Slack apps that OpenBot manages. The host id is read when the socket
   // opens, and the team store is built further down, so it starts as "no name yet".
   let slackIngressHostId: () => string | null = () => null;
@@ -854,13 +867,26 @@ export async function createApplicationServices({
           { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) },
           (value) => requiredString(decodeRecord(value, "Slack sign-in"), "authorizeUrl"),
         ),
-      installRedirectUrl: () => centralAuth.resolveApiUrl("/slack/connect"),
+      // Slack accepts only an HTTPS redirect, and a development account API is plain HTTP.
+      installRedirectUrl: () =>
+        (!app.isPackaged && process.env.OPENBOT_DEV_SLACK_REDIRECT_URL) || centralAuth.resolveApiUrl("/slack/connect"),
       openExternal: (url) => shell.openExternal(url),
     },
   });
   // Not awaited: a connection waits for Slack, and the app does not wait for it.
   void messaging.start().catch((error) => logger.warn("Messaging connections did not start.", toLogValue(error)));
   teardown.push(TEARDOWN_ORDER.messaging, "the messaging connections", () => messaging.stop());
+  // Development only: `bun run dev:slack` tunnels this port, so a Slack sign-in reaches this dev app
+  // and not an installed OpenBot that owns the `openbot://` scheme.
+  const developmentSlackCallbackPort = app.isPackaged ? 0 : Number(process.env.OPENBOT_DEV_SLACK_CALLBACK_PORT ?? 0);
+  if (developmentSlackCallbackPort > 0) {
+    const callback = await startSlackDevCallbackServer(developmentSlackCallbackPort, (signIn) =>
+      signIn.kind === "slack-install"
+        ? messaging.completeSlackInstall(signIn.state, signIn.code)
+        : messaging.completeSlackWorkspace(signIn.nonce, signIn.grant),
+    );
+    teardown.push(TEARDOWN_ORDER.slackIngress, "the Slack development callback", () => callback.close());
+  }
   // The capability and the tool list both follow the daemon, and nothing else can tell them: no
   // provider probe reaches the driver, because the driver is this process's child.
   // The held state first: the providers start at `unavailable`, and a listener hears only what
@@ -989,6 +1015,8 @@ export async function createApplicationServices({
   await teamStore.initialize();
   slackIngressHostId = () => teamStore.getIdentity()?.serverId ?? null;
   slackIngress.reconnect();
+  // Now that the host has its identity: move each Slack app to this start's addresses.
+  void messaging.syncSlackApps().catch((error) => logger.warn("Slack apps were not updated.", toLogValue(error)));
   // After `teamStore.initialize()` and before `HostService`, which reads the account it activates.
   if (developmentRemoteRole) {
     await applyDevelopmentRemoteAccount({

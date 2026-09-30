@@ -47,10 +47,9 @@ const PREVIEW_THREADS: MessagingThread[] = [
 const PREVIEW_WORKSPACE: SlackWorkspace = { workspaceId: "T0PREVIEW", name: "Preview workspace" };
 
 /**
- * The Slack connection of each preview agent. A connect with tokens of the right form connects at
- * once to a preview workspace that already has two conversations; anything else fails the way the
- * host does. The managed path connects the preview workspace, creates an app that waits for its
- * install, and connects when the install page opens.
+ * The Slack connection of each preview agent. Connecting Slack connects a preview workspace. Adding
+ * an agent creates an app that waits for its install, and opening the install page connects it to
+ * a workspace that already has two conversations.
  */
 export function createMockMessaging(agentName: (agentId: string) => string | undefined): MessagingDesktopApi {
   const connections = new Map<string, MessagingConnection>();
@@ -85,35 +84,6 @@ export function createMockMessaging(agentName: (agentId: string) => string | und
   };
   return {
     getOverview: async ({ agentId }) => overview(agentId),
-    getSlackSetup: async ({ agentId }) => {
-      const name = requireAgent(agentId);
-      const manifest = {
-        display_information: { name },
-        settings: { socket_mode_enabled: true, interactivity: { is_enabled: true } },
-      };
-      return {
-        manifestJson: JSON.stringify(manifest, null, 2),
-        createAppUrl: `https://api.slack.com/apps?new_app=1&manifest_json=${encodeURIComponent(JSON.stringify(manifest))}`,
-      };
-    },
-    connectSlack: async ({ agentId, botToken, appToken }) => {
-      requireAgent(agentId);
-      if (!botToken.startsWith("xoxb-")) throw new Error(sourceText("error.messaging.botTokenInvalid"));
-      if (!appToken.startsWith("xapp-")) throw new Error(sourceText("error.messaging.appTokenInvalid"));
-      connections.set(agentId, {
-        agentId,
-        platform: "slack",
-        enabled: true,
-        state: "connected",
-        workspaceName: "Preview workspace",
-        botUserId: "U0PREVIEW",
-        missingScopes: [],
-        retryAt: null,
-        credentials: "saved",
-        managed: false,
-      });
-      return overview(agentId);
-    },
     reconnect: async ({ agentId }) => change(agentId, { enabled: true, state: "connected" }),
     setEnabled: async ({ agentId, enabled }) => change(agentId, { enabled, state: enabled ? "connected" : "paused" }),
     disconnect: async ({ agentId }) =>
@@ -151,7 +121,6 @@ export function createMockMessaging(agentName: (agentId: string) => string | und
         missingScopes: [],
         retryAt: null,
         credentials: "saved",
-        managed: true,
       });
       return overview(agentId);
     },

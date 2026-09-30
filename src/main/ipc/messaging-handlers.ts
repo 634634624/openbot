@@ -2,7 +2,7 @@
 // goes there, and the host answers only an owner or admin. Tokens only travel towards the host; no
 // result carries one.
 
-import { decodeMessagingOverview, decodeMessagingThread, decodeSlackSetup } from "@openbot/contracts/ipc";
+import { decodeMessagingOverview, decodeMessagingThread } from "@openbot/contracts/ipc";
 import type { TeamCurrentCapability } from "@openbot/contracts/team-protocol/current";
 import { MESSAGING_CAPABILITY, MESSAGING_ROUTES } from "@openbot/contracts/team-protocol/messaging-v1";
 import { sourceText } from "@openbot/i18n/source";
@@ -11,7 +11,6 @@ import type { ResponseDecoder } from "../remote-host-decoding";
 import type { RemoteRequestInit } from "../remote-server-client";
 import type { IpcGroupHandlers } from "./define-ipc-group";
 import {
-  parseConnectSlackInput,
   parseCreateSlackAppInput,
   parseMessagingAgentInput,
   parseReadMessagingThreadInput,
@@ -29,8 +28,6 @@ interface MessagingIpcDependencies {
   messaging: Pick<
     MessagingService,
     | "overview"
-    | "slackSetup"
-    | "connectSlack"
     | "reconnect"
     | "setEnabled"
     | "disconnect"
@@ -62,14 +59,6 @@ export function messagingIpcHandlers({
       getOverview: scopedHandler(parseMessagingAgentInput, {
         local: ({ agentId }) => messaging.overview(agentId),
         remote: (input, serverId) => remote(serverId, MESSAGING_ROUTES.overview, input, decodeMessagingOverview),
-      }),
-      getSlackSetup: scopedHandler(parseMessagingAgentInput, {
-        local: ({ agentId }) => messaging.slackSetup(agentId),
-        remote: (input, serverId) => remote(serverId, MESSAGING_ROUTES.slackSetup, input, decodeSlackSetup),
-      }),
-      connectSlack: scopedHandler(parseConnectSlackInput, {
-        local: (input) => messaging.connectSlack(input),
-        remote: (input, serverId) => remote(serverId, MESSAGING_ROUTES.slackConnect, input, decodeMessagingOverview),
       }),
       reconnect: scopedHandler(parseMessagingAgentInput, {
         local: ({ agentId }) => messaging.reconnect(agentId),

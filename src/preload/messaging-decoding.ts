@@ -4,19 +4,12 @@
 import {
   isMessagingOverview,
   isMessagingThread,
-  isSlackSetup,
   type MessagingOverview,
   type MessagingThread,
-  type SlackSetup,
 } from "@openbot/contracts/ipc";
 
 export function decodeMessagingOverviewReply(value: unknown): MessagingOverview {
   if (!isMessagingOverview(value)) throw new Error("Invalid messaging overview response.");
-  return value;
-}
-
-export function decodeSlackSetupReply(value: unknown): SlackSetup {
-  if (!isSlackSetup(value)) throw new Error("Invalid Slack setup response.");
   return value;
 }
 

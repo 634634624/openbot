@@ -5,7 +5,7 @@
  */
 
 import { isBoundedString, isIdentifier, isNullableBoundedString } from "./ipc-bounded-values";
-import { isBoolean, isDynamicRecord, isOneOf, isString } from "./runtime-values";
+import { isBoolean, isDynamicRecord, isOneOf } from "./runtime-values";
 
 export const MESSAGING_PLATFORMS = ["slack"] as const;
 export type MessagingPlatform = (typeof MESSAGING_PLATFORMS)[number];
@@ -17,9 +17,7 @@ export const MESSAGING_CONNECTION_STATES = [
   "paused",
   "invalid_token",
   "missing_scope",
-  "tokens_mismatch",
   "rate_limited",
-  "socket_mode_off",
   "secret_storage_unavailable",
   "error",
   // A managed Slack app exists, and the user has not installed it in the workspace yet.
@@ -38,12 +36,9 @@ export const MESSAGING_LIMITS = {
   name: 256,
   scope: 64,
   scopes: 32,
-  token: 256,
   threads: 200,
   threadMessages: 200,
   messageText: 20_000,
-  manifest: 16_000,
-  url: 32_000,
   workspaces: 50,
 } as const;
 
@@ -59,8 +54,6 @@ export interface MessagingConnection {
   /** When the connection tries again after a rate limit, as an ISO time. */
   retryAt: string | null;
   credentials: MessagingCredentialState;
-  /** True for a Slack app that OpenBot created for the agent through the manager app. */
-  managed: boolean;
 }
 
 /** A Slack workspace where the OpenBot manager app can create an app for each agent. */
@@ -99,21 +92,8 @@ export interface MessagingThread {
   messages: MessagingThreadMessage[];
 }
 
-export interface SlackSetup {
-  /** The app manifest, as JSON text that the user can paste into Slack. */
-  manifestJson: string;
-  /** Opens the Slack "Create app" page with the manifest filled in. */
-  createAppUrl: string;
-}
-
 export interface MessagingAgentInput {
   agentId: string;
-}
-
-export interface ConnectSlackInput {
-  agentId: string;
-  botToken: string;
-  appToken: string;
 }
 
 export interface CreateSlackAppInput {
@@ -154,8 +134,7 @@ export function isMessagingConnection(value: unknown): value is MessagingConnect
     isNullableBoundedString(value.botUserId, MESSAGING_LIMITS.name) &&
     isScopeList(value.missingScopes) &&
     isNullableBoundedString(value.retryAt, 64) &&
-    isOneOf(MESSAGING_CREDENTIAL_STATES, value.credentials) &&
-    isBoolean(value.managed)
+    isOneOf(MESSAGING_CREDENTIAL_STATES, value.credentials)
   );
 }
 
@@ -210,27 +189,12 @@ export function isMessagingThread(value: unknown): value is MessagingThread {
   );
 }
 
-export function isSlackSetup(value: unknown): value is SlackSetup {
-  return (
-    isDynamicRecord(value) &&
-    isBoundedString(value.manifestJson, MESSAGING_LIMITS.manifest) &&
-    isString(value.createAppUrl) &&
-    value.createAppUrl.length <= MESSAGING_LIMITS.url &&
-    value.createAppUrl.startsWith("https://api.slack.com/")
-  );
-}
-
 // The replies of a host's `messaging-v1` routes, as the desktop main process and the browser client
 // read them. The route codec has already checked their bounds; these give them their IPC types and
 // fail closed on anything else. The preload has its own decoders.
 
 export function decodeMessagingOverview(value: unknown): MessagingOverview {
   if (!isMessagingOverview(value)) throw new Error("Invalid messaging overview.");
-  return value;
-}
-
-export function decodeSlackSetup(value: unknown): SlackSetup {
-  if (!isSlackSetup(value)) throw new Error("Invalid Slack setup.");
   return value;
 }
 

@@ -156,10 +156,7 @@ export interface TeamApiAdmin {
   /** `host-update-v1`: the app update of this computer. Advertised also when the host user turned it off. */
   update?: Pick<RequestedUpdate, "snapshot" | "check" | "start" | "cancel" | "changeSettings">;
   /** `messaging-v1`: the Slack connection of each agent on this computer. */
-  messaging?: Pick<
-    MessagingService,
-    "overview" | "slackSetup" | "connectSlack" | "reconnect" | "setEnabled" | "disconnect" | "readThread"
-  >;
+  messaging?: Pick<MessagingService, "overview" | "reconnect" | "setEnabled" | "disconnect" | "readThread">;
 }
 
 interface TeamApiHostIdentity {

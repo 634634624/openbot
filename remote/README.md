@@ -2,7 +2,7 @@
 
 This directory holds our own control plane for WebRTC connections. The Remote API relays SDP and ICE.
 Team files, chats, commands and video never pass through the Remote API or Cloudflare. The one exception
-is a managed Slack app: see [Slack requests](#slack-requests).
+is an agent's Slack app: see [Slack requests](#slack-requests).
 
 ## Flow
 

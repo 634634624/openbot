@@ -695,35 +695,30 @@ describe("Team API host-update-v1", () => {
 });
 
 describe("Team API messaging-v1", () => {
-  it("lets only an admin connect an agent to Slack, and never sends a token back", async () => {
-    const BOT = "xoxb-5555-6666-routebottoken";
-    const APP = "xapp-1-A5-7777-routeapptoken";
-    const received: string[] = [];
-    const overview = (saved: boolean) => ({
+  it("lets only an admin change an agent's Slack connection, and cuts a long message to the frozen bound", async () => {
+    const changes: string[] = [];
+    const overview = (enabled: boolean) => ({
       connection: {
         agentId: "chief",
         platform: "slack" as const,
-        enabled: saved,
-        state: saved ? ("connected" as const) : ("paused" as const),
-        workspaceName: saved ? "Test workspace" : null,
-        botUserId: saved ? "UBOT" : null,
+        enabled,
+        state: enabled ? ("connected" as const) : ("paused" as const),
+        workspaceName: "Test workspace",
+        botUserId: "UBOT",
         missingScopes: [],
         retryAt: null,
-        credentials: saved ? ("saved" as const) : ("missing" as const),
-        managed: false,
+        credentials: "saved" as const,
       },
       threads: [{ linkId: "link-1", title: "#general", isDirect: false, updatedAt: "2026-09-29T12:00:00.000Z" }],
-      slackWorkspaces: [],
+      slackWorkspaces: [{ workspaceId: "T1", name: "Test workspace" }],
     });
     const messaging = {
-      overview: () => overview(false),
-      slackSetup: () => ({ manifestJson: "{}", createAppUrl: "https://api.slack.com/apps?new_app=1" }),
-      connectSlack: async (input: { botToken: string; appToken: string }) => {
-        received.push(input.botToken, input.appToken);
-        return overview(true);
-      },
+      overview: () => overview(true),
       reconnect: async () => overview(true),
-      setEnabled: async () => overview(true),
+      setEnabled: async (_agentId: string, enabled: boolean) => {
+        changes.push(`enabled:${enabled}`);
+        return overview(enabled);
+      },
       disconnect: async () => overview(false),
       readThread: () => ({
         linkId: "link-1",
@@ -735,28 +730,22 @@ describe("Team API messaging-v1", () => {
     };
     const { admin, asMember, post } = await signedIn("messaging", { admin: { messaging } });
     const withCapability = { ...admin, "OpenBot-Capabilities": "messaging-v1" };
-    const bodies: string[] = [];
-    const send = async (path: string, body: unknown, headers = withCapability) => {
-      const response = await post(path, body, headers);
-      bodies.push(await response.clone().text());
-      return response;
-    };
-    const connect = { agentId: "chief", botToken: BOT, appToken: APP };
+    const pause = { agentId: "chief", enabled: false };
 
-    expect((await send("/v1/admin/messaging/slack/connect", connect, admin)).status).toBe(400);
+    expect((await post("/v1/admin/messaging/set-enabled", pause, admin)).status).toBe(400);
     const member = { ...withCapability, Authorization: asMember.Authorization };
-    expect((await send("/v1/admin/messaging/slack/connect", connect, member)).status).toBe(403);
-    expect(received).toEqual([]);
+    expect((await post("/v1/admin/messaging/set-enabled", pause, member)).status).toBe(403);
+    expect(changes).toEqual([]);
 
-    const connected = await send("/v1/admin/messaging/slack/connect", connect);
-    expect(connected.status).toBe(200);
-    expect((await connected.json()).connection).toMatchObject({ state: "connected", credentials: "saved" });
-    expect(received).toEqual([BOT, APP]);
-    const thread = await (await send("/v1/admin/messaging/thread", { agentId: "chief", linkId: "link-1" })).json();
+    const paused = await post("/v1/admin/messaging/set-enabled", pause, withCapability);
+    expect(paused.status).toBe(200);
+    expect((await paused.json()).connection).toMatchObject({ state: "paused", credentials: "saved" });
+    expect(changes).toEqual(["enabled:false"]);
+    // The removed token routes are not routes any more.
+    expect((await post("/v1/admin/messaging/slack/connect", { agentId: "chief" }, withCapability)).status).toBe(404);
+    const thread = await (
+      await post("/v1/admin/messaging/thread", { agentId: "chief", linkId: "link-1" }, withCapability)
+    ).json();
     expect(thread.messages[0].text).toHaveLength(20_000);
-    for (const body of bodies) {
-      expect(body).not.toContain("routebottoken");
-      expect(body).not.toContain("routeapptoken");
-    }
   });
 });

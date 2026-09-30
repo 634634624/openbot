@@ -20,7 +20,6 @@ const loadAgentSettingsPanel = () => import("./AgentSettingsPanel");
 
 import { Portal } from "@solidjs/web";
 import { createEffect, Loading, lazy, onSettled, Show } from "solid-js";
-import { writeClipboardText } from "../../clipboard";
 import { conversationPort } from "./conversation-port";
 import type { ConversationRuntime } from "./conversation-runtime";
 
@@ -96,15 +95,7 @@ export function ConversationPanels(panelProps: { onOpenUsage?: (trigger: HTMLBut
     if (!serverCanAdminister(server, "messaging-v1")) return undefined;
     if (!runtime) return desktopMessagingPort(server.id, server.kind === "local");
     const api = runtime.admin?.messaging;
-    return api
-      ? {
-          api,
-          serverId: server.id,
-          managedApps: false,
-          openUrl: (url) => runtime.openUrl(url),
-          copyText: writeClipboardText,
-        }
-      : undefined;
+    return api ? { api, serverId: server.id, managedApps: false } : undefined;
   };
   /** Agent settings > Files. */
   const agentFiles = (server: ServerSummary | undefined, agentId: string): AgentFilesOptions | undefined => {

@@ -5,8 +5,6 @@ import { AgentSlackSettings } from "../src/features/messaging/AgentSlackSettings
 import type { MessagingPort } from "../src/features/messaging/messaging-port";
 import { createMockMessaging } from "../src/preview/mock-messaging";
 
-const STORY_TOKENS = { agentId: "chief", botToken: "xoxb-preview-token", appToken: "xapp-preview-token" };
-
 /**
  * The preview host, with the connection already made and then changed by `connection`. `workspace`
  * connects the preview Slack workspace first, for the managed app path.
@@ -14,8 +12,11 @@ const STORY_TOKENS = { agentId: "chief", botToken: "xoxb-preview-token", appToke
 function storyPort(connection?: Partial<MessagingConnection>, workspace = false): MessagingPort {
   const api: MessagingDesktopApi = createMockMessaging((agentId) => (agentId === "chief" ? "Chief" : undefined));
   const ready = (async () => {
-    if (workspace) await api.connectSlackWorkspace({ agentId: "chief" }, "local");
-    if (connection) await api.connectSlack(STORY_TOKENS, "local");
+    if (workspace || connection) await api.connectSlackWorkspace({ agentId: "chief" }, "local");
+    if (connection) {
+      await api.createSlackApp({ agentId: "chief", workspaceId: "T0PREVIEW" }, "local");
+      await api.openSlackInstall({ agentId: "chief" }, "local");
+    }
   })();
   return {
     api: {
@@ -30,8 +31,6 @@ function storyPort(connection?: Partial<MessagingConnection>, workspace = false)
     },
     serverId: "local",
     managedApps: true,
-    openUrl: async () => undefined,
-    copyText: async () => undefined,
   };
 }
 
@@ -70,10 +69,10 @@ export const Setup: Story = {};
 export const WorkspaceConnected: Story = { args: { workspace: true } };
 
 export const AwaitingInstall: Story = {
-  args: { workspace: true, connection: { state: "awaiting_install", managed: true, botUserId: null } },
+  args: { connection: { state: "awaiting_install", botUserId: null } },
 };
 
-export const RelayUnavailable: Story = { args: { connection: { state: "relay_unavailable", managed: true } } };
+export const RelayUnavailable: Story = { args: { connection: { state: "relay_unavailable" } } };
 
 export const Connected: Story = { args: { connection: {} } };
 

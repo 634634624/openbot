@@ -194,14 +194,12 @@ import type {
   TestMcpServerInput,
 } from "./ipc-mcp-servers";
 import type {
-  ConnectSlackInput,
   CreateSlackAppInput,
   MessagingAgentInput,
   MessagingOverview,
   MessagingThread,
   ReadMessagingThreadInput,
   SetMessagingEnabledInput,
-  SlackSetup,
   SlackWorkspaceInput,
 } from "./ipc-messaging";
 import type { NotificationOpenedEvent, NotificationPreference } from "./ipc-notifications";
@@ -559,8 +557,6 @@ export const IPC_ENDPOINTS = {
   // remote admin reaches the host. A token only travels towards the host; no result carries one.
   messaging: {
     getOverview: scopedRequest<MessagingAgentInput, MessagingOverview, "required">()("messaging:get-overview"),
-    getSlackSetup: scopedRequest<MessagingAgentInput, SlackSetup, "required">()("messaging:get-slack-setup"),
-    connectSlack: scopedRequest<ConnectSlackInput, MessagingOverview, "required">()("messaging:connect-slack"),
     reconnect: scopedRequest<MessagingAgentInput, MessagingOverview, "required">()("messaging:reconnect"),
     setEnabled: scopedRequest<SetMessagingEnabledInput, MessagingOverview, "required">()("messaging:set-enabled"),
     disconnect: scopedRequest<MessagingAgentInput, MessagingOverview, "required">()("messaging:disconnect"),

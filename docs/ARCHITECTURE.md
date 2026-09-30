@@ -645,7 +645,7 @@ the saved messages, and can be tried again when the provider connects or the app
 Current remote connections use Team API protocol v5 over three ordered WebRTC DataChannels: `rpc`,
 `events`, and `files`. A sandboxed hidden Chromium page owns each `RTCPeerConnection`. Electron main
 uses a `MessagePort` and transfers binary data as `ArrayBuffer`. Signal carries SDP and ICE only,
-except the Slack requests of a managed Slack app (see [Messaging connections](#messaging-connections)).
+except the Slack requests of an agent's Slack app (see [Messaging connections](#messaging-connections)).
 OpenBot Mobile uses the same ticket, authentication transcript, framing, RPC codec, and event stream.
 In Expo Go, an Expo DOM component owns the browser `RTCPeerConnection` inside a hidden WebView and
 passes only serializable, validated commands and events to the native React UI; no native WebRTC
@@ -1388,22 +1388,17 @@ No account API, Signal, IPC contract, or database migration changes are required
 ## Messaging connections
 
 An agent can answer in an external chat platform. Slack is the first platform; [messaging.md](messaging.md)
-has the setup, the limits and how to add a platform. Each agent has its own Slack app, of one of two
-kinds:
-
-- **An app the user creates** from a manifest. The host opens a Socket Mode WebSocket to Slack, so it
-  needs no public address, and the account API and Signal carry nothing of it.
-- **A managed app**, which the host creates through the OpenBot Slack manager app
-  (`SlackManagedApps`, `apps.manifest.*`). Its request URL is `https://signal.openbot.run/v1/slack/events/<route>`.
-  The route token is an ES256 JWT that `apps/auth-api` signs with its own key for a host that proves
-  its machine token; it names the host and the connection, so Signal needs no table. Signal passes the
-  exact request body to the host's `ingress` socket (`SlackIngress` in main, a plain `ws` client:
-  no WebRTC, so no hidden window) and returns the host's answer within 2.5 s, or 503 so that Slack
-  sends it again. The host checks Slack's signature with the app's signing secret, which never
-  leaves it. An `ingress` socket is not a `host` socket: Signal never attaches a client to it, and
-  it opens while a managed connection exists, published or not. The manager token of a workspace
-  reaches the host from the account API's OAuth callback sealed to a one-use host key
-  (`@openbot/contracts/slack-workspace-grant`); the account API keeps nothing.
+has the setup, the limits and how to add a platform. Each agent has its own Slack app, which the host
+creates through the OpenBot Slack manager app (`SlackManagedApps`, `apps.manifest.*`). Its request URL
+is `https://signal.openbot.run/v1/slack/events/<route>`. The route token is an ES256 JWT that
+`apps/auth-api` signs with its own key for a host that proves its machine token; it names the host and
+the connection, so Signal needs no table. Signal passes the exact request body to the host's `ingress`
+socket (`SlackIngress` in main, a plain `ws` client: no WebRTC, so no hidden window) and returns the
+host's answer within 2.5 s, or 503 so that Slack sends it again. The host checks Slack's signature
+with the app's signing secret, which never leaves it. An `ingress` socket is not a `host` socket:
+Signal never attaches a client to it, and it opens while a Slack connection exists, published or not.
+The manager token of a workspace reaches the host from the account API's OAuth callback sealed to a
+one-use host key (`@openbot/contracts/slack-workspace-grant`); the account API keeps nothing.
 
 The code has two halves. `MessagingThreads` (`src/backend/messaging/`) is built by `AgentService`
 beside `ChannelService` and knows no platform. `MessagingService` is built in the main process and
@@ -1413,9 +1408,8 @@ transport for its events. `messaging-types.ts` is the seam; the core never reads
 - **Storage.** Migration 24 adds `projection_messaging_connections` (one per agent and platform) and
   `projection_messaging_threads` (one per external conversation). Tokens are not in the database:
   `MessagingCredentialStore` keeps them encrypted by `safeStorage`, keyed by connection, and only
-  their state crosses IPC or the Team API. A managed app's secrets, request URL and manifest hash are
-  in the same entry, and each workspace's manager token is under `slack-workspace:<id>`, so a managed
-  app needs no column of its own.
+  their state crosses IPC or the Team API. The app's secrets, request URL and manifest hash are in
+  the same entry, and the workspace's manager token is under `slack-workspace:<id>`.
 - **Execution threads.** Each Slack thread or direct message is a link with its own execution thread
   in `projection_threads`, as a channel-agent pair is. `MessagingThreads.event` takes that thread's
   conversation and turn events, so the public chat, the renderer and Team peers never see them.

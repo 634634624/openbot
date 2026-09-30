@@ -1,9 +1,9 @@
 // The seam between the platform-agnostic messaging core and one chat platform. A platform is one
-// `MessagingDriver`: an adapter for its API and a transport for its inbound events. A Slack app that
-// the user made uses Socket Mode; a Discord driver would use the Gateway and a Telegram driver long
-// polling (`getUpdates`). All of them connect out from the host, so no public endpoint is needed.
-// A Slack app that OpenBot manages uses the Events API instead: Slack posts to Signal, and Signal
-// passes each request to this host over the `MessagingIngress` socket, which the host also opens.
+// `MessagingDriver`: an adapter for its API and a transport for its inbound events. A Slack app,
+// which OpenBot creates for the agent, uses the Events API: Slack posts to Signal, and Signal passes
+// each request to this host over the `MessagingIngress` socket, which the host opens. A Discord
+// driver would use the Gateway and a Telegram driver long polling (`getUpdates`). No transport needs
+// a public endpoint on the host.
 
 import type { MessagingConnectionState, MessagingPlatform } from "@openbot/contracts/ipc";
 import type { MessagingAnswerFile } from "./messaging-threads";
@@ -82,9 +82,7 @@ export interface ContextEntry {
 
 /** A failure the connection cannot recover from alone. The user must act. */
 export class MessagingConnectionError extends Error {
-  constructor(
-    readonly state: Extract<MessagingConnectionState, "invalid_token" | "tokens_mismatch" | "socket_mode_off">,
-  ) {
+  constructor(readonly state: Extract<MessagingConnectionState, "invalid_token">) {
     super(state);
   }
 }
@@ -178,8 +176,6 @@ export interface MessagingDriverOptions {
 
 export interface MessagingDriver {
   readonly platform: MessagingPlatform;
-  /** Checks the format of the credentials the user entered. Throws a user-readable error. */
-  validateCredentials(credentials: Record<string, string>): void;
   createAdapter(credentials: Record<string, string>, options: MessagingDriverOptions): MessagingAdapter;
   createTransport(credentials: Record<string, string>, identity: ConnectionIdentity): MessagingTransport;
 }

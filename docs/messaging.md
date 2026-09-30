@@ -5,45 +5,29 @@ An agent can answer in an external chat platform. Slack is supported today. The 
 
 ## Connect an agent to Slack
 
-There are two ways. Both give the agent its own Slack app and its own bot user, so people can
-mention it and send it direct messages, and each agent in a workspace is a separate app.
-
-### Let OpenBot create the app
-
-This is the default on the computer that runs the agent. It needs an OpenBot account, and a name for
-this computer (**Server settings**), because Slack sends the app's events to OpenBot's Signal service,
-which passes them to this computer.
+OpenBot creates a Slack app for each agent, so each agent is its own bot user: people can mention it
+and send it direct messages, and each agent in a workspace is a separate app. This needs an OpenBot
+account and a name for this computer (**Server settings**), because Slack sends the app's events to
+OpenBot's Signal service, which passes them to this computer.
 
 1. Open the agent, then **Agent settings → Slack**.
-2. Select **Connect a Slack workspace**. Slack opens in the browser and asks to let the OpenBot
-   manager app create and change apps. Allow it. You do this one time for each workspace.
-3. Select **Add to** the workspace. OpenBot creates a Slack app with the agent's name and opens its
+2. Select **Connect Slack**. Slack opens in the browser. Select the workspace, and allow the OpenBot
+   manager app to create and change apps there. You do this one time: every agent goes to this
+   workspace.
+3. Select **Add to Slack**. OpenBot creates a Slack app with the agent's name and opens its
    install page. Select **Allow**. If the workspace needs an admin to approve new apps, the
    connection shows **Waiting for install** until the admin approves; then select **Install in
    Slack** again.
 4. In Slack, invite the agent to a channel with `/invite @name`, then mention it.
 
 When the agent is renamed, OpenBot renames its Slack app. **Disconnect**, or deleting the agent,
-deletes the app. **Forget workspace** removes the manager token from this computer and revokes it;
-the apps that exist keep working.
+deletes the app. **Disconnect workspace** removes the manager token from this computer and revokes
+it; the apps that exist keep working. Then **Connect Slack** can connect another workspace.
 
-### Use your own Slack app
-
-1. Open the agent, then **Agent settings → Slack**.
-2. Select **Create Slack app**. Slack opens with a manifest that OpenBot filled in: the agent's name,
-   the bot scopes, the events, interactivity and Socket Mode. Pick the workspace and create the app.
-   **Copy manifest** gives the same manifest to paste by hand.
-3. Install the app to the workspace. In **OAuth & Permissions**, copy the **Bot User OAuth Token**
-   (`xoxb-`).
-4. In **Basic Information → App-Level Tokens**, add a token with the `connections:write` scope and
-   copy it (`xapp-`).
-5. Paste both tokens and select **Connect**. The host checks the bot token with Slack before it
-   stores anything.
-6. In Slack, invite the agent to a channel with `/invite @name`, then mention it.
-
-On a joined server, an owner or admin can do the same from their own computer or the browser client
-at `/app`. The host must advertise `messaging-v1`. A managed app can be created only on the host's
-own desktop, because Slack returns to that computer's browser.
+Only the computer that runs the agent can add it to Slack, because Slack returns to that computer's
+browser. On a joined server, an owner or admin can see the connection, reconnect, pause, resume or
+disconnect it, and read its conversations from their own computer or the browser client at `/app`.
+The host must advertise `messaging-v1`.
 
 ## What the agent does in Slack
 
@@ -60,19 +44,46 @@ own desktop, because Slack returns to that computer's browser.
 - `stop` or `cancel` in the thread, or the **Stop** button, stops the request of the person who
   sends it.
 
+## Test Slack locally
+
+Slack must reach Signal and the dev app over public HTTPS, and until Slack enrolls the OpenBot
+manager app, its OAuth cannot give a workspace token. `bun run dev:slack` covers both. It opens a
+`cloudflared` tunnel to Signal and one to a sign-in listener in the dev app, so the install returns
+to the dev app even when an installed OpenBot owns the `openbot://` links.
+
+1. Install `cloudflared` (`brew install cloudflared`).
+2. At <https://api.slack.com/apps>, under **Your App Configuration Tokens**, generate a token for the
+   test workspace. Copy the **Access Token** (`xoxe.xoxp-…`). It lasts 12 hours.
+3. Write `.env.slack-dev` in the worktree root. Git ignores it.
+   ```
+   OPENBOT_DEV_SLACK_CONFIG_TOKEN='xoxe.xoxp-…'
+   OPENBOT_DEV_SLACK_WORKSPACE_ID='T…'
+   OPENBOT_DEV_SLACK_WORKSPACE_NAME='…'
+   ```
+4. In `apps/auth-api/.env.dev`, add `SLACK_ROUTE_PRIVATE_JWK` with the same value as
+   `REMOTE_TICKET_PRIVATE_JWK`, and `SLACK_ROUTE_KEY_ID=openbot-remote-1`. Development only: the
+   ticket key's public key is already in the JWKS that Signal loads.
+5. Run `bun run dev:slack` (add `--isolated` for a profile of this worktree).
+6. Sign in, give this computer a name in **Server settings**, then **Agent settings → Slack → Add to
+   Slack**, and **Allow** on the Slack page.
+
+The token stands in for the workspace's manager token, so the workspace shows as connected and
+**Connect Slack** is not used. **Disconnect workspace** forgets the token until the next start and
+does not revoke it.
+The tunnel addresses change on each start. At start, OpenBot moves each app it made to the new
+address, while the token lasts. A packaged build ignores all of these variables.
+
 ## Troubleshooting
 
 | State | Cause | Action |
 | --- | --- | --- |
-| Token not accepted | Slack refused a token, or the app was uninstalled. | Disconnect, reinstall the app if needed, connect with new tokens. |
-| Tokens do not match | The two tokens are from different Slack apps. | Disconnect, then use both tokens of one app. |
-| Socket Mode is off | Socket Mode was turned off in the app settings. | Turn it on, then **Reconnect**. |
-| Missing permissions | The app has fewer scopes than the manifest asks for. | Add them in **OAuth & Permissions**, reinstall the app, **Reconnect**. |
+| Token not accepted | Slack refused the app's token, or the app was uninstalled. | **Disconnect**, then **Add to Slack** again. |
+| Missing permissions | The app has fewer scopes than OpenBot asks for. | **Disconnect**, then **Add to Slack** again. |
 | Waiting for Slack | Slack rate-limited the app. | Nothing. The host tries again at the time shown. |
-| Tokens unreadable | The host cannot decrypt the stored tokens. | Disconnect, then connect again. |
+| Tokens unreadable | The host cannot decrypt the stored tokens. | **Disconnect**, then **Add to Slack** again. |
 | Reconnecting | The host lost the connection. | Nothing, or **Reconnect** after the network is back. |
-| Waiting for install | A managed app exists, but it is not installed in the workspace. | **Install in Slack**, or ask a workspace admin to approve the app. |
-| Cannot receive events | A managed app gets its events through Signal, and this computer cannot reach it: it is signed out, has no name, or Signal is down. | Sign in, name this computer in **Server settings**, keep OpenBot open. |
+| Waiting for install | The agent's Slack app exists, but it is not installed in the workspace. | **Install in Slack**, or ask a workspace admin to approve the app. |
+| Cannot receive events | The app gets its events through Signal, and this computer cannot reach it: it is signed out, has no name, or Signal is down. | Sign in, name this computer in **Server settings**, keep OpenBot open. |
 
 ## Limits
 
@@ -80,12 +91,10 @@ own desktop, because Slack returns to that computer's browser.
 - An agent runs one turn at a time. A Slack request waits behind the agent's own work and behind
   channel work, and the thread shows that it waits. One agent keeps at most 5 Slack requests waiting,
   and one person at most 2.
-- Use one Slack app per agent and per host. Two hosts with the same app token split Slack's events
-  between them.
 - A free Slack workspace allows at most 10 apps, and each agent uses one. Slack does not document a
   limit for paid plans. A workspace can also require an admin to approve each new app.
-- A managed app gets its events from Slack through Signal. When this computer does not answer, Slack
-  sends an event again after about 1 and 5 minutes, then drops it.
+- Slack sends the events through Signal. When this computer does not answer, Slack sends an event
+  again after about 1 and 5 minutes, then drops it.
 - Anyone who can post in the workspace, guests and Slack Connect members included, can give the
   agent work. The agent runs with the access you gave it. With Turbo or **Always allow**, it runs
   commands without asking.
@@ -103,11 +112,11 @@ core changes:
 - `createAdapter` implements `MessagingAdapter`: post, edit, react, upload, download, history,
   author and place names, and mentions.
 - `createTransport` implements `MessagingTransport` and turns the platform's events into
-  `InboundMessage` and `InboundAction` values. It must connect out from the host.
+  `InboundMessage` and `InboundAction` values. It must not need a public address on the host.
 
 | Platform | Transport | Conversation key | Notes |
 | --- | --- | --- | --- |
-| Slack | Socket Mode WebSocket, or the Events API through Signal for a managed app | `thread_ts`, or `direct` for a DM | Implemented. |
+| Slack | The Events API through Signal | `thread_ts`, or `direct` for a DM | Implemented. |
 | Discord | Gateway WebSocket (`@discordjs/ws` style: heartbeat, resume) | The thread channel id, or the message id that starts a thread | Needs the Message Content intent. Reactions map directly. |
 | Telegram | Long polling with `getUpdates` and an offset | `message_thread_id` in a forum, else the chat id | No history API: store what the bot sees for context. |
 

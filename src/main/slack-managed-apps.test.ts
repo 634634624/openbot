@@ -151,6 +151,7 @@ class FakeSlack {
             oauth_authorize_url: "https://slack.com/oauth/v2/authorize?client_id=client-9",
           });
         }
+        case "apps.manifest.update":
         case "apps.manifest.delete":
         case "auth.revoke":
           return token === MANAGER_TOKEN ? reply({}) : fail("invalid_auth");
@@ -261,41 +262,45 @@ describe.sequential("Managed Slack app end to end", () => {
     const credentials = new MemoryCredentials();
     const authorizations: Array<{ hostNonce: string; hostPublicKey: string }> = [];
     const opened: string[] = [];
+    let requestUrl = REQUEST_URL;
     ingress = new SlackIngress({
       hostId: () => "host-1",
       signedIn: () => true,
       issueTicket: async () => ({ ticket: "ticket-1", signalUrl: signal.url }),
       issueRequestUrl: async (_hostId, id) => {
         connectionId = id;
-        return REQUEST_URL;
+        return requestUrl;
       },
     });
-    messaging = new MessagingService({
-      threads: started.service.messaging,
-      agents: {
-        listAgents: () => started.service.listAgents(),
-        respondToApproval: (input) => started.service.respondToApproval(input),
-        onEvent: (listener) => {
-          started.service.on("event", listener);
-          return () => started.service.off("event", listener);
+    const slackIngress = ingress;
+    const createMessaging = () =>
+      new MessagingService({
+        threads: started.service.messaging,
+        agents: {
+          listAgents: () => started.service.listAgents(),
+          respondToApproval: (input) => started.service.respondToApproval(input),
+          onEvent: (listener) => {
+            started.service.on("event", listener);
+            return () => started.service.off("event", listener);
+          },
         },
-      },
-      credentials,
-      drivers: [slackDriver({ origin: slack.origin, ingress })],
-      downloadsRoot: join(root, "messaging-downloads"),
-      ingress,
-      slackManager: {
-        authorize: async (input) => {
-          authorizations.push(input);
-          return "https://slack.com/oauth/v2/authorize?client_id=manager";
+        credentials,
+        drivers: [slackDriver({ origin: slack.origin, ingress: slackIngress })],
+        downloadsRoot: join(root, "messaging-downloads"),
+        ingress: slackIngress,
+        slackManager: {
+          authorize: async (input) => {
+            authorizations.push(input);
+            return "https://slack.com/oauth/v2/authorize?client_id=manager";
+          },
+          installRedirectUrl: () => "https://openbot.run/slack/connect",
+          openExternal: async (url) => {
+            opened.push(url);
+          },
         },
-        installRedirectUrl: () => "https://openbot.run/slack/connect",
-        openExternal: async (url) => {
-          opened.push(url);
-        },
-      },
-      slackOrigin: slack.origin,
-    });
+        slackOrigin: slack.origin,
+      });
+    messaging = createMessaging();
     await messaging.start();
 
     // The workspace: the manager token comes back sealed to this sign-in's key.
@@ -314,7 +319,7 @@ describe.sequential("Managed Slack app end to end", () => {
 
     // The app: Slack checks the request URL while it creates it, then the install page opens.
     const created = await messaging.createSlackApp({ agentId: agent.id, workspaceId: "T1" });
-    expect(created.connection).toMatchObject({ managed: true, state: "awaiting_install" });
+    expect(created.connection).toMatchObject({ state: "awaiting_install" });
     expect(signal.hellos).toEqual([{ type: "hello", version: 1, peer: "ingress", token: "ticket-1" }]);
     const manifest = JSON.parse(slack.of("apps.manifest.create")[0]?.params.manifest ?? "{}");
     expect(manifest.settings).toMatchObject({
@@ -353,6 +358,17 @@ describe.sequential("Managed Slack app end to end", () => {
     });
     const unknown = await signal.deliver({ connectionId: "messaging-unknown", ...signed(mention) });
     expect([forged.status, stale.status, unknown.status]).toEqual([401, 401, 404]);
+
+    // A restart behind a new Signal address, such as a new tunnel, moves the app to it.
+    await messaging.stop();
+    requestUrl = "https://moved-signal.example.test/v1/slack/events/route-token-2";
+    messaging = createMessaging();
+    await messaging.start();
+    await messaging.syncSlackApps();
+    await waitFor(() => slack.of("apps.manifest.update").length === 1);
+    const moved = JSON.parse(slack.of("apps.manifest.update")[0]?.params.manifest ?? "{}");
+    expect(moved.settings.event_subscriptions.request_url).toBe(requestUrl);
+    await waitFor(() => messaging?.overview(agent.id).connection?.state === "connected");
 
     // Disconnect deletes the app that OpenBot made, with the workspace's manager token.
     await messaging.disconnect(agent.id);

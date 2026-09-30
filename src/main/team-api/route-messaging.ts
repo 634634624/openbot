@@ -4,7 +4,6 @@ import { MESSAGING_CAPABILITY, MESSAGING_ROUTES } from "@openbot/contracts/team-
 import { sourceText } from "@openbot/i18n/source";
 import { redactText } from "@openbot/logging";
 import {
-  parseConnectSlackInput,
   parseMessagingAgentInput,
   parseReadMessagingThreadInput,
   parseSetMessagingEnabledInput,
@@ -23,8 +22,8 @@ const WIRE_MESSAGES = 200;
 
 /**
  * The Slack connection of an agent on this computer, managed from a joined server. Frozen by
- * `messaging-v1`. `requireAdmin` runs on every route. The tokens only arrive here; no response
- * carries one, and no error message quotes the request.
+ * `messaging-v1`. `requireAdmin` runs on every route. No response carries a token, and no error
+ * message quotes the request.
  */
 export async function routeMessaging(
   context: TeamApiRequestContext,
@@ -41,10 +40,6 @@ export async function routeMessaging(
     switch (url.pathname) {
       case MESSAGING_ROUTES.overview:
         return json(200, wireOverview(messaging.overview(parsed(parseMessagingAgentInput, body).agentId)));
-      case MESSAGING_ROUTES.slackSetup:
-        return json(200, messaging.slackSetup(parsed(parseMessagingAgentInput, body).agentId));
-      case MESSAGING_ROUTES.slackConnect:
-        return json(200, wireOverview(await messaging.connectSlack(parsed(parseConnectSlackInput, body))));
       case MESSAGING_ROUTES.reconnect:
         return json(200, wireOverview(await messaging.reconnect(parsed(parseMessagingAgentInput, body).agentId)));
       case MESSAGING_ROUTES.setEnabled: {

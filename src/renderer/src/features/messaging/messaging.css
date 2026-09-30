@@ -34,13 +34,6 @@
   margin-top: var(--openbot-space-2);
 }
 
-.agent-slack-form {
-  display: flex;
-  flex-direction: column;
-  gap: var(--openbot-space-3);
-  margin-top: var(--openbot-space-3);
-}
-
 .agent-slack-threads,
 .agent-slack-transcript {
   display: flex;

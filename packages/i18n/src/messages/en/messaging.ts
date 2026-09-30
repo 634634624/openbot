@@ -12,30 +12,15 @@ export const messages = defineMessages("messaging", {
   "messaging.slack.managed.title": "Add {name} to Slack",
   "messaging.slack.managed.intro":
     "OpenBot creates a Slack app for {name}, with its own name. People can mention it in channels and send it direct messages.",
-  "messaging.slack.managed.connectWorkspace": "Connect a Slack workspace",
-  "messaging.slack.managed.connectAnother": "Connect another workspace",
-  "messaging.slack.managed.connectHint": "Slack opens in your browser. You connect each workspace one time.",
+  "messaging.slack.managed.connectStep":
+    "Connect your Slack workspace. Slack opens in your browser, and you select the workspace there.",
+  "messaging.slack.managed.connect": "Connect Slack",
+  "messaging.slack.managed.connected": "Connected to {workspace}.",
+  "messaging.slack.managed.disconnectWorkspace": "Disconnect workspace",
+  "messaging.slack.managed.addStep": "Add {name} to the workspace. Slack asks you to allow the app.",
+  "messaging.slack.managed.add": "Add to Slack",
   "messaging.slack.managed.limit": "A free Slack workspace allows up to 10 apps, and each agent uses one.",
-  "messaging.slack.managed.create": "Add to {workspace}",
-  "messaging.slack.managed.forget": "Forget workspace",
-
-  "messaging.slack.setup.title": "Connect a Slack app",
-  "messaging.slack.setup.ownTitle": "Use your own Slack app",
-  "messaging.slack.setup.create": "Create a Slack app for {name}. OpenBot fills in its settings.",
-  "messaging.slack.setup.createButton": "Create Slack app",
-  "messaging.slack.setup.copyManifest": "Copy manifest",
-  "messaging.slack.setup.manifestCopied": "Manifest copied",
-  "messaging.slack.setup.install":
-    "Install the app to your workspace. In OAuth & Permissions, copy the Bot User OAuth Token (xoxb-).",
-  "messaging.slack.setup.appToken":
-    "In Basic Information, add an app-level token with the connections:write scope (xapp-).",
-  "messaging.slack.setup.invite": "Invite {name} to a channel with /invite, then mention it there.",
-  "messaging.slack.setup.botToken": "Bot token",
-  "messaging.slack.setup.appTokenLabel": "App-level token",
-  "messaging.slack.setup.botTokenPlaceholder": "xoxb-…",
-  "messaging.slack.setup.appTokenPlaceholder": "xapp-…",
-  "messaging.slack.setup.connect": "Connect",
-  "messaging.slack.setup.connecting": "Connecting…",
+  "messaging.slack.managed.hostOnly": "Add {name} to Slack in OpenBot on the computer that runs it.",
 
   "messaging.slack.status.title": "Connection",
   "messaging.slack.status.workspace": "Workspace",
@@ -45,8 +30,6 @@ export const messages = defineMessages("messaging", {
   "messaging.slack.status.disconnect": "Disconnect",
   "messaging.slack.status.disconnectTitle": "Disconnect Slack?",
   "messaging.slack.status.disconnectDescription":
-    "OpenBot removes the tokens from the host. The conversations stay, and you can connect again later.",
-  "messaging.slack.status.disconnectManagedDescription":
     "OpenBot deletes the Slack app of this agent and removes its tokens from the host. The conversations stay.",
   "messaging.slack.status.install": "Install in Slack",
   "messaging.slack.status.missingScopes":
@@ -59,17 +42,13 @@ export const messages = defineMessages("messaging", {
   "messaging.state.paused": "Paused",
   "messaging.state.invalid_token": "Token not accepted",
   "messaging.state.missing_scope": "Missing permissions",
-  "messaging.state.tokens_mismatch": "Tokens do not match",
   "messaging.state.rate_limited": "Waiting for Slack",
-  "messaging.state.socket_mode_off": "Socket Mode is off",
   "messaging.state.secret_storage_unavailable": "Tokens unreadable",
   "messaging.state.error": "Error",
   "messaging.state.awaiting_install": "Waiting for install",
   "messaging.state.relay_unavailable": "Cannot receive events",
-  "messaging.help.invalid_token": "Slack did not accept a token. Disconnect, then connect with new tokens.",
-  "messaging.help.tokens_mismatch":
-    "The bot token and the app-level token are from different Slack apps. Disconnect, then use two tokens of one app.",
-  "messaging.help.socket_mode_off": "Turn on Socket Mode in the settings of the Slack app, then reconnect.",
+  "messaging.help.invalid_token":
+    "Slack no longer accepts the app of this agent. It may have been uninstalled. Disconnect, then add the agent to Slack again.",
   "messaging.help.secret_storage_unavailable":
     "OpenBot cannot read the saved tokens on the host. Disconnect, then connect again.",
   "messaging.help.relay_unavailable":

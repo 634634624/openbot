@@ -1,19 +1,18 @@
 // @vitest-environment node
 
 // End to end on the real modules: `AgentService` with its SQLite database and mailbox, the
-// messaging core, and the Slack driver with its Web API client and Socket Mode transport. Slack is a
-// local fake: one HTTP server for the Web API, file upload and download, and a WebSocket server for
-// Socket Mode on the same port. Only the provider is faked, as in every agent service test.
-// Writes .openbot-build/slack-e2e/report.json.
+// messaging core, and the Slack driver with its Web API client and Events API transport. Slack is a
+// local fake: one HTTP server for the Web API and file upload and download. Its events arrive signed,
+// as Signal passes them on; `src/main/slack-managed-apps.test.ts` covers the Signal socket itself.
+// Only the provider is faked, as in every agent service test. Writes .openbot-build/slack-e2e/report.json.
 
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { join, resolve } from "node:path";
 import type { AgentEvent, AgentSummary } from "@openbot/contracts/ipc";
-import { type DynamicRecord, isDynamicRecord, isString } from "@openbot/contracts/runtime-values";
+import { type DynamicRecord, isString } from "@openbot/contracts/runtime-values";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { type WebSocket, WebSocketServer } from "ws";
 import type { AgentService } from "../agent-service";
 import {
   type FakeAgentClient,
@@ -25,45 +24,34 @@ import {
   waitFor,
 } from "../agent-service-test-harness";
 import { type MessagingCredentials, MessagingService } from "./messaging-service";
+import type { MessagingIngress } from "./messaging-types";
 import { slackDriver } from "./slack/slack-driver";
 import { SLACK_BOT_SCOPES } from "./slack/slack-manifest";
 
 const REPORT_DIR = resolve(import.meta.dirname, "../../../.openbot-build/slack-e2e");
 const BOT_TOKEN = "xoxb-1111-2222-testbottoken";
-const APP_TOKEN = "xapp-1-A1-3333-testapptoken";
+const SIGNING_SECRET = "00112233445566778899aabbccddeeff";
 
 interface SlackCall {
   method: string;
   params: Record<string, string>;
 }
 
-/** A Slack workspace with one app: the Web API over HTTP and Socket Mode over a WebSocket. */
+/** A Slack workspace with one app: the Web API over HTTP, and events signed with the app's secret. */
 class FakeSlack {
   readonly calls: SlackCall[] = [];
   readonly uploads = new Map<string, Buffer>();
-  readonly acks = new Set<string>();
   readonly files = new Map<string, Buffer>();
   readonly replies = new Map<string, DynamicRecord[]>();
   appId = "A1";
   rejectBotToken = false;
   rateLimitOnce: string | null = null;
   #server: Server | null = null;
-  #sockets: WebSocketServer | null = null;
-  #socket: WebSocket | null = null;
   #ts = 1000;
   origin = "";
 
   async start(): Promise<void> {
     this.#server = createServer((request, response) => void this.#handle(request, response));
-    this.#sockets = new WebSocketServer({ server: this.#server, path: "/socket" });
-    this.#sockets.on("connection", (socket) => {
-      this.#socket = socket;
-      socket.on("message", (data) => {
-        const frame = JSON.parse(data.toString());
-        if (isDynamicRecord(frame) && isString(frame.envelope_id)) this.acks.add(frame.envelope_id);
-      });
-      socket.send(JSON.stringify({ type: "hello", connection_info: { app_id: this.appId }, num_connections: 1 }));
-    });
     await new Promise<void>((resolve) => this.#server?.listen(0, "127.0.0.1", resolve));
     const address = this.#server.address();
     if (!address || typeof address === "string") throw new Error("The fake Slack has no port.");
@@ -71,19 +59,25 @@ class FakeSlack {
   }
 
   async stop(): Promise<void> {
-    for (const client of this.#sockets?.clients ?? []) client.terminate();
-    this.#sockets?.close();
     await new Promise<void>((resolve) => this.#server?.close(() => resolve()));
   }
 
-  connected(): boolean {
-    return this.#socket?.readyState === 1;
-  }
-
-  /** Sends one envelope and waits for the host to acknowledge it. */
-  async send(type: "events_api" | "interactive", payload: DynamicRecord, envelopeId = randomUUID()): Promise<void> {
-    this.#socket?.send(JSON.stringify({ type, envelope_id: envelopeId, payload }));
-    await waitFor(() => this.acks.has(envelopeId));
+  /** Sends one event or button press to the app's request URL, signed, and waits for the answer. */
+  async send(type: "events_api" | "interactive", payload: DynamicRecord): Promise<void> {
+    const body =
+      type === "events_api"
+        ? JSON.stringify({ type: "event_callback", api_app_id: this.appId, event_id: randomUUID(), ...payload })
+        : new URLSearchParams({ payload: JSON.stringify(payload) }).toString();
+    const timestamp = String(Math.floor(Date.now() / 1_000));
+    const signature = `v0=${createHmac("sha256", SIGNING_SECRET).update(`v0:${timestamp}:${body}`).digest("hex")}`;
+    const answer = await messaging?.deliverSlack(connectionId, {
+      kind: type === "events_api" ? "events" : "interactivity",
+      timestamp,
+      signature,
+      retryNum: null,
+      body: Buffer.from(body),
+    });
+    expect(answer).toEqual({ status: 200 });
   }
 
   mention(text: string, ts: string, extra: DynamicRecord = {}): DynamicRecord {
@@ -162,10 +156,6 @@ class FakeSlack {
       response.setHeader("content-type", "application/json");
       response.end(JSON.stringify({ ok: false, error }));
     };
-    if (method === "apps.connections.open") {
-      if (token !== APP_TOKEN) return fail("invalid_auth");
-      return reply({ url: `${this.origin.replace("http", "ws")}/socket` });
-    }
     if (token !== BOT_TOKEN || this.rejectBotToken) return fail("invalid_auth");
     switch (method) {
       case "auth.test":
@@ -194,6 +184,16 @@ class FakeSlack {
   }
 }
 
+/** The Signal relay, always online: `send` above hands each request to the service directly. */
+const onlineIngress: MessagingIngress = {
+  acquire: () => () => undefined,
+  state: () => "online",
+  onState: () => () => undefined,
+  handle: () => undefined,
+  reconnect: () => undefined,
+  requestUrl: async () => "https://signal.example.test/v1/slack/events/route",
+};
+
 class MemoryCredentials implements MessagingCredentials {
   readonly values = new Map<string, Record<string, string>>();
   keys() {
@@ -220,6 +220,7 @@ let root: string;
 let service: AgentService | null = null;
 let messaging: MessagingService | null = null;
 let slack: FakeSlack;
+let connectionId = "";
 const report: Record<string, Record<string, number | boolean | string[]>> = {};
 
 beforeEach(async () => {
@@ -254,12 +255,26 @@ async function connected(options: { autoComplete?: boolean } = {}) {
       },
     },
     credentials,
-    drivers: [slackDriver({ origin: slack.origin })],
+    drivers: [slackDriver({ origin: slack.origin, ingress: onlineIngress })],
     downloadsRoot: join(root, "messaging-downloads"),
+    ingress: onlineIngress,
   });
+  // An installed app, as `SlackManagedApps` leaves it after the install.
+  const record = started.service.messaging.store.ensureConnection(agent.id, "slack");
+  connectionId = record.connectionId;
+  await credentials.set(connectionId, {
+    botToken: BOT_TOKEN,
+    signingSecret: SIGNING_SECRET,
+    clientId: "client-1",
+    clientSecret: "client-secret",
+    requestUrl: "https://signal.example.test/v1/slack/events/route",
+    workspaceId: "T1",
+    manifestHash: "",
+  });
+  started.service.messaging.store.updateConnection(connectionId, { enabled: true, appId: "A1" });
   await messaging.start();
-  const overview = await messaging.connectSlack({ agentId: agent.id, botToken: BOT_TOKEN, appToken: APP_TOKEN });
   await waitFor(() => messaging?.overview(agent.id).connection?.state === "connected");
+  const overview = messaging.overview(agent.id);
   return { ...started, agent, credentials, events, overview };
 }
 
@@ -394,19 +409,17 @@ describe.sequential("Slack messaging end to end", () => {
     report.approval = { refusedOther: true, accepted: true, interrupted: true };
   });
 
-  it("refuses a token Slack does not accept, and removes the tokens with the agent", async () => {
+  it("stops on a token Slack no longer accepts, and removes the tokens with the agent", async () => {
     const { agent, credentials } = await connected();
     slack.rejectBotToken = true;
-    await expect(
-      messaging?.connectSlack({ agentId: agent.id, botToken: "xoxb-9999-8888-othertoken", appToken: APP_TOKEN }),
-    ).rejects.toThrow("Slack did not accept the bot token.");
+    await messaging?.reconnect(agent.id);
+    await waitFor(() => messaging?.overview(agent.id).connection?.state === "invalid_token");
     slack.rejectBotToken = false;
     expect(credentials.values.size).toBe(1);
 
     await service?.deleteAgent(agent.id);
     await waitFor(() => credentials.values.size === 0);
     expect(service?.messaging.store.connections()).toEqual([]);
-    await waitFor(() => !slack.connected());
     report.deletion = { credentialsLeft: credentials.values.size };
   });
 

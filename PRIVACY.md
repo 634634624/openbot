@@ -304,8 +304,8 @@ the mail client shows images. The image address is the same in every message and
 recipient.
 
 Cloudflare processes account and configuration API requests. It does not carry Team API, file,
-message, command, Remote Desktop media, or Remote Desktop input traffic. For a managed Slack app, it
-exchanges the Slack sign-in and returns the install page; see [Slack connections](#slack-connections). Cloudflare and the email
+message, command, Remote Desktop media, or Remote Desktop input traffic. For an agent's Slack app, it
+exchanges the Slack sign-in and serves the install page; see [Slack connections](#slack-connections). Cloudflare and the email
 provider can keep their own security, delivery, and network logs under their own policies. These
 provider logs are outside the OpenBot application database and its daily maintenance task.
 
@@ -367,7 +367,7 @@ media connection. ICE uses a direct peer-to-peer path when possible. If a direct
 Agents, conversations, queues, direct messages, attachments, browser data, prompts, approvals, and
 Remote Desktop data remain on the host. The central account service does not copy them into D1 or
 R2. The Signal service does not proxy them or write them to logs. The host does not need a public
-inbound port. The one thing Signal passes to a host is the Slack events of a managed Slack app, in
+inbound port. The one thing Signal passes to a host is the Slack events of an agent's Slack app, in
 transit; see [Slack connections](#slack-connections).
 
 An owner or admin of a joined server can manage its host from their own computer, or from the
@@ -401,26 +401,20 @@ Network traffic can also occur when:
 
 ## Slack connections
 
-An agent that the user connects to Slack uses its own Slack app in the user's workspace. There are
-two kinds:
+An agent that the user connects to Slack gets its own Slack app, which OpenBot creates in the user's
+workspace. A workspace member first lets the OpenBot Slack manager app create apps in the workspace.
+The account service exchanges that sign-in with Slack, because the manager app's secret lives there,
+and gives the resulting token to the computer encrypted to a key that only that computer has. The
+account service keeps no Slack token. The computer then creates the agent's app and keeps its
+secrets. Slack sends the app's events, which contain the Slack messages that address the agent, to
+OpenBot's Signal service (`signal.openbot.run`). Signal passes each request to the computer over its
+Signal connection, in transit only: it does not store, log, or read the message, and it cannot check
+Slack's signature, which only the computer can. The browser that returns from Slack's install page
+carries a one-use install code through `openbot.run`; the code is useless without the app's secret
+on the computer. The agent's answers go from the computer to the Slack Web API directly.
 
-- **An app the user creates.** The computer that runs the agent opens a Socket Mode connection to
-  `slack.com` and calls the Slack Web API directly. Nothing goes through an OpenBot server.
-- **An app OpenBot creates (managed).** A workspace member first lets the OpenBot Slack manager app
-  create apps in the workspace. The account service exchanges that sign-in with Slack, because the
-  manager app's secret lives there, and gives the resulting token to the computer encrypted to a key
-  that only that computer has. The account service keeps no Slack token. The computer then creates
-  the agent's app and keeps its secrets. Slack sends the app's events, which contain the Slack
-  messages that address the agent, to OpenBot's Signal service (`signal.openbot.run`). Signal passes
-  each request to the computer over its Signal connection, in transit only: it does not store,
-  log, or read the message, and it cannot check Slack's signature, which only the computer can.
-  The browser that returns from Slack's install page carries a one-use install code through
-  `openbot.run`; the code is useless without the app's secret on the computer. The agent's answers
-  go from the computer to the Slack Web API directly.
-
-- **Stored on the host.** The bot token and the app-level token, or a managed app's bot token,
-  signing secret and client secret, and the manager token of each connected workspace, are
-  encrypted by the operating system's secret storage, like provider API keys, and redacted from
+- **Stored on the host.** The app's bot token, signing secret and client secret, and the manager
+  token of the connected workspace, are encrypted by the operating system's secret storage, like provider API keys, and redacted from
   logs, exports and diagnostics.
   The database holds the workspace name and ids of the Slack app, and one row per Slack thread or
   direct message the agent answers. The messages of that thread are kept as a conversation of the
