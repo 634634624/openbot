@@ -7,8 +7,9 @@
   shows. On a built-in display with no notch, it no longer draws a notch. Each preview scales so
   that the widest width fits its frame, and keeps that scale while the setting changes.
 
-- A lower or higher Dynamic Island now has smaller or larger bottom corners, in proportion to its
-  height, so it keeps the shape of the default island. At 100% height nothing changes.
+- A lower Dynamic Island now has smaller bottom corners (7.9px at 75% height, 14px at 100%), and a
+  higher one larger corners. On an external display the island stays a capsule at every height. At
+  100% height nothing changes.
 
 ### Changed
 

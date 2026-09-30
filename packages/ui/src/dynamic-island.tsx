@@ -480,7 +480,7 @@ interface IslandSilhouetteGeometry {
 
 /**
  * The compact height against the height the island has by default. A lower island gets smaller
- * bottom corners, so a short island keeps the shape of the default one.
+ * bottom corners, and a higher one larger corners.
  */
 function compactHeightScale(props: Pick<DynamicIslandProps, "compactHeight" | "notchSize">): number {
   const base = props.notchSize?.height ?? DEFAULT_COMPACT_HEIGHT;
@@ -497,7 +497,9 @@ function islandSilhouetteTarget(
     return { topRadius: 0, bottomRadius: 0, capsuleRadius: 16 * compactScale };
   }
   if (state === "expanded") return { topRadius: 19, bottomRadius: 24 };
-  return { topRadius: 6, bottomRadius: 14 * compactScale };
+  // A lower island loses its corners faster than its height, or a short island reads as a pill.
+  const cornerScale = compactScale < 1 ? compactScale * compactScale : compactScale;
+  return { topRadius: 6, bottomRadius: 14 * cornerScale };
 }
 
 interface SharedElementTransform {
