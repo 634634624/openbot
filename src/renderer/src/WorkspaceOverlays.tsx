@@ -8,7 +8,7 @@ import { desktopAnalytics } from "./analytics";
 import { appPort } from "./app-port";
 import { useAuth } from "./features/account/account-context";
 import { useAgents } from "./features/agents/agents-context";
-import { createGitHubConnector } from "./features/connectors/github-connector";
+import { createGitHubConnector, type GitHubConnectorController } from "./features/connectors/github-connector";
 import { useCustomAgents } from "./features/custom-agents/custom-agents-context";
 import { useCustomProviders } from "./features/custom-providers/custom-providers-context";
 import { useProviderDetection } from "./features/custom-providers/provider-detection-context";
@@ -62,14 +62,30 @@ interface AccountProps {
  * the components here read the desktop contexts and pass them on.
  */
 export function WorkspaceOverlays(props: AccountProps) {
+  const { activeServer } = useServers();
+  const { skillsMarketplaceOpen } = useSettings();
+  const { serverSettingsOpen, serverSettingsTarget } = useServerSettings();
+  /* One GitHub connection of this computer, which Server settings and the Marketplace both show.
+     A build with no GitHub App has none. */
+  const github = createGitHubConnector();
+  const githubFor = (server: ServerSummary | undefined) =>
+    server?.kind === "local" && github.status().available ? github : undefined;
+  /* The overlays mount with the app. A first read that failed then must not hide GitHub for good, and
+     the sign-in can change outside this window, so each window reads the status again when it opens. */
+  createEffect(
+    () => skillsMarketplaceOpen() || serverSettingsOpen(),
+    (open) => {
+      if (open) github.reload();
+    },
+  );
   return (
     <>
       <PermissionsReview account={props.account} />
-      <SkillsMarketplace />
+      <SkillsMarketplace githubConnector={githubFor(activeServer())} />
       <SharedAgentInstall />
       <JoinServer account={props.account} />
       <AddServer />
-      <ServerSettings />
+      <ServerSettings githubConnector={githubFor(serverSettingsTarget())} />
       <AppSettings account={props.account} />
       <GlobalMessageSearch />
       <RemoteDesktop />
@@ -114,7 +130,7 @@ function PermissionsReview(props: AccountProps) {
  * serves `agent-install-v1`, otherwise to this computer. An agent of a joined server is updated from
  * its listing only when its host serves `agent-update-v1`.
  */
-function SkillsMarketplace() {
+function SkillsMarketplace(props: { githubConnector: GitHubConnectorController | undefined }) {
   const { skillsMarketplaceOpen, setSkillsMarketplaceOpen, pendingPluginSlug, setPendingPluginSlug } = useSettings();
   const { agentList, activeAgent, agentStatus, agentSetupOpen, creatingAgent } = useAgents();
   const { selectAgent } = useNavigation();
@@ -133,6 +149,7 @@ function SkillsMarketplace() {
       onAgentInstalled={openInstalledMarketplaceAgent}
       pluginSlug={pendingPluginSlug()}
       onPluginSlugConsumed={() => setPendingPluginSlug(null)}
+      githubConnector={props.githubConnector}
     />
   );
 }
@@ -207,7 +224,7 @@ function AddServer() {
  * Settings for one server, which is any server on the rail rather than the
  * active one - hence the target held by the domain instead of `activeServer()`.
  */
-function ServerSettings() {
+function ServerSettings(props: { githubConnector: GitHubConnectorController | undefined }) {
   const platform = usePlatform();
   const { hostStatus, setServerMuted, setServerNotificationLevel } = useServers();
   const { selectAgent, selectGlobalSearchMessage } = useNavigation();
@@ -241,7 +258,6 @@ function ServerSettings() {
     remove: localAgents.deleteCustomAgent,
     check: localAgents.checkCustomAgent,
   };
-  const github = createGitHubConnector();
   /**
    * Whether the tool runtimes the providers context holds are this server's: this computer's, or,
    * over `providers-v1`, those of the host of the joined server on screen.
@@ -276,11 +292,6 @@ function ServerSettings() {
     setMcpServerEnabled,
     testMcpServer,
   } = useServerSettings();
-  // The overlay mounts with the app. A first read that failed then must not hide GitHub for good.
-  createEffect(serverSettingsOpen, (open) => {
-    if (open) github.reload();
-  });
-
   // The workspace belongs to the selected server. For another server, the switch comes first and
   // the agent is published for the scope it lands in; a message there opens as its agent's chat.
   const openOnServer = (server: ServerSummary, agentId: string, open: () => void) => {
@@ -458,8 +469,7 @@ function ServerSettings() {
                 }
               : undefined
           }
-          // The GitHub connection belongs to this computer, and a build with no GitHub App has none.
-          githubConnector={server().kind === "local" && github.status().available ? github : undefined}
+          githubConnector={props.githubConnector}
         />
       )}
     </Show>
