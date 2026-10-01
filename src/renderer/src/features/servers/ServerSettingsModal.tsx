@@ -34,7 +34,7 @@ import {
   toast,
   UsersRound,
 } from "@openbot/ui";
-import { GitHubConnectorPanel } from "@openbot/ui/features/settings/GitHubConnectorPanel";
+import type { AgentProfile } from "@openbot/ui/data";
 import { SaveBarDock, SettingsDialogShell } from "@openbot/ui/features/settings/SettingsDialogShell";
 import { SettingsHostedSitesTab } from "@openbot/ui/features/settings/SettingsHostedSitesTab";
 import {
@@ -43,7 +43,9 @@ import {
 } from "@openbot/ui/features/settings/stores/hosted-sites-store";
 import { useText } from "@openbot/ui/text";
 import { createEffect, createSignal, onCleanup, Show, untrack } from "solid-js";
-import { type GitHubConnectorController, githubPanelProps } from "../connectors/github-connector";
+import { ConnectorsPanel } from "../connectors/ConnectorsPanel";
+import type { GitHubConnectorController } from "../connectors/github-connector";
+import type { SlackConnectorController } from "../connectors/slack-connector";
 import { type ServerStorageOptions, ServerStoragePanel } from "../files/ServerStoragePanel";
 import { type HostProviderSettings, HostProviderSettingsPanel } from "../settings/ProviderSettingsSection";
 import type { McpServerConfig, McpTestResult } from "./mcp-servers";
@@ -137,10 +139,14 @@ export interface ServerSettingsModalProps {
    */
   agentImport?: ServerImportOptions | undefined;
   /**
-   * The Connectors section appears only when a caller supplies this: the GitHub connection belongs
-   * to this computer, so a remote server and a build without a GitHub App pass nothing.
+   * The Connectors section appears only when a caller supplies one of these: the GitHub connection
+   * and the Slack apps belong to this computer, so a remote server passes neither, and a build
+   * without a GitHub App passes no GitHub.
    */
   githubConnector?: GitHubConnectorController | undefined;
+  slackConnector?: SlackConnectorController | undefined;
+  /** This computer's agents, for the Slack page. */
+  connectorAgents?: AgentProfile[] | undefined;
   /**
    * The Updates section appears only when a caller supplies this: a remote host with
    * `host-update-v1` that this member administers.
@@ -544,7 +550,7 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
                 <span>{t(sections.import.title)}</span>
               </Tabs.Trigger>
             </Show>
-            <Show when={props.githubConnector}>
+            <Show when={props.githubConnector || props.slackConnector}>
               <Tabs.Trigger class="settings-modal-nav-item" value="connectors">
                 <Plug aria-hidden="true" />
                 <span>{t(sections.connectors.title)}</span>
@@ -660,16 +666,14 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
             </Tabs.Content>
           )}
         </Show>
-        <Show when={props.githubConnector}>
-          {(github) => (
-            <Tabs.Content
-              value="connectors"
-              class="settings-modal-tab-panel server-settings-panel"
-              data-tab="connectors"
-            >
-              <GitHubConnectorPanel {...githubPanelProps(github())} />
-            </Tabs.Content>
-          )}
+        <Show when={props.githubConnector || props.slackConnector}>
+          <Tabs.Content value="connectors" class="settings-modal-tab-panel server-settings-panel" data-tab="connectors">
+            <ConnectorsPanel
+              github={props.githubConnector}
+              slack={props.slackConnector}
+              agents={props.connectorAgents ?? []}
+            />
+          </Tabs.Content>
         </Show>
       </SettingsDialogShell>
 

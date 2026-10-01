@@ -55,6 +55,7 @@ import { hostedSiteIpcHandlers } from "./ipc/hosted-site-handlers";
 import { marketplaceAgentIpcHandlers } from "./ipc/marketplace-agent-handlers";
 import { mcpServerIpcHandlers } from "./ipc/mcp-server-handlers";
 import { memoryIpcHandlers } from "./ipc/memory-handlers";
+import { messagingIpcHandlers } from "./ipc/messaging-handlers";
 import { notificationIpcHandlers } from "./ipc/notification-handlers";
 import { pluginIpcHandlers } from "./ipc/plugin-handlers";
 import { providerAdminIpcHandlers } from "./ipc/provider-admin-handlers";
@@ -213,7 +214,7 @@ let relaunchRequested = false;
  * and the sign-in waiting for that grant lives in this process. It is also never held: a grant is
  * answered by the sign-in that started it, and there is no such sign-in before the app is running.
  */
-type RendererDeepLink = Exclude<DeepLink, { kind: "mcp-auth" }>;
+type RendererDeepLink = Exclude<DeepLink, { kind: "mcp-auth" | "slack-workspace" }>;
 
 // One link at a time, of whichever kind: a second replaces the first, because what a user opened
 // last is what they meant. `deepLinkReceiverReady` says a window has asked for it, which is what
@@ -387,6 +388,7 @@ function registerIpcHandlers({
   service,
   providerRuntimes,
   providerCredentials,
+  messaging,
   mailbox,
   browser,
   browserPictureInPicture,
@@ -518,6 +520,7 @@ function registerIpcHandlers({
       customProviders: customProviderChanges,
       remoteServers,
     }),
+    ...messagingIpcHandlers({ messaging }),
     ...mcpServerIpcHandlers({
       service,
       remoteServers,
@@ -645,6 +648,10 @@ function acceptDeepLink(link: DeepLink): void {
     receiveMcpAuthorizationCode(link.state, link.code);
     return;
   }
+  if (link.kind === "slack-workspace") {
+    receiveSlackSignIn(link);
+    return;
+  }
   pendingDeepLink = link;
   const window = windowHolder.current;
   if (!window || window.isDestroyed() || !deepLinkReceiverReady) return;
@@ -672,7 +679,25 @@ function takePendingDeepLink(kind: RendererDeepLink["kind"]): string | null {
 
 /** A link of a kind a renderer can be sent, or null for one it cannot - which includes no link. */
 function takeRendererDeepLink(link: DeepLink | null): RendererDeepLink | null {
-  return link && link.kind !== "mcp-auth" ? link : null;
+  return link && link.kind !== "mcp-auth" && link.kind !== "slack-workspace" ? link : null;
+}
+
+/**
+ * Hands a Slack install the sealed token it is waiting for. As with an MCP grant, a link this run did
+ * not start does nothing and raises no window.
+ */
+function receiveSlackSignIn(link: Extract<DeepLink, { kind: "slack-workspace" }>): void {
+  const messaging = services?.messaging;
+  if (!messaging) return;
+  void messaging
+    .completeSlackWorkspace(link.nonce, link.grant)
+    .then((accepted) => {
+      const window = windowHolder.current;
+      if (accepted && window && !window.isDestroyed()) showMainWindow(window);
+    })
+    .catch(() => {
+      // The Slack settings show the connection's state. The error can quote Slack.
+    });
 }
 
 /**
@@ -880,6 +905,8 @@ if (!hasSingleInstanceLock) {
       screen.on("display-metrics-changed", reconcileDynamicIsland);
       powerMonitor.on("resume", reconcileDynamicIsland);
       powerMonitor.on("resume", () => remoteServers.wake());
+      // A Slack socket can be dead after sleep without knowing it; reconnect instead of waiting for a ping.
+      powerMonitor.on("resume", () => built.messaging.resume());
       const routineWake = new RoutineWake({ routines: service, isOnline: () => net.isOnline() });
       powerMonitor.on("suspend", () => routineWake.suspend());
       powerMonitor.on("resume", () => routineWake.resume());

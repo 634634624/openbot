@@ -310,10 +310,11 @@ recipient.
 
 Cloudflare processes account and configuration API requests. It does not carry Team API, file,
 message, command, Remote Desktop media, or Remote Desktop input traffic. It forwards sealed iPhone
-Live Activity updates that it cannot read; see [iPhone Live Activity](#iphone-live-activity).
-Cloudflare and the email provider can keep their own security, delivery, and network logs under
-their own policies. These provider logs are outside the OpenBot application database and its daily
-maintenance task.
+Live Activity updates that it cannot read; see [iPhone Live Activity](#iphone-live-activity). For an
+agent's Slack app, it exchanges the Slack sign-in and serves the install page; see
+[Slack connections](#slack-connections). Cloudflare and the email provider can keep their own
+security, delivery, and network logs under their own policies. These provider logs are outside the
+OpenBot application database and its daily maintenance task.
 
 Paid server plans use Stripe. You enter card and billing details on Stripe's pages, not in OpenBot.
 Stripe sends the account service the subscription state, the plan, its price, the period, and the
@@ -381,7 +382,8 @@ media connection. ICE uses a direct peer-to-peer path when possible. If a direct
 Agents, conversations, queues, direct messages, attachments, browser data, prompts, approvals, and
 Remote Desktop data remain on the host. The central account service does not copy them into D1 or
 R2. The Signal service does not proxy them or write them to logs. The host does not need a public
-inbound port.
+inbound port. The one thing Signal passes to a host is the Slack events of an agent's Slack app, in
+transit; see [Slack connections](#slack-connections).
 
 An owner or admin of a joined server can manage its host from their own computer, or from the
 browser client at `/app`. A provider API key, a custom endpoint key or header, the code that a
@@ -422,7 +424,46 @@ Network traffic can also occur when:
   `downloads.cursor.com` (for the download size) for Cursor, and it reads a list of blocked
   versions from `raw.githubusercontent.com/nightly-labs/openbot`. These requests contain no account, agent,
   conversation or file data;
-- a user opens an explicitly labeled external support or setup link.
+- a user opens an explicitly labeled external support or setup link;
+- a Slack workspace is connected. See [Slack connections](#slack-connections).
+
+## Slack connections
+
+A workspace member installs the OpenBot Slack app in their workspace from OpenBot on their computer.
+The account service exchanges that install with Slack, because the app's secret lives there. It
+records which OpenBot computer answers the workspace: the Slack workspace ID, the computer, the
+OpenBot account that connected it, and the Slack app and bot user IDs. It keeps no Slack token and no
+message. It gives the bot token to the computer encrypted to a key that only that computer has.
+
+Slack sends the workspace's events, which contain the Slack messages in the channels OpenBot is in
+and its direct messages, to OpenBot's Signal service (`signal.openbot.run`). Signal checks Slack's
+signature and reads only the app ID and the workspace ID, to find the computer. It passes each request to that
+computer over its Signal connection, in transit only: it does not store or log the message. The
+answers go from the computer to the Slack Web API directly.
+
+- **Stored on the host.** The bot token is encrypted by the operating system's secret storage, like
+  provider API keys, and redacted from logs, exports and diagnostics. The database holds the
+  workspace name and IDs, which agent is its Slack Orchestrator, and one row per Slack
+  thread that an agent answers. The messages of that thread are kept as a conversation of that
+  agent, with the Slack display name of each author, and files people send are kept with the agent's
+  attachments. Disconnect revokes and removes the token and keeps the conversations; deleting an
+  agent removes its conversations.
+- **Read from Slack.** The messages that mention OpenBot, the replies in a thread an agent answers,
+  its direct messages, the files in them, the display names of their authors, the names of the
+  channels, and earlier messages of a thread as context. OpenBot joins every public channel of the
+  workspace, and Slack sends every message of each channel that OpenBot is in; the computer keeps
+  only the messages that address OpenBot or continue a conversation.
+- **Given to the Slack Orchestrator.** Every new Slack request goes first to the orchestrator agent,
+  which runs on its provider like any other agent and passes the work to a teammate with the facts
+  it needs.
+- **Sent to Slack.** The agents' answers and the files they attach, short status posts ("Working on
+  it…"), reactions, and approval requests with the command, folder and
+  reason the provider gave, redacted. A failed request posts a fixed sentence, never the provider's
+  error.
+
+Anyone who can post in the Slack workspace, guests and Slack Connect members included, can give the
+agents work. The agents run on the host with the access the user gave them. A hosted server stays awake
+while a Slack connection is live.
 
 Plugin pages on openbot.run show each listing's own icon. The page asks `openbot.run` for that
 picture, and the website fetches it there from the address the plugin catalog holds, so reading a

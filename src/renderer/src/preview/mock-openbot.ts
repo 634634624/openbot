@@ -102,6 +102,7 @@ import { createMockChannels } from "./mock-channels";
 import { createMockGitHubConnector } from "./mock-github-connector";
 import { createMockHostUpdate, type MockHostUpdateOptions } from "./mock-host-update";
 import { createMockHostedServers } from "./mock-hosted-servers";
+import { createMockMessaging } from "./mock-messaging";
 import { createMockProviderRuntimes, type MockProviderRuntimeOptions } from "./mock-provider-runtimes";
 import { applySidebarLayoutAction } from "./mock-sidebar-layout";
 import { createMockSkills, type MockSkillsOptions } from "./mock-skills";
@@ -679,6 +680,9 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
         return clone(detectionSettings);
       },
     },
+    // Preview has one host, so every server answers for the same agents.
+    // The Slack Orchestrator of the preview is its first agent.
+    messaging: createMockMessaging(() => agents[0]?.id ?? "preview-agent"),
     // Preview has one host, so every server answers from the same providers as this computer.
     providerAdmin: {
       // A host signs Claude in with a code its page shows, which the user pastes back.

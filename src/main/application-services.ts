@@ -42,6 +42,7 @@ import type {
   VoiceModelStatus,
 } from "@openbot/contracts/ipc";
 import { IPC_ENDPOINTS, isManagedToolRuntime, isUpdateBusyPhase } from "@openbot/contracts/ipc";
+import { decodeRecord, requiredString } from "@openbot/contracts/ipc-decoding";
 import { sourceText } from "@openbot/i18n/source";
 import { createOpenBotLogger, toLogValue } from "@openbot/logging";
 import { REMOTE_ACCOUNT_CHECK_INTERVAL_MS } from "@openbot/team-client";
@@ -52,6 +53,8 @@ import { AgentStore } from "../backend/agent-store";
 import { BrowserHost } from "../backend/browser-host";
 import { MailboxStore } from "../backend/mailbox-store";
 import { McpOAuth } from "../backend/mcp-oauth-provider";
+import { MessagingService } from "../backend/messaging/messaging-service";
+import { slackDriver } from "../backend/messaging/slack/slack-driver";
 import { SidebarLayoutStore } from "../backend/sidebar-layout-store";
 import { StorageUsageScanner, StorageUsageService } from "../backend/storage-usage";
 import { TeamChatStore } from "../backend/team-chat-store";
@@ -128,6 +131,7 @@ import {
 import { ManagedSkillService } from "./managed-skill-service";
 import { startMcpOAuthRedirectServer } from "./mcp-oauth-redirect-server";
 import { McpOAuthStore } from "./mcp-oauth-store";
+import { MessagingCredentialStore } from "./messaging-credential-store";
 import { probeModels } from "./model-server-probe";
 import { NotificationPreferenceStore } from "./notification-preference-store";
 import { ProviderCredentialStore } from "./provider-credential-store";
@@ -149,6 +153,8 @@ import {
 } from "./session-configuration";
 import { readSetupState } from "./setup-store";
 import { SkillMarketplaceService } from "./skill-marketplace-service";
+import { SLACK_DEV_CALLBACK_PATH, startSlackDevCallbackServer } from "./slack-dev-callback-server";
+import { SlackIngress } from "./slack-ingress";
 import { TeamStore } from "./team-store";
 import { TeamWebRtcBridge } from "./team-webrtc-bridge";
 import { TeamWebRtcClientTransport } from "./team-webrtc-client-transport";
@@ -189,6 +195,7 @@ const LEGACY_REMOTE_DESKTOP_CREDENTIAL_FILE = "openbot-remote-desktop-credential
 const REMOTE_DESKTOP_RUNTIME_SECRET_FILE = "openbot-remote-desktop-runtime-v1.json";
 const CUSTOM_PROVIDERS_FILE = "openbot-custom-providers-v1.json";
 const PROVIDER_CREDENTIAL_FILE = "openbot-provider-credentials-v1.json";
+const MESSAGING_CREDENTIAL_FILE = "openbot-messaging-credentials-v1.json";
 /** The MCP sign-ins. Separate from the keys above: a key is typed by the user, a token is not. */
 const MCP_OAUTH_FILE = "openbot-mcp-oauth-v1.json";
 /** The one GitHub sign-in of this computer, with the same cipher as the MCP sign-ins. */
@@ -227,6 +234,10 @@ const TEARDOWN_ORDER = {
   remoteServers: 60,
   voice: 70,
   remoteDesktop: 80,
+  // Before the host and the service: no new external message arrives while they stop.
+  messaging: 85,
+  // After the connections that hold it.
+  slackIngress: 86,
   host: 90,
   teamWebRtcBridge: 100,
   mcpOAuthRedirect: 105,
@@ -267,6 +278,8 @@ export interface ApplicationServices {
   service: AgentService;
   providerRuntimes: ProviderRuntimeManager;
   providerCredentials: ProviderCredentialStore;
+  /** The Slack connections of the agents on this host. */
+  messaging: MessagingService;
   /** Reached by the entry point for one thing only: handing a returning grant to its sign-in. */
   mcpOAuth: McpOAuth;
   githubConnector: GitHubConnectorService;
@@ -861,6 +874,96 @@ export async function createApplicationServices({
     tables,
   });
   teardown.push(TEARDOWN_ORDER.service, "the agent service", () => service.stop());
+  /*
+   * The Slack workspaces where the agents answer. The tokens use the same cipher as every other
+   * secret; an unreadable file is reported, not fatal, and each workspace then connects again.
+   */
+  const messagingCredentials = new MessagingCredentialStore(
+    join(app.getPath("userData"), MESSAGING_CREDENTIAL_FILE),
+    secretCipher,
+  );
+  const messagingCredentialLoadError = await messagingCredentials.load();
+  if (messagingCredentialLoadError)
+    logger.warn(
+      `OpenBot could not read the messaging token file (${messagingCredentialLoadError.name}). It was left unchanged.`,
+    );
+  // The Signal socket that brings the events of the Slack workspaces linked to this host. The host
+  // id is read when the socket opens, and the team store is built further down, so it starts as "no
+  // name yet".
+  let slackIngressHostId: () => string | null = () => null;
+  const slackIngress = new SlackIngress({
+    hostId: () => slackIngressHostId(),
+    signedIn: () => {
+      try {
+        centralAuth.getSignedInUser();
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    issueTicket: (hostId) => centralAuth.issueRemoteHostTicket(hostId),
+    issueSlackRoute: (hostId) => centralAuth.issueSlackRoute(hostId),
+  });
+  teardown.push(TEARDOWN_ORDER.slackIngress, "the Slack ingress socket", () => slackIngress.dispose());
+  // Development only: `bun run dev:slack` names this loopback port, so a Slack install returns to this
+  // dev app and not to an installed OpenBot that owns `openbot://`.
+  const developmentSlackCallbackPort = app.isPackaged ? 0 : Number(process.env.OPENBOT_DEV_SLACK_CALLBACK_PORT ?? 0);
+  const messaging = new MessagingService({
+    threads: service.messaging,
+    agents: {
+      listAgents: () => service.listAgents(),
+      respondToApproval: (input) => service.respondToApproval(input),
+      onEvent: (listener) => {
+        service.on("event", listener);
+        return () => service.off("event", listener);
+      },
+      createAgentProfile: (input) => service.createAgentProfile(input),
+      createMemory: (input) => service.createMemory(input),
+    },
+    credentials: messagingCredentials,
+    drivers: [slackDriver({ ingress: slackIngress })],
+    downloadsRoot: join(app.getPath("userData"), "messaging-downloads"),
+    ingress: slackIngress,
+    sidebar: sidebarLayout,
+    slackApp: {
+      authorize: (input) => {
+        const hostId = slackIngressHostId();
+        if (!hostId) throw new Error(sourceText("error.messaging.relayUnavailable"));
+        return centralAuth.requestAuthorized(
+          "/v2/slack/authorize",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              hostId,
+              ...input,
+              ...(developmentSlackCallbackPort > 0
+                ? { returnUrl: `http://127.0.0.1:${developmentSlackCallbackPort}${SLACK_DEV_CALLBACK_PATH}` }
+                : {}),
+            }),
+          },
+          (value) => requiredString(decodeRecord(value, "Slack sign-in"), "authorizeUrl"),
+        );
+      },
+      unlink: async (workspaceId) => {
+        const hostId = slackIngressHostId();
+        if (hostId) await centralAuth.unlinkSlackWorkspace(hostId, workspaceId);
+      },
+      openExternal: (url) => shell.openExternal(url),
+    },
+  });
+  // Not awaited: a connection waits for Slack, and the app does not wait for it.
+  void messaging.start().catch((error) => logger.warn("Messaging connections did not start.", toLogValue(error)));
+  teardown.push(TEARDOWN_ORDER.messaging, "the messaging connections", () => messaging.stop());
+  if (developmentSlackCallbackPort > 0) {
+    // As `openbot://` does for a packaged build, a finished install brings OpenBot to the front.
+    const callback = await startSlackDevCallbackServer(developmentSlackCallbackPort, async (nonce, grant) => {
+      const received = await messaging.completeSlackWorkspace(nonce, grant);
+      if (received) app.focus({ steal: true });
+      return received;
+    });
+    teardown.push(TEARDOWN_ORDER.slackIngress, "the Slack development callback", () => callback.close());
+  }
   // A connect, a disconnect or an expiry changes the tools and the `gh` sign-in of every agent.
   githubConnector.onAgentAccessChanged(() => service.notifyGitHubConnectorChanged());
   // The capability and the tool list both follow the daemon, and nothing else can tell them: no
@@ -989,6 +1092,8 @@ export async function createApplicationServices({
     join(app.getPath("userData"), TEAM_FILE),
   );
   await teamStore.initialize();
+  slackIngressHostId = () => teamStore.getIdentity()?.serverId ?? null;
+  slackIngress.reconnect();
   // After `teamStore.initialize()` and before `HostService`, which reads the account it activates.
   if (developmentRemoteRole) {
     await applyDevelopmentRemoteAccount({
@@ -1441,8 +1546,10 @@ export async function createApplicationServices({
     );
     const hostedServerActivity = new HostedServerActivity({
       hostId: hostedServer.hostId,
+      // A live Slack connection counts: stopped, the server could not hear the next message.
       inUse: () =>
         service.hasActiveWork().length > 0 ||
+        messaging.hasLiveConnection() ||
         host.describeRestartBlockers().length > 0 ||
         (host.connectedClientCount() > 0 && Date.now() - (host.lastClientRequestAt() ?? 0) < CLIENT_USE_WINDOW_MS),
       nextRunAt: () => {
@@ -1472,6 +1579,7 @@ export async function createApplicationServices({
     service,
     providerRuntimes,
     providerCredentials,
+    messaging,
     mcpOAuth,
     githubConnector,
     mailbox,

@@ -10,6 +10,7 @@ apps/
   auth-api/          Public web and /app browser entry, accounts, memberships, connection tickets, and billing
   mobile/            Expo React Native client for remote team hosts
   site-router/       Cloudflare Worker that serves published sites from private R2 storage
+  slack-app/         Slack CLI projects with the OpenBot Slack app manifests (production, development)
 packages/
   ui/                Shared SolidJS controls and primitive styles for desktop, web, and Storybook
   brand/             Shared logos, avatars, and design tokens
@@ -649,7 +650,8 @@ the saved messages, and can be tried again when the provider connects or the app
 
 Current remote connections use Team API protocol v5 over three ordered WebRTC DataChannels: `rpc`,
 `events`, and `files`. A sandboxed hidden Chromium page owns each `RTCPeerConnection`. Electron main
-uses a `MessagePort` and transfers binary data as `ArrayBuffer`. Signal carries SDP and ICE only.
+uses a `MessagePort` and transfers binary data as `ArrayBuffer`. Signal carries SDP and ICE only,
+except the Slack requests of an agent's Slack app (see [Messaging connections](#messaging-connections)).
 OpenBot Mobile uses the same ticket, authentication transcript, framing, RPC codec, and event stream.
 In Expo Go, an Expo DOM component owns the browser `RTCPeerConnection` inside a hidden WebView and
 passes only serializable, validated commands and events to the native React UI; no native WebRTC
@@ -1485,6 +1487,90 @@ Mobile channel settings use one native sheet with a nested stack for memories an
 memory and routine editors share their controls with agent settings and use channel API operations.
 Channel settings have no provider or model controls because each member retains its own runtime.
 No account API, Signal, IPC contract, or database migration changes are required for mobile channels.
+
+## Messaging connections
+
+The agents of a computer can answer in an external chat platform. Slack is the first platform;
+[messaging.md](messaging.md) has the setup, the limits and how to add a platform. Every workspace
+installs the one OpenBot Slack app (`apps/slack-app`), and the workspace is linked to the host that
+connected it. People mention @OpenBot or send it a direct message. The workspace's Slack Orchestrator,
+an agent that the connect dialog adds, receives each new conversation, asks its teammates and posts
+the answer. Every answer comes from OpenBot.
+
+- **Install.** The desktop asks `POST /v2/slack/authorize` for Slack's install URL, with a one-use host
+  key. The Worker exchanges the code at `/v2/slack/callback`, because the app's client secret lives
+  there. It links the workspace to the host in D1 (`slack_workspace_routes`: team, host, account; no
+  token) and seals the bot token to the host key (`@openbot/contracts/slack-workspace-grant`). The
+  page `/slack/connect` opens `openbot://slack-workspace`. Only the account that linked a workspace
+  can move it to another of its hosts; another account gets `slack_workspace_taken`.
+- **Events.** Slack posts every workspace's events and button presses to one URL,
+  `https://signal.openbot.run/v1/slack/events`. Signal checks Slack's signature with the app's
+  signing secret, answers `url_verification`, and reads only the app ID and the workspace ID. Each
+  signing secret is bound to its app, and a route is one app in one workspace, so the production and
+  development apps can share a workspace. It passes the exact body to the `ingress` socket (`SlackIngress` in main, a plain `ws` client: no WebRTC, so no hidden
+  window) that holds a route ticket for that workspace, and returns the host's answer within 2.5 s,
+  or 503 so that Slack sends it again. The route ticket is an ES256 JWT that `apps/auth-api` signs
+  with its own key for a host that proves its machine token. It names only the workspaces that D1
+  links to that host, expires after 5 minutes, and the host asks for a new one each time the socket
+  connects. Each workspace in the ticket carries the time D1 linked it. When a workspace is unlinked
+  or moved, the Worker sends Signal `slack-route-revoked` through the signed auth-event outbox:
+  Signal drops the route and refuses tickets with that link or an older one, so a host that lost the
+  workspace cannot keep it with the ticket it holds. Signal keeps these revocations in memory, so for
+  one ticket lifetime after it starts it asks the Worker (`/v2/remote/slack-route/validate`, signed
+  like `/v2/remote/resume/validate`) which links of each ticket D1 still has. The host trusts a delivery because Signal checked the signature; no host has the
+  signing secret.
+
+The code has two halves. `MessagingThreads` (`src/backend/messaging/`) is built by `AgentService`
+beside `ChannelService` and knows no platform. `MessagingService` is built in the main process and
+owns the live connections, through one `MessagingDriver` per platform: an adapter for its API and a
+transport for its events. `messaging-types.ts` is the seam; the core never reads a platform payload.
+
+- **Storage.** Migration 25 adds `projection_messaging_connections` (one per workspace, with its
+  orchestrator agent) and `projection_messaging_threads` (one per external conversation, with the
+  agent that answers it).
+  Tokens are not in the database: `MessagingCredentialStore` keeps the bot token encrypted by
+  `safeStorage`, keyed by connection, and only its state crosses IPC.
+- **Orchestrator.** A message in a thread that has a link goes to the link's agent. A new conversation
+  goes to the workspace's orchestrator; without one, Slack is told that no agent answers. The
+  orchestrator is a normal agent (`slack-orchestrator.ts`): its description is its standing remit, and
+  it starts with five memories, which are facts only, because the model reads memories as data. It
+  gives work to one teammate with `send_message`; the request carries `messagingReturn`, so the
+  teammate's answer runs as a follow-up turn in the same Slack thread. A turn that only asked a
+  teammate posts "A teammate is working on it" (`MessagingThreads.awaitsTeammate`). It goes in the
+  sidebar's Integrations section, which `MessagingService` creates the first time; the renderer shows
+  that section collapsed.
+- **Execution threads.** Each Slack thread is a link with its own execution thread in
+  `projection_threads`, as a channel-agent pair is. A direct message is answered in a thread under
+  it, so each one is its own conversation. `MessagingThreads.event` takes that thread's conversation
+  and turn events, so the public chat, the renderer and Team peers never see them. Approvals still
+  reach the host.
+- **Deliveries.** An external message is a mailbox message from `user` with a `messaging` origin
+  (link, author, platform message). No new sender kind, so the frozen Team protocol codecs are
+  unchanged. The queue and the public chat hide it like channel work. A request the agent sends from
+  a Slack turn carries `messagingReturn`, the origin of that turn; `MailboxStore.enqueue` gives the
+  answer to it that origin as `messaging`, so the answer runs in the same execution thread, and its
+  turn posts to Slack as a follow-up. `DrainScheduler` asks `MessagingThreads.prepare` for the thread
+  and the prompt, which frames the text as external input and adds earlier messages of the thread.
+- **Order.** The one-turn-per-agent rule is unchanged, so Slack requests wait behind the agent's own
+  work and behind channel work that holds the host. The Slack thread shows a waiting post.
+- **Replies.** `MessagingThreads` reports each turn start and end. `MessagingService` posts a status
+  with a Stop button, replaces it with the answer, uploads the files the agent attached, and sets
+  reactions. It serializes the posts of one conversation, so a fast turn cannot race its status. No
+  post names the agent.
+- **Approvals and stop.** An approval of a messaging thread is also posted with buttons. Only the
+  Slack user whose message started the turn can answer or stop it; the host can always answer. The
+  button value is a random token that exists only in memory.
+- **Channels.** When a connection starts, OpenBot joins every public channel it is not in
+  (`conversations.list`, `conversations.join`, scope `channels:join`), so people can mention it with
+  no invitation. It joins each new public channel on `channel_created`. A private channel needs
+  `/invite`.
+- **Deduplication.** An in-memory set drops a redelivered event at once; the mailbox idempotency key
+  covers a restart. Events that arrive while no socket is open are lost after Slack's retries.
+- **Screen.** **Server settings → Connectors → Slack** on the computer that runs the agents shows each
+  workspace and its orchestrator, and a two-step dialog connects the workspace and adds the
+  orchestrator on the model the user picks (`messaging:*`). A remote server shows
+  no Slack page, because the install returns to the host's own browser. A live connection counts as
+  use, so a hosted server does not idle out.
 
 ## Skill folders and MCP configuration
 

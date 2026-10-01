@@ -7,8 +7,10 @@ import { createEffect, Loading, Show } from "solid-js";
 import { desktopAnalytics } from "./analytics";
 import { appPort } from "./app-port";
 import { useAuth } from "./features/account/account-context";
+import { resolveCreationModel } from "./features/agents/agent-creation-model";
 import { useAgents } from "./features/agents/agents-context";
 import { createGitHubConnector, type GitHubConnectorController } from "./features/connectors/github-connector";
+import { createSlackConnector } from "./features/connectors/slack-connector";
 import { useCustomAgents } from "./features/custom-agents/custom-agents-context";
 import { useCustomProviders } from "./features/custom-providers/custom-providers-context";
 import { useProviderDetection } from "./features/custom-providers/provider-detection-context";
@@ -26,6 +28,7 @@ import { useServerSwitch } from "./features/servers/server-switch";
 import { useServers } from "./features/servers/servers-context";
 import type { HostProviderSettings } from "./features/settings/ProviderSettingsSection";
 import { useSettings } from "./features/settings/settings-context";
+import { useSidebar } from "./features/sidebar/sidebar-context";
 import { useUpdates } from "./features/updates/updates-context";
 import { useGlobalSearchSources } from "./global-search-sources";
 import { InitialSetup, RemoteDesktopWorkspace, SettingsModal } from "./lazy-views";
@@ -226,11 +229,12 @@ function AddServer() {
  */
 function ServerSettings(props: { githubConnector: GitHubConnectorController | undefined }) {
   const platform = usePlatform();
-  const { hostStatus, setServerMuted, setServerNotificationLevel } = useServers();
+  const { hostStatus, setServerMuted, setServerNotificationLevel, activeServer } = useServers();
   const { selectAgent, selectGlobalSearchMessage } = useNavigation();
   const { selectServer } = useServerSelection();
   const { setPendingAgentSelection } = useServerSwitch();
-  const { agentStatus } = useAgents();
+  const { agentList, agentStatus, modelOptions, serverSetupChoice } = useAgents();
+  const { setupState } = useSetup();
   const {
     toolRuntimeStatuses,
     providerAdminServerId,
@@ -292,6 +296,28 @@ function ServerSettings(props: { githubConnector: GitHubConnectorController | un
     setMcpServerEnabled,
     testMcpServer,
   } = useServerSettings();
+  // The Slack Orchestrator runs on this computer, so its picker lists this computer's models: none
+  // while a joined server is on screen, and then it starts on a new agent's default.
+  const { collapseSidebarSection } = useSidebar();
+  const slack = createSlackConnector(
+    undefined,
+    () => {
+      const options = modelOptions();
+      if (activeServer()?.kind !== "local" || options.length === 0) return undefined;
+      return {
+        modelOptions: options,
+        agentStatus: agentStatus(),
+        initial: resolveCreationModel(serverSetupChoice() ?? setupState(), options),
+        customProviders: localEndpoints.customProviders(),
+        customAgents: localAgents.customAgents(),
+      };
+    },
+    // The Integrations section starts collapsed: the orchestrator is not an agent people chat with
+    // every day. The collapse belongs to the local server, the one on screen when Slack connects.
+    (sectionId) => {
+      if (activeServer()?.kind === "local") collapseSidebarSection(sectionId);
+    },
+  );
   // The workspace belongs to the selected server. For another server, the switch comes first and
   // the agent is published for the scope it lands in; a message there opens as its agent's chat.
   const openOnServer = (server: ServerSummary, agentId: string, open: () => void) => {
@@ -470,6 +496,10 @@ function ServerSettings(props: { githubConnector: GitHubConnectorController | un
               : undefined
           }
           githubConnector={props.githubConnector}
+          // Slack is connected on the computer that runs the agents: Slack opens this computer's browser
+          // and returns to its `openbot://` link.
+          slackConnector={server().kind === "local" ? slack : undefined}
+          connectorAgents={agentList()}
         />
       )}
     </Show>

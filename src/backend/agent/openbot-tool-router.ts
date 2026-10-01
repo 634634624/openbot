@@ -704,6 +704,11 @@ export class OpenBotToolRouter {
       throw new Error("expectsReply must be a boolean.");
     }
 
+    // A request from a Slack turn: the teammate's answer goes back to that Slack thread.
+    const messagingReturn = this.#mailbox
+      .findDeliveriesByTurn(senderAgentId, params.turnId)
+      .map(({ delivery }) => this.#mailbox.messagingOrigin(delivery.id))
+      .find((origin) => origin !== null);
     const receipt = await this.#mailbox.enqueue({
       sender: { kind: "agent", agentId: senderAgentId },
       recipientAgentIds: recipientValues,
@@ -711,6 +716,7 @@ export class OpenBotToolRouter {
       sourcePaths: paths,
       replyToMessageId: replyToMessageId ?? null,
       expectsReply,
+      ...(messagingReturn ? { messagingReturn } : {}),
       idempotencyKey: `${params.threadId}:${params.turnId}:${params.callId}`,
     });
     for (const recipient of recipientValues) {

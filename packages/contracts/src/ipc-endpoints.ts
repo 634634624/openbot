@@ -199,6 +199,13 @@ import type {
   SetMcpServerEnabledInput,
   TestMcpServerInput,
 } from "./ipc-mcp-servers";
+import type {
+  AddSlackOrchestratorInput,
+  AddSlackOrchestratorResult,
+  SetSlackEnabledInput,
+  SlackOverview,
+  SlackWorkspaceInput,
+} from "./ipc-messaging";
 import type { NotificationOpenedEvent, NotificationPreference } from "./ipc-notifications";
 import type {
   DetectedModelServer,
@@ -559,6 +566,19 @@ export const IPC_ENDPOINTS = {
     ),
     deleteCustomProvider: scopedRequest<DeleteCustomProviderInput, CustomProviderResult, "required">()(
       "provider-admin:delete-custom-provider",
+    ),
+  },
+  // The Slack workspaces where this computer's agents answer. Only the host's own desktop can use
+  // these: a connect opens a Slack page in this computer's browser, and the page returns to this
+  // computer's `openbot://` link. A token only travels towards the host; no result carries one.
+  messaging: {
+    getSlackOverview: request<undefined, SlackOverview>()("messaging:get-slack-overview"),
+    connectSlackWorkspace: request<undefined, void>()("messaging:connect-slack-workspace"),
+    disconnectSlackWorkspace: request<SlackWorkspaceInput, void>()("messaging:disconnect-slack-workspace"),
+    reconnectSlackWorkspace: request<SlackWorkspaceInput, void>()("messaging:reconnect-slack-workspace"),
+    setSlackEnabled: request<SetSlackEnabledInput, void>()("messaging:set-slack-enabled"),
+    addSlackOrchestrator: request<AddSlackOrchestratorInput, AddSlackOrchestratorResult>()(
+      "messaging:add-slack-orchestrator",
     ),
   },
   // The server name, logo and app update of one server's host. `host.updateIdentity` and `update`

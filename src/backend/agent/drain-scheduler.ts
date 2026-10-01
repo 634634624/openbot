@@ -4,6 +4,7 @@ import type { AgentProvider } from "../agent-client";
 import type { AgentStore } from "../agent-store";
 import type { ChannelService } from "../channel-service";
 import type { DeliveryContext, MailboxStore } from "../mailbox-store";
+import type { MessagingThreads } from "../messaging/messaging-threads";
 import { decodeTurnResponse } from "../protocol";
 import type { ContextCompaction } from "./context-compaction";
 import type { ConversationRuntime } from "./conversation-runtime";
@@ -53,6 +54,7 @@ export interface DrainSchedulerOptions {
   memory: MemoryHold;
   hooks: DrainHooks;
   channels?: ChannelService;
+  messaging?: MessagingThreads;
 }
 
 /**
@@ -83,6 +85,7 @@ export class DrainScheduler {
   #wakingSlotWaiters = false;
   readonly #hooks: DrainHooks;
   readonly #channels: ChannelService | undefined;
+  readonly #messaging: MessagingThreads | undefined;
   readonly #drainingAgents = new Set<string>();
   /**
    * The model each agent's running turn was started with, by turn id. The agent record can be moved
@@ -115,6 +118,7 @@ export class DrainScheduler {
     this.#memory = options.memory;
     this.#hooks = options.hooks;
     this.#channels = options.channels;
+    this.#messaging = options.messaging;
     this.#slots = new TurnSlots({
       limit: () => this.#memory.turnLimit(),
       agentIds: () => this.#store.list().map((agent) => agent.id),
@@ -260,7 +264,7 @@ export class DrainScheduler {
       const assignment = this.#channels?.store.assignmentForDelivery(context.delivery.id);
       const publicThreadId = assignment
         ? this.#channels?.store.context(assignment.channelId, assignment.agentId).threadId
-        : agent?.threadId;
+        : (this.#messaging?.threadForDelivery(context.delivery.id) ?? agent?.threadId);
       const session =
         agent && publicThreadId ? this.#store.database.activeProviderSession(publicThreadId, agent.provider) : null;
       if (session && this.#compaction.reserve(agentId, session.externalSessionId)) {
@@ -278,9 +282,15 @@ export class DrainScheduler {
   async startDelivery(context: DeliveryContext): Promise<void> {
     const { delivery } = context;
     const channelDelivery = this.#channels ? this.#channels.store.assignmentForDelivery(delivery.id) !== null : false;
-    // The teammate answers that start in this turn too. A channel task always runs alone. The
-    // person's message goes last, so the turn answers it with the answers already read.
-    const companions = channelDelivery ? [] : this.#mailbox.repliesToStartWith(delivery.id);
+    const messagingDelivery = this.#messaging?.ownsDelivery(delivery.id) ?? false;
+    // The teammate answers that start in this turn too. A channel task and an external message
+    // always run alone; a teammate's answer in an external conversation takes the other answers to
+    // the same request. The person's message goes last, so the turn answers it with the answers
+    // already read.
+    const companions =
+      channelDelivery || (messagingDelivery && delivery.sender.kind !== "agent")
+        ? []
+        : this.#mailbox.repliesToStartWith(delivery.id);
     let batch = delivery.sender.kind === "user" ? [...companions, context] : [context, ...companions];
     let confirmedTurnId: string | null = null;
     const claimed = this.#deliveryProviders(delivery.recipientAgentId);
@@ -325,11 +335,21 @@ export class DrainScheduler {
       this.#threads.applyPendingRuntimeRefresh(agent, new Set(batch.map((item) => item.delivery.id)));
       releaseRuntimeRefresh = this.#threads.holdRuntimeRefresh(agent.id);
       const client = await this.#providers.ensureAgentClient(agent);
-      const execution = this.#channels ? await this.#channels.prepare(context) : null;
-      if (channelDelivery && !execution) {
+      const execution = messagingDelivery
+        ? await this.#messaging?.prepare(context)
+        : this.#channels
+          ? await this.#channels.prepare(context)
+          : null;
+      if ((channelDelivery || messagingDelivery) && !execution) {
         const current = this.#mailbox.getDelivery(delivery.id)?.delivery;
         if (current?.status === "starting")
-          await this.#mailbox.markTerminal(delivery.id, "interrupted", "The channel was deleted before starting.");
+          await this.#mailbox.markTerminal(
+            delivery.id,
+            "interrupted",
+            channelDelivery
+              ? "The channel was deleted before starting."
+              : "The messaging thread was removed before starting.",
+          );
         return;
       }
       let threadId = await this.#threads.ensureThread(agent, client, execution?.threadId);
@@ -357,7 +377,7 @@ export class DrainScheduler {
             snapshot,
             routineRun:
               item.delivery.sender.kind === "routine" ? this.#routines.runForDelivery(item.delivery.id) : null,
-            channelText: execution?.text,
+            executionText: execution?.text,
           }),
         ),
         [...requestIds].flatMap((requestId) => this.#mailbox.unansweredRecipients(requestId)),
@@ -471,6 +491,7 @@ export class DrainScheduler {
       }
       this.#mailboxSync.emitQueue(delivery.recipientAgentId);
       this.#channels?.deliveryFailed(delivery.id, "The provider could not start this assignment. Resume to try again.");
+      this.#messaging?.deliveryFailed(delivery.id);
       this.#hooks.emitError("delivery_start_failed", error, delivery.recipientAgentId);
       this.scheduleDrain(delivery.recipientAgentId);
       // The requester may hold the other answers until this request ends.
