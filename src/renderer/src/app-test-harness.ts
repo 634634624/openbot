@@ -573,6 +573,7 @@ export function installOpenbotStub(): void {
       setPreference: vi.fn(async (preference) => ({ ...preference })),
       publishPresentation: vi.fn().mockResolvedValue(undefined),
       getPresentation: vi.fn().mockResolvedValue(null),
+      getBuiltInDisplayGeometry: vi.fn().mockResolvedValue({ width: 192, height: 32 }),
       performAction: vi.fn().mockResolvedValue(undefined),
       performHaptic: vi.fn().mockResolvedValue(undefined),
       onAction: vi.fn(dynamicIslandActionBridge.subscribe),

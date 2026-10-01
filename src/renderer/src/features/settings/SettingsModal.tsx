@@ -4,6 +4,7 @@ import type {
   AvatarImageInput,
   BillingDesktopApi,
   CentralAuthUser,
+  DynamicIslandGeometry,
   HostedServersDesktopApi,
   MobileConnectedDevice,
   MobileConnectTicket,
@@ -36,6 +37,8 @@ export interface SettingsModalProps {
   value: GeneralSettingsValue;
   onValueChange: (value: GeneralSettingsValue) => void;
   appInfo: AppInfo | null;
+  /** The built-in display's notch, null when it has none, or undefined before main answers. */
+  builtInDisplayGeometry?: DynamicIslandGeometry | undefined;
   updateStatus: UpdateStatus;
   onUpdateAction: () => Promise<void>;
   onCancelScheduledRestart?: () => Promise<void>;
@@ -200,6 +203,7 @@ export function SettingsModal(props: SettingsModalProps) {
             <SettingsDynamicIslandTab
               value={props.value}
               variant={props.appInfo?.variant ?? "production"}
+              builtInDisplayGeometry={props.builtInDisplayGeometry}
               onUpdateSetting={updateSetting}
               onUpdateSettings={updateSettings}
             />

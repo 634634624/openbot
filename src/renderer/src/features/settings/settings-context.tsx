@@ -1,4 +1,8 @@
-import { type ApprovalAutomationPreference, agentAutoApprovalEnabled } from "@openbot/contracts/ipc";
+import {
+  type ApprovalAutomationPreference,
+  agentAutoApprovalEnabled,
+  type DynamicIslandGeometry,
+} from "@openbot/contracts/ipc";
 import { toast } from "@openbot/ui";
 import { DEFAULT_GENERAL_SETTINGS, type GeneralSettingsValue } from "@openbot/ui/features/settings/app-settings";
 import { currentText } from "@openbot/ui/text";
@@ -40,6 +44,8 @@ const Settings = createSimpleContext({
 
     const [analyticsPreferenceLoaded, setAnalyticsPreferenceLoaded] = createSignal<boolean | null>(null);
     const [skillsMarketplaceOpen, setSkillsMarketplaceOpen] = createSignal(false);
+    // Undefined until main answers. The Settings preview then draws the notch it had before.
+    const [builtInDisplayGeometry, setBuiltInDisplayGeometry] = createSignal<DynamicIslandGeometry | undefined>();
     /**
      * The plugin an `openbot://plugins/<slug>` link asked for, held beside the open flag because the
      * marketplace is loaded lazily: the slug has to outlive the chunk load that shows it. It is a
@@ -352,6 +358,10 @@ const Settings = createSimpleContext({
           })),
         )
         .catch(() => undefined);
+      void settingsPort()
+        .dynamicIsland.getBuiltInDisplayGeometry()
+        .then((geometry) => setBuiltInDisplayGeometry(geometry))
+        .catch(() => undefined);
     });
 
     const sendTestNotification = () => settingsPort().notifications.test();
@@ -360,6 +370,7 @@ const Settings = createSimpleContext({
     return {
       analyticsPreferenceLoaded,
       generalSettings,
+      builtInDisplayGeometry,
       turboModePending,
       updateGeneralSettings,
       sendTestNotification,

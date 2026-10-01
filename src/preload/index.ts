@@ -477,6 +477,7 @@ const openbotApi: OpenBotDesktopApi = {
     preference: decodeDynamicIslandPreference,
     presentation: decodeDynamicIslandPresentation,
     geometry: decodeDynamicIslandGeometry,
+    getBuiltInDisplayGeometry: decodeDynamicIslandGeometry,
     performAction: decodeVoid,
     performHaptic: decodeVoid,
     action: decodeDynamicIslandAction,

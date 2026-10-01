@@ -474,6 +474,7 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
         dynamicIslandPresentation = clone(presentation);
       },
       getPresentation: async () => clone(dynamicIslandPresentation),
+      getBuiltInDisplayGeometry: async () => ({ width: 192, height: 32 }),
       onPreference: () => () => undefined,
       onPresentation: () => () => undefined,
       onGeometry: () => () => undefined,
