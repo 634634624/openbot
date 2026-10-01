@@ -9,6 +9,7 @@ import {
   anchorNewMessages,
   countableTimelineMessage,
   type NewMessageTally,
+  silentAgentAnswer,
   tallyNewMessages,
 } from "@openbot/ui/features/conversation/new-message-tally";
 import {
@@ -54,7 +55,9 @@ export function createScrollStore(deps: ScrollStoreDeps) {
   let talliedConversationIdentity: string | undefined;
 
   const timelineMessages = createMemo(() =>
-    summarizeRoutineRunMessages(deps.props.messages.filter((message) => message.kind !== "thinking")),
+    summarizeRoutineRunMessages(
+      deps.props.messages.filter((message) => message.kind !== "thinking" && !silentAgentAnswer(message)),
+    ),
   );
   /* Every row anchors the count, but only some rows add to it. */
   const timelineRows = createMemo(() =>
