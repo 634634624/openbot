@@ -30,6 +30,7 @@ import { getString } from "../protocol";
 import { DIAGNOSTIC_TEXT_LIMIT } from "../stderr-diagnostics";
 import { DrainScheduler } from "./drain-scheduler";
 import { isUsageLimitDiagnostic } from "./provider-diagnostics";
+import { OPENCODE_FREE_MODEL_FALLBACKS } from "./provider-models";
 import { PROVIDER_IDLE_RELEASE_MS, PROVIDER_UNASSIGNED_RELEASE_MS } from "./provider-runtime";
 
 let root: string;
@@ -314,6 +315,72 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     expect(service.listModels().filter((model) => model.provider === "opencode")).toEqual([]);
   });
 
+  it("discovers OpenCode models when a reconnect signs in after sign-in-required", async () => {
+    process.env.OPENBOT_OPENCODE_PATH = await createFakeOpencode(root);
+    let opencodeClients = 0;
+    const { service: agentService } = await startService(root, {
+      client: (provider) => {
+        if (provider === "opencode") opencodeClients += 1;
+        return new FakeAgentClient(provider, "DONE", false, provider !== "opencode" || opencodeClients > 1);
+      },
+      preferredProvider: "opencode",
+    });
+    service = agentService;
+    expect(service.getStatus().providers).toContainEqual(
+      expect.objectContaining({ id: "opencode", state: "sign-in-required" }),
+    );
+    await service.connectProvider("opencode", vi.fn());
+    expect(service.getStatus().providers).toContainEqual(
+      expect.objectContaining({ id: "opencode", state: "available" }),
+    );
+    expect(
+      service
+        .listModels()
+        .filter((model) => model.provider === "opencode")
+        .map((model) => model.id),
+    ).toEqual(["opencode/example-model"]);
+  });
+
+  it.each(["throws", "returns empty"] as const)(
+    "offers the OpenCode free tier when discovery %s after the preferred provider fails to sign in",
+    async (discoveryFailure) => {
+      process.env.OPENBOT_OPENCODE_PATH = await createFakeOpencode(root);
+      const { service: agentService, clientFor } = await startService(root, {
+        preferredProvider: "codex",
+        client: (provider) => {
+          // Reproduce the reported order: ChatGPT/Codex fails its account check first, then the
+          // authenticated OpenCode provider reports an unavailable catalog.
+          const client = new FakeAgentClient(
+            provider,
+            "DONE",
+            false,
+            provider !== "codex",
+            provider === "opencode" ? { "account/read": 25 } : {},
+          );
+          if (provider === "opencode") {
+            client.modelList = () => {
+              if (discoveryFailure === "throws") throw new Error("OpenCode model discovery timed out.");
+              return { data: [] };
+            };
+          }
+          return client;
+        },
+      });
+      service = agentService;
+
+      expect(service.getStatus().providers).toContainEqual(
+        expect.objectContaining({ id: "codex", state: "sign-in-required" }),
+      );
+      expect(service.getStatus().providers).toContainEqual(
+        expect.objectContaining({ id: "opencode", state: "available" }),
+      );
+      expect(clientFor("opencode")?.requests.some((request) => request.method === "model/list")).toBe(true);
+      expect(service.listModels().filter((model) => model.provider === "opencode")).toEqual(
+        OPENCODE_FREE_MODEL_FALLBACKS,
+      );
+    },
+  );
+
   it("restarts OpenCode on a changed key before it reports the change", async () => {
     process.env.OPENBOT_OPENCODE_PATH = await createFakeOpencode(root);
     let storedKey: string | null = null;
@@ -378,7 +445,10 @@ describe.sequential("ProviderRuntime: account checks and login", () => {
     });
     const fallback = service.listModels();
     await service.initialize();
-    expect(service.listModels()).toEqual(fallback);
+    const catalog = service.listModels();
+    const byProviderAndId = (models: typeof catalog) =>
+      [...models].sort((left, right) => left.provider.localeCompare(right.provider) || left.id.localeCompare(right.id));
+    expect(byProviderAndId(catalog)).toEqual(byProviderAndId(fallback));
   });
 
   it.each(["codex", "claude", "grok"] as const)(

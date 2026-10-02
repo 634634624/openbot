@@ -70,6 +70,8 @@ import {
   FALLBACK_MODELS,
   isOpencodeModelUnusableWithStoredKey,
   modelDisplayName,
+  modelsAfterOpenCodeDiscoveryFailure,
+  OPENCODE_FREE_MODEL_FALLBACKS,
   PREFERRED_MODEL_ORDER,
 } from "./provider-models";
 import {
@@ -92,6 +94,7 @@ export const PROVIDER_IDLE_RELEASE_MS = 10 * 60_000;
  */
 export const PROVIDER_UNASSIGNED_RELEASE_MS = 60_000;
 const PROVIDER_IDLE_CHECK_MS = 60_000;
+const MODEL_METADATA_FALLBACKS = [...FALLBACK_MODELS, ...OPENCODE_FREE_MODEL_FALLBACKS];
 /**
  * The providers whose shared process reads the agent environment only when it starts. Claude reads
  * it at each session start, and Codex with each thread's config.
@@ -2045,6 +2048,13 @@ export class ProviderRuntime implements ProviderPort {
         async ({ id: provider }): Promise<{ provider: AgentProvider; models: AgentModelOption[]; fresh: boolean }> => {
           const previous = this.#models.filter((model) => model.provider === provider);
           const client = this.#clients.get(provider);
+          const signedOut = this.#status.providers?.some(
+            (status) => status.id === provider && status.state === "sign-in-required",
+          );
+          // Do not expose fallback or stale models when OpenCode reports sign-in-required. A client
+          // in the map has an account: activation refreshes the catalog before it marks the
+          // provider available, so the old status alone does not mean signed out.
+          if (provider === "opencode" && signedOut && !client) return { provider, models: [], fresh: false };
           if (!client) return { provider, models: previous, fresh: false };
           // Read once per pass, not per model: a stored key cannot change inside one refresh, and
           // a model is unusable only because OpenBot is what put that key in the environment.
@@ -2090,7 +2100,7 @@ export class ProviderRuntime implements ProviderPort {
             const models: AgentModelOption[] = [];
             for (const server of serverModels.values()) {
               if (!server.model) continue;
-              const fallback = FALLBACK_MODELS.find(
+              const fallback = MODEL_METADATA_FALLBACKS.find(
                 (candidate) => candidate.provider === client.provider && candidate.id === server.model,
               );
               const efforts = (server?.supportedReasoningEfforts ?? [])
@@ -2137,9 +2147,22 @@ export class ProviderRuntime implements ProviderPort {
             const sorted = [...models].sort(
               (left, right) => rank(left) - rank(right) || compareModelVersions(left, right),
             );
+            // A successful but empty OpenCode response is no more useful to the picker than a
+            // timeout: it must not erase the built-in free tier on first discovery. Keep the last
+            // known catalog when available, otherwise seed the OpenCode safety net. It is not a
+            // fresh catalog, so callers must not treat it as proof that this process serves it.
+            // A response that the stored-key filter emptied is a real answer: restoring the last
+            // catalog would bring back the models that the key cannot use.
+            if (client.provider === "opencode" && serverModels.size === 0) {
+              return { provider, models: modelsAfterOpenCodeDiscoveryFailure(previous), fresh: false };
+            }
             return { provider, models: sorted, fresh: true };
           } catch {
-            return { provider, models: previous, fresh: false };
+            return {
+              provider,
+              models: provider === "opencode" ? modelsAfterOpenCodeDiscoveryFailure(previous) : previous,
+              fresh: false,
+            };
           }
         },
       ),
