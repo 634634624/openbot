@@ -43,10 +43,25 @@ open a database that a newer one migrated. It also refuses a computer that is a 
 | `openbot logs [-f]` | Show the journal of `openbot.service`. |
 | `sudo openbot start\|stop\|restart` | Control `openbot.service`. |
 | `sudo openbot update` | Download, check and install the newest release now. |
+| `sudo openbot uninstall` | Sign out and remove OpenBot. The data stays (see [Remove](#remove)). |
 | `openbot version` | Show the installed version. |
 
 Run the account commands with `sudo` or as the service user. Other users cannot open the control
 socket.
+
+## Remove
+
+`sudo openbot uninstall` signs out, then removes the service, the units, the AppArmor profile, the
+`openbot` command and the server files in `/opt/OpenBot`. It keeps the home folder of the service user
+and the keyring in `/srv/openbot-hosted`. The keyring has the key of the encrypted data in that home
+folder, so keep or delete the two together. An install with the same `--user` uses them again. To
+delete the data too:
+
+```sh
+sudo userdel --remove openbot && sudo rm -rf /srv/openbot-hosted
+```
+
+The server stays in the server list of the account, offline. Remove it there.
 
 ## How it works
 
@@ -90,7 +105,10 @@ Threat model:
 
 ## Not confirmed
 
-- Only the Ubuntu 24.04 package names in `packages.txt` are tested. Debian and newer Ubuntu
-  releases can name some packages differently, and then the install stops.
+- The full install runs only on Ubuntu 24.04 in tests. On Debian 12, Debian 13 and Ubuntu 26.04,
+  only the package step is tested (`apt-get --dry-run`). Debian 12 names some libraries without the
+  `t64` suffix, and the install uses those names. Debian 13 and Ubuntu 26.04 have no
+  `libminiupnpc17`, so the install skips it with a warning, and the remote desktop runtime can fail
+  to start there.
 - The full install was not run on a Linux computer before the first release that has the setup
   file. It needs a release build.
