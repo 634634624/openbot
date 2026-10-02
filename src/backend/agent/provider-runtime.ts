@@ -54,6 +54,7 @@ import { type CliCodeLogin, startCliCodeLogin } from "./cli-code-login";
 import { CodexLoginFlow } from "./codex-login";
 import type { ConversationRuntime } from "./conversation-runtime";
 import {
+  createAcpRequestEchoReader,
   ignoredCodexSettings,
   isAcpHandlerDiagnostic,
   isBackgroundRefreshDiagnostic,
@@ -100,7 +101,14 @@ const MODEL_METADATA_FALLBACKS = [...FALLBACK_MODELS, ...OPENCODE_FREE_MODEL_FAL
  * The providers whose shared process reads the agent environment only when it starts. Claude reads
  * it at each session start, and Codex with each thread's config.
  */
-const SPAWN_ENVIRONMENT_PROVIDERS: readonly AgentProvider[] = ["grok", "opencode", "antigravity", "cursor", "acp"];
+const SPAWN_ENVIRONMENT_PROVIDERS: readonly AgentProvider[] = [
+  "grok",
+  "opencode",
+  "antigravity",
+  "cursor",
+  "cline",
+  "acp",
+];
 
 /** The CLI did not answer in time: its `--version`, or a request of its start, such as `initialize`. */
 function isProviderTimeout(error: unknown): boolean {
@@ -219,6 +227,7 @@ const INITIAL_STATUS: AgentStatus = {
     { id: "opencode", state: "not-started", version: null, message: null },
     { id: "antigravity", state: "not-started", version: null, message: null },
     { id: "cursor", state: "not-started", version: null, message: null },
+    { id: "cline", state: "not-started", version: null, message: null },
     { id: "acp", state: "not-started", version: null, message: null },
   ],
   capabilities: {
@@ -712,7 +721,7 @@ export class ProviderRuntime implements ProviderPort {
             startAcpAuthentication({
               executable: cli.executable,
               argv: signIn.argv,
-              env: {},
+              env: { ...signIn.env },
               methodId: signIn.methodId,
               timeoutMs: signIn.timeoutMs,
             }),
@@ -1842,7 +1851,19 @@ export class ProviderRuntime implements ProviderPort {
     // Taken before `start()`, which is where the CLI reads the endpoint files.
     this.#configRevisions.set(client, this.#hooks.captureConfigRevision());
     this.#hooks.bindClient(client);
+    const readAcpRequestEcho = createAcpRequestEchoReader();
     client.on("diagnostic", (raw, origin) => {
+      const echo = readAcpRequestEcho(raw);
+      if (echo !== undefined) {
+        if (echo !== null) {
+          logger.warn("A provider logged an error that it also sent as a reply.", {
+            provider: client.provider,
+            method: echo.method,
+            message: echo.error === null ? null : shortenDiagnostic(this.#redactMcp(echo.error)),
+          });
+        }
+        return;
+      }
       if (!/error|failed|warning/i.test(raw)) return;
       // Redacted before the first use, not at each one. A CLI reports an MCP failure by quoting
       // what it sent, so an API key or an inherited credential is in the line that is about to be
