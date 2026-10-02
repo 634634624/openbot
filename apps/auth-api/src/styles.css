@@ -48,13 +48,30 @@ a {
   text-decoration: none;
 }
 
-.t-stagger-line--4 {
-  transition-delay: calc(var(--stagger-stagger) * 3);
+/* The hero lines rise in with CSS when the page loads, not after hydration. The
+   text is the largest paint, and Chrome does not count it while its opacity is 0,
+   so the lines only move and sharpen: they never fade. */
+@keyframes landing-hero-in {
+  from {
+    transform: translateY(var(--stagger-distance));
+    filter: blur(var(--stagger-blur));
+  }
 }
 
-.landing-actions.t-stagger-line--4 {
-  transition-duration: 400ms;
-  transition-delay: var(--stagger-stagger);
+.landing-hero-line {
+  animation: landing-hero-in var(--stagger-dur) var(--stagger-ease) both;
+  animation-delay: calc(var(--landing-hero-line, 0) * var(--stagger-stagger));
+}
+
+.landing-actions.landing-hero-line {
+  animation-duration: 400ms;
+  animation-delay: var(--stagger-stagger);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .landing-hero-line {
+    animation: none;
+  }
 }
 
 /* The wrap stacks two layers on the same coordinates. The
