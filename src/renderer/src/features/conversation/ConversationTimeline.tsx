@@ -85,6 +85,7 @@ export function ConversationTimeline() {
     messageVirtualizer,
     newMessageCount,
     timelineMessages,
+    unreadBoundaryMessageId,
     moveChatSearch,
     openExternalMessageUrl,
     openMoreMessageId,
@@ -275,7 +276,7 @@ export function ConversationTimeline() {
                 const continuesRun = createMemo(() => {
                   const current = message();
                   if (!current) return false;
-                  if (current.id === props.firstUnreadMessageId || current.actionMarker) return false;
+                  if (current.id === unreadBoundaryMessageId() || current.actionMarker) return false;
                   const previous = timelineMessages()[virtualRow.index - 1];
                   return continuesSenderRun(previous && senderRunRow(previous), senderRunRow(current), {
                     previousDrawsTime: previous !== undefined && rowDrawsTime(previous),
@@ -308,7 +309,7 @@ export function ConversationTimeline() {
                 const groupedWithMarker = createMemo(() => {
                   const current = message();
                   if (!current?.actionMarker) return false;
-                  if (current.id === props.firstUnreadMessageId) return false;
+                  if (current.id === unreadBoundaryMessageId()) return false;
                   const previous = timelineMessages()[virtualRow.index - 1];
                   return previous !== undefined && markerRowEndsWithMarker(previous);
                 });
@@ -332,7 +333,7 @@ export function ConversationTimeline() {
                           </div>
                         )}
                       </Show>
-                      <Show when={message()?.id === props.firstUnreadMessageId}>
+                      <Show when={message()?.id === unreadBoundaryMessageId()}>
                         <UnreadMessagesDivider
                           elementRef={(element) => {
                             setUnreadMessagesDividerElement(element);
@@ -428,7 +429,7 @@ export function ConversationTimeline() {
                           </div>
                         )}
                       </Show>
-                      <Show when={message()?.id === props.firstUnreadMessageId}>
+                      <Show when={message()?.id === unreadBoundaryMessageId()}>
                         <UnreadMessagesDivider
                           elementRef={(element) => {
                             setUnreadMessagesDividerElement(element);
@@ -483,7 +484,7 @@ export function ConversationTimeline() {
                         </div>
                       )}
                     </Show>
-                    <Show when={message()?.id === props.firstUnreadMessageId}>
+                    <Show when={message()?.id === unreadBoundaryMessageId()}>
                       <UnreadMessagesDivider
                         elementRef={(element) => {
                           setUnreadMessagesDividerElement(element);
