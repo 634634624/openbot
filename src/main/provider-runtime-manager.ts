@@ -5,6 +5,7 @@ import { createReadStream, createWriteStream } from "node:fs";
 import { access, mkdir, readdir, readFile, rename, rm, stat, statfs, utimes, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { finished } from "node:stream/promises";
+import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import {
   isManagedToolRuntime,
@@ -68,6 +69,11 @@ const VERSION_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
  * failing says so rather than looping.
  */
 const COMMIT_ATTEMPTS = 3;
+/**
+ * How long a move waits, in turn, for a file in its source that another program still holds open.
+ * About a second and a half, the same budget Node gives `rm` with `maxRetries: 5`.
+ */
+const HELD_SOURCE_WAITS_MS = [100, 200, 400, 800];
 /**
  * What the sweep collects by age beside the version directories.
  *
@@ -664,7 +670,9 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
       if (committed) await this.#discardRejected(spec);
       throw error;
     } finally {
-      await rm(staging, { recursive: true, force: true });
+      // Caught, so a stage Windows still holds open cannot replace the error that matters; the sweep
+      // collects what is left by its age.
+      await rm(staging, { recursive: true, force: true, maxRetries: 5 }).catch(() => undefined);
     }
   }
 
@@ -710,13 +718,17 @@ export class ProviderRuntimeManager extends EventEmitter<ProviderRuntimeManagerE
     // Each pass reads the destination again, because a sibling can fill it or replace it between
     // any two steps below. Whatever it did, the next pass sees the result: a verified install is
     // adopted, and only what is still damaged is replaced.
+    let held = false;
     for (let attempt = 0; attempt < COMMIT_ATTEMPTS; attempt += 1) {
       if (await renameIfVacant(staging, destination)) return true;
+      // Still vacant: the stage is held open, and there is nothing to adopt or replace.
+      held = !(await pathExists(destination));
+      if (held) continue;
       if (await this.#verifies(destination, spec)) return false;
       const outcome = await this.#replaceUnderLock(staging, destination, spec);
       if (outcome !== "moved") return outcome === "committed";
     }
-    throw new Error(sourceText("error.provider.runtimeReplacing"));
+    throw new Error(sourceText(held ? "error.provider.runtimeFilesInUse" : "error.provider.runtimeReplacing"));
   }
 
   /**
@@ -964,17 +976,36 @@ async function verifyInstalledRuntime(root: string, spec: RuntimeSpec, lock: Age
  * Moves `from` onto `to`, or reports that something already occupies `to`.
  *
  * POSIX answers an occupied directory with `ENOTEMPTY` or `EEXIST`; Windows answers with `EEXIST`,
- * `EPERM` or `EACCES`, the last two also when a file inside it is open. Every one of them means the
- * same thing here -- the caller has to look at what is there -- and anything else is a real fault.
+ * `EPERM` or `EACCES`, the last two also when a file inside it is open. Those two are also what
+ * Windows answers when a file inside `from` is still open -- the staged CLI that its own version
+ * check has just run, or an antivirus scan of it -- while `to` is vacant. Reading that as occupied
+ * sent the commit looking for an install no one had made, and three empty looks ended in "another
+ * instance is replacing it" on a computer with one instance. So `to` is looked at: present means
+ * occupied, and absent means the source is held, which passes and is waited for. A source still
+ * held after the wait answers `false` like an occupied one, so every caller keeps its own reading of
+ * what is there; `#commit` is the one that tells the user which of the two it was.
  */
 async function renameIfVacant(from: string, to: string): Promise<boolean> {
-  try {
-    await rename(from, to);
-    return true;
-  } catch (error) {
-    if (isOccupiedError(error)) return false;
-    throw error;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await rename(from, to);
+      return true;
+    } catch (error) {
+      const code = errorCode(error);
+      if (code === "ENOTEMPTY" || code === "EEXIST") return false;
+      if (code !== "EPERM" && code !== "EACCES" && code !== "EBUSY") throw error;
+      const wait = HELD_SOURCE_WAITS_MS[attempt];
+      if (wait === undefined || (await pathExists(to))) return false;
+      await delay(wait);
+    }
   }
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  return await access(path).then(
+    () => true,
+    () => false,
+  );
 }
 
 /**
@@ -1071,9 +1102,8 @@ async function renameIfPresent(from: string, to: string): Promise<boolean> {
   }
 }
 
-function isOccupiedError(error: unknown): boolean {
-  if (!(error instanceof Error) || !("code" in error) || !isString(error.code)) return false;
-  return ["ENOTEMPTY", "EEXIST", "EPERM", "EACCES"].includes(error.code);
+function errorCode(error: unknown): string | null {
+  return error instanceof Error && "code" in error && isString(error.code) ? error.code : null;
 }
 
 async function streamResponse(
