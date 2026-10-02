@@ -7,6 +7,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { get as getEncryptedValue } from "@dotenvx/dotenvx";
 import { createOpenBotLogger, toLogValue } from "@openbot/logging";
+import { cliSpawnTarget } from "../src/backend/cli";
 import {
   developmentInstanceIdForWorktree,
   developmentUserDataName,
@@ -30,6 +31,7 @@ import {
 import { attachSlackTunnels } from "./dev-slack-tunnels";
 import { resolveDevelopmentAppDataRoot } from "./development-state-paths";
 import { withoutElectronRuntimeFlags } from "./electron-spawn-env";
+import { resolvePackageBin } from "./package-bin";
 import { prepareDevelopmentEnvironment } from "./prepare-dev-environment";
 
 const logger = createOpenBotLogger("dev-services");
@@ -122,7 +124,7 @@ export function createDevelopmentServiceSpec(
   }
 
   if (name === "remote") {
-    const dotenvx = join(projectRoot, "node_modules", ".bin", process.platform === "win32" ? "dotenvx.cmd" : "dotenvx");
+    const dotenvx = resolvePackageBin(projectRoot, "dotenvx");
     return {
       name,
       executable: dotenvx,
@@ -148,12 +150,7 @@ export function createDevelopmentServiceSpec(
 
   const isTestClient = name === "test-client";
   const outputDirectory = isTestClient ? "out-dev-test-client" : "out-dev-app";
-  const electronVite = join(
-    projectRoot,
-    "node_modules",
-    ".bin",
-    process.platform === "win32" ? "electron-vite.cmd" : "electron-vite",
-  );
+  const electronVite = resolvePackageBin(projectRoot, "electron-vite");
   return {
     name,
     executable: electronVite,
@@ -525,12 +522,14 @@ async function runDevelopmentServices(specs: DevelopmentServiceSpec[], stack: De
 
   try {
     for (const spec of specs) {
-      const child = spawn(spec.executable, spec.args, {
+      const target = cliSpawnTarget(spec.executable, spec.args);
+      const child = spawn(target.command, target.args, {
         cwd: spec.cwd,
         env: spec.env,
         stdio: "inherit",
         shell: false,
         detached: process.platform !== "win32",
+        windowsVerbatimArguments: target.windowsVerbatimArguments,
       });
       processes.set(spec.name, child);
       if (stack && child.pid) {

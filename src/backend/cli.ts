@@ -645,6 +645,29 @@ export function posixFallbackPaths(provider: AgentProviderId, userHome = homedir
 }
 
 /**
+ * One argument on a `cmd.exe /c` line that runs a batch wrapper. `cmd.exe` reads the line first: it
+ * toggles quoting at every `"` and expands `%NAME%` inside quotes too. The wrapper then hands `%*` to
+ * a program that splits it with the C runtime rules. So an argument with any character outside a
+ * plain set is quoted, an inner `"` is written as `""` with the backslashes before it doubled, which
+ * both parsers read as one literal quote, and `%` is written as `%%cd:~,%`, which expands to one `%`.
+ */
+function batchArgument(argument: string): string {
+  if (/^[\w\-.,/:=@+\\]+$/.test(argument)) return argument;
+  let quoted = '"';
+  let backslashes = 0;
+  for (const character of argument) {
+    if (character === "\\") {
+      backslashes += 1;
+    } else {
+      if (character === '"') quoted += `${"\\".repeat(backslashes)}"`;
+      backslashes = 0;
+    }
+    quoted += character === "%" ? "%%cd:~,%" : character;
+  }
+  return `${quoted}${"\\".repeat(backslashes)}"`;
+}
+
+/**
  * How to start a resolved CLI. A `.cmd` or `.bat` wrapper is a script that only the Windows command
  * processor runs, so it is called through `cmd.exe` with the same verbatim quoting as
  * `readCliVersion`. Every other executable starts with no shell. That keeps a path that holds a
@@ -660,7 +683,7 @@ export function cliSpawnTarget(
     return { command: executable, args: [...argv], windowsVerbatimArguments: false };
   }
 
-  const commandLine = [`"${executable.replaceAll("%", "%%")}"`, ...argv].join(" ");
+  const commandLine = [`"${executable.replaceAll("%", "%%")}"`, ...argv.map(batchArgument)].join(" ");
   return {
     command: process.env.ComSpec?.trim() || "cmd.exe",
     args: ["/d", "/s", "/c", `"${commandLine}"`],
