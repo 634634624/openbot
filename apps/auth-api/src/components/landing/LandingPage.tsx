@@ -4,6 +4,8 @@ import { landingAnalytics } from "../../lib/analytics";
 import { EXTERNAL_LINK_REL, OPENBOT_LINKS } from "../../lib/landing-links";
 import { Button } from "../ui/button";
 import { DownloadSection } from "./DownloadSection";
+import { FaqSection } from "./FaqSection";
+import { FeaturesSection } from "./FeaturesSection";
 import { HeroDownloadSelector } from "./HeroDownloadSelector";
 import { LandingAppPreview } from "./LandingAppPreview";
 import { LandingFooter } from "./LandingFooter";
@@ -51,14 +53,15 @@ export function LandingPage() {
                 ·
               </span>
               <span class="landing-availability-platform">
-                <PlatformLogo platform="linux" />
+                <PlatformLogo platform="linux" solid />
                 Linux
               </span>
             </p>
 
             <h1 id="landing-title" class="landing-title t-stagger-line t-stagger-line--2">
-              <span>Meet</span>
-              <AppLogo variant="production" animation="blink" interactive class="landing-hero-logo" />
+              {/* The spaces do not render in the flex row. They keep the words apart in
+                  the text that search engines read, which was "MeetOpenBot". */}
+              <span>Meet</span> <AppLogo variant="production" animation="blink" interactive class="landing-hero-logo" />{" "}
               <span>OpenBot</span>
             </h1>
 
@@ -108,7 +111,9 @@ export function LandingPage() {
 
           <LandingAppPreview />
         </section>
+        <FeaturesSection />
         <PricingSection />
+        <FaqSection />
         <DownloadSection />
       </main>
       <LandingFooter />
