@@ -476,6 +476,7 @@ export function ConversationComposer() {
                           ? t("composer.send.voice")
                           : t("composer.send.message")
                     }
+                    data-cuelume-emphasis="normal"
                     disabled={
                       attachmentBusy() ||
                       submitting() ||
@@ -498,6 +499,7 @@ export function ConversationComposer() {
                   type="button"
                   class="voice-button voice-button-active"
                   aria-label={t("composer.send.stop")}
+                  data-cuelume-tap="close"
                   onClick={props.onStop}
                 >
                   <StopIcon />

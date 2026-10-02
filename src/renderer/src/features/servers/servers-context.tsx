@@ -5,6 +5,7 @@ import { WAKE_RECONNECT_STATES } from "@openbot/team-client/hosted-server-wake";
 import { toast } from "@openbot/ui";
 import { currentText } from "@openbot/ui/text";
 import { createEffect, createMemo, createSignal, flush, onSettled } from "solid-js";
+import { actionToast } from "../../action-toast";
 import { FALLBACK_HOST_STATUS } from "../../app-defaults";
 import { createSimpleContext } from "../../simple-context";
 import { createHostRestartToasts } from "../updates/host-restart-toast";
@@ -287,7 +288,7 @@ const Servers = createSimpleContext({
       } catch (error) {
         pendingCompatibilityRetryServerId = null;
         const text = currentText();
-        toast.error(text.t("server.connection.failedTitle"), {
+        actionToast.error(text.t("server.connection.failedTitle"), {
           description: text.errorMessage(error, text.t("server.connection.failedDescription")),
         });
       }
@@ -303,7 +304,7 @@ const Servers = createSimpleContext({
         );
       } catch (error) {
         const text = currentText();
-        toast.error(text.t("server.notifications.changeFailedTitle"), {
+        actionToast.error(text.t("server.notifications.changeFailedTitle"), {
           description: text.errorMessage(error, text.t("server.notifications.changeFailedDescription")),
         });
       }
@@ -314,7 +315,7 @@ const Servers = createSimpleContext({
         applyServerSummaries(await serversPort().servers.setNotificationLevel({ serverId, level }));
       } catch (error) {
         const text = currentText();
-        toast.error(text.t("server.notifications.changeFailedTitle"), {
+        actionToast.error(text.t("server.notifications.changeFailedTitle"), {
           description: text.errorMessage(error, text.t("server.notifications.changeFailedDescription")),
         });
       }
