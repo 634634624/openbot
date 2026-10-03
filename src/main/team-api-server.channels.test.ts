@@ -218,4 +218,83 @@ describe("Team API channel access", () => {
       });
     }
   });
+
+  it("keeps a hidden member that a save still in the queue adds", async () => {
+    const source = agentFixture[0];
+    if (!isAgentSummary(source)) throw new Error("Invalid agent fixture.");
+    const chief: AgentSummary = { ...source, id: "chief", provider: "codex", model: "gpt-5.6-luna" };
+    const first: AgentSummary = { ...source, id: "agent-acp-1", provider: "acp", model: "custom/opus" };
+    const second: AgentSummary = { ...source, id: "agent-acp-2", provider: "acp", model: "custom/opus" };
+    const agents = [chief, first, second];
+    const fixture = await createTeamApiFixture("channels-queued-save", { configure: true });
+    const data = stores(fixture.root);
+    await data.store.initialize();
+    await data.mailbox.initialize();
+    const channels = new ChannelService(data.store.database, data.mailbox, {
+      agents: () => agents,
+      generate: async () => "",
+      schedule: () => undefined,
+      interrupt: async () => undefined,
+      busy: () => false,
+      changed: () => undefined,
+      error: () => undefined,
+    });
+    cleanups.push(async () => {
+      await channels.stop();
+      data.store.database.close();
+    });
+    const owner = { id: "owner", name: "Owner" };
+    const draft = { name: "Shared", title: "", instructions: "", leadAgentId: first.id };
+    await channels.command(
+      {
+        type: "save",
+        operationId: "create",
+        channelId: "shared",
+        draft: { ...draft, members: [{ agentId: chief.id }, { agentId: first.id }] },
+      },
+      owner,
+    );
+    // The desktop save goes into the queue after the peer's request arrived and before the peer's
+    // save gets its turn: the channel that the request could read does not have the second agent.
+    const command = channels.command.bind(channels);
+    let desktopSave: Promise<unknown> | undefined;
+    channels.command = (input, actor, beforeApply) => {
+      if (input.operationId === "rename")
+        desktopSave = command(
+          {
+            type: "save",
+            operationId: "add",
+            channelId: "shared",
+            update: true,
+            draft: { ...draft, members: [{ agentId: chief.id }, { agentId: first.id }, { agentId: second.id }] },
+          },
+          owner,
+        );
+      return command(input, actor, beforeApply);
+    };
+    const { base } = await fixture.start({ channels, agents: createAgents({ listAgents: () => agents }) });
+    const save = await fetch(`${base}/v1/channels/commands`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${await fixture.signIn()}`,
+        "OpenBot-Protocol-Version": "4",
+        "OpenBot-Capabilities": "opencode,channel-chats-v1",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        type: "save",
+        operationId: "rename",
+        channelId: "shared",
+        update: true,
+        draft: { ...draft, name: "Renamed", members: [{ agentId: chief.id }], leadAgentId: null },
+      }),
+    });
+    expect(save.status).toBe(200);
+    await desktopSave;
+    expect(channels.store.get("shared")).toMatchObject({
+      name: "Renamed",
+      members: [{ agentId: chief.id }, { agentId: first.id }, { agentId: second.id }],
+      leadAgentId: first.id,
+    });
+  });
 });

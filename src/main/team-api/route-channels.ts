@@ -80,10 +80,9 @@ export async function routeChannels(
     throw new HttpError(403, sourceText("error.team.membersCannotArchiveChannels"));
   return json(
     200,
-    await channels.command(keepHiddenMembers(input, channels, hiddenAgentIds), {
-      id: member.id,
-      name: member.name ?? "Team member",
-    }),
+    await channels.command(input, { id: member.id, name: member.name ?? "Team member" }, (queued) =>
+      keepHiddenMembers(queued, channels, hiddenAgentIds),
+    ),
   );
 }
 
@@ -91,6 +90,10 @@ export async function routeChannels(
  * A peer never sees an agent its protocol hides, so its save names only the members it sees and no
  * lead when the lead is hidden. The stored hidden members and the hidden lead stay: without them,
  * renaming a channel on that peer would remove those agents from it and pause their tasks.
+ *
+ * It runs when the save's turn in the command queue comes, not when the request arrives: a save
+ * that still waits in the queue can add a hidden member, and the channel read at arrival does not
+ * have that member yet.
  */
 function keepHiddenMembers(
   input: ChannelCommand,

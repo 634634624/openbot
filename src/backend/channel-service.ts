@@ -121,10 +121,19 @@ export class ChannelService {
     return this.store.database.commandResult(`channels:${actorId}:${operationId}`) !== undefined;
   }
 
-  async command(command: ChannelCommand, actor: { id: string; name: string }): Promise<Channel> {
-    if (command.type === "stop" || command.type === "archive") return this.apply(command, actor);
+  /**
+   * `beforeApply` changes the command when its turn in the queue comes, immediately before it is
+   * applied. A caller that completes a command from the stored channel must do it there: the
+   * channel it reads before the call can be older than the commands that still wait in the queue.
+   */
+  async command(
+    command: ChannelCommand,
+    actor: { id: string; name: string },
+    beforeApply: (command: ChannelCommand) => ChannelCommand = (queued) => queued,
+  ): Promise<Channel> {
+    if (command.type === "stop" || command.type === "archive") return this.apply(beforeApply(command), actor);
     const prior = this.#commands.get(command.channelId) ?? Promise.resolve(null);
-    const next = prior.catch(() => null).then(() => this.apply(command, actor));
+    const next = prior.catch(() => null).then(() => this.apply(beforeApply(command), actor));
     this.#commands.set(command.channelId, next);
     try {
       return await next;
