@@ -67,6 +67,8 @@ export interface RoutineHooks {
   excludedAgents(): ReadonlySet<string>;
   /** The timer only arms while the service is initialized and not stopping. */
   isRunning(): boolean;
+  /** Whether a spent provider plan holds this agent's queue. */
+  usageLimited(agentId: string): boolean;
 }
 
 /** Enough for every message a busy host queues between restarts; each entry is a few bytes. */
@@ -539,10 +541,13 @@ export class RoutineScheduler implements RoutineDueSource {
           now,
         );
         // A run that has not finished already does this routine's work. Another one would only
-        // queue behind it, and after a sleep the queue drains as a burst of identical runs.
-        const run = this.#hasLiveRun(due.routine.agentId, due.routine.id)
-          ? null
-          : this.#routines.createRun(due.routine, due.triggerId, "scheduled", scheduledFor.toISOString());
+        // queue behind it, and after a sleep the queue drains as a burst of identical runs. A routine
+        // set to skip drops the occurrence while a spent plan would only make it wait.
+        const run =
+          this.#hasLiveRun(due.routine.agentId, due.routine.id) ||
+          (due.routine.limitPolicy === "skip" && this.#hooks.usageLimited(due.routine.agentId))
+            ? null
+            : this.#routines.createRun(due.routine, due.triggerId, "scheduled", scheduledFor.toISOString());
         this.#routines.advanceTrigger(due.routine.id, due.triggerId, nextRunAt.toISOString());
         changedAgents.add(due.routine.agentId);
         if (run && !run.deliveryId) {
@@ -572,6 +577,16 @@ export class RoutineScheduler implements RoutineDueSource {
   }
 
   async #enqueueRun(run: RoutineRun): Promise<RoutineRun> {
+    // A test or a script run that arrives while a spent plan holds the agent would wait for the
+    // reset, and a routine set to skip has no use for a late result.
+    if (
+      this.#routines.get(run.agentId, run.routineId)?.limitPolicy === "skip" &&
+      this.#hooks.usageLimited(run.agentId)
+    ) {
+      const cancelled = this.#transitionRunWithConversation(run, "cancelled");
+      this.stateChanged(run.agentId);
+      return cancelled;
+    }
     recordRestartActivity();
     const validateRecipient = this.#mailbox.prepareDelivery([run.agentId]);
     const agent = await this.#store.getOrCreate(run.agentId);

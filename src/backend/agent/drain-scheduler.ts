@@ -13,11 +13,13 @@ import type { DuplicationGate } from "./duplication-gate";
 import type { MailboxSync } from "./mailbox-sync";
 import type { MemoryHold } from "./memory-hold";
 import type { ProfileSave } from "./profile-save";
+import { isPlanLimitDiagnostic } from "./provider-diagnostics";
 import type { ProviderRuntime } from "./provider-runtime";
 import type { RoutineScheduler } from "./routine-scheduler";
 import { isMissingProviderSessionError, isRequestTimeout, providerForAgent } from "./thread-items";
 import type { ThreadLifecycle } from "./thread-lifecycle";
 import { TurnSlots } from "./turn-slots";
+import type { UsageLimitGate } from "./usage-limit-gate";
 import { codexSandboxPolicy, workspaceWritableRoots } from "./workspace-sandbox";
 
 /** Shown to the user when a message names a model of an endpoint that was taken out. */
@@ -38,6 +40,8 @@ export interface DrainHooks {
    * generic redaction: it does not know which values this machine's MCP servers were given.
    */
   redactMcp(text: string): string;
+  /** Gives a channel task back to its channel after a spent plan refused it; false when it cannot go back. */
+  requeueChannelDelivery(deliveryId: string): boolean;
 }
 
 export interface DrainSchedulerOptions {
@@ -52,6 +56,7 @@ export interface DrainSchedulerOptions {
   routines: RoutineScheduler;
   threads: ThreadLifecycle;
   memory: MemoryHold;
+  usageLimits: UsageLimitGate;
   hooks: DrainHooks;
   channels?: ChannelService;
   messaging?: MessagingThreads;
@@ -79,6 +84,7 @@ export class DrainScheduler {
   readonly #routines: RoutineScheduler;
   readonly #threads: ThreadLifecycle;
   readonly #memory: MemoryHold;
+  readonly #usageLimits: UsageLimitGate;
   readonly #slots: TurnSlots;
   /** Agents that a full set of turn slots held back. A drain that may free a slot tries them again. */
   readonly #slotWaiters = new Set<string>();
@@ -116,6 +122,7 @@ export class DrainScheduler {
     this.#routines = options.routines;
     this.#threads = options.threads;
     this.#memory = options.memory;
+    this.#usageLimits = options.usageLimits;
     this.#hooks = options.hooks;
     this.#channels = options.channels;
     this.#messaging = options.messaging;
@@ -142,7 +149,8 @@ export class DrainScheduler {
       this.#profileSave.mayDrain(agentId) &&
       this.#duplication.mayDrain(agentId) &&
       this.#compaction.mayDrain(agentId) &&
-      this.#routines.mayDrain(agentId)
+      this.#routines.mayDrain(agentId) &&
+      this.#usageLimits.mayDrain(agentId)
     );
   }
 
@@ -304,6 +312,9 @@ export class DrainScheduler {
     // Released in the `finally` when no turn starts: a start that fails uses no provider memory.
     const releaseReservation = this.#memory.reserveTurn();
     let turnMayRun = false;
+    // The model this start asks for. The agent can move to another one while `turn/start` waits, and
+    // a plan limit belongs to the model the provider refused.
+    let requestedModel: string | null = null;
     try {
       for (const item of batch) await this.#mailbox.markStarting(item.delivery.id);
       this.#mailboxSync.emitQueue(delivery.recipientAgentId);
@@ -324,6 +335,7 @@ export class DrainScheduler {
         this.#mailboxSync.emitQueue(delivery.recipientAgentId);
       }
       const agent = await this.#store.getOrCreate(delivery.recipientAgentId);
+      requestedModel = agent.model;
       // The endpoint was removed while this agent was busy, so no other model could be given to it
       // then. The old process would still answer on the removed endpoint, with the credentials it
       // started with, until it restarts. Thrown rather than failed here: the catch below also ends
@@ -484,6 +496,24 @@ export class DrainScheduler {
         return;
       }
       const reason = this.#hooks.redactMcp(error instanceof Error ? error.message : String(error));
+      // A spent plan window refused the start, so nothing ran. The messages wait for the reset, and
+      // a channel task goes back to its channel, so that its assignment does not reserve the host.
+      if (!messagingDelivery && isPlanLimitDiagnostic(reason)) {
+        if (!channelDelivery) {
+          for (const item of batch) await this.#mailbox.restoreQueued(item.delivery.id);
+          this.#mailboxSync.emitQueue(delivery.recipientAgentId);
+          // After the restore, so a routine set to skip finds its run back in the queue.
+          this.#usageLimits.reached(delivery.recipientAgentId, null, requestedModel);
+          return;
+        }
+        // Before the requeue, so the channel does not assign the task to this agent again at once.
+        this.#usageLimits.reached(delivery.recipientAgentId, null, requestedModel);
+        if (this.#hooks.requeueChannelDelivery(delivery.id)) {
+          await this.#mailbox.markTerminal(delivery.id, "interrupted", null);
+          this.#mailboxSync.emitQueue(delivery.recipientAgentId);
+          return;
+        }
+      }
       await this.#mailbox.markTerminal(delivery.id, "failed", reason);
       // The provider did not read the answers that were to start with it, so they wait for the next turn.
       for (const { delivery: companion } of batch) {

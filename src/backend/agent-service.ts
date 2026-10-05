@@ -119,8 +119,9 @@ import {
 } from "./agent/model-choice";
 import { OpenBotToolRouter } from "./agent/openbot-tool-router";
 import { ProfileClients } from "./agent/profile-clients";
-import { generateProfile, generateTextWithoutTools } from "./agent/profile-generation";
+import { GenerationUsageLimitError, generateProfile, generateTextWithoutTools } from "./agent/profile-generation";
 import { ProfileSave } from "./agent/profile-save";
+import { isPlanLimitDiagnostic } from "./agent/provider-diagnostics";
 import { type AgentClientFactory, ProviderRuntime } from "./agent/provider-runtime";
 import { QueueControls } from "./agent/queue-controls";
 import { type RoutineMutationOptions, RoutineScheduler } from "./agent/routine-scheduler";
@@ -130,6 +131,7 @@ import type { LocalSkillTools } from "./agent/skill-tools";
 import { isRequestTimeout, providerForAgent, providerLabel, type ToolUsageSignal } from "./agent/thread-items";
 import { ThreadLifecycle } from "./agent/thread-lifecycle";
 import { type AgentBrowserHost, TurnLifecycle } from "./agent/turn-lifecycle";
+import { UsageLimitGate } from "./agent/usage-limit-gate";
 import type { AgentProvider } from "./agent-client";
 import type { AgentTables } from "./agent-data/agent-tables";
 import type { AgentStore } from "./agent-store";
@@ -259,6 +261,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
   readonly #images: ImageGenRuntime;
   readonly #threads: ThreadLifecycle;
   readonly #memoryHold: MemoryHold;
+  readonly #usageLimits: UsageLimitGate;
   readonly #drain: DrainScheduler;
   readonly #queue: QueueControls;
   readonly #attachments: AttachmentGateway;
@@ -372,6 +375,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
         listAgents: () => this.listAgents(),
         excludedAgents: () => new Set([...this.#duplication.pendingAgents(), ...this.#removal.deleting()]),
         isRunning: () => this.#initialized && !this.#stopping,
+        usageLimited: (agentId) => !this.#usageLimits.mayDrain(agentId),
       },
     });
     this.#hostedSites = new HostedSiteCoordinator({
@@ -640,14 +644,25 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
           .find((item) => item.provider === lead.provider && item.id === lead.model);
         if (!model) throw new Error(sourceText("error.backend.channelLeadModelUnavailable"));
         const client = this.#providers.createProfileClient(lead.provider);
-        return this.#profileClients.run(client, (cancelled) =>
-          generateTextWithoutTools(
-            client,
-            { ...model, defaultReasoningEffort: lead.reasoningEffort },
-            prompt,
-            cancelled,
-          ),
-        );
+        try {
+          return await this.#profileClients.run(client, (cancelled) =>
+            generateTextWithoutTools(
+              client,
+              { ...model, defaultReasoningEffort: lead.reasoningEffort },
+              prompt,
+              cancelled,
+            ),
+          );
+        } catch (error) {
+          // A routing turn can be the first one a spent plan refuses: in its completion, or as the
+          // error of the `turn/start` request. It holds the lead's model the way a refused member turn
+          // does, and the channel keeps the task queued for the reset.
+          if (error instanceof GenerationUsageLimitError)
+            this.#usageLimits.reached(lead.id, error.resetsAt, lead.model);
+          else if (error instanceof Error && isPlanLimitDiagnostic(error.message))
+            this.#usageLimits.reached(lead.id, null, lead.model);
+          throw error;
+        }
       },
       schedule: (agentId) => this.#drain.scheduleDrain(agentId),
       awaitDrain: (agentId) => this.#drain.taskFor(agentId),
@@ -664,8 +679,12 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
         [...this.#conversation.activeSnapshots()].some(
           ([, snapshot]) => snapshot.activeTurnId && !this.#conversation.isExecutionThread(snapshot.threadId),
         ),
+      // A held agent gets no channel assignment: one that waited for the reset would reserve the host.
       busy: (agentId) =>
-        Boolean(this.#conversation.workingSnapshot(agentId)?.activeTurnId || this.#mailbox.nextQueued(agentId)),
+        Boolean(this.#conversation.workingSnapshot(agentId)?.activeTurnId || this.#mailbox.nextQueued(agentId)) ||
+        !this.#usageLimits.mayDrain(agentId),
+      usageLimited: (agentId) => !this.#usageLimits.mayDrain(agentId),
+      skipAtLimit: (task) => this.#channelRoutines.skipAtLimit(task.channelId, task.requestMessageId),
       steer: async (agentId, threadId, turnId, messageId, text) => {
         const agent = this.#store.list().find((item) => item.id === agentId);
         const session = agent ? this.#store.database.activeProviderSession(threadId, agent.provider) : null;
@@ -714,6 +733,10 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
         },
         emitError: (code, error) => this.#emitError(code, error),
         excludedChannels: () => new Set(),
+        usageLimited: (channelId) => {
+          const lead = this.channels.store.get(channelId).leadAgentId;
+          return lead !== null && !this.#usageLimits.mayDrain(lead);
+        },
       },
     });
     this.messaging = new MessagingThreads(store.database, mailbox, {
@@ -734,6 +757,20 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
         emitError: (code, error, agentId) => this.#emitError(code, error, agentId),
       },
     });
+    this.#usageLimits = new UsageLimitGate({
+      store,
+      hooks: {
+        emit: (event) => this.#emit(event),
+        emitRuntimeSnapshot: () => this.#emitRuntimeSnapshot(),
+        scheduleDrain: (agentId) => this.#drain.scheduleDrain(agentId),
+        readUsage: (provider, model) => this.#providers.usage({ provider, model }),
+        held: (agentIds) => {
+          void this.#settleHeldQueues(agentIds).catch((error) => this.#emitError("usage_limit_hold_failed", error));
+        },
+        // A channel task that went back to its queue is assigned again only by a pump.
+        released: () => this.channels.wake(),
+      },
+    });
     this.#drain = new DrainScheduler({
       channels: this.channels,
       messaging: this.messaging,
@@ -748,11 +785,13 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       routines: this.#routines,
       threads: this.#threads,
       memory: this.#memoryHold,
+      usageLimits: this.#usageLimits,
       hooks: {
         emitError: (code, error, agentId) => this.#emitError(code, error, agentId),
         redactMcp: (text) => this.#mcp.redact(text),
         isStopping: () => this.#stopping,
         servesModel: (model) => this.#endpoints.serves(model),
+        requeueChannelDelivery: (deliveryId) => this.#requeueChannelDelivery(deliveryId),
       },
     });
     this.#browser.onControlChanged((state) => {
@@ -783,6 +822,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       compaction: this.#compaction,
       images: this.#images,
       deltas: this.#deltas,
+      usageLimits: this.#usageLimits,
       hooks: {
         emit: (event) => this.#emit(event),
         emitError: (code, error, agentId) => this.#emitError(code, error, agentId),
@@ -793,6 +833,8 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
         listAgents: () => this.listAgents(),
         redactMcp: (text) => this.#mcp.redact(text),
         emitToolUsage: (usage) => this.emit("toolUsage", usage),
+        turnModel: (agentId, turnId) => this.#drain.modelForTurn(agentId, turnId),
+        requeueChannelDelivery: (deliveryId) => this.#requeueChannelDelivery(deliveryId),
       },
     });
     this.#removal = new AgentRemoval({
@@ -900,6 +942,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       mailbox: this.#mailbox,
       turn: this.#turn,
       attention: this.#attention,
+      usageLimits: this.#usageLimits,
     });
   }
 
@@ -1366,6 +1409,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
   async #applyAgentUpdate(input: UpdateAgentInput, initiatingAgentId?: string): Promise<AgentSummary> {
     this.#conversation.requireKnownAgent(input.agentId);
     const previous = this.#store.list().find((agent) => agent.id === input.agentId);
+    const wasHeld = !this.#usageLimits.mayDrain(input.agentId);
     const requestedModel = input.model
       ? this.#endpoints
           .available()
@@ -1447,6 +1491,20 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     // own, and it is written from the same profile.
     if (profileChanged) this.#conversation.unloadAgentThreads(agent.id);
     this.#emit({ type: "agents-changed", agents: this.listAgents() });
+    // A plan limit belongs to a provider and a model, so a model change can end a hold or start one.
+    // Leaving a hold, nothing else would start the queue before the limit it left resets. Entering
+    // one, the queue is settled as at any other start of a hold.
+    const isHeld = !this.#usageLimits.mayDrain(agent.id);
+    if (wasHeld !== isHeld) this.#emitRuntimeSnapshot();
+    if (wasHeld && !isHeld) {
+      this.#drain.scheduleDrain(agent.id);
+      // A channel task that the hold gave back waits in its channel, not in this queue.
+      this.channels.wake();
+    } else if (!wasHeld && isHeld) {
+      void this.#settleHeldQueues([agent.id]).catch((error) =>
+        this.#emitError("usage_limit_hold_failed", error, agent.id),
+      );
+    }
     return agent;
   }
 
@@ -1696,6 +1754,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       if (session) this.#images.interrupt(agentId, session.externalSessionId, snapshot.activeTurnId);
     }
     this.#turn.dispose();
+    this.#usageLimits.dispose();
     this.#drain.dispose();
     this.#browser.clearControls();
     await Promise.all(clients.map((client) => client.stop().catch(() => undefined)));
@@ -1781,6 +1840,43 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
 
   cancelQueuedMessage(agentId: string, deliveryId: string): Promise<void> {
     return this.#queue.cancel(agentId, deliveryId);
+  }
+
+  /**
+   * Gives a channel task that a spent plan holds back to its channel, so its assignment does not
+   * reserve the host until the reset. A task of a channel routine set to skip is dropped instead.
+   */
+  #requeueChannelDelivery(deliveryId: string): boolean {
+    return this.channels.requeueForLimit(deliveryId);
+  }
+
+  /**
+   * What a spent plan does to the queues it now holds. A channel task goes back to its channel, and
+   * a wake lets each channel drop the queued tasks of routines set to skip. A routine set to skip
+   * leaves the agent's queue too, because its result is no use when late; cancelling the delivery
+   * settles the run.
+   */
+  async #settleHeldQueues(agentIds: readonly string[]): Promise<void> {
+    this.channels.wake();
+    for (const agentId of agentIds) {
+      for (const deliveryId of this.#mailbox.queuedDeliveryIds(agentId)) {
+        if (!this.channels.store.assignmentForDelivery(deliveryId) || !this.#requeueChannelDelivery(deliveryId))
+          continue;
+        await this.#mailbox.cancel(agentId, deliveryId);
+        this.#mailboxSync.emitQueue(agentId);
+      }
+      const skipped = new Set(
+        this.#routines
+          .listFor(agentId)
+          .filter((routine) => routine.limitPolicy === "skip")
+          .map((routine) => routine.id),
+      );
+      if (skipped.size === 0) continue;
+      for (const delivery of this.listQueue(agentId).deliveries) {
+        if (delivery.status !== "queued" || delivery.sender.kind !== "routine") continue;
+        if (skipped.has(delivery.sender.routineId)) await this.#queue.cancel(agentId, delivery.id);
+      }
+    }
   }
 
   /** A saved edit is the editor's text, so `sender` becomes the sender of the message. */
