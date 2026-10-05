@@ -24,6 +24,7 @@ export const messages = defineMessages("mobile.app", {
   "mobile.app.route.hostedServerSetup": "Setup",
   "mobile.app.route.routines": "Routines",
   "mobile.app.route.routine": "Routine",
+  "mobile.app.route.usage": "Usage",
   "mobile.app.route.message": "Message",
   "mobile.app.messageActions.reply": "Reply",
   "mobile.app.messageActions.selectText": "Select Text",

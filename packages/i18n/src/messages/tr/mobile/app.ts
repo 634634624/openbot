@@ -25,6 +25,7 @@ export const messages = {
   "mobile.app.route.hostedServerSetup": "Kurulum",
   "mobile.app.route.routines": "Rutinler",
   "mobile.app.route.routine": "Rutin",
+  "mobile.app.route.usage": "Kullanım",
   "mobile.app.route.message": "Mesaj",
   "mobile.app.messageActions.reply": "Yanıtla",
   "mobile.app.messageActions.selectText": "Metni Seç",
