@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { AgentEvent } from "@openbot/contracts/ipc";
+import { registerSecretValue } from "@openbot/logging";
 import { afterEach, assert, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEVELOPMENT_DEFAULT_MODEL, DEVELOPMENT_DEFAULT_REASONING_EFFORT } from "./agent/development-defaults";
 import type { AgentProvider } from "./agent-client";
@@ -748,6 +749,68 @@ describe.sequential("AgentService: queue", () => {
       { provider: "claude", state: "inactive" },
       { provider: "grok", state: "active" },
     ]);
+  });
+
+  it("hands the work steps of the previous provider to the next one, with secrets redacted", async () => {
+    process.env.OPENBOT_GROK_PATH = await createFakeGrok(root);
+    const secret = "handoff-secret-7c1f9e2a4b";
+    registerSecretValue(secret);
+    const clients = new Map<AgentProvider, FakeAgentClient>();
+    const started = await startService(root, {
+      client: (provider) => {
+        const client = new FakeAgentClient(provider);
+        clients.set(provider, client);
+        return client;
+      },
+      preferredProvider: "codex",
+    });
+    service = started.service;
+    await service.sendMessage({ agentId: "chief", text: "First request" });
+    await waitForQueue(service, "chief", (queue) => queue.deliveries[0]?.status === "completed");
+    const turnId = (await service.readConversation("chief")).messages.find(
+      (message) => message.text === "CODEX_DONE",
+    )?.turnId;
+    const codex = clients.get("codex");
+    assert(turnId && codex, "The Codex turn did not complete.");
+    codex.threadRead = (params) => ({
+      thread: {
+        id: getString(params, "threadId"),
+        turns: [
+          {
+            id: turnId,
+            items: [
+              {
+                id: "command-1",
+                type: "commandExecution",
+                command: "bun test",
+                status: "completed",
+                exitCode: 1,
+                // The kept end of the output starts inside the secret.
+                aggregatedOutput: `1 failed\ntoken ${secret}\n${"y".repeat(590)}`,
+              },
+              {
+                id: "patch-1",
+                type: "fileChange",
+                status: "completed",
+                changes: [{ path: "src/app.ts", kind: { type: "update" }, diff: "@@ -1 +1 @@" }],
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    await service.updateAgent({ agentId: "chief", provider: "grok", model: "grok-4.5" });
+    await service.sendMessage({ agentId: "chief", text: "Second request" });
+    await waitForQueue(service, "chief", (queue) => queue.deliveries[1]?.status === "completed");
+    const grokInput = firstInputText(
+      clients.get("grok")?.requests.find((request) => request.method === "turn/start")?.params,
+    );
+
+    expect(grokInput).toContain("$ bun test (exit 1)");
+    expect(grokInput).toContain("update src/app.ts");
+    expect(grokInput).toContain("CODEX_DONE");
+    expect(grokInput).not.toContain("e2a4b");
   });
 
   it("resumes and retries once when Grok loses its in-memory session", async () => {

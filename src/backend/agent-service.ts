@@ -103,6 +103,7 @@ import { agentNamesById, displayMessageReferences } from "./agent/delivery-conte
 import { DeltaBuffer } from "./agent/delta-buffer";
 import { DrainScheduler } from "./agent/drain-scheduler";
 import { DuplicationGate } from "./agent/duplication-gate";
+import { decodeProviderTurns } from "./agent/handoff-tool-steps";
 import { type AgentHostedSites, HostedSiteCoordinator } from "./agent/hosted-site-coordinator";
 import { ImageGenRuntime } from "./agent/image-gen-runtime";
 import { MailboxSync } from "./agent/mailbox-sync";
@@ -148,6 +149,7 @@ import { recordAgentRestartActivity } from "./restart-activity";
 import type { RoutineHoldWindow } from "./routine-store";
 import { RoutineTimer } from "./routine-timer";
 import type { SidebarLayoutStore } from "./sidebar-layout-store";
+import { withTimeout } from "./with-timeout";
 import {
   type ResolvedSharedFile,
   type ResolvedWorkspaceFile,
@@ -586,6 +588,19 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       mcpToolRuntimes: () => this.#mcp.toolRuntimes(),
       mcpAuthorization: (config) => this.#mcp.authorization(config),
       ...(credentials.agentEnvironment ? { agentEnvironment: credentials.agentEnvironment } : {}),
+      // The previous provider's CLI stops a minute after no agent uses it, so it is started again. The
+      // first turn on the new provider waits for the start and the read, so both share one short
+      // limit. No `cwd` is sent, as in the boot backfill: a replaced ACP session is not opened again.
+      readProviderTurns: (provider, threadId) =>
+        withTimeout(
+          (async () => {
+            await this.#providers.ensureProvider(provider);
+            const client = this.#providers.clientFor(provider);
+            return client ? client.request("thread/read", { threadId, includeTurns: true }, decodeProviderTurns) : [];
+          })(),
+          10_000,
+          "The earlier provider session could not be read in time.",
+        ),
       passwordVaultConnected: () => options.passwordVault?.connected() ?? false,
       hooks: {
         logRecovery: (agentId, provider, outcome) =>
@@ -593,6 +608,8 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
         logReleaseFailure: (provider, error) =>
           logger.warn("Could not close a replaced provider session.", { provider, error }),
         reportMcpDrops: (provider, drops) => this.#mcp.reportDrops(provider, drops),
+        logHandoffReadFailure: (provider, error) =>
+          logger.warn("Could not read the work steps of an earlier provider session.", { provider, error }),
       },
     });
     this.#boot = new BootRecovery({
