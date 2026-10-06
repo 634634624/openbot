@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { agentProviderDescriptor } from "@openbot/contracts/agent-providers";
 import { sortConversationMessages } from "@openbot/contracts/conversation-order";
@@ -246,11 +246,16 @@ export interface AgentServiceOptions {
   hostMemory?: HostMemory | null;
 }
 
+/** How long a user send's `clientMessageId` answers a retry. A retry follows a lost reply, not a day. */
+const USER_SEND_RETRY_WINDOW_MS = 24 * 60 * 60 * 1000;
+
 export class AgentService extends EventEmitter<AgentServiceEvents> {
   readonly channels: ChannelService;
   readonly messaging: MessagingThreads;
   readonly #profileSave: ProfileSave;
   readonly #profileClients = new ProfileClients();
+  /** User sends still before their mailbox write, by idempotency key: a retry joins the first call. */
+  readonly #pendingUserSends = new Map<string, Promise<QueuedMessageReceipt>>();
   readonly #store: AgentStore;
   readonly #mailbox: MailboxStore;
   readonly #browser: AgentBrowserHost;
@@ -1918,11 +1923,38 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
    * `sender` is the person the host saw send it. It is not part of `SendMessageInput`: the caller of
    * that input, a renderer or a Team API body, never names who it is. `timezone` is the zone of a
    * Team API member's client, when it sent one.
+   *
+   * A `clientMessageId` the same sender used for this agent within a day returns the first receipt. The
+   * key is a hash, so it fits the identifier bound whatever the ids are, and has no `:`-separated
+   * turn id for the mailbox to read.
    */
-  async sendMessage(
+  sendMessage(
     input: SendMessageInput,
     sender?: ConversationMessageSender,
     timezone?: string,
+  ): Promise<QueuedMessageReceipt> {
+    if (!input.clientMessageId) return this.#sendUserMessage(input, sender, timezone);
+    const idempotencyKey = `user-send:${createHash("sha256")
+      .update(JSON.stringify([sender?.id ?? null, input.agentId, input.clientMessageId]))
+      .digest("hex")}`;
+    // Every user message adds a key, and the map is persisted whole, so keys older than the window go.
+    this.#mailbox.forgetIdempotencyKeys("user-send:", new Date(Date.now() - USER_SEND_RETRY_WINDOW_MS));
+    const stored = this.#mailbox.receiptForKey(idempotencyKey);
+    if (stored) return Promise.resolve(stored);
+    const pending = this.#pendingUserSends.get(idempotencyKey);
+    if (pending) return pending;
+    const send = this.#sendUserMessage(input, sender, timezone, idempotencyKey).finally(() => {
+      this.#pendingUserSends.delete(idempotencyKey);
+    });
+    this.#pendingUserSends.set(idempotencyKey, send);
+    return send;
+  }
+
+  async #sendUserMessage(
+    input: SendMessageInput,
+    sender: ConversationMessageSender | undefined,
+    timezone: string | undefined,
+    idempotencyKey?: string,
   ): Promise<QueuedMessageReceipt> {
     const validateRecipient = this.#mailbox.prepareDelivery([input.agentId]);
     if (this.#duplication.isPending(input.agentId))
@@ -1937,6 +1969,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       text: input.text,
       draftIds: input.attachmentDraftIds ?? [],
       replyToMessageId: input.replyToMessageId ?? null,
+      ...(idempotencyKey ? { idempotencyKey } : {}),
     });
     const [queued] = receipt.deliveries;
     const delivery = queued ? this.#mailbox.getDelivery(queued.id) : null;
