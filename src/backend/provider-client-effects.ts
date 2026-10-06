@@ -1,4 +1,5 @@
 import { Effect, Result, Schema } from "effect";
+import { causeHelpers } from "./effect-boundary";
 import { getString } from "./protocol";
 
 /** Preserves provider SDK failures at the existing Promise interfaces. */
@@ -8,6 +9,8 @@ export class ProviderClientOperationError extends Schema.TaggedError<ProviderCli
     cause: Schema.Defect(),
   },
 ) {}
+
+export const { rewrap: toProviderClientOperationError } = causeHelpers(ProviderClientOperationError);
 
 export function providerFailure(cause: unknown): ProviderClientOperationError {
   return cause instanceof ProviderClientOperationError ? cause : new ProviderClientOperationError({ cause });

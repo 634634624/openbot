@@ -75,12 +75,13 @@ import {
   type TurnResponse,
 } from "./protocol";
 import {
-  ProviderClientOperationError,
+  type ProviderClientOperationError,
   providerCall,
   providerFailure,
   providerResult,
   providerSync,
   requiredString,
+  toProviderClientOperationError,
 } from "./provider-client-effects";
 
 const execFileAsync = promisify(execFile);
@@ -303,9 +304,7 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
     this.#threads.forget(threadId);
     const runtime = this.#threads.get(threadId);
     if (!runtime) return;
-    yield* this.#threads
-      .close(runtime)
-      .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause })));
+    yield* this.#threads.close(runtime).pipe(toProviderClientOperationError);
   });
 
   readonly #closeRuntime = Effect.fn("ClaudeAgentClient.closeRuntime")(function* (
@@ -586,15 +585,13 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
       if (current && JSON.stringify(current.config) === JSON.stringify(config)) return;
       if (current) {
         if (current.activeTurn) return yield* providerFailure(new Error(sourceText("error.provider.claudeTurnActive")));
-        yield* this.#threads
-          .close(current)
-          .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause })));
+        yield* this.#threads.close(current).pipe(toProviderClientOperationError);
         continue;
       }
       if (
         yield* this.#threads
           .opening(threadId, () => this.#startThread(threadId, config, true))
-          .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause })))
+          .pipe(toProviderClientOperationError)
       )
         return;
     }
@@ -645,7 +642,7 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
             agentMcpServers(this.#mcpServers(), config.computerUse),
             this.#mcpToolRuntimes?.(),
             this.#mcpAuthorization,
-          ).pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause }))),
+          ).pipe(toProviderClientOperationError),
         );
     const stateDirectory = this.#stateDirectory;
     const skillPlugin =
@@ -739,7 +736,7 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
     const threadId = yield* providerSync(() => requiredString(params, "threadId"));
     return yield* this.#threads
       .startTurn(threadId, () => this.#openTurn(threadId, params))
-      .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause })));
+      .pipe(toProviderClientOperationError);
   });
 
   readonly #openTurn = Effect.fn("ClaudeAgentClient.openTurn")(function* (
@@ -747,9 +744,7 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
     threadId: string,
     params: unknown,
   ): Effect.fn.Return<TurnResponse, ProviderClientOperationError> {
-    yield* this.#threads
-      .wake(threadId)
-      .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause })));
+    yield* this.#threads.wake(threadId).pipe(toProviderClientOperationError);
     const runtime = yield* providerSync(() => this.#requireThread(threadId));
     if (runtime.activeTurn) return yield* providerFailure(new Error("The Claude thread already has an active turn."));
 
@@ -1358,7 +1353,7 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
         tool: name,
         arguments: args,
       })
-      .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause })));
+      .pipe(toProviderClientOperationError);
     if (!isRecord(result)) return { content: [{ type: "text" as const, text: String(result) }] };
     const content: CallToolResult["content"] = [];
     if (Array.isArray(result.contentItems)) {
@@ -1388,7 +1383,7 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
         itemId: toolUseId,
         questions,
       })
-      .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause })));
+      .pipe(toProviderClientOperationError);
     const responseAnswers = isRecord(result) && isRecord(result.answers) ? result.answers : {};
     const answers = Object.fromEntries(
       questions.map((question) => {
@@ -1419,7 +1414,7 @@ export class ClaudeAgentClient extends EventEmitter<ClientEvents> {
         itemId: toolUseId,
         reason: sourceText("status.agent.claudeWriteOutside", { path }),
       })
-      .pipe(Effect.mapError((failure) => new ProviderClientOperationError({ cause: failure.cause })));
+      .pipe(toProviderClientOperationError);
     if (isRecord(result) && result.decision === "accept") return { behavior: "allow", updatedInput: toolInput };
     return { behavior: "deny", message: "The user did not allow this write outside the workspace." };
   });

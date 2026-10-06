@@ -4,6 +4,7 @@ import { sourceText } from "@openbot/i18n/source";
 import { Effect, Exit, Fiber, Schema, Scope } from "effect";
 import type { AgentClient, AgentProvider } from "./../agent-client";
 import type { AgentCliInfo } from "./../cli";
+import { causeHelpers } from "../effect-boundary";
 import type { AccountReadResult } from "./../protocol";
 import type { ProviderClientOperationError } from "../provider-client-effects";
 import type { ProviderCliCommand } from "./../provider-drivers";
@@ -89,7 +90,7 @@ export class CliLoginFlow {
       const scope = Scope.makeUnsafe();
       const { child, done, prompt, submit } = yield* start(resolved).pipe(
         Effect.provideService(Scope.Scope, scope),
-        Effect.mapError((failure) => new CliLoginFailed({ cause: failure.cause })),
+        toCliLoginFailed,
         Effect.onError(() => Scope.close(scope, Exit.void)),
       );
       const pending: PendingCliLogin = {
@@ -104,7 +105,7 @@ export class CliLoginFlow {
       // The login outlives the request; dispose/cancel owns the registered child and task.
       pending.task = yield* Effect.forkIn(
         done.pipe(
-          Effect.mapError((failure) => new CliLoginFailed({ cause: failure.cause })),
+          toCliLoginFailed,
           Effect.flatMap(() => this.#complete(provider, pending)),
           Effect.catch((failure) => this.#fail(provider, pending, failure.cause)),
           Effect.ensuring(Scope.close(scope, Exit.void)),
@@ -134,7 +135,7 @@ export class CliLoginFlow {
     const code = this.#pending.get(provider)?.code;
     if (!code) return yield* new CliLoginFailed({ cause: new Error(sourceText("error.provider.codeLoginNoLink")) });
     const expiresAt = Date.now() + command.timeoutMs;
-    const prompt = yield* code.prompt.pipe(Effect.mapError((failure) => new CliLoginFailed({ cause: failure.cause })));
+    const prompt = yield* code.prompt.pipe(toCliLoginFailed);
     if (prompt.flow === "link") return { kind: "link", verificationUrl: prompt.verificationUrl, expiresAt };
     return prompt.flow === "paste"
       ? { kind: "paste", verificationUrl: prompt.verificationUrl, expiresAt }
@@ -162,9 +163,7 @@ export class CliLoginFlow {
     const pending = this.#pending.get(provider);
     if (!pending) return;
     this.#pending.delete(provider);
-    yield* stopProcessTree(pending.child).pipe(
-      Effect.mapError((failure) => new CliLoginFailed({ cause: failure.cause })),
-    );
+    yield* stopProcessTree(pending.child).pipe(toCliLoginFailed);
     yield* Scope.close(pending.scope, Exit.void);
     const task = pending.task;
     if (task) yield* Fiber.join(task).pipe(Effect.ignore);
@@ -192,10 +191,7 @@ export class CliLoginFlow {
     yield* Effect.gen({ self: this }, function* () {
       const candidate = yield* this.#options.authenticate(provider, pending.cli);
       if (this.#pending.get(provider) !== pending) {
-        yield* candidate.client
-          .stop()
-          .pipe(Effect.mapError((failure) => new CliLoginFailed({ cause: failure.cause })))
-          .pipe(Effect.ignore);
+        yield* candidate.client.stop().pipe(toCliLoginFailed).pipe(Effect.ignore);
         return;
       }
       yield* this.#options.activate(provider, candidate.client, pending.cli, candidate.account, {
@@ -213,9 +209,7 @@ export class CliLoginFlow {
   ) {
     if (this.#pending.get(provider) !== pending) return;
     this.#pending.delete(provider);
-    yield* stopProcessTree(pending.child).pipe(
-      Effect.mapError((failure) => new CliLoginFailed({ cause: failure.cause })),
-    );
+    yield* stopProcessTree(pending.child).pipe(toCliLoginFailed);
     this.#options.setFailure(provider, error, pending.cli.version);
   });
 }
@@ -223,3 +217,5 @@ export class CliLoginFlow {
 export class CliLoginFailed extends Schema.TaggedError<CliLoginFailed>()("CliLoginFailed", {
   cause: Schema.Defect(),
 }) {}
+
+export const { rewrap: toCliLoginFailed } = causeHelpers(CliLoginFailed);
