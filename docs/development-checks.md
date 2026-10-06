@@ -109,11 +109,11 @@ Its main jobs are:
 | Tests (sites) | `ubuntu-latest` | `bun run test:sites` |
 | Tests (remote) | `ubuntu-latest` | `bun run test:remote` |
 | Surfaces | `ubuntu-latest` | `bun run mobile:typecheck`, `bun run typecheck:sites`, `bun run typecheck:team-client`, `bun run typecheck:remote`, `bun run --parallel typecheck:logging typecheck:user-errors typecheck:i18n`, `bun run remote:check:compose` |
-| API | `ubuntu-latest` | `bun run check:api` |
+| API | `ubuntu-latest` | `bun run check:api`, then, for a pull request from this repository, upload `apps/auth-api/dist` |
 | Storybook build | `ubuntu-latest` | `bun run build-storybook` |
-| Cloudflare preview build | `ubuntu-latest` | `CLOUDFLARE_ENV=preview bun run api:build`, then upload `apps/auth-api/dist` |
 
-The preview build job has no secrets. After the CI run completes, the trusted
+`check:api` ends with `api:build:check`, which is the preview build of the Worker, so the API job
+uploads that build as the `cloudflare-preview` artifact. The job has no secrets. After the CI run completes, the trusted
 [cloudflare-preview.yml](../.github/workflows/cloudflare-preview.yml) workflow runs its `main`
 version with the preview deploy token. It skips a closed pull request, a newer commit, and a fork. It
 builds the `main` Worker config, and `scripts/check-preview-worker-config.ts` stops the upload when
@@ -121,7 +121,7 @@ the pull request's generated `wrangler.json` differs from it in anything but the
 compatibility settings. Thus a pull request that changes the preview Worker name, bindings, vars, or
 routes gets no preview. A change to `cloudflare-preview.yml` takes effect only after it merges.
 
-All of these jobs except the preview build gate Cloudflare production deployment on `main`. Surfaces was previously missing from
+All of these jobs gate Cloudflare production deployment on `main`. Surfaces was previously missing from
 that dependency list, which allowed deployment despite a failed mobile or remote check.
 These long suites belong in CI; local desktop runs can reach their time limits under load.
 
@@ -135,7 +135,7 @@ renderer bundles it. Then it selects the lanes:
 | --- | --- | --- |
 | `code` | Check, Tests (desktop) | anything that is left |
 | `desktop` | Browser smoke | outside `apps/auth-api`, `apps/mobile`, `apps/site-router`, `remote` and `docker` |
-| `api` | API, Cloudflare preview build | in `apps/auth-api`, `apps/site-router`, `src/renderer` or `resources`, or a `CHANGELOG.md` |
+| `api` | API | in `apps/auth-api`, `apps/site-router`, `src/renderer` or `resources`, or a `CHANGELOG.md` |
 | `sites` | Tests (sites) | in `apps/site-router` |
 | `remote` | Tests (remote) | in `remote` or `scripts` |
 | `storybook` | Storybook build | in `src`, `apps/auth-api`, `.storybook`, `resources`, `marketplace` or `build` |
