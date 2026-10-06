@@ -188,6 +188,33 @@ break a destructured export.
 deliberately not cached: `install-electron` takes 2.6s on a runner, and a measured cache hit
 restored 123 MB in 4.4s and left `bun install` at 29.9s against 29.0s with no cache at all.
 
+## Focused tests
+
+`bun run test:changed` is `vitest run --changed origin/main --maxWorkers=1`. First it runs
+`git merge-base origin/main HEAD`, and stops with an error when `origin/main` or a common commit is
+missing. Without this guard, Vitest ignores the failed `git diff`, finds no test files and exits
+with code 0, so a broken test would pass. Vitest takes the files
+in `git diff origin/main...HEAD`, the staged files, and the unstaged and untracked files. Then it
+runs each test file whose import graph contains one of them. It uses the root `vitest.config.ts`,
+so each file goes to its usual project (`node`, `renderer` or `mobile-ui`) and environment. When
+no test imports a changed file, it finds no test files and exits with code 0. Fetch `origin/main`
+first if it is old: an old base selects tests for changes that are already on `main`.
+
+`bun run test:related -- <source>...` is `vitest related --run --maxWorkers=1`. It runs the test
+files that import the named source files, with no Git query.
+
+A change to `vitest.config.ts`, a setup file or `package.json` selects no test. The root config
+sets `forceRerunTriggers: []`. The Vitest default (`**/package.json/**`,
+`**/{vitest,vite}.config.*/**`) selects every test for such a change, but only when the checkout
+path has no dot directory: `**` does not match a dot directory such as `.t3` or `.claude`. A full
+run on one worker is not a focused check. A setup file is not in a test's import graph. After such
+a change, run the test files that it can affect with
+`bun run test:desktop -- <path>`.
+
+A shared module can have many dependents. For example, `packages/ui/src/digit-roll.ts` selects 16
+files, including the `App.*.test.tsx` files. Do a list first to see the set without a run:
+`bun x vitest list --filesOnly --changed origin/main`.
+
 ## Test environment guard
 
 `tools/vitest/hermetic-setup.ts` is the first setup file of the `node` and `renderer` projects, so it
