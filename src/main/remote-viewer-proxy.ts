@@ -15,6 +15,7 @@ import { Deferred, Effect, Semaphore } from "effect";
 import type * as Ws from "ws";
 import { readBodyWithin } from "./http-body";
 import { LifecycleGate } from "./lifecycle-gate";
+import { listenLoopback } from "./listen-loopback";
 import {
   decodeRemoteDesktopSignalBinary,
   decodeRemoteDesktopSignalControl,
@@ -130,14 +131,11 @@ export class RemoteViewerProxy {
           this.#openStream(route.serverId, route.upstreamPath, webSocket),
         );
       });
-      server.once("error", reject);
-      server.listen(0, "127.0.0.1", () => {
-        const address = server.address();
-        if (!address || isString(address)) return reject(new Error(sourceText("error.remote.viewerProxyNoPort")));
+      listenLoopback(server, () => new Error(sourceText("error.remote.viewerProxyNoPort"))).then((port) => {
         this.#server = server;
-        this.#port = address.port;
-        resolve(address.port);
-      });
+        this.#port = port;
+        resolve(port);
+      }, reject);
       return Effect.sync(() => {
         if (this.#server !== server) server.close();
       });
