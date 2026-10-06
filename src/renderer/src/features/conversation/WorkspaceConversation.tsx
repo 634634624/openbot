@@ -324,6 +324,7 @@ export function WorkspaceConversation(props: { account: () => CentralAuthUser })
           : (remoteAgentSettings()?.autoApproveLocked ?? false)
       }
       onSetAgentAutoApprove={setAgentAutoApproveForActiveAgent()}
+      defaultBusyMessageMode={generalSettings().busyMessageMode}
       onClearAgentContext={clearActiveAgentContext()}
       onRespondToBrowserTakeover={respondToBrowserTakeover}
       onCancelQueuedMessage={cancelQueuedMessage}
