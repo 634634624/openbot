@@ -4,6 +4,7 @@ import { toAgentRemovalFailed } from "../backend/agent/agent-removal";
 import { toHostedSiteOperationFailed } from "../backend/agent/hosted-site-coordinator";
 import { AgentDatabaseSupervisor } from "../backend/agent-data/agent-database-supervisor";
 import { AgentTables } from "../backend/agent-data/agent-tables";
+import { DiscordConnectFailed, toDiscordConnectFailed } from "../backend/messaging/discord/discord-connect";
 import { SlackConnectFailed, toSlackConnectFailed } from "../backend/messaging/slack/slack-connect";
 import { type AgentAdminSettingsService, createAgentAdminSettings } from "./agent-admin-settings";
 import { spawnAgentDatabaseHost } from "./agent-database-host-process";
@@ -61,6 +62,7 @@ import { BrowserHost } from "../backend/browser-host";
 import { runCauseEffect } from "../backend/effect-boundary";
 import { MailboxStore } from "../backend/mailbox-store";
 import { McpOAuth } from "../backend/mcp-oauth-provider";
+import { discordDriver } from "../backend/messaging/discord/discord-driver";
 import { MessagingService } from "../backend/messaging/messaging-service";
 import { slackDriver } from "../backend/messaging/slack/slack-driver";
 import { SidebarLayoutStore } from "../backend/sidebar-layout-store";
@@ -165,9 +167,9 @@ import {
   configureServerLogoProtocols,
 } from "./session-configuration";
 import { readSetupState } from "./setup-store";
+import { SignalIngress } from "./signal-ingress";
 import { SkillMarketplaceService } from "./skill-marketplace-service";
 import { SLACK_DEV_CALLBACK_PATH, startSlackDevCallbackServer } from "./slack-dev-callback-server";
-import { SlackIngress } from "./slack-ingress";
 import { TeamStore } from "./team-store";
 import { TeamWebRtcBridge } from "./team-webrtc-bridge";
 import { TeamWebRtcClientTransport } from "./team-webrtc-client-transport";
@@ -257,7 +259,7 @@ const TEARDOWN_ORDER = {
   // Before the host and the service: no new external message arrives while they stop.
   messaging: 85,
   // After the connections that hold it.
-  slackIngress: 86,
+  signalIngress: 86,
   host: 90,
   teamWebRtcBridge: 100,
   // Before the agent service, so no calendar read finds it stopping.
@@ -411,7 +413,10 @@ interface MessagingServicesContext {
   readHostId: () => string | null;
 }
 
-/** The Slack connections. Awaited in place, so start and teardown order stay as they were inline. */
+/**
+ * The Slack and Discord connections. Awaited in place, so start and teardown order stay as they were
+ * inline.
+ */
 async function createMessagingServices({
   teardown,
   secretCipher,
@@ -419,9 +424,9 @@ async function createMessagingServices({
   service,
   sidebarLayout,
   readHostId,
-}: MessagingServicesContext): Promise<{ messaging: MessagingService; slackIngress: SlackIngress }> {
+}: MessagingServicesContext): Promise<{ messaging: MessagingService; signalIngress: SignalIngress }> {
   /*
-   * The Slack workspaces where the agents answer. The tokens use the same cipher as every other
+   * The Slack workspaces and Discord guilds where the agents answer. The tokens use the same cipher as every other
    * secret; an unreadable file is reported, not fatal, and each workspace then connects again.
    */
   const messagingCredentials = new MessagingCredentialStore(
@@ -433,8 +438,9 @@ async function createMessagingServices({
     logger.warn(
       `OpenBot could not read the messaging token file (${messagingCredentialLoadError.name}). It was left unchanged.`,
     );
-  // The Signal socket that brings the events of the Slack workspaces linked to this host.
-  const slackIngress = new SlackIngress({
+  // The Signal socket that brings the events of the Slack workspaces and Discord guilds linked to this
+  // host, and makes its Discord calls.
+  const signalIngress = new SignalIngress({
     hostId: readHostId,
     signedIn: () => {
       try {
@@ -446,9 +452,10 @@ async function createMessagingServices({
     },
     issueTicket: (hostId) => centralAuth.issueRemoteHostTicket(hostId).pipe(toRemoteWorkflowError),
     issueSlackRoute: (hostId) => centralAuth.issueSlackRoute(hostId).pipe(toRemoteWorkflowError),
+    issueDiscordRoute: (hostId) => centralAuth.issueDiscordRoute(hostId).pipe(toRemoteWorkflowError),
   });
-  teardown.push(TEARDOWN_ORDER.slackIngress, "the Slack ingress socket", () =>
-    Effect.runPromise(slackIngress.dispose()),
+  teardown.push(TEARDOWN_ORDER.signalIngress, "the Signal ingress socket", () =>
+    Effect.runPromise(signalIngress.dispose()),
   );
   // Development only: `bun run dev:slack` names this loopback port, so a Slack install returns to this
   // dev app and not to an installed OpenBot that owns `openbot://`.
@@ -466,9 +473,9 @@ async function createMessagingServices({
       createMemory: (input) => service.createMemory(input),
     },
     credentials: messagingCredentials,
-    drivers: [slackDriver({ ingress: slackIngress })],
+    drivers: [slackDriver({ ingress: signalIngress }), discordDriver({ ingress: signalIngress })],
     downloadsRoot: join(app.getPath("userData"), "messaging-downloads"),
-    ingress: slackIngress,
+    ingress: signalIngress,
     sidebar: sidebarLayout,
     slackApp: {
       authorize: (input) =>
@@ -505,6 +512,33 @@ async function createMessagingServices({
         }),
       openExternal: (url) => shell.openExternal(url),
     },
+    discordApp: {
+      authorize: (input) =>
+        Effect.suspend(() => {
+          const hostId = readHostId();
+          if (!hostId)
+            return Effect.fail(
+              new DiscordConnectFailed({ cause: new Error(sourceText("error.messaging.discordRelayUnavailable")) }),
+            );
+          return centralAuth
+            .requestAuthorized(
+              "/v2/discord/authorize",
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ hostId, ...input }),
+              },
+              (value) => requiredString(decodeRecord(value, "Discord sign-in"), "authorizeUrl"),
+            )
+            .pipe(toDiscordConnectFailed);
+        }),
+      unlink: (guildId) =>
+        Effect.suspend(() => {
+          const hostId = readHostId();
+          return hostId ? centralAuth.unlinkDiscordGuild(hostId, guildId).pipe(toDiscordConnectFailed) : Effect.void;
+        }),
+      openExternal: (url) => shell.openExternal(url),
+    },
   });
   // Not awaited: a connection waits for Slack, and the app does not wait for it.
   void runCauseEffect(messaging.start()).catch((error) =>
@@ -518,9 +552,9 @@ async function createMessagingServices({
       if (received) app.focus({ steal: true });
       return received;
     });
-    teardown.push(TEARDOWN_ORDER.slackIngress, "the Slack development callback", () => callback.close());
+    teardown.push(TEARDOWN_ORDER.signalIngress, "the Slack development callback", () => callback.close());
   }
-  return { messaging, slackIngress };
+  return { messaging, signalIngress };
 }
 
 export async function createApplicationServices({
@@ -1133,16 +1167,16 @@ export async function createApplicationServices({
   });
   await Effect.runPromise(routineFeed.start());
   teardown.push(TEARDOWN_ORDER.routineFeed, "the routine feed", () => Effect.runPromise(routineFeed.stop()));
-  // The host id is read when the Slack socket opens, and the team store is built further down, so
+  // The host id is read when the Signal socket opens, and the team store is built further down, so
   // it starts as "no name yet".
-  let slackIngressHostId: () => string | null = () => null;
-  const { messaging, slackIngress } = await createMessagingServices({
+  let ingressHostId: () => string | null = () => null;
+  const { messaging, signalIngress } = await createMessagingServices({
     teardown,
     secretCipher,
     centralAuth,
     service,
     sidebarLayout,
-    readHostId: () => slackIngressHostId(),
+    readHostId: () => ingressHostId(),
   });
   // A connect, a disconnect or an expiry changes the tools and the `gh` sign-in of every agent.
   githubConnector.onAgentAccessChanged(() => {
@@ -1285,8 +1319,8 @@ export async function createApplicationServices({
     join(app.getPath("userData"), TEAM_FILE),
   );
   await runCauseEffect(teamStore.initialize());
-  slackIngressHostId = () => teamStore.getIdentity()?.serverId ?? null;
-  slackIngress.reconnect();
+  ingressHostId = () => teamStore.getIdentity()?.serverId ?? null;
+  signalIngress.reconnect();
   // After `teamStore.initialize()` and before `HostService`, which reads the account it activates.
   if (developmentRemoteRole) {
     await runCauseEffect(
