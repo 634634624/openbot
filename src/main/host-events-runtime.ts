@@ -55,6 +55,10 @@ export class HostEventsRuntime {
     );
   }
 
+  setAccountPrincipal(principalId: string | null): void {
+    this.#service.setAccountPrincipal(principalId);
+  }
+
   stop(): Effect.Effect<void> {
     return Effect.suspend(() => {
       this.#running = false;

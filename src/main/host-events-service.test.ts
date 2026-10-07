@@ -30,6 +30,8 @@ import { createWebhookSignature } from "./webhook-security";
 //   administrator check: "keeps webhook routines out of the released routine routes".
 // - A secret that the host cannot decrypt answers 401, so the sender stops a retry that can succeed:
 //   "rejects changed bytes and stale timestamps".
+// - An account-A route result mutates local state after account B signs in: "discards a stale route
+//   result after a principal switch".
 let decryptFails = false;
 const cipher = {
   encrypt: (value: string) => Buffer.from([...value].reverse().join("")),
@@ -51,19 +53,45 @@ afterEach(async () => {
 function fakeRelay() {
   const registered: string[] = [];
   const revoked: string[] = [];
+  const accountChanges: boolean[] = [];
+  const blocked: { routeId: string | null; started: boolean; resolve: (() => void) | null; resultUrl: string | null } =
+    {
+      routeId: null,
+      started: false,
+      resolve: null,
+      resultUrl: null,
+    };
   const relay = {
     registered,
     revoked,
+    accountChanges,
+    blocked,
     offline: false,
     conflicts: new Set<string>(),
     connected: () => true,
     setEnabled: (_enabled: boolean) => undefined,
+    setAccountActive: (active: boolean) => relay.accountChanges.push(active),
     refresh: () => undefined,
     registerRoute: (routeId: string): Effect.Effect<string, { readonly cause: unknown } | WebhookRouteConflict> => {
       if (relay.offline) return Effect.fail({ cause: new Error("offline") });
       if (relay.conflicts.has(routeId)) return Effect.fail(new WebhookRouteConflict());
-      relay.registered.push(routeId);
-      return Effect.succeed(`https://signal.example/v1/webhooks/${routeId}`);
+      const url = relay.blocked.resultUrl ?? `https://signal.example/v1/webhooks/${routeId}`;
+      if (relay.blocked.routeId !== routeId) {
+        relay.registered.push(routeId);
+        return Effect.succeed(url);
+      }
+      return Effect.promise(
+        () =>
+          new Promise<void>((resolve) => {
+            relay.blocked.started = true;
+            relay.blocked.resolve = resolve;
+          }),
+      ).pipe(
+        Effect.map(() => {
+          relay.registered.push(routeId);
+          return url;
+        }),
+      );
     },
     revokeRoute: (routeId: string): Effect.Effect<void, { readonly cause: unknown }> => {
       if (relay.offline) return Effect.fail({ cause: new Error("offline") });
@@ -90,7 +118,13 @@ async function fixture() {
   agentService = service;
   await Effect.runPromise(service.initialize());
   const relay = fakeRelay();
-  const events = new HostEventsService({ routines: service.routineRecords, cipher, relay });
+  const account: { principal: string | null } = { principal: "account-a" };
+  const events = new HostEventsService({
+    routines: service.routineRecords,
+    cipher,
+    relay,
+    accountPrincipal: () => account.principal,
+  });
   const owner: EventRoutineOwner = { kind: "agent", id: agent.id };
   const input: SaveEventRoutineInput = {
     owner,
@@ -109,6 +143,7 @@ async function fixture() {
     database: store.database,
     service,
     events,
+    account,
     relay,
     owner,
     input,
@@ -150,6 +185,49 @@ describe("HostEventsService receipt boundary", () => {
     expect(await Effect.runPromise(events.receive(receipt))).toEqual({ status: 503 });
     expect(database.connection.prepare("SELECT receipt_id FROM projection_webhook_receipts").all()).toEqual([]);
     expect(runs()).toEqual([]);
+  });
+
+  it("rejects signed deliveries while signed out and resumes the stored route after sign-in", async () => {
+    const { database, events, account, owner, routeId, secret, saved, runs, relay } = await fixture();
+    account.principal = null;
+    events.setAccountPrincipal(null);
+    expect(await Effect.runPromise(events.receive(signed(routeId, secret, "signed-out-1", BUILD)))).toEqual({
+      status: 503,
+    });
+    expect(runs()).toEqual([]);
+    expect(database.connection.prepare("SELECT receipt_id FROM projection_webhook_receipts").all()).toEqual([]);
+
+    const [signedOutRoutine] = await Effect.runPromise(events.listRoutines({ owner }));
+    expect(signedOutRoutine?.trigger).toMatchObject({ url: `https://signal.example/v1/webhooks/${routeId}` });
+    await Effect.runPromise(events.syncRoutes({ all: true }));
+    expect(relay.registered).toEqual([routeId]);
+
+    account.principal = "account-a";
+    events.setAccountPrincipal("account-a");
+    await Effect.runPromise(events.syncRoutes({ all: true }));
+    expect(relay.registered).toContain(routeId);
+    expect(relay.accountChanges).toEqual([false, true]);
+    expect(saved.routine.trigger.kind).toBe("webhook");
+    expect(await Effect.runPromise(events.receive(signed(routeId, secret, "signed-in-1", BUILD)))).toEqual({
+      status: 202,
+    });
+    expect(runs()).toHaveLength(1);
+  });
+
+  it("discards a stale route result after a principal switch", async () => {
+    const { events, account, owner, routeId, relay } = await fixture();
+    relay.blocked.routeId = routeId;
+    relay.blocked.resultUrl = `https://signal.example/v1/webhooks/${routeId}/account-a`;
+    const pending = Effect.runPromise(events.syncRoutes({ all: true }));
+    await waitFor(() => relay.blocked.started);
+
+    account.principal = "account-b";
+    events.setAccountPrincipal("account-b");
+    relay.blocked.resolve?.();
+    await pending;
+
+    const [current] = await Effect.runPromise(events.listRoutines({ owner }));
+    expect(current?.trigger).toMatchObject({ url: `https://signal.example/v1/webhooks/${routeId}` });
   });
 
   it("starts one run per delivery ID when the sender retries after a lost acknowledgement", async () => {
