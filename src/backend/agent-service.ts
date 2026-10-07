@@ -109,7 +109,7 @@ import { DeltaBuffer } from "./agent/delta-buffer";
 import { DrainScheduler } from "./agent/drain-scheduler";
 import { DuplicationGate, toAgentDuplicationFailed } from "./agent/duplication-gate";
 import type { FailureContext, FailureSignal } from "./agent/failure-signal";
-import { decodeProviderTurns } from "./agent/handoff-tool-steps";
+import { readCapturedSteps } from "./agent/handoff-tool-steps";
 import { type AgentHostedSites, HostedSiteCoordinator } from "./agent/hosted-site-coordinator";
 import { ImageGenRuntime } from "./agent/image-gen-runtime";
 import { MailboxSync } from "./agent/mailbox-sync";
@@ -162,6 +162,7 @@ import { MessagingThreads, toMessagingThreadFailed } from "./messaging/messaging
 import type { PasswordVault } from "./password-vault";
 import { decodeRecordResponse } from "./protocol";
 import { NO_PROVIDER_CREDENTIALS, type ProviderClientContext } from "./provider-drivers";
+import { providerHistoryPersistence } from "./provider-history-persistence";
 import { recordAgentRestartActivity } from "./restart-activity";
 import type { RoutineHoldWindow } from "./routine-store";
 import { RoutineTimer } from "./routine-timer";
@@ -523,6 +524,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       // endpoint can refuse the prompt itself, after the waits every caller above it makes.
       credentials: {
         ...credentials,
+        history: credentials.history ?? ((provider) => providerHistoryPersistence(this.#store.database, provider)),
         servesModel: (modelId) => this.#endpoints.serves(modelId),
         // Every MCP set that leaves for a provider is remembered, so its secrets stay redactable
         // after the user edits them. This is the second of the two ways one leaves; the other is
@@ -612,6 +614,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       mailbox,
       conversation: this.#conversation,
       routines: this.#routines,
+      scope: () => this.#scope,
       hooks: {
         emit: (event) => this.#emit(event),
         emitError: (code, error, agentId) => this.#emitError(code, error, agentId),
@@ -656,14 +659,12 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       // The previous provider's CLI stops a minute after no agent uses it, so it is started again. The
       // first turn on the new provider waits for the start and the read, so both share one short
       // limit. No `cwd` is sent, as in the boot backfill: a replaced ACP session is not opened again.
-      readProviderTurns: (provider, threadId) =>
+      readProviderSteps: (provider, threadId) =>
         withTimeout(
           Effect.gen({ self: this }, function* () {
             yield* this.#providers.ensureProvider(provider);
             const client = this.#providers.clientFor(provider);
-            return client
-              ? yield* client.request("thread/read", { threadId, includeTurns: true }, decodeProviderTurns)
-              : [];
+            return client ? yield* readCapturedSteps(client, threadId) : new Map<string, string>();
           }),
           10_000,
           "The earlier provider session could not be read in time.",
@@ -2688,14 +2689,10 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       );
     const snapshot = this.#conversation.ensureSnapshot(agent.id, agent.threadId);
     if (!snapshot.messages.some((message) => message.id === input.messageId)) {
-      yield* this.readConversation(agent.id).pipe(
-        Effect.mapError(
-          (failure) => new AgentLifecycleFailed({ operation: "read reaction conversation", cause: failure.cause }),
-        ),
-      );
+      const [message] = this.#store.database.readConversationMessages(agent.id, agent.threadId, [input.messageId]);
+      if (message) snapshot.messages.push(message);
     }
-    const current = this.#conversation.ensureSnapshot(agent.id, agent.threadId);
-    if (!current.messages.some((message) => message.id === input.messageId)) {
+    if (!snapshot.messages.some((message) => message.id === input.messageId)) {
       return yield* new AgentLifecycleFailed({
         operation: "set message reaction",
         cause: new Error(sourceText("error.agent.messageUnavailable")),
@@ -2708,8 +2705,8 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
           (failure) => new AgentLifecycleFailed({ operation: "set message reaction", cause: failure.cause }),
         ),
       );
-    this.#mailboxSync.syncMailboxMessages(current);
-    this.#conversation.emitConversation(current);
+    this.#mailboxSync.syncMailboxMessages(snapshot);
+    this.#conversation.emitConversation(snapshot);
   }, Effect.uninterruptible).bind(this);
 
   interrupt(agentId: string, turnId: string, executionThreadId?: string): Effect.Effect<void, AgentLifecycleFailed> {
