@@ -164,6 +164,7 @@ import { decodeRecordResponse } from "./protocol";
 import { NO_PROVIDER_CREDENTIALS, type ProviderClientContext } from "./provider-drivers";
 import { providerHistoryPersistence } from "./provider-history-persistence";
 import { recordAgentRestartActivity } from "./restart-activity";
+import { RoutineRecords } from "./routine-records";
 import type { RoutineHoldWindow } from "./routine-store";
 import { RoutineTimer } from "./routine-timer";
 import type { SidebarLayoutStore } from "./sidebar-layout-store";
@@ -283,6 +284,8 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
   readonly #routines: RoutineScheduler;
   readonly #routineTimer: RoutineTimer;
   readonly #channelRoutines: ChannelRoutineScheduler;
+  /** Agent and channel routines of every trigger kind, with their webhook routes. */
+  readonly routineRecords: RoutineRecords;
   readonly #mcp: McpGateway;
   readonly #providers: ProviderRuntime;
   readonly #endpoints: CustomEndpoints;
@@ -818,6 +821,15 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
           return lead !== null && !this.#usageLimits.mayDrain(lead);
         },
       },
+    });
+    this.routineRecords = new RoutineRecords({
+      database: store.database,
+      agentRoutines: this.#routines,
+      channelRoutines: this.#channelRoutines,
+      agentExists: (agentId) => this.listAgents().some((agent) => agent.id === agentId),
+      channelExists: (channelId) => this.channels.store.exists(channelId),
+      channelRoutinesChanged: (channelId) => this.#emit({ type: "channel-routines-changed", channelId }),
+      routinesHeld: () => this.#routineTimer.held,
     });
     this.messaging = new MessagingThreads(store.database, mailbox, {
       schedule: (agentId) => this.#drain.scheduleDrain(agentId),
@@ -2455,7 +2467,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       }
       const skipped = new Set(
         this.#routines
-          .listFor(agentId)
+          .listRecordsFor(agentId)
           .filter((routine) => routine.limitPolicy === "skip")
           .map((routine) => routine.id),
       );

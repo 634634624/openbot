@@ -115,6 +115,8 @@ import { DynamicIslandFailed, DynamicIslandWindowController, toDynamicIslandFail
 import { githubAppConfig } from "./github-connector-config";
 import { GitHubConnectorService } from "./github-connector-service";
 import { GitHubConnectorStore } from "./github-connector-store";
+import { HostEventsRuntime } from "./host-events-runtime";
+import { HostEventsService } from "./host-events-service";
 import { HostService } from "./host-service";
 import { HostUpdateCoordinator } from "./host-update-coordinator";
 import { CLIENT_USE_WINDOW_MS, HostedServerActivity } from "./hosted-server-activity";
@@ -192,6 +194,7 @@ import {
 import { listSiblingOpenBotInstances } from "./update-sibling-instances";
 import { WHISPER_MODEL_NAME, WHISPER_MODEL_URL } from "./voice-model-service";
 import { VoiceTranscriptionService } from "./voice-transcription-service";
+import { WebhookRelay } from "./webhook-relay";
 
 const logger = createOpenBotLogger("application-services");
 const SETUP_FILE = "openbot-setup-v2.json";
@@ -263,6 +266,7 @@ const TEARDOWN_ORDER = {
   remoteDesktop: 80,
   // Before the host and the service: no new external message arrives while they stop.
   messaging: 85,
+  hostEvents: 85.5,
   // After the connections that hold it.
   signalIngress: 86,
   host: 90,
@@ -361,6 +365,8 @@ export interface ApplicationServices {
   billing: BillingDesktopService;
   hostedServers: HostedServerDesktopService;
   routineFeed: RoutineFeedServer;
+  events: HostEventsService;
+  eventsRuntime: HostEventsRuntime;
   /** The terminal control of a self-hosted server. Null in every other build. */
   serverMode: ServerMode | null;
   customProviders: CustomProviderStore;
@@ -460,6 +466,7 @@ async function createMessagingServices({
     issueTicket: (hostId) => centralAuth.issueRemoteHostTicket(hostId).pipe(toRemoteWorkflowError),
     issueSlackRoute: (hostId) => centralAuth.issueSlackRoute(hostId).pipe(toRemoteWorkflowError),
     issueDiscordRoute: (hostId) => centralAuth.issueDiscordRoute(hostId).pipe(toRemoteWorkflowError),
+    issueWebhookRoute: (hostId) => centralAuth.issueWebhookRoute(hostId).pipe(toRemoteWorkflowError),
   });
   teardown.push(TEARDOWN_ORDER.signalIngress, "the Signal ingress socket", () =>
     Effect.runPromise(signalIngress.dispose()),
@@ -1334,6 +1341,22 @@ export async function createApplicationServices({
   await runCauseEffect(teamStore.initialize());
   ingressHostId = () => teamStore.getIdentity()?.serverId ?? null;
   signalIngress.reconnect();
+  const webhookRelay = new WebhookRelay({
+    account: centralAuth,
+    ingress: signalIngress,
+    hostId: () => teamStore.getIdentity()?.serverId ?? null,
+  });
+  const events = new HostEventsService({
+    routines: service.routineRecords,
+    cipher: secretCipher,
+    relay: webhookRelay,
+  });
+  const eventsRuntime = new HostEventsRuntime(events);
+  signalIngress.handleWebhooks((input) => events.receive(input));
+  teardown.push(TEARDOWN_ORDER.hostEvents, "the event service", async () => {
+    webhookRelay.stop();
+    await Effect.runPromise(eventsRuntime.stop());
+  });
   // After `teamStore.initialize()` and before `HostService`, which reads the account it activates.
   if (developmentRemoteRole) {
     await runCauseEffect(
@@ -1404,6 +1427,7 @@ export async function createApplicationServices({
     appVersion: app.getVersion(),
     store: teamStore,
     agents: service,
+    events,
     skills,
     sidebarLayout,
     mailbox,
@@ -1781,6 +1805,7 @@ export async function createApplicationServices({
     Effect.gen(function* () {
       yield* Fiber.join(computerUseWarmUp);
       yield* service.initialize({ heldRoutines: takeRoutineHold(routineHoldFile, (message) => logger.warn(message)) });
+      yield* eventsRuntime.start();
       yield* automation.sync();
     }),
   );
@@ -1968,6 +1993,8 @@ export async function createApplicationServices({
     billing,
     hostedServers,
     routineFeed,
+    events,
+    eventsRuntime,
     serverMode,
     customProviders,
     customProviderChanges,

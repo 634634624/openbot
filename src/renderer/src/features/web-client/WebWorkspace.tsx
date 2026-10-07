@@ -13,6 +13,7 @@ import {
 } from "@openbot/contracts/ipc";
 import { AGENT_IMPORT_CAPABILITY } from "@openbot/contracts/team-protocol/agent-import-v1";
 import { CONTEXT_RESET_CAPABILITY } from "@openbot/contracts/team-protocol/context-reset-v1";
+import { EVENTS_CAPABILITY } from "@openbot/contracts/team-protocol/events-v1";
 import { HOST_UPDATE_CAPABILITY } from "@openbot/contracts/team-protocol/host-update-v1";
 import { HOSTED_SITES_CAPABILITY } from "@openbot/contracts/team-protocol/hosted-sites-v1";
 import { runTeamEffect } from "@openbot/team-client";
@@ -469,6 +470,10 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
       throw new Error(t("webClient.error.connectServerFirst"));
     return admin.request;
   }
+  // The events routes answer only an owner or admin. A member keeps the released routine routes.
+  const eventsEnabled = () =>
+    workspace.state.capabilities.includes(EVENTS_CAPABILITY) &&
+    (workspace.state.host?.role === "owner" || workspace.state.host?.role === "admin");
   const providerSettings = createWebProviderSettings({
     server: () => (workspace.runtime.admin ? server() : undefined),
     request: hostRequest,
@@ -481,6 +486,7 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
     () => workspace.state.host?.hostId ?? "",
     workspace.runtime.admin ? () => hostRequest() : undefined,
     workspace.onHostEvent,
+    eventsEnabled,
   );
   const remoteAgentAdmin = createRemoteAgentAdmin(
     () => {
@@ -631,6 +637,7 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
     workspace.runtime,
     workspace.onHostEvent,
     () => workspace.state.host?.hostId ?? "",
+    eventsEnabled,
   );
   const channelsSupported = () =>
     workspace.state.status === "online" &&

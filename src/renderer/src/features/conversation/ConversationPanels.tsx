@@ -10,6 +10,7 @@ import { serverCanAdminister, serverSupportsCapability } from "../servers/server
 import { htmlAttachmentPageUrl } from "./chat-visual-url";
 import { useConversationController } from "./conversation-controller-context";
 import { useConversationViewScope } from "./conversation-scope";
+import { desktopEventRoutinesApi } from "./routine-webhooks-api";
 
 const SETTINGS_PANEL_MIN = 180;
 const SETTINGS_PANEL_MAX = 1600;
@@ -347,6 +348,11 @@ export function ConversationPanels(panelProps: { onOpenUsage?: (trigger: HTMLBut
               onRoutineSelectionRequestHandled={handleRoutineSettingsRequest}
               onOpenRoutineRun={props.onOpenSearchMessage ? openRoutineRunMessage : undefined}
               files={agentFiles(props.server, agent().id)}
+              eventRoutines={
+                !props.runtime && serverCanAdminister(props.server, "events-v1")
+                  ? desktopEventRoutinesApi(props.server.id)
+                  : undefined
+              }
             />
           </Loading>
         )}

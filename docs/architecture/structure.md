@@ -63,6 +63,12 @@ SolidJS, provider, Cloudflare, and application code; and the account server to d
 
 - `openbot.db` is the source of truth for OpenBot agents, conversations, queues, reactions,
   attachments, and provider-session bindings.
+- `RoutineStore` saves a routine and its webhook trigger in one transaction. `WebhookRouteStore`
+  owns route IDs, encrypted secrets, receipts, and route revocations. `RoutineRecords` gives main one
+  owner-neutral view of these. Webhook runs use the existing agent and channel queues. Main owns
+  signature checks, the secret cipher, and Signal ingress (`HostEventsService`, `WebhookRelay`). D1
+  stores route metadata only.
+  See [Webhook routines](events.md).
 - `MailboxStore` owns attachment records, staged generated attachments, mailbox commits, and the
   file-deletion outbox. `AttachmentFiles` owns draft and transfer files: copying, size limits,
   hashes, manifests, managed-path checks, and cleanup. It does not read or write the database.
