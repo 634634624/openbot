@@ -70,6 +70,7 @@ import { type OpenBotToolResponse, openBotToolFailure, openBotToolResult } from 
 import { type AgentSidebar, handleSidebarTool } from "./sidebar-tools";
 import { LOCAL_SKILL_TOOL_DEFINITIONS, type LocalSkillTools, runLocalSkillTool } from "./skill-tools";
 import { isDynamicToolCall } from "./thread-items";
+import { toolCallIdempotencyKey } from "./tool-call-idempotency";
 import { ToolOperationFailed, toolStep, toToolOperationFailed } from "./tool-operation";
 import type { AgentBrowserHost } from "./turn-lifecycle";
 
@@ -978,7 +979,7 @@ export class OpenBotToolRouter {
           replyToMessageId: replyToMessageId ?? null,
           expectsReply,
           ...(messagingReturn ? { messagingReturn } : {}),
-          idempotencyKey: `${params.threadId}:${params.turnId}:${params.callId}`,
+          idempotencyKey: toolCallIdempotencyKey(params),
         })
         .pipe(toToolOperationFailed);
       for (const recipient of recipientValues) {
