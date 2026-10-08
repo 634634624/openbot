@@ -742,7 +742,7 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
         </Show>
       </SettingsDialogShell>
 
-      <members.RemoveDialog />
+      <members.ConfirmDialogs />
       <general.LeaveDialog />
     </Tabs.Root>
   );
