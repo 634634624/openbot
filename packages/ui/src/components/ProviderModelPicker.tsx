@@ -78,7 +78,8 @@ interface ProviderModelPickerProps {
   customProviders?: readonly CustomProviderSummary[] | undefined;
   /** The user's own ACP agents; provider `acp`, drawn on the Custom tab with one group each. */
   customAgents?: readonly CustomAgentSummary[] | undefined;
-  onAddCustomProvider?: () => void;
+  /** Receives the picker trigger, so focus returns to it when the opened settings close. */
+  onAddCustomProvider?: (trigger: HTMLElement) => void;
   /**
    * This agent's standing approval, below Effort. Without the callback the row is absent, which is
    * how a remote agent and the setup screen show the picker they always showed: the grant belongs
@@ -537,7 +538,15 @@ export function ProviderModelPicker(props: ProviderModelPickerProps) {
                         <span>{railHeadingSummary(provider, status())}</span>
                       </div>
                       <Show when={provider === CUSTOM_RAIL && props.onAddCustomProvider}>
-                        <Button type="button" size="xs" variant="default" onClick={() => props.onAddCustomProvider?.()}>
+                        <Button
+                          type="button"
+                          size="xs"
+                          variant="default"
+                          onClick={() => {
+                            setOpen(false);
+                            if (trigger) props.onAddCustomProvider?.(trigger);
+                          }}
+                        >
                           <Plus />
                           {t("provider.picker.addProvider")}
                         </Button>

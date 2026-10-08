@@ -105,6 +105,7 @@ export interface AgentSettingsPanelProps {
   onDownloadProvider?: (provider: AgentProviderId) => void | Promise<void>;
   onCancelProviderDownload?: (provider: AgentProviderId) => void | Promise<void>;
   onConnectProvider?: (provider: AgentProviderId) => void | Promise<void>;
+  onAddCustomProvider?: (trigger: HTMLElement) => void;
   maxWidth: () => number;
   onClose: () => void;
   width: number;
@@ -793,6 +794,7 @@ export default function AgentSettingsPanel(props: AgentSettingsPanelProps) {
                   onDownloadProvider={props.onDownloadProvider}
                   onCancelProviderDownload={props.onCancelProviderDownload}
                   onConnectProvider={props.onConnectProvider}
+                  onAddCustomProvider={props.onAddCustomProvider}
                   disabled={props.working}
                   disabledReason={
                     props.working ? t("agentSettings.runtime.modelBusy") : t("agentSettings.runtime.modelUnavailable")
