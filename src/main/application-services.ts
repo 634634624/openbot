@@ -172,6 +172,8 @@ import { loadOrCreateRemoteDesktopCredentials } from "./remote-desktop-secret-st
 import { appendRemoteDiagnosticLog } from "./remote-diagnostics";
 import { decodeVoid } from "./remote-host-decoding";
 import { RemoteServerManager } from "./remote-server-manager";
+import { RemoteSessionCache } from "./remote-session-cache";
+import { RemoteSessionReusePreferenceStore } from "./remote-session-reuse-preference-store";
 import { sendToRenderer } from "./renderer-ipc";
 import { RequestedUpdate, RequestedUpdateRefusal } from "./requested-update";
 import { RoutineFeedServer } from "./routine-feed-server";
@@ -217,6 +219,7 @@ const LOGO_COLOR_PREFERENCE_FILE = "openbot-logo-color-preference-v1.json";
 const UPDATE_PREFERENCE_FILE = "openbot-update-preference-v1.json";
 const NOTIFICATION_PREFERENCE_FILE = "openbot-notification-preference-v1.json";
 const BUSY_MESSAGE_MODE_PREFERENCE_FILE = "openbot-busy-message-mode-v1.json";
+const REMOTE_SESSION_REUSE_PREFERENCE_FILE = "openbot-remote-session-reuse-preference-v1.json";
 const DYNAMIC_ISLAND_PREFERENCE_FILE = "openbot-dynamic-island-preference-v1.json";
 const BROWSER_STATE_FILE = "openbot-browser-state-v1.json";
 const SIDEBAR_LAYOUT_FILE = "openbot-sidebar-layout-v1.json";
@@ -225,6 +228,7 @@ const TEAM_FILE = "openbot-team-server-v1.json";
 const TEAM_FILE_V2 = "openbot-team-server-v2.json";
 const REMOTE_SERVERS_FILE = "openbot-remote-servers-v1.json";
 const CENTRAL_AUTH_FILE = "openbot-central-auth-v1.bin";
+const REMOTE_SESSIONS_FILE = "openbot-remote-sessions-v1.bin";
 const LEGACY_REMOTE_DESKTOP_CREDENTIAL_FILE = "openbot-remote-desktop-credential-v1.json";
 const REMOTE_DESKTOP_RUNTIME_SECRET_FILE = "openbot-remote-desktop-runtime-v1.json";
 const CUSTOM_PROVIDERS_FILE = "openbot-custom-providers-v1.json";
@@ -371,6 +375,8 @@ export interface ApplicationServices {
   logoColor: LogoColorService;
   notificationPreference: NotificationPreferenceStore;
   busyMessageMode: BusyMessageModePreferenceStore;
+  remoteSessionReuse: RemoteSessionReusePreferenceStore;
+  remoteSessionCache: RemoteSessionCache;
   agentInitialization: AgentInitializationGate<AgentLifecycleFailed>;
   sidebarLayout: SidebarLayoutStore;
   host: HostService;
@@ -811,6 +817,22 @@ export async function createApplicationServices({
     join(app.getPath("userData"), BUSY_MESSAGE_MODE_PREFERENCE_FILE),
   );
   await runCauseEffect(busyMessageMode.load());
+  const remoteSessionReuse = new RemoteSessionReusePreferenceStore(
+    join(app.getPath("userData"), REMOTE_SESSION_REUSE_PREFERENCE_FILE),
+  );
+  await runCauseEffect(remoteSessionReuse.load());
+  const remoteSessionCache = new RemoteSessionCache({
+    path: join(app.getPath("userData"), REMOTE_SESSIONS_FILE),
+    enabled: remoteSessionReuse.get().keepBetweenRuns,
+    ...safeStorageCipher("error.app.macSecureStorageUnavailable"),
+  });
+  // A kept session is useless without an account, and it names the last one. The listener also
+  // covers a sign-out that settles before the remote services exist.
+  const forgetSignedOutSessions = (state: CentralAuthState) => {
+    if (state.status === "signed_out") void Effect.runPromise(remoteSessionCache.clear());
+  };
+  forgetSignedOutSessions(centralAuth.getState());
+  centralAuth.on("changed", forgetSignedOutSessions);
   const updatePreference = await runCauseEffect(readUpdatePreference(updatePreferenceFile));
   const approvalAutomationFile = join(app.getPath("userData"), APPROVAL_AUTOMATION_FILE);
   const approvalAutomation = new ApprovalAutomation({
@@ -1763,6 +1785,7 @@ export async function createApplicationServices({
         downloadHostLogo: (hostId, version) => centralAuth.downloadRemoteHostLogo(hostId, version),
         transferDirectory: join(app.getPath("userData"), "remote-transfers"),
         connectTrace,
+        sessionCache: remoteSessionCache,
       }),
     },
   );
@@ -2076,6 +2099,8 @@ export async function createApplicationServices({
     logoColor,
     notificationPreference,
     busyMessageMode,
+    remoteSessionReuse,
+    remoteSessionCache,
     agentInitialization,
     hostUpdateCoordinator,
     requestedUpdate: remoteUpdate,
