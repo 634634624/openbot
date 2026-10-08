@@ -19,11 +19,11 @@ afterEach(() => {
 
 describe("development environment preparation", () => {
   it("accepts the supported stable Bun version", () => {
-    expect(() => assertSupportedBunVersion("1.4.0")).not.toThrow();
+    expect(() => assertSupportedBunVersion("1.4.2")).not.toThrow();
   });
 
-  it.each(["1.4.0-canary.1", "1.3.11"])("rejects unsupported Bun %s with upgrade instructions", (version) => {
-    expect(() => assertSupportedBunVersion(version)).toThrow("OpenBot development requires stable Bun 1.4.0");
+  it.each(["1.4.2-canary.1", "1.4.0", "1.3.11"])("rejects unsupported Bun %s with upgrade instructions", (version) => {
+    expect(() => assertSupportedBunVersion(version)).toThrow("OpenBot development requires stable Bun 1.4.2");
   });
 
   it("generates the development env file before running any command", () => {
@@ -36,7 +36,7 @@ describe("development environment preparation", () => {
       projectRoot: root,
       mainCheckoutRoot: root,
       executable: "bun",
-      bunVersion: "1.4.0",
+      bunVersion: "1.4.2",
       run,
     });
 
@@ -53,7 +53,7 @@ describe("development environment preparation", () => {
       projectRoot: root,
       mainCheckoutRoot: root,
       executable: "bun",
-      bunVersion: "1.4.0",
+      bunVersion: "1.4.2",
       run,
     });
 
@@ -75,7 +75,7 @@ describe("development environment preparation", () => {
       mkdirSync(join(root, "apps", "auth-api", ".wrangler", "state", "v3", "d1"), { recursive: true });
     };
     const prepare = () =>
-      prepareDevelopmentEnvironment({ projectRoot: root, mainCheckoutRoot: root, bunVersion: "1.4.0", run });
+      prepareDevelopmentEnvironment({ projectRoot: root, mainCheckoutRoot: root, bunVersion: "1.4.2", run });
 
     prepare();
     prepare();
@@ -106,7 +106,7 @@ describe("development environment preparation", () => {
       projectRoot: root,
       mainCheckoutRoot: root,
       executable: "bun",
-      bunVersion: "1.4.0",
+      bunVersion: "1.4.2",
       run,
     });
 
