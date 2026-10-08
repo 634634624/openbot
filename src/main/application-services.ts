@@ -14,6 +14,7 @@ import { RoutineFlowStore } from "../backend/routine-flows/routine-flow-store";
 import { createRoutineFlows, type RoutineFlowsHandle } from "../backend/routine-flows/routine-flows";
 import { type AgentAdminSettingsService, createAgentAdminSettings } from "./agent-admin-settings";
 import { spawnAgentDatabaseHost } from "./agent-database-host-process";
+import { HostReleaseService, readInstallationMode } from "./host-release-service";
 import { LocalSkillLibrary } from "./local-skill-library";
 import { localSkillTools } from "./local-skill-tools";
 import { MAC_PERMISSION_URLS } from "./mac-permission-urls";
@@ -1457,6 +1458,19 @@ export async function createApplicationServices({
   // The host comes before the updater, and the restart readiness reads the host. The routes reach
   // the schedule through this, and a request that arrives before it exists is refused.
   let requestedUpdate: RequestedUpdate | undefined;
+  const hostRelease = new HostReleaseService({
+    currentVersion: app.getVersion(),
+    packaged: app.isPackaged,
+    platform: process.platform,
+    arch: process.arch,
+    environment: process.env,
+    installationMode:
+      app.isPackaged && process.platform === "linux" ? await runCauseEffect(readInstallationMode()) : null,
+    updateStatus: () => ({
+      phase: requestedUpdate?.snapshot().phase ?? "unsupported",
+      managedByHost: requestedUpdate?.snapshot().remoteUpdates === "managed",
+    }),
+  });
   const scheduledUpdate = (): RequestedUpdate => {
     if (!requestedUpdate) throw new RequestedUpdateRefusal("unsupported");
     return requestedUpdate;
@@ -1506,10 +1520,12 @@ export async function createApplicationServices({
         customProviders: customProviderChanges,
         pasteSignIn: pasteCodeLoginSupported(),
       },
+      release: hostRelease,
       update: {
         snapshot: () => scheduledUpdate().snapshot(),
         check: () => scheduledUpdate().check(),
         start: (member, mode) => scheduledUpdate().start(member, mode),
+        requestWhenIdle: (member) => scheduledUpdate().requestWhenIdle(member),
         cancel: () => scheduledUpdate().cancel(),
         changeSettings: (change) => scheduledUpdate().changeSettings(change),
       },
