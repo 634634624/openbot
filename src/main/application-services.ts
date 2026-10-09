@@ -72,8 +72,9 @@ import { runCauseEffect } from "../backend/effect-boundary";
 import { MailboxStore } from "../backend/mailbox-store";
 import { McpOAuth } from "../backend/mcp-oauth-provider";
 import { discordDriver } from "../backend/messaging/discord/discord-driver";
-import { MessagingService } from "../backend/messaging/messaging-service";
+import { MessagingOperationFailed, MessagingService } from "../backend/messaging/messaging-service";
 import { slackDriver } from "../backend/messaging/slack/slack-driver";
+import { telegramDriver } from "../backend/messaging/telegram/telegram-driver";
 import { passwordVaultRouter } from "../backend/password-vault-router";
 import { SidebarLayoutStore } from "../backend/sidebar-layout-store";
 import { StorageUsageScanner, StorageUsageService } from "../backend/storage-usage";
@@ -347,7 +348,7 @@ export interface ApplicationServices {
   routineFlows: RoutineFlowsService;
   providerRuntimes: ProviderRuntimeManager;
   providerCredentials: ProviderCredentialStore;
-  /** The Slack connections of the agents on this host. */
+  /** The Slack and Telegram connections of the agents on this host. */
   messaging: MessagingService;
   /** Reached by the entry point for one thing only: handing a returning grant to its sign-in. */
   mcpOAuth: McpOAuth;
@@ -451,7 +452,7 @@ interface MessagingServicesContext {
 }
 
 /**
- * The Slack and Discord connections. Awaited in place, so start and teardown order stay as they were
+ * The Slack, Discord and Telegram connections. Awaited in place, so start and teardown order stay as they were
  * inline.
  */
 async function createMessagingServices({
@@ -463,7 +464,7 @@ async function createMessagingServices({
   readHostId,
 }: MessagingServicesContext): Promise<{ messaging: MessagingService; signalIngress: SignalIngress }> {
   /*
-   * The Slack workspaces and Discord guilds where the agents answer. The tokens use the same cipher as every other
+   * The Slack workspaces, Discord guilds and Telegram chats where the agents answer. The tokens use the same cipher as every other
    * secret; an unreadable file is reported, not fatal, and each workspace then connects again.
    */
   const messagingCredentials = new MessagingCredentialStore(
@@ -475,8 +476,8 @@ async function createMessagingServices({
     logger.warn(
       `OpenBot could not read the messaging token file (${messagingCredentialLoadError.name}). It was left unchanged.`,
     );
-  // The Signal socket that brings the events of the Slack workspaces and Discord guilds linked to this
-  // host, and makes its Discord calls.
+  // The Signal socket that brings the events of the Slack workspaces, Discord guilds and Telegram chats
+  // linked to this host, and makes its Discord and Telegram calls.
   const signalIngress = new SignalIngress({
     hostId: readHostId,
     signedIn: () => {
@@ -491,6 +492,7 @@ async function createMessagingServices({
     issueSlackRoute: (hostId) => centralAuth.issueSlackRoute(hostId).pipe(toRemoteWorkflowError),
     issueDiscordRoute: (hostId) => centralAuth.issueDiscordRoute(hostId).pipe(toRemoteWorkflowError),
     issueWebhookRoute: (hostId) => centralAuth.issueWebhookRoute(hostId).pipe(toRemoteWorkflowError),
+    issueTelegramRoute: (hostId) => centralAuth.issueTelegramRoute(hostId).pipe(toRemoteWorkflowError),
   });
   teardown.push(TEARDOWN_ORDER.signalIngress, "the Signal ingress socket", () =>
     Effect.runPromise(signalIngress.dispose()),
@@ -511,7 +513,11 @@ async function createMessagingServices({
       createMemory: (input) => service.createMemory(input),
     },
     credentials: messagingCredentials,
-    drivers: [slackDriver({ ingress: signalIngress }), discordDriver({ ingress: signalIngress })],
+    drivers: [
+      slackDriver({ ingress: signalIngress }),
+      discordDriver({ ingress: signalIngress }),
+      telegramDriver({ ingress: signalIngress }),
+    ],
     downloadsRoot: join(app.getPath("userData"), "messaging-downloads"),
     ingress: signalIngress,
     sidebar: sidebarLayout,
@@ -574,6 +580,31 @@ async function createMessagingServices({
         Effect.suspend(() => {
           const hostId = readHostId();
           return hostId ? centralAuth.unlinkDiscordGuild(hostId, guildId).pipe(toDiscordConnectFailed) : Effect.void;
+        }),
+      openExternal: (url) => shell.openExternal(url),
+    },
+    telegramApp: {
+      createLink: () =>
+        Effect.suspend(() => {
+          const hostId = readHostId();
+          if (!hostId)
+            return Effect.fail(
+              new MessagingOperationFailed({
+                cause: new Error(sourceText("error.messaging.telegramRelayUnavailable")),
+              }),
+            );
+          return centralAuth
+            .createTelegramLink(hostId)
+            .pipe(Effect.mapError((error) => new MessagingOperationFailed({ cause: error.cause })));
+        }),
+      unlink: (chatId) =>
+        Effect.suspend(() => {
+          const hostId = readHostId();
+          return hostId
+            ? centralAuth
+                .unlinkTelegramChat(hostId, chatId)
+                .pipe(Effect.mapError((error) => new MessagingOperationFailed({ cause: error.cause })))
+            : Effect.void;
         }),
       openExternal: (url) => shell.openExternal(url),
     },

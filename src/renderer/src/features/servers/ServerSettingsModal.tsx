@@ -51,6 +51,7 @@ import type { DiscordConnectorController } from "../connectors/discord-connector
 import type { GitHubConnectorController } from "../connectors/github-connector";
 import type { OnePasswordConnectorController } from "../connectors/onepassword-connector";
 import type { SlackConnectorController } from "../connectors/slack-connector";
+import type { TelegramConnectorController } from "../connectors/telegram-connector";
 import { type ServerStorageOptions, ServerStoragePanel } from "../files/ServerStoragePanel";
 import { type HostProviderSettings, HostProviderSettingsPanel } from "../settings/ProviderSettingsSection";
 import type { McpServerConfig, McpTestResult } from "./mcp-servers";
@@ -148,8 +149,8 @@ export interface ServerSettingsModalProps {
   agentImport?: ServerImportOptions | undefined;
   /**
    * The Connectors section appears only when a caller supplies one of these: the GitHub connection
-   * and the Slack and Discord apps belong to this computer, so a remote server passes neither, and a build
-   * without a GitHub App passes no GitHub.
+   * and the Slack, Discord and Telegram apps belong to this computer, so a remote server passes none,
+   * and a build without a GitHub App passes no GitHub.
    */
   githubConnector?: GitHubConnectorController | undefined;
   /** This computer's 1Password connection. A remote server passes none. */
@@ -157,7 +158,8 @@ export interface ServerSettingsModalProps {
   bitwardenConnector?: BitwardenConnectorPanelProps | undefined;
   slackConnector?: SlackConnectorController | undefined;
   discordConnector?: DiscordConnectorController | undefined;
-  /** This computer's agents, for the Slack and Discord pages. */
+  telegramConnector?: TelegramConnectorController | undefined;
+  /** This computer's agents, for the Slack, Discord and Telegram pages. */
   connectorAgents?: AgentProfile[] | undefined;
   /**
    * The Updates section appears only when a caller supplies this: a remote host with
@@ -588,7 +590,8 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
                 props.onePasswordConnector ||
                 props.bitwardenConnector ||
                 props.slackConnector ||
-                props.discordConnector
+                props.discordConnector ||
+                props.telegramConnector
               }
             >
               <Tabs.Trigger class="settings-modal-nav-item" value="connectors">
@@ -726,7 +729,8 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
             props.onePasswordConnector ||
             props.bitwardenConnector ||
             props.slackConnector ||
-            props.discordConnector
+            props.discordConnector ||
+            props.telegramConnector
           }
         >
           <Tabs.Content value="connectors" class="settings-modal-tab-panel server-settings-panel" data-tab="connectors">
@@ -736,6 +740,7 @@ export function ServerSettingsModal(props: ServerSettingsModalProps) {
               bitwarden={props.bitwardenConnector}
               slack={props.slackConnector}
               discord={props.discordConnector}
+              telegram={props.telegramConnector}
               agents={props.connectorAgents ?? []}
             />
           </Tabs.Content>

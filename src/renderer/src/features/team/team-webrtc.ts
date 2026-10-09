@@ -306,13 +306,16 @@ function connectSignal(state: PeerState, prepared: WebSocket | null = null): voi
 }
 
 async function handleSignal(state: PeerState, message: SignalServerMessage): Promise<void> {
-  // Signal sends Slack and Discord messages only to the main process's `ingress` socket, never to this peer.
+  // Signal sends Slack, Discord, webhook and Telegram messages only to the main process's `ingress`
+  // socket, never to this peer.
   if (
     message.type === "slack-delivery" ||
     message.type === "discord-session" ||
     message.type === "discord-delivery" ||
     message.type === "webhook-ready" ||
-    message.type === "webhook-delivery"
+    message.type === "webhook-delivery" ||
+    message.type === "telegram-delivery" ||
+    message.type === "telegram-call-result"
   )
     return;
   if (message.type === "account-profile-changed") {

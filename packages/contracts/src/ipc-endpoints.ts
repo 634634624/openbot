@@ -223,12 +223,17 @@ import type {
   AddMessagingOrchestratorResult,
   AddSlackOrchestratorInput,
   AddSlackOrchestratorResult,
+  AddTelegramOrchestratorInput,
+  ConnectTelegramChatInput,
   MessagingOverview,
   MessagingWorkspaceInput,
   SetMessagingEnabledInput,
   SetSlackEnabledInput,
+  SetTelegramEnabledInput,
   SlackOverview,
   SlackWorkspaceInput,
+  TelegramChatInput,
+  TelegramOverview,
 } from "./ipc-messaging";
 import type { NotificationOpenedEvent, NotificationPreference } from "./ipc-notifications";
 import type { OnePasswordConnectInput, OnePasswordConnectorStatus } from "./ipc-onepassword-connector";
@@ -628,10 +633,10 @@ export const IPC_ENDPOINTS = {
       "provider-admin:delete-custom-provider",
     ),
   },
-  // The Slack workspaces and Discord guilds where this computer's agents answer. Only the host's own
-  // desktop can use these: a connect opens a Slack or Discord page in this computer's browser, and
-  // the page returns to this computer's `openbot://` link. A token only travels towards the host; no
-  // result carries one.
+  // The Slack workspaces, Discord guilds and Telegram chats where this computer's agents answer. Only
+  // the host's own desktop can use these: a connect opens a Slack, Discord or Telegram page in this
+  // computer's browser, and a Slack or Discord page returns to this computer's `openbot://` link. A
+  // token only travels towards the host; no result carries one.
   messaging: {
     getSlackOverview: request<undefined, SlackOverview>()("messaging:get-slack-overview"),
     connectSlackWorkspace: request<undefined, void>()("messaging:connect-slack-workspace"),
@@ -648,6 +653,16 @@ export const IPC_ENDPOINTS = {
     setDiscordEnabled: request<SetMessagingEnabledInput, void>()("messaging:set-discord-enabled"),
     addDiscordOrchestrator: request<AddMessagingOrchestratorInput, AddMessagingOrchestratorResult>()(
       "messaging:add-discord-orchestrator",
+    ),
+    // The Telegram chats that added the OpenBot bot. A connect opens a `t.me` link with a one-use code
+    // in this computer's browser; the chat links itself when the bot is added.
+    getTelegramOverview: request<undefined, TelegramOverview>()("messaging:get-telegram-overview"),
+    connectTelegramChat: request<ConnectTelegramChatInput, void>()("messaging:connect-telegram-chat"),
+    disconnectTelegramChat: request<TelegramChatInput, void>()("messaging:disconnect-telegram-chat"),
+    reconnectTelegramChat: request<TelegramChatInput, void>()("messaging:reconnect-telegram-chat"),
+    setTelegramEnabled: request<SetTelegramEnabledInput, void>()("messaging:set-telegram-enabled"),
+    addTelegramOrchestrator: request<AddTelegramOrchestratorInput, AddMessagingOrchestratorResult>()(
+      "messaging:add-telegram-orchestrator",
     ),
   },
   // The server name, logo and app update of one server's host. `host.updateIdentity` and `update`
