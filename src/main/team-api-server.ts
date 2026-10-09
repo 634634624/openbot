@@ -43,6 +43,7 @@ import {
   LIVE_ACTIVITY_PUSH_CAPABILITY,
   legacyTeamCapabilities,
   MCP_SERVERS_CAPABILITY,
+  MCP_SIGN_IN_CAPABILITY,
   PROVIDERS_ADMIN_CAPABILITY,
   PROVIDERS_RUNTIMES_V2_CAPABILITY,
   PROVIDERS_SIGN_IN_V3_CAPABILITY,
@@ -137,6 +138,7 @@ import { routeHostUpdate } from "./team-api/route-host-update";
 import { routeHostedSites } from "./team-api/route-hosted-sites";
 import { routeLiveActivityPush } from "./team-api/route-live-activity-push";
 import { routeMcpServers } from "./team-api/route-mcp";
+import { routeMcpSignIn } from "./team-api/route-mcp-sign-in";
 import { routeProviders } from "./team-api/route-providers";
 import { routeRemoteScreen } from "./team-api/route-remote-screen";
 import { routeSharedTables } from "./team-api/route-shared-tables";
@@ -697,6 +699,7 @@ export class TeamApiServer {
         "handled"
       )
         return;
+      if ((await routeMcpSignIn(context, this.#options.mcpServers && this.#options.mcpSignIns)) === "handled") return;
       if ((await routeStorage(context, this.#options.storage)) === "handled") return;
       if ((await routeHostedSites(context, this.#options.hostedSites)) === "handled") return;
       if ((await routeAgentAdmin(context, this.#options.admin, hidden)) === "handled") return;
@@ -940,10 +943,11 @@ export class TeamApiServer {
     Effect.runFork(materialize);
   }
 
-  #broadcastAgentEventToClients(event: AgentEvent, audience: ConversationEventAudience = "all"): void {
+  #broadcastAgentEventToClients(broadcast: AgentEvent, audience: ConversationEventAudience = "all"): void {
     const filteredConversationPayloads = new Map<string, string>();
 
     for (const [client, connection] of this.#eventClients) {
+      const event = this.#eventFor(connection, broadcast);
       if (event.type === "conversation") {
         const legacy = isLegacyConversationClient(connection);
         if ((audience === "legacy" && !legacy) || (audience === "modern" && legacy)) continue;
@@ -1052,6 +1056,17 @@ export class TeamApiServer {
       if (Buffer.byteLength(completionSnapshot) > AGENT_RUNTIME_SNAPSHOT_BYTES_LIMIT) continue;
       client.send(completionSnapshot);
     }
+  }
+
+  /** A member does not see an administrator's private MCP sign-in tab, the same as on the browser routes. */
+  #eventFor(connection: EventClientState, event: AgentEvent): AgentEvent {
+    if (event.type !== "browser-changed") return event;
+    const { browser, store } = this.#options;
+    if (!event.tabs.some((tab) => browser.isPrivate(tab.id))) return event;
+    const role = store.authenticate(connection.token)?.role;
+    if (role && role !== "member") return event;
+    const tabs = event.tabs.filter((tab) => !browser.isPrivate(tab.id));
+    return { ...event, tabs, activeTabId: tabs.some((tab) => tab.id === event.activeTabId) ? event.activeTabId : null };
   }
 
   #connectEvents(
@@ -1452,6 +1467,8 @@ export class TeamApiServer {
         if (capability === "remote-desktop-setup")
           return this.#options.remoteScreen?.checkSetup !== undefined && this.#options.remoteScreen?.test !== undefined;
         if (capability === MCP_SERVERS_CAPABILITY) return this.#options.mcpServers !== undefined;
+        if (capability === MCP_SIGN_IN_CAPABILITY)
+          return this.#options.mcpServers !== undefined && this.#options.mcpSignIns !== undefined;
         if (capability === STORAGE_CAPABILITY) return this.#options.storage !== undefined;
         if (capability === HOSTED_SITES_CAPABILITY) return this.#options.hostedSites !== undefined;
         if (capability === AGENT_ADMIN_CAPABILITY) return this.#options.admin?.agents !== undefined;

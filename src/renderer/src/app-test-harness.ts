@@ -745,6 +745,7 @@ export function installOpenbotStub(): void {
       setMcpServerEnabled: notStubbed("agent.setMcpServerEnabled"),
       testMcpServer: notStubbed("agent.testMcpServer"),
       signInMcpServer: notStubbed("agent.signInMcpServer"),
+      mcpSignInPage: notStubbed("agent.mcpSignInPage"),
       cancelMcpSignIn: notStubbed("agent.cancelMcpSignIn"),
       signOutMcpServer: notStubbed("agent.signOutMcpServer"),
       listMcpSignIns: notStubbed("agent.listMcpSignIns"),
