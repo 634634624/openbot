@@ -8,6 +8,8 @@
 // would push it into all three.
 
 import { isBoolean, isDynamicRecord, isNumber, isString } from "../runtime-values";
+import { decodeDiscordDelivery } from "./discord-api";
+import { DISCORD_ROUTE_GUILDS_LIMIT } from "./discord-route";
 import {
   type IceServer,
   SIGNAL_PROTOCOL_VERSION,
@@ -15,7 +17,20 @@ import {
   type SignalServerMessage,
   SLACK_DELIVERY_BODY_BYTES_LIMIT,
   type SlackDeliveryKind,
+  WEBHOOK_DELIVERY_BODY_BYTES_LIMIT,
 } from "./messages";
+import {
+  TELEGRAM_BOT_ID_PATTERN,
+  TELEGRAM_CHAT_ID_PATTERN,
+  TELEGRAM_UPDATE_BYTES_LIMIT,
+  type TelegramCallResult,
+} from "./telegram-route";
+import {
+  WEBHOOK_DELIVERY_ID_PATTERN,
+  WEBHOOK_ROUTE_ID_PATTERN,
+  WEBHOOK_SIGNATURE_PATTERN,
+  WEBHOOK_TIMESTAMP_PATTERN,
+} from "./webhook-route";
 
 /**
  * Returns `null` for a frame whose `type` this version does not know: a newer Signal service may add
@@ -38,6 +53,7 @@ export function decodeSignalServerMessage(value: unknown): SignalServerMessage |
         connectionId: value.connectionId === null ? null : identifier(value.connectionId),
         resumeToken: identifier(value.resumeToken),
         iceServers: iceServers(value.iceServers),
+        ...(value.capabilities === undefined ? {} : { capabilities: capabilities(value.capabilities) }),
       };
     case "peer-ready":
       return {
@@ -97,7 +113,58 @@ export function decodeSignalServerMessage(value: unknown): SignalServerMessage |
         kind: deliveryKind(value.kind),
         retryNum: value.retryNum === null ? null : retryNumber(value.retryNum),
         retryReason: value.retryReason === null ? null : identifier(value.retryReason),
-        bodyBase64: deliveryBody(value.bodyBase64),
+        bodyBase64: deliveryBody(value.bodyBase64, SLACK_DELIVERY_BODY_BYTES_LIMIT),
+      };
+    case "webhook-delivery":
+      return {
+        type: kind,
+        version,
+        requestId: identifier(value.requestId),
+        routeId: matching(value.routeId, WEBHOOK_ROUTE_ID_PATTERN),
+        timestamp: matching(value.timestamp, WEBHOOK_TIMESTAMP_PATTERN),
+        deliveryId: matching(value.deliveryId, WEBHOOK_DELIVERY_ID_PATTERN),
+        signature: matching(value.signature, WEBHOOK_SIGNATURE_PATTERN),
+        bodyBase64: deliveryBody(value.bodyBase64, WEBHOOK_DELIVERY_BODY_BYTES_LIMIT),
+      };
+    case "discord-session":
+      return { type: kind, version, token: identifier(value.token), guilds: guildList(value.guilds) };
+    case "webhook-ready":
+      return { type: kind, version };
+    case "discord-delivery":
+      return {
+        type: kind,
+        version,
+        guildId: identifier(value.guildId),
+        delivery: decodeDiscordDelivery(value.delivery),
+      };
+    case "telegram-delivery":
+      if (value.linked !== undefined && value.linked !== true) invalid();
+      return {
+        type: kind,
+        version,
+        botId: matching(value.botId, TELEGRAM_BOT_ID_PATTERN),
+        chatId: matching(value.chatId, TELEGRAM_CHAT_ID_PATTERN),
+        bodyBase64: deliveryBody(value.bodyBase64, TELEGRAM_UPDATE_BYTES_LIMIT),
+        ...(value.linked === true ? { linked: true as const } : {}),
+      };
+    case "telegram-call-result":
+      if (value.ok === true)
+        return {
+          type: kind,
+          version,
+          requestId: identifier(value.requestId),
+          ok: true,
+          result: telegramResult(value.result),
+        };
+      if (value.ok !== false) invalid();
+      return {
+        type: kind,
+        version,
+        requestId: identifier(value.requestId),
+        ok: false,
+        errorCode: integer(value.errorCode),
+        description: text(value.description).slice(0, 256),
+        ...(value.retryAfter === undefined ? {} : { retryAfter: retryNumber(value.retryAfter) }),
       };
     default:
       return null;
@@ -164,14 +231,39 @@ function deliveryKind(value: unknown): SlackDeliveryKind {
 }
 
 // Base64 of at most the body limit.
-function deliveryBody(value: unknown): string {
+function deliveryBody(value: unknown, bytesLimit: number): string {
   const candidate = text(value);
-  if (
-    candidate.length > Math.ceil(SLACK_DELIVERY_BODY_BYTES_LIMIT / 3) * 4 ||
-    !/^[A-Za-z0-9+/]*={0,2}$/u.test(candidate)
-  )
-    invalid();
+  if (candidate.length > Math.ceil(bytesLimit / 3) * 4 || !/^[A-Za-z0-9+/]*={0,2}$/u.test(candidate)) invalid();
   return candidate;
+}
+
+function matching(value: unknown, pattern: RegExp): string {
+  const candidate = text(value);
+  if (!pattern.test(candidate)) invalid();
+  return candidate;
+}
+
+function guildList(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > DISCORD_ROUTE_GUILDS_LIMIT) invalid();
+  return value.map(identifier);
+}
+
+// Unknown capabilities are kept: a host acts only on the ones it knows.
+function capabilities(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > 32) invalid();
+  return value.map(identifier);
+}
+
+function telegramResult(value: unknown): TelegramCallResult {
+  if (!isDynamicRecord(value)) invalid();
+  return {
+    ...(value.messageId === undefined ? {} : { messageId: integer(value.messageId) }),
+    ...(value.botId === undefined ? {} : { botId: matching(value.botId, TELEGRAM_BOT_ID_PATTERN) }),
+    ...(value.username === undefined ? {} : { username: identifier(value.username) }),
+    ...(value.fileToken === undefined ? {} : { fileToken: identifier(value.fileToken) }),
+    ...(value.fileSize === undefined ? {} : { fileSize: retryNumber(value.fileSize) }),
+    ...(value.uploadToken === undefined ? {} : { uploadToken: identifier(value.uploadToken) }),
+  };
 }
 
 function channel(value: unknown): SignalChannel {

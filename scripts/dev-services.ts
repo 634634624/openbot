@@ -1,11 +1,10 @@
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { type NetworkInterfaceInfo, networkInterfaces } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { get as getEncryptedValue } from "@dotenvx/dotenvx";
 import { createOpenBotLogger, toLogValue } from "@openbot/logging";
 import { cliSpawnTarget } from "../src/backend/cli";
 import {
@@ -13,6 +12,7 @@ import {
   developmentUserDataName,
   readDevelopmentInstanceId,
 } from "../src/main/development-profile";
+import { developmentRemoteConnectionPath } from "../src/main/development-runtime-directory";
 import {
   type DevInstanceRecord,
   removeDevInstanceRecord,
@@ -29,6 +29,13 @@ import {
   writeDevStackRecord,
 } from "./dev-automation/stack-registry";
 import { attachSlackTunnels } from "./dev-slack-tunnels";
+import {
+  developmentChildEnvironment,
+  developmentSettingsForService,
+  loadDevelopmentEnvironment,
+  loadSharedDevelopmentEnvironment,
+  requireDevelopmentValues,
+} from "./development-environment";
 import { resolveDevelopmentAppDataRoot } from "./development-state-paths";
 import { withoutElectronRuntimeFlags } from "./electron-spawn-env";
 import { resolvePackageBin } from "./package-bin";
@@ -112,7 +119,7 @@ export function createDevelopmentServiceSpec(
   // ELECTRON_RUN_AS_NODE=1. Every spec below becomes a spawned child, and the
   // app/test-client children relaunch Electron, so the runtime flags are
   // stripped once here rather than at each spawn.
-  const childEnvironment = withoutElectronRuntimeFlags(environment);
+  const childEnvironment = withoutElectronRuntimeFlags(developmentChildEnvironment(environment, name));
   if (name === "api") {
     return {
       name,
@@ -124,25 +131,10 @@ export function createDevelopmentServiceSpec(
   }
 
   if (name === "remote") {
-    const dotenvx = resolvePackageBin(projectRoot, "dotenvx");
     return {
       name,
-      executable: dotenvx,
-      args: [
-        "run",
-        "--redact",
-        "--strict",
-        "-f",
-        join(projectRoot, "apps", "auth-api", ".env.dev"),
-        "-fk",
-        join(projectRoot, ".env.keys"),
-        "--",
-        process.execPath,
-        "run",
-        "--cwd",
-        join(projectRoot, "remote", "api"),
-        "dev",
-      ],
+      executable: process.execPath,
+      args: [join(projectRoot, "scripts/run-development.ts"), "remote"],
       cwd: projectRoot,
       env: { ...childEnvironment },
     };
@@ -237,7 +229,7 @@ function seedDevelopmentProfile(profile: string, environment: NodeJS.ProcessEnv)
   });
 }
 
-const DEVELOPMENT_OPTIONS = ["--dry-run", "--force", "--isolated", "--hosting=test", "--slack"] as const;
+const DEVELOPMENT_OPTIONS = ["--dry-run", "--force", "--shared", "--isolated", "--hosting=test", "--slack"] as const;
 /** The deployed `test` account Worker. It creates real hosted server VMs for the accounts on its allow list. */
 const TEST_ACCOUNT_API_URL = "https://openbot-auth-api-test.internal9671.workers.dev";
 
@@ -248,12 +240,12 @@ export interface DevelopmentInvocation {
   // stacks in one worktree is nearly always a forgotten terminal, so it takes
   // saying so.
   force: boolean;
-  // Give this worktree a profile of its own, keyed to its path, instead of
-  // whichever suffix the renderer port happened to produce. The default keeps
-  // the shared `OpenBot Dev` profile; `--isolated` is for the times two
-  // worktrees must not see each other's conversations. Either way the profile
-  // is seeded on the start that creates it.
-  isolated: boolean;
+  // Open the shared `OpenBot Dev` profile instead of the profile of this
+  // worktree, which is keyed to its path. The default keeps two worktrees from
+  // seeing each other's conversations. `--isolated`, the old way to ask for the
+  // default, is still accepted and does nothing. Either way the profile is
+  // seeded on the start that creates it.
+  shared: boolean;
   // Sign the app in to the `test` account Worker instead of the local one, so that a hosted server
   // is a real boat VM that can reach its Worker and Signal. The app gets one profile for this that
   // all worktrees share: its account session belongs to the test Worker, not the local one.
@@ -272,11 +264,14 @@ export function parseDevelopmentTarget(args: string[]): DevelopmentInvocation {
     (argument) => argument.startsWith("--") && !DEVELOPMENT_OPTIONS.some((option) => option === argument),
   );
   if (unsupportedOption) throw new Error(`Unknown option: ${unsupportedOption}.`);
+  if (args.includes("--shared") && args.includes("--isolated")) {
+    throw new Error("Use --shared or --isolated, not both.");
+  }
   return {
     target,
     dryRun: args.includes("--dry-run"),
     force: args.includes("--force"),
-    isolated: args.includes("--isolated"),
+    shared: args.includes("--shared"),
     hostingTest: args.includes("--hosting=test"),
     slack: args.includes("--slack"),
   };
@@ -284,29 +279,22 @@ export function parseDevelopmentTarget(args: string[]): DevelopmentInvocation {
 
 /**
  * The test Worker lets an account create servers when the app sends this key. It is in the encrypted
- * `.env.shared`, so only a developer with `DOTENV_PRIVATE_KEY_SHARED` can read it. Never log it.
+ * `.env.dev`, so only a developer with `DOTENV_PRIVATE_KEY_DEV` can read it. Never log it.
  */
 async function readHostingDeveloperKey(): Promise<string> {
-  const missing =
-    "--hosting=test needs DOTENV_PRIVATE_KEY_SHARED in .env.keys or the environment, to read HOSTED_SERVERS_DEVELOPER_KEY.";
-  const value = await getEncryptedValue("HOSTED_SERVERS_DEVELOPER_KEY", {
-    path: join(projectRoot, "apps", "auth-api", ".env.shared"),
-    envKeysFile: join(projectRoot, ".env.keys"),
-    strict: true,
-  }).catch((error: unknown) => {
-    throw new Error(missing, { cause: error });
-  });
-  const key = value?.trim() ?? "";
-  if (!key || key.startsWith("encrypted:")) throw new Error(missing);
-  return key;
+  const shared = await loadSharedDevelopmentEnvironment(projectRoot);
+  const environment = { ...shared, ...process.env };
+  requireDevelopmentValues(environment, ["HOSTED_SERVERS_DEVELOPER_KEY"]);
+  return environment.HOSTED_SERVERS_DEVELOPER_KEY ?? "";
 }
 
 async function main(): Promise<void> {
-  const { target, dryRun, force, isolated, hostingTest, slack } = parseDevelopmentTarget(process.argv.slice(2));
+  const { target, dryRun, force, shared, hostingTest, slack } = parseDevelopmentTarget(process.argv.slice(2));
   if (!dryRun && prepareDevelopmentEnvironment() === "created") {
-    logger.info("Generated apps/auth-api/.env.dev for local development.");
+    logger.info("Prepared local development state.");
   }
   const services = servicesForTarget(target);
+  const developmentEnvironment = dryRun ? {} : await loadDevelopmentEnvironment(projectRoot);
   const sharedEnvironment = developmentEnvironmentForTarget(target);
   if (hostingTest) {
     sharedEnvironment.OPENBOT_AUTH_API_URL = TEST_ACCOUNT_API_URL;
@@ -317,9 +305,8 @@ async function main(): Promise<void> {
     sharedEnvironment.OPENBOT_DEV_REMOTE_ROLE = "none";
     logger.info(`The app signs in to the test account Worker: ${TEST_ACCOUNT_API_URL}.`);
   }
-  if (isolated) {
-    sharedEnvironment.OPENBOT_DEV_INSTANCE_ID ??= developmentInstanceIdForWorktree(projectRoot);
-  }
+  // The host and the test client of this stack find each other through a file named after it.
+  sharedEnvironment.OPENBOT_DEV_STACK_ID = String(process.pid);
 
   // Everything between reading the registry and publishing this stack's ports
   // happens under one machine-wide lock, so a sibling worktree starting at the
@@ -336,7 +323,23 @@ async function main(): Promise<void> {
       }
       logger.warn(`This worktree already runs a dev stack:\n${detail}`);
     }
-    const allocated = await allocateDevelopmentPorts(services, sharedEnvironment, heldDevStackPorts(records));
+    const instanceId = developmentInstanceIdForStart({
+      configured: sharedEnvironment.OPENBOT_DEV_INSTANCE_ID,
+      shared,
+      besideOwnStack: conflicts.length > 0,
+      projectRoot,
+    });
+    if (instanceId !== sharedEnvironment.OPENBOT_DEV_INSTANCE_ID) {
+      sharedEnvironment.OPENBOT_DEV_INSTANCE_ID = instanceId;
+      // The default changed from the shared profile, so a developer who expects their old data learns where it is.
+      logger.info("This worktree opens its own dev profile. Pass --shared to open the shared OpenBot Dev profile.");
+    }
+    const allocated = await allocateDevelopmentPorts(
+      services,
+      sharedEnvironment,
+      heldDevStackPorts(records),
+      developmentEnvironment,
+    );
     validateServiceSpecs(allocated);
     if (dryRun) return { specs: allocated, stack: null };
     const record = createDevStackRecord(allocated, process.pid, Date.now());
@@ -367,6 +370,22 @@ async function main(): Promise<void> {
     closeSlackTunnels?.();
     throw error;
   }
+}
+
+/**
+ * The profile the start opens before the ports are chosen. An explicit id wins, and `--shared`
+ * keeps the shared `OpenBot Dev` profile. Beside a running stack of this worktree, that stack
+ * already holds the worktree profile and Chromium lets one app hold a profile, so the start keeps
+ * no id and the port allocation names a profile after the renderer port.
+ */
+export function developmentInstanceIdForStart(input: {
+  configured: string | undefined;
+  shared: boolean;
+  besideOwnStack: boolean;
+  projectRoot: string;
+}): string | undefined {
+  if (input.configured || input.shared || input.besideOwnStack) return input.configured;
+  return developmentInstanceIdForWorktree(input.projectRoot);
 }
 
 // The ports the stack won, under the label a developer reads in
@@ -407,6 +426,7 @@ async function allocateDevelopmentPorts(
   services: DevelopmentService[],
   sharedEnvironment: NodeJS.ProcessEnv,
   heldPorts: Set<number>,
+  developmentEnvironment: NodeJS.ProcessEnv,
 ): Promise<DevelopmentServiceSpec[]> {
   const reservedPorts = new Set<number>();
 
@@ -458,7 +478,7 @@ async function allocateDevelopmentPorts(
 
   const specs: DevelopmentServiceSpec[] = [];
   for (const service of services) {
-    const environment = { ...sharedEnvironment };
+    const environment = { ...developmentSettingsForService(developmentEnvironment, service), ...sharedEnvironment };
     if (service === "app" || service === "test-client") {
       const defaultPort = DEFAULT_RENDERER_PORTS[service];
       const rendererPort = await findAvailablePort(
@@ -514,6 +534,10 @@ async function runDevelopmentServices(specs: DevelopmentServiceSpec[], stack: De
     // pids. Dropping it before the escalation would make anything that
     // survived SIGKILL an unrecorded orphan holding this worktree's ports.
     if (stack) removeDevStackRecord(stack);
+    // The host's handoff file holds the test client's session token, and no
+    // later stack reads it.
+    const app = specs.find((spec) => spec.name === "app");
+    if (app) rmSync(developmentRemoteConnectionPath(app.env), { force: true });
   };
 
   process.once("SIGINT", () => void stopAll("SIGTERM").then(() => process.exit(130)));
@@ -742,7 +766,7 @@ function validateServiceSpecs(specs: DevelopmentServiceSpec[]): void {
       throw new Error("The Remote API package is missing at remote/api/package.json.");
     }
     if (spec.name !== "api" && !existsSync(spec.executable)) {
-      const executableName = spec.name === "remote" ? "dotenvx" : "electron-vite";
+      const executableName = spec.name === "remote" ? "bun" : "electron-vite";
       throw new Error(`${executableName} is missing at ${spec.executable}. Run bun install.`);
     }
   }

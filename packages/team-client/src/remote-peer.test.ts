@@ -13,6 +13,7 @@ import { CHANNEL_ROUTES } from "@openbot/contracts/team-protocol/channels-v1";
 import { STORAGE_ROUTES } from "@openbot/contracts/team-protocol/storage-v1";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createEd25519Identity, signEd25519 } from "./ed25519";
+import { runTeamEffect } from "./effect-boundary";
 import {
   createRemoteCommandMailbox,
   createRemoteTeamPeer,
@@ -41,6 +42,24 @@ const channelFixture = {
 };
 
 describe("browser remote peer recovery", () => {
+  it("sends ICE candidates without sending gathering completion markers", async () => {
+    const network = await setupNetwork();
+    await network.connect();
+    const send = vi.spyOn(network.socket(), "send");
+    const candidate = {
+      candidate: "candidate:1 1 UDP 2122260223 192.0.2.1 5000 typ host",
+      sdpMid: "0",
+      sdpMLineIndex: 0,
+    };
+    network.connection().onicecandidate?.({ candidate });
+    network.connection().onicecandidate?.({ candidate: { ...candidate, candidate: "" } });
+    network.connection().onicecandidate?.({ candidate: null });
+    expect(send.mock.calls.map(([data]) => JSON.parse(data))).toEqual([
+      { type: "ice-candidate", version: 1, connectionId: "connection-1", channel: "team", ...candidate },
+    ]);
+    expect(network.updates.at(-1)).toMatchObject({ state: "online" });
+    await network.runtime.dispose();
+  });
   it("delivers browser-view frames only while the host connection is authenticated", async () => {
     const received = deferred();
     const onHostStreamData = vi.fn(() => {
@@ -991,7 +1010,7 @@ async function setupNetwork(
     responseFile?: TeamProtocolV2Json;
   } = {},
 ) {
-  const host = await createEd25519Identity(() => new Uint8Array(32).fill(7));
+  const host = await runTeamEffect(createEd25519Identity(() => new Uint8Array(32).fill(7)));
   const sockets: TestSocket[] = [];
   const connections: TestConnection[] = [];
   const updates: RemoteTeamConnectionUpdate[] = [];
@@ -1088,7 +1107,7 @@ async function setupNetwork(
           clientFingerprint: "AA:11",
           hostFingerprint: "BB:22",
         });
-        void signEd25519(new TextEncoder().encode(transcript), host.secretKey).then((signature) =>
+        void runTeamEffect(signEd25519(new TextEncoder().encode(transcript), host.secretKey)).then((signature) =>
           this.receive(
             encodeTeamProtocolV2Frame({
               version: 2,
@@ -1127,6 +1146,7 @@ async function setupNetwork(
   }
 
   class TestConnection {
+    onicecandidate: ((event: { candidate: RTCIceCandidateInit | null }) => void) | null = null;
     connectionState = "new";
     localDescription: RTCSessionDescriptionInit | null = null;
     remoteDescription: RTCSessionDescriptionInit | null = null;

@@ -132,6 +132,22 @@
   object-fit: contain;
 }
 
+/* The image opens in the image viewer. The button keeps the image's own size. */
+.message-markdown-image-button {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  height: auto;
+  padding: 0;
+  border-radius: var(--openbot-radius-md);
+  cursor: zoom-in;
+}
+
+.message-markdown-image-button:focus-visible {
+  outline: 2px solid var(--openbot-border-focus);
+  outline-offset: 2px;
+}
+
 .message-markdown-table-scroll {
   width: 100%;
   min-width: 0;
@@ -151,8 +167,9 @@
   border-right: 1px solid var(--openbot-data-table-border);
   border-bottom: 1px solid var(--openbot-data-table-border);
   padding: var(--openbot-space-2) var(--openbot-space-3);
+  overflow-wrap: break-word;
   text-align: left;
-  white-space: nowrap;
+  vertical-align: top;
 }
 
 .message-markdown-table th {
@@ -826,14 +843,27 @@
   overscroll-behavior-inline: contain;
 }
 
+.message-data-table-frame {
+  width: 100%;
+  min-width: 0;
+}
+
+/* The copy actions under the table. */
+.message-data-table-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--openbot-space-1);
+  margin-top: var(--openbot-space-1);
+}
+
 .message-data-table-scroll:focus-visible {
   outline: 2px solid var(--openbot-border-focus);
   outline-offset: 2px;
 }
 
 .message-data-table {
-  width: max-content;
-  min-width: max(100%, calc(var(--message-data-table-columns) * 112px));
+  width: 100%;
+  min-width: calc(var(--message-data-table-columns) * 112px);
   overflow: hidden;
   border: 1px solid var(--openbot-data-table-outer-border);
   border-radius: var(--openbot-radius-lg);
@@ -861,8 +891,9 @@
   padding: 9px 12px;
   color: var(--openbot-data-table-text);
   font-weight: inherit;
+  overflow-wrap: break-word;
   text-align: left;
-  white-space: nowrap;
+  vertical-align: top;
 }
 
 .message-data-table thead th {
@@ -877,8 +908,11 @@
   border-right: 1px solid var(--openbot-data-table-border);
 }
 
-.message-data-table-cell-text {
-  white-space: nowrap;
+/* Links and code can be one long token. Break them inside the column, so they do not make the
+   table wider than the message. Auto table layout sizes a column to its longest plain word, so a
+   short column does not split a word. */
+:is(.message-data-table, .message-markdown-table) :is(th, td) :is(a, code) {
+  overflow-wrap: anywhere;
 }
 
 .message-data-table [data-align="center"] {
@@ -1241,6 +1275,30 @@
     color var(--openbot-duration-hover) ease;
 }
 
+/* Keep message references in inline flow. Flex/grid children make Chromium add line breaks to
+   copied selections, even when the child is an icon that cannot be selected. */
+.reference-chip.message-reference-chip,
+.message-file-reference {
+  --message-reference-icon-size: var(--openbot-space-4);
+
+  display: inline-block;
+  user-select: text;
+}
+
+.message-file-reference:has(> [data-badge-length="3"]) {
+  --message-reference-icon-size: var(--openbot-icon-lg);
+}
+
+.message-file-reference:has(> [data-badge-length="4"]) {
+  --message-reference-icon-size: var(--openbot-space-6);
+}
+
+/* A table measures its columns before it knows their widths, so the percentage cap above does not
+   apply there, and a long path makes its column as wide as the path. A fixed cap keeps it short. */
+:is(.message-data-table, .message-markdown-table) .message-file-reference {
+  max-width: 240px;
+}
+
 :is(
   .message-file-reference,
   .composer-file-reference,
@@ -1508,4 +1566,35 @@
 
 .choice-input::placeholder {
   color: var(--openbot-text-muted);
+}
+
+.reference-chip.message-reference-chip .reference-chip-icon,
+.message-file-reference .attachment-reference-visual {
+  display: inline-block;
+  margin-right: var(--openbot-space-1);
+  text-align: center;
+  vertical-align: middle;
+  user-select: none;
+}
+
+.reference-chip.message-reference-chip .agent-avatar {
+  display: inline-block;
+}
+
+.message-file-reference .attachment-reference-visual > svg,
+.reference-chip.message-reference-chip .reference-chip-icon > svg,
+.reference-chip.message-reference-chip .agent-avatar > svg {
+  display: inline;
+  vertical-align: middle;
+}
+
+.reference-chip.message-reference-chip .reference-chip-name,
+.message-file-reference .inline-file-reference-name {
+  display: inline-block;
+  max-width: calc(100% - var(--message-reference-icon-size) - var(--openbot-space-1));
+  vertical-align: middle;
+}
+
+.reference-chip.message-reference-chip > .sr-only {
+  user-select: none;
 }

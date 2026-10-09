@@ -1,5 +1,6 @@
 import type { CentralAuthUser, UpdateAgentInput } from "@openbot/contracts/ipc";
 import { hasVisibleToasts } from "@openbot/ui";
+import { unloadedHistory } from "@openbot/ui/features/conversation/ChatScrollRail";
 import { createMemo } from "solid-js";
 import { useNavigation } from "../../navigation";
 import { usePlatform } from "../../platform";
@@ -15,6 +16,7 @@ import { useCustomAgents } from "../custom-agents/custom-agents-context";
 import { useCustomProviders } from "../custom-providers/custom-providers-context";
 import { useRemoteDesktop } from "../remote-desktop/remote-desktop-context";
 import { serverSupportsCapability } from "../servers/server-capabilities";
+import { useServerScope } from "../servers/server-scope";
 import { useServerSettings } from "../servers/server-settings";
 import { useServers } from "../servers/servers-context";
 import { useSettings } from "../settings/settings-context";
@@ -38,9 +40,10 @@ import { useConversation } from "./conversation-context";
  */
 export function WorkspaceConversation(props: { account: () => CentralAuthUser }) {
   const scopeIsCurrent = createScopeGuard();
+  const serverScope = useServerScope();
   const platform = usePlatform();
   const { activeServer, activeServerSupportsCapability, joinServerOpen } = useServers();
-  const { serverSettingsOpen } = useServerSettings();
+  const { serverSettingsOpen, openServerSettings } = useServerSettings();
   const {
     appSettingsOpen,
     skillsMarketplaceOpen,
@@ -63,8 +66,16 @@ export function WorkspaceConversation(props: { account: () => CentralAuthUser })
   // a remote server's OpenCode has its own catalogue. Only the write paths are local-only.
   const { customProviders } = useCustomProviders();
   const { customAgents } = useCustomAgents();
-  const { agentStatus, agentList, activeAgent, modelOptions, settingsRequest, updateAgent, setAgentAvatar } =
-    useAgents();
+  const {
+    agentStatus,
+    agentList,
+    agentListConnecting,
+    activeAgent,
+    modelOptions,
+    settingsRequest,
+    updateAgent,
+    setAgentAvatar,
+  } = useAgents();
   const {
     activeQueue,
     activeRoutineIds,
@@ -208,6 +219,12 @@ export function WorkspaceConversation(props: { account: () => CentralAuthUser })
       (activeServer()?.kind === "local" || providerAdminServerId() !== undefined) &&
       providerRuntimeDownloadsAvailable(),
   );
+  /** Custom endpoints are added in the Providers section that this computer, or an administered host, shows. */
+  const manageProviders = createMemo(() => activeServer()?.kind === "local" || providerAdminServerId() !== undefined);
+  const openProviderSettings = (trigger: HTMLElement) => {
+    const server = activeServer();
+    if (server) openServerSettings(server.id, trigger, "providers");
+  };
   /** The browser sign-in opens on this computer, so it stays local. */
   const localProviderDownloads = createMemo(
     () => activeServer()?.kind === "local" && providerRuntimeDownloadsAvailable(),
@@ -223,7 +240,12 @@ export function WorkspaceConversation(props: { account: () => CentralAuthUser })
         setSkillsMarketplaceOpen(true);
       }}
       onOpenUsage={(trigger) => usage.openUsage(activeServer()?.id ?? "local", trigger, activeAgent()?.id)}
-      agentStatus={agentStatus()}
+      agentStatus={
+        activeServer()?.kind === "remote" && (!serverScope.loaded() || !conversations[activeAgent()?.id ?? ""]?.loaded)
+          ? { ...agentStatus(), phase: "starting" }
+          : agentStatus()
+      }
+      agentsConnecting={agentListConnecting()}
       accountUsage={auth.accountUsage()}
       providerRuntimeStatuses={providerDownloads() ? providerRuntimeStatuses() : undefined}
       customProviders={customProviders()}
@@ -233,6 +255,7 @@ export function WorkspaceConversation(props: { account: () => CentralAuthUser })
       onCancelProviderDownload={providerDownloads() ? cancelProviderRuntimeDownload : undefined}
       onConnectProvider={localProviderDownloads() ? connectProvider : undefined}
       onSignInProvider={activeServer()?.kind === "local" ? connectProvider : undefined}
+      onManageProviders={manageProviders() ? openProviderSettings : undefined}
       agent={conversationAgent()}
       agents={agentList()}
       availableRoutineIds={activeRoutineIds()}
@@ -250,6 +273,7 @@ export function WorkspaceConversation(props: { account: () => CentralAuthUser })
           ? (conversations[activeAgent()?.id ?? ""]?.page?.hasOlder ?? false)
           : false
       }
+      unloadedHistory={activeAgent() ? unloadedHistory(conversations[activeAgent()?.id ?? ""]?.page) : undefined}
       discontinuous={activeAgent() ? conversations[activeAgent()?.id ?? ""]?.windowMode === "around" : false}
       loadingOlder={activeAgent() ? conversations[activeAgent()?.id ?? ""]?.olderLoading === true : false}
       olderError={activeAgent() ? (conversations[activeAgent()?.id ?? ""]?.olderError ?? null) : null}
@@ -322,6 +346,7 @@ export function WorkspaceConversation(props: { account: () => CentralAuthUser })
           : (remoteAgentSettings()?.autoApproveLocked ?? false)
       }
       onSetAgentAutoApprove={setAgentAutoApproveForActiveAgent()}
+      defaultBusyMessageMode={generalSettings().busyMessageMode}
       onClearAgentContext={clearActiveAgentContext()}
       onRespondToBrowserTakeover={respondToBrowserTakeover}
       onCancelQueuedMessage={cancelQueuedMessage}

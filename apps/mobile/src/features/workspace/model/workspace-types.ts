@@ -21,6 +21,7 @@ import type {
   InstallAgentTemplateInput,
   InstalledSkill,
   QueueSnapshot,
+  RespondToApprovalInput,
   RespondToBrowserSecretInput,
   RespondToPromptInput,
   Routine,
@@ -35,9 +36,21 @@ import type {
   UpdateAgentInput,
   UpdateRoutineInput,
 } from "@openbot/contracts/ipc";
+import type {
+  EventActivity,
+  EventRoutine,
+  EventRoutineOwner,
+  EventRoutineRef,
+  ListEventActivityInput,
+  SaveEventRoutineInput,
+  SaveEventRoutineResult,
+  WebhookSecret,
+} from "@openbot/contracts/ipc-events";
 import type { QueueEditRequest } from "@openbot/contracts/team-protocol/queue-edit-v1";
 import type { RemoteRecoveryStatus, RemoteTeamDirectoryClient } from "@openbot/team-client";
 import type { RemoteFileUpload } from "@openbot/team-client/remote-peer";
+import type { MobileBrowserTab } from "@/features/browser/model/browser-tabs";
+import type { BrowserViewBridgeEvent, RemoteBrowserViewSession } from "@/features/browser/model/browser-view-bridge";
 import type { MobileChannelStore } from "@/features/channels/model/channel-store";
 import type { MobileConversationStore } from "./conversation-store";
 import type { LiveWorkspaceStore } from "./live-workspace-store";
@@ -87,7 +100,40 @@ interface AddRemoteServerInput {
   inviteUrl: string;
 }
 
+/** What a host serves of the live browser view. */
+export interface MobileBrowserViewSupport {
+  /** `browser-control` and `browser-view`: the phone can show the agent's tab and use it. */
+  view: boolean;
+  /** `browser-view-clipboard`: the host pastes text and answers the selected text. */
+  clipboard: boolean;
+  /** `browser-view-context-menu`: the host sends the phone the menu of its right-clicks. */
+  contextMenu: boolean;
+  /** `browser-view-viewport`: the host holds the page at the size the phone asks for. */
+  viewport: boolean;
+}
+
+/** What the phone does to a host browser tab, through the released `browser-control` routes. */
+type MobileBrowserTabAction =
+  | { type: "navigate"; tabId: string; direction: "back" | "forward" }
+  | { type: "reload"; tabId: string }
+  | { type: "open"; url: string; ownerAgentId: string; ownerThreadId: string | null }
+  | { type: "close"; tabId: string };
+
 export interface MobileWorkspaceContextValue {
+  browserViewSupport: (serverId: string) => MobileBrowserViewSupport;
+  /** Null when the server is not connected, or its peer page is not ready yet. */
+  openBrowserView: (
+    serverId: string,
+    tabId: string,
+    listener: (event: BrowserViewBridgeEvent) => void,
+  ) => RemoteBrowserViewSession | null;
+  /** The new tab for `open`, and null for the other actions. */
+  controlBrowserTab: (serverId: string, action: MobileBrowserTabAction) => Promise<MobileBrowserTab | null>;
+  /**
+   * Allows or denies an approval that the server's agent waits on. Rejects with
+   * `InactiveRequestError`, and drops the request, when it no longer waits on the host.
+   */
+  respondToApproval: (serverId: string, input: RespondToApprovalInput) => Promise<void>;
   respondToBrowserTakeover: (
     serverId: string,
     input: { requestId: string | number; decision: "complete" | "cancel" },
@@ -152,6 +198,15 @@ export interface MobileWorkspaceContextValue {
   updateAgentRoutine: (input: UpdateRoutineInput, serverId: string) => Promise<void>;
   deleteAgentRoutine: (agentId: string, routineId: string, serverId: string) => Promise<void>;
   testAgentRoutine: (agentId: string, routineId: string, serverId: string) => Promise<void>;
+  /** Event administration is available only to owners and admins on hosts with events-v1. */
+  canManageEvents: (serverId: string) => boolean;
+  listEventRoutines: (owner: EventRoutineOwner, serverId: string) => Promise<EventRoutine[]>;
+  /** The result has the signing secret only when the save made a new webhook trigger. */
+  saveEventRoutine: (input: SaveEventRoutineInput, serverId: string) => Promise<SaveEventRoutineResult>;
+  deleteEventRoutine: (input: EventRoutineRef, serverId: string) => Promise<void>;
+  testEventRoutine: (input: EventRoutineRef, serverId: string) => Promise<void>;
+  rotateEventRoutineSecret: (input: EventRoutineRef, serverId: string) => Promise<WebhookSecret>;
+  listEventActivity: (input: ListEventActivityInput, serverId: string) => Promise<EventActivity[]>;
   loadAgentModels: (serverId: string) => Promise<AgentModelOption[]>;
   loadAgentMemories: (agentId: string, serverId: string) => Promise<AgentMemory[]>;
   loadAgentRoutines: (agentId: string, serverId: string) => Promise<Routine[]>;

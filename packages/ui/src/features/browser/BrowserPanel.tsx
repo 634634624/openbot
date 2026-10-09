@@ -81,6 +81,8 @@ interface BrowserPanelProps {
   /** The tab to draw here, for a host whose browser is not a view on this screen. Local: `null`. */
   liveViewTabId: string | null;
   liveViewRuntime: BrowserViewRuntime;
+  /** Whether the host pastes and copies for the live view. */
+  liveViewClipboard: boolean;
   canCloseTabs?: boolean;
   /** False where the page cannot leave the window, such as the web app. */
   canEnterPip?: boolean;
@@ -140,6 +142,7 @@ export default function BrowserPanel(props: BrowserPanelProps) {
             runtime={props.liveViewRuntime}
             tabId={tabId()}
             active={props.open}
+            clipboard={props.liveViewClipboard}
             onFrameSize={setFrameSize}
           />
         )}
@@ -214,8 +217,10 @@ export default function BrowserPanel(props: BrowserPanelProps) {
       activationMode="automatic"
     >
       <header class="browser-panel-header window-drag">
-        <div class="browser-tabs no-drag">
-          <Tabs.List class="browser-tab-strip" aria-label={t("browser.tabs.label")}>
+        {/* Only the strip takes the drag region back. The row fills the header, so the free space
+         * after the new tab button stays a handle that moves the window. */}
+        <div class="browser-tabs">
+          <Tabs.List class="browser-tab-strip no-drag" aria-label={t("browser.tabs.label")}>
             <For each={props.tabs} keyed={(tab) => tab.id}>
               {(tab) => {
                 const control = () => {

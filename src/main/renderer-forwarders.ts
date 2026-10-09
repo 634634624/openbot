@@ -26,6 +26,7 @@ import type { AppFormat, AppTranslate } from "@openbot/i18n";
 import { notificationForAgentEvent, notificationForUsageLimit } from "@openbot/team-client/agent-notifications";
 import { BrowserWindow, Notification } from "electron";
 import type { AgentService } from "../backend/agent-service";
+import { runCauseEffect } from "../backend/effect-boundary";
 import type { HostAnalytics } from "./analytics";
 import { showRetainedNotification } from "./desktop-notifications";
 import type { HostService } from "./host-service";
@@ -100,10 +101,13 @@ export function createRendererForwarders({
     if (!initialLevel || !Notification.isSupported()) return;
     // Skip the remote agent lookup for an event the level already rules out.
     if (initialLevel === "needs-me" && event.type === "turn-completed") return;
+    const remoteManager = getRemoteServerManager();
     const agents =
       serverId === LOCAL_SERVER_ID
         ? (getAgentService()?.listAgents() ?? [])
-        : ((await getRemoteServerManager()?.request(serverId, TEAM_API_ROUTES.agents.all, decodeAgentSummaries)) ?? []);
+        : remoteManager
+          ? await runCauseEffect(remoteManager.request(serverId, TEAM_API_ROUTES.agents.all, decodeAgentSummaries))
+          : [];
     const level = notifyLevel();
     const content = !level
       ? null
@@ -162,12 +166,24 @@ export function createRendererForwarders({
     sendToRenderer(window, IPC_ENDPOINTS.githubConnector.changed, status);
   }
 
+  function forwardRoutineFlowsChanged(change: import("@openbot/contracts/ipc").RoutineFlowsChanged): void {
+    const window = getMainWindow();
+    if (!window || window.isDestroyed()) return;
+    sendToRenderer(window, IPC_ENDPOINTS.routineFlows.changed, change);
+  }
+
   function forwardOnePasswordConnectorStatus(
     status: import("@openbot/contracts/ipc").OnePasswordConnectorStatus,
   ): void {
     const window = getMainWindow();
     if (!window || window.isDestroyed()) return;
     sendToRenderer(window, IPC_ENDPOINTS.onePasswordConnector.changed, status);
+  }
+
+  function forwardBitwardenConnectorStatus(status: import("@openbot/contracts/ipc").BitwardenConnectorStatus): void {
+    const window = getMainWindow();
+    if (!window || window.isDestroyed()) return;
+    sendToRenderer(window, IPC_ENDPOINTS.bitwardenConnector.changed, status);
   }
 
   function forwardHostStatus(status: import("@openbot/contracts/ipc").HostStatus): void {
@@ -232,7 +248,9 @@ export function createRendererForwarders({
     forwardVoiceModelStatus,
     forwardProviderRuntimeStatus,
     forwardGitHubConnectorStatus,
+    forwardRoutineFlowsChanged,
     forwardOnePasswordConnectorStatus,
+    forwardBitwardenConnectorStatus,
     forwardHostStatus,
     forwardRemoteDesktopSessions,
     forwardServers,

@@ -1,14 +1,17 @@
 import { AcpAgentClient } from "./acp-client";
+
 import { NO_PROVIDER_CREDENTIALS, requireProviderDriver } from "./provider-drivers";
 // @vitest-environment node
 
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type DynamicRecord, isDynamicRecord } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { runCauseEffect } from "./effect-boundary";
 import { GrokAgentClient } from "./grok-client";
+import { OpenBotDatabase } from "./openbot-database";
 import {
   type AppServerNotification,
   type AppServerRequest,
@@ -19,30 +22,72 @@ import {
   decodeThreadResponse,
   decodeTurnResponse,
 } from "./protocol";
+import { providerHistoryPersistence } from "./provider-history-persistence";
 
 let root: string;
+/**
+ * The fake agent, written once for this file and not once for each test. macOS checks an executable
+ * the first time it runs from a new path, and that check cost about 200 ms in each test that wrote
+ * its own copy. The agent reads its mode and its log path from the environment.
+ */
+let executableRoot: string;
 let executable: string;
 let logPath: string;
 let client: AcpAgentClient | null = null;
+let historyDatabase: OpenBotDatabase | null = null;
+
+beforeAll(async () => {
+  executableRoot = await mkdtemp(join(tmpdir(), "openbot-grok-acp-cli-"));
+  executable = join(executableRoot, "grok");
+  await writeFile(executable, FAKE_GROK_ACP, { mode: 0o700 });
+});
+
+afterAll(async () => {
+  await rm(executableRoot, { recursive: true, force: true });
+});
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "openbot-grok-acp-"));
-  executable = join(root, "grok");
+  historyDatabase = new OpenBotDatabase(join(root, "history"));
+  await runCauseEffect(historyDatabase.initialize());
   logPath = join(root, "fake-grok.jsonl");
-  await writeFile(executable, FAKE_GROK_ACP);
-  await chmod(executable, 0o700);
   process.env.OPENBOT_FAKE_GROK_LOG = logPath;
   delete process.env.OPENBOT_FAKE_GROK_MODE;
 });
 
 afterEach(async () => {
-  await client?.stop();
+  if (client) await runCauseEffect(client.stop());
   client = null;
+  historyDatabase?.close();
+  historyDatabase = null;
   delete process.env.OPENBOT_FAKE_GROK_LOG;
   delete process.env.OPENBOT_FAKE_GROK_MODE;
   delete process.env.OPENBOT_FAKE_OPENCODE_ERROR;
   await rm(root, { recursive: true, force: true });
 });
+
+function historyFor(provider: "grok" | "opencode") {
+  if (!historyDatabase) throw new Error("The test history database is not initialized.");
+  return providerHistoryPersistence(historyDatabase, provider);
+}
+
+function bindHistorySession(threadId: string, provider: "grok" | "opencode"): void {
+  if (!historyDatabase) throw new Error("The test history database is not initialized.");
+  historyDatabase.connection
+    .prepare(
+      `INSERT OR IGNORE INTO projection_threads
+         (thread_id, agent_id, title, active_turn_id, created_at, updated_at, last_event_sequence)
+       VALUES (?, ?, ?, NULL, ?, ?, 0)`,
+    )
+    .run(threadId, "history-test-agent", "History test", new Date().toISOString(), new Date().toISOString());
+  historyDatabase.bindProviderSession({
+    threadId,
+    provider,
+    externalSessionId: threadId,
+    model: "test-model",
+    effort: "medium",
+  });
+}
 
 describe.sequential("GrokAgentClient", () => {
   it("runs OpenCode ACP without Grok authentication or billing and preserves its resumed session", async () => {
@@ -53,16 +98,22 @@ describe.sequential("GrokAgentClient", () => {
       signInMessage: "Connect OpenCode.",
     });
     client.start();
-    await client.request("initialize", {}, decodeRecordResponse);
-    expect((await client.request("account/read", {}, decodeAccountReadResult)).account?.type).toBe("opencode");
-    expect(await client.request("account/rateLimits/read", {}, decodeAccountRateLimitsReadResult)).toEqual({
+    await runCauseEffect(client.request("initialize", {}, decodeRecordResponse));
+    expect((await runCauseEffect(client.request("account/read", {}, decodeAccountReadResult))).account?.type).toBe(
+      "opencode",
+    );
+    expect(
+      await runCauseEffect(client.request("account/rateLimits/read", {}, decodeAccountRateLimitsReadResult)),
+    ).toEqual({
       rateLimits: null,
       rateLimitsByLimitId: null,
     });
-    const resumed = await client.request(
-      "thread/resume",
-      { threadId: "existing-opencode-session", cwd: root, dynamicTools: [] },
-      decodeThreadResponse,
+    const resumed = await runCauseEffect(
+      client.request(
+        "thread/resume",
+        { threadId: "existing-opencode-session", cwd: root, dynamicTools: [] },
+        decodeThreadResponse,
+      ),
     );
     expect(resumed.thread.id).toBe("existing-opencode-session");
     const log = (await readFile(logPath, "utf8"))
@@ -90,15 +141,19 @@ describe.sequential("GrokAgentClient", () => {
       argv: ["acp"],
       env: {},
       signInMessage: "Connect OpenCode.",
+      history: historyFor("opencode"),
     });
     const notifications: AppServerNotification[] = [];
     client.on("notification", (event) => notifications.push(event));
     client.start();
-    const { thread } = await client.request("thread/start", { cwd: root }, decodeThreadResponse);
-    await client.request(
-      "turn/start",
-      { threadId: thread.id, input: [{ type: "text", text: "Answer" }] },
-      decodeTurnResponse,
+    const { thread } = await runCauseEffect(client.request("thread/start", { cwd: root }, decodeThreadResponse));
+    bindHistorySession(thread.id, "opencode");
+    await runCauseEffect(
+      client.request(
+        "turn/start",
+        { threadId: thread.id, input: [{ type: "text", text: "Answer" }] },
+        decodeTurnResponse,
+      ),
     );
     await waitFor(() => notifications.some((event) => event.method === "turn/completed"));
     expect(notifications.find((event) => event.method === "turn/completed")?.params).toMatchObject({
@@ -117,13 +172,17 @@ describe.sequential("GrokAgentClient", () => {
       ]);
     else expect(errors).toEqual([]);
     notifications.length = 0;
-    await client.request(
-      "turn/start",
-      { threadId: thread.id, input: [{ type: "text", text: "Retry" }] },
-      decodeTurnResponse,
+    await runCauseEffect(
+      client.request(
+        "turn/start",
+        { threadId: thread.id, input: [{ type: "text", text: "Retry" }] },
+        decodeTurnResponse,
+      ),
     );
     await waitFor(() => notifications.some((event) => event.method === "turn/completed"));
-    const history = await client.request("thread/read", { threadId: thread.id }, decodeThreadResponse);
+    const history = await runCauseEffect(
+      client.request("thread/read", { threadId: thread.id, includeTurns: true }, decodeThreadResponse),
+    );
     expect(history.thread.turns?.map((turn) => turn.status)).toEqual([status, "completed"]);
     expect(history.thread.turns?.[1]?.items).toContainEqual(expect.objectContaining({ text: "Reply after retry." }));
   });
@@ -134,12 +193,12 @@ describe.sequential("GrokAgentClient", () => {
     const providerClient = driver.createClient({ executable, version: "1.0.0" }, 5_000, NO_PROVIDER_CREDENTIALS);
     providerClient.start();
     try {
-      await providerClient.request("initialize", {}, decodeRecordResponse);
-      expect((await providerClient.request("account/read", {}, decodeAccountReadResult)).account?.type).toBe(
-        "opencode",
-      );
+      await runCauseEffect(providerClient.request("initialize", {}, decodeRecordResponse));
+      expect(
+        (await runCauseEffect(providerClient.request("account/read", {}, decodeAccountReadResult))).account?.type,
+      ).toBe("opencode");
     } finally {
-      await providerClient.stop();
+      await runCauseEffect(providerClient.stop());
     }
   });
 
@@ -154,16 +213,16 @@ describe.sequential("GrokAgentClient", () => {
         argv: ["acp"],
         env: {},
         signInMessage: "Connect OpenCode.",
+        history: historyFor("opencode"),
       });
       const notifications: AppServerNotification[] = [];
       client.on("notification", (event) => notifications.push(event));
       client.start();
-      const { thread } = await client.request("thread/start", { cwd: root }, decodeThreadResponse);
+      const { thread } = await runCauseEffect(client.request("thread/start", { cwd: root }, decodeThreadResponse));
+      bindHistorySession(thread.id, "opencode");
       for (const text of ["Try", "Retry"]) {
-        await client.request(
-          "turn/start",
-          { threadId: thread.id, input: [{ type: "text", text }] },
-          decodeTurnResponse,
+        await runCauseEffect(
+          client.request("turn/start", { threadId: thread.id, input: [{ type: "text", text }] }, decodeTurnResponse),
         );
         await waitFor(
           () => notifications.filter((event) => event.method === "turn/completed").length === (text === "Try" ? 1 : 2),
@@ -174,7 +233,9 @@ describe.sequential("GrokAgentClient", () => {
           message: sourceText("error.provider.opencodeCredentialsRejected", { detail: reason }),
         }),
       ]);
-      const history = await client.request("thread/read", { threadId: thread.id }, decodeThreadResponse);
+      const history = await runCauseEffect(
+        client.request("thread/read", { threadId: thread.id, includeTurns: true }, decodeThreadResponse),
+      );
       expect(history.thread.turns?.map((turn) => turn.status)).toEqual(["failed", "completed"]);
     },
   );
@@ -188,6 +249,8 @@ describe.sequential("GrokAgentClient", () => {
     ["Too Many Requests", "opencodeRateLimited"],
     ["No payment method.", "opencodeBilling"],
     ["Upstream request failed: Insufficient account funds", "opencodeBilling"],
+    ["Invalid upload request.", "opencodeInvalidUpload"],
+    ["Upstream request failed: [invalid_request_error] Invalid upload request.", "opencodeInvalidUpload"],
     ["Upstream request failed: Endpoint is unavailable.", "opencodeProviderFailed"],
     ["Service Unavailable", "opencodeProviderFailed"],
     ["Upstream request failed: Cannot connect to API: Unable to connect.", "opencodeProviderFailed"],
@@ -204,11 +267,9 @@ describe.sequential("GrokAgentClient", () => {
     const notifications: AppServerNotification[] = [];
     client.on("notification", (event) => notifications.push(event));
     client.start();
-    const { thread } = await client.request("thread/start", { cwd: root }, decodeThreadResponse);
-    await client.request(
-      "turn/start",
-      { threadId: thread.id, input: [{ type: "text", text: "Try" }] },
-      decodeTurnResponse,
+    const { thread } = await runCauseEffect(client.request("thread/start", { cwd: root }, decodeThreadResponse));
+    await runCauseEffect(
+      client.request("turn/start", { threadId: thread.id, input: [{ type: "text", text: "Try" }] }, decodeTurnResponse),
     );
     await waitFor(() => notifications.some((event) => event.method === "turn/completed"));
     expect(notifications.filter((event) => event.method === "error").map((event) => event.params)).toEqual([
@@ -227,11 +288,13 @@ describe.sequential("GrokAgentClient", () => {
     const notifications: AppServerNotification[] = [];
     client.on("notification", (event) => notifications.push(event));
     client.start();
-    const { thread } = await client.request("thread/start", { cwd: root }, decodeThreadResponse);
-    await client.request(
-      "turn/start",
-      { threadId: thread.id, input: [{ type: "text", text: "Inspect" }] },
-      decodeTurnResponse,
+    const { thread } = await runCauseEffect(client.request("thread/start", { cwd: root }, decodeThreadResponse));
+    await runCauseEffect(
+      client.request(
+        "turn/start",
+        { threadId: thread.id, input: [{ type: "text", text: "Inspect" }] },
+        decodeTurnResponse,
+      ),
     );
     await waitFor(() => notifications.some((event) => event.method === "turn/completed"));
     const tools = notifications.flatMap((event) => {
@@ -239,7 +302,7 @@ describe.sequential("GrokAgentClient", () => {
         return [];
       return event.params.item.type === "toolCall" ? [event.params.item.name] : [];
     });
-    expect(tools).toEqual(["Read files", "Check results"]);
+    expect(tools).toEqual(["Read files", "Read more", "Check results"]);
   });
 
   it("starts profile generation with no built-in tools and denies approval requests", async () => {
@@ -247,12 +310,16 @@ describe.sequential("GrokAgentClient", () => {
     const requests: AppServerRequest[] = [];
     client.on("request", (request) => requests.push(request));
     client.start();
-    await client.request("initialize", {}, decodeRecordResponse);
-    const thread = await client.request("thread/start", { cwd: root, dynamicTools: [] }, decodeThreadResponse);
-    await client.request(
-      "turn/start",
-      { threadId: thread.thread.id, input: [{ type: "text", text: "Draft a profile" }] },
-      decodeTurnResponse,
+    await runCauseEffect(client.request("initialize", {}, decodeRecordResponse));
+    const thread = await runCauseEffect(
+      client.request("thread/start", { cwd: root, dynamicTools: [] }, decodeThreadResponse),
+    );
+    await runCauseEffect(
+      client.request(
+        "turn/start",
+        { threadId: thread.thread.id, input: [{ type: "text", text: "Draft a profile" }] },
+        decodeTurnResponse,
+      ),
     );
     await vi.waitFor(async () => expect(await readFile(logPath, "utf8")).toContain("permission-response"));
     const log = (await readFile(logPath, "utf8"))
@@ -282,26 +349,44 @@ describe.sequential("GrokAgentClient", () => {
     "shows only the final segment in chat when Grok ends with %s",
     async (stopReason) => {
       process.env.OPENBOT_FAKE_GROK_MODE = stopReason;
-      client = new GrokAgentClient({ executable, version: "1.0.5" }, 5_000);
+      client = new GrokAgentClient(
+        { executable, version: "1.0.5" },
+        5_000,
+        false,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        historyFor("grok"),
+      );
       const notifications: AppServerNotification[] = [];
       client.on("notification", (notification) => notifications.push(notification));
       client.start();
-      const { thread } = await client.request("thread/start", { cwd: root }, decodeThreadResponse);
-      await client.request(
-        "turn/start",
-        { threadId: thread.id, input: [{ type: "text", text: "Inspect and answer" }] },
-        decodeTurnResponse,
+      const { thread } = await runCauseEffect(client.request("thread/start", { cwd: root }, decodeThreadResponse));
+      bindHistorySession(thread.id, "grok");
+      await runCauseEffect(
+        client.request(
+          "turn/start",
+          { threadId: thread.id, input: [{ type: "text", text: "Inspect and answer" }] },
+          decodeTurnResponse,
+        ),
       );
       await waitFor(() => notifications.some((notification) => notification.method === "turn/completed"));
       expect(notifications.find((event) => event.method === "openbot/usage")?.params).toMatchObject({
         usage: { inputTokens: 300, outputTokens: 50, cachedReadTokens: 200 },
       });
-      const history = await client.request("thread/read", { threadId: thread.id }, decodeThreadResponse);
-      const messages = history.thread.turns?.[0]?.items;
+      const history = await runCauseEffect(
+        client.request("thread/read", { threadId: thread.id, includeTurns: true }, decodeThreadResponse),
+      );
+      const messages = history.thread.turns?.[0]?.items?.filter((item) => item.type === "agentMessage");
       expect(messages).toEqual([
         expect.objectContaining({ phase: "commentary", text: "Planning inspection." }),
         expect.objectContaining({ phase: "commentary", text: "Inspecting files." }),
         expect.objectContaining({ phase: "commentary", text: "Reviewing findings." }),
+        // A tool call between two thoughts keeps them apart (#1540).
+        expect.objectContaining({ phase: "commentary", text: "Comparing results." }),
         expect.objectContaining({ phase: "commentary", text: "Checking results." }),
         expect.objectContaining({
           phase: "final_answer",
@@ -342,7 +427,7 @@ describe.sequential("GrokAgentClient", () => {
           }
         }
       }
-      expect([...texts.values()]).toEqual(["Planning inspection.", "Reviewing findings."]);
+      expect([...texts.values()]).toEqual(["Planning inspection.", "Reviewing findings.", "Comparing results."]);
       expect(streamedThoughts).toEqual(["Reviewing findings."]);
       expect(completedAnswers).toEqual(["The final answer."]);
       expect([...phases.values()].filter((phase) => phase === "final_answer")).toHaveLength(1);
@@ -351,22 +436,38 @@ describe.sequential("GrokAgentClient", () => {
 
   it("sends a steer that the agent refused after the running prompt ends, in the same turn", async () => {
     process.env.OPENBOT_FAKE_GROK_MODE = "busy-steer";
-    client = new GrokAgentClient({ executable, version: "1.0.5" }, 5_000);
+    client = new GrokAgentClient(
+      { executable, version: "1.0.5" },
+      5_000,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      historyFor("grok"),
+    );
     const notifications: AppServerNotification[] = [];
     const diagnostics: string[] = [];
     client.on("notification", (notification) => notifications.push(notification));
     client.on("diagnostic", (message: string) => diagnostics.push(message));
     client.start();
-    const { thread } = await client.request("thread/start", { cwd: root }, decodeThreadResponse);
-    await client.request(
-      "turn/start",
-      { threadId: thread.id, clientUserMessageId: "turn-1", input: [{ type: "text", text: "Build it" }] },
-      decodeTurnResponse,
+    const { thread } = await runCauseEffect(client.request("thread/start", { cwd: root }, decodeThreadResponse));
+    bindHistorySession(thread.id, "grok");
+    await runCauseEffect(
+      client.request(
+        "turn/start",
+        { threadId: thread.id, clientUserMessageId: "turn-1", input: [{ type: "text", text: "Build it" }] },
+        decodeTurnResponse,
+      ),
     );
-    await client.request(
-      "turn/steer",
-      { threadId: thread.id, expectedTurnId: "turn-1", input: [{ type: "text", text: "Also add tests" }] },
-      decodeRecordResponse,
+    await runCauseEffect(
+      client.request(
+        "turn/steer",
+        { threadId: thread.id, expectedTurnId: "turn-1", input: [{ type: "text", text: "Also add tests" }] },
+        decodeRecordResponse,
+      ),
     );
     await waitFor(() => notifications.some((notification) => notification.method === "turn/completed"));
 
@@ -381,7 +482,9 @@ describe.sequential("GrokAgentClient", () => {
       .filter((entry) => entry.method === "session/prompt")
       .map((entry) => entry.text);
     expect(prompts).toEqual(["Build it", "Also add tests", "Also add tests"]);
-    const history = await client.request("thread/read", { threadId: thread.id }, decodeThreadResponse);
+    const history = await runCauseEffect(
+      client.request("thread/read", { threadId: thread.id, includeTurns: true }, decodeThreadResponse),
+    );
     expect(history.thread.turns?.[0]?.items).toEqual([
       expect.objectContaining({ phase: "final_answer", text: "First answer." }),
       expect.objectContaining({ phase: "final_answer", text: "Reply to the steer." }),
@@ -392,22 +495,26 @@ describe.sequential("GrokAgentClient", () => {
   it("reads the current weekly billing period and a monthly period", async () => {
     client = new GrokAgentClient({ executable, version: "1.0.5" }, 5_000);
     client.start();
-    await client.request("initialize", {}, decodeRecordResponse);
+    await runCauseEffect(client.request("initialize", {}, decodeRecordResponse));
     await expect(
-      client.request("account/rateLimits/read", { model: "grok-4.5" }, decodeAccountRateLimitsReadResult),
+      runCauseEffect(
+        client.request("account/rateLimits/read", { model: "grok-4.5" }, decodeAccountRateLimitsReadResult),
+      ),
     ).resolves.toMatchObject({
       rateLimits: {
         secondary: { usedPercent: 8, windowDurationMins: 10_080, resetsAt: 1_788_825_600 },
       },
     });
-    await client.stop();
+    await runCauseEffect(client.stop());
 
     process.env.OPENBOT_FAKE_GROK_MODE = "monthly-billing";
     client = new GrokAgentClient({ executable, version: "1.0.5" }, 5_000);
     client.start();
-    await client.request("initialize", {}, decodeRecordResponse);
+    await runCauseEffect(client.request("initialize", {}, decodeRecordResponse));
     await expect(
-      client.request("account/rateLimits/read", { model: "grok-4.5" }, decodeAccountRateLimitsReadResult),
+      runCauseEffect(
+        client.request("account/rateLimits/read", { model: "grok-4.5" }, decodeAccountRateLimitsReadResult),
+      ),
     ).resolves.toMatchObject({
       rateLimits: {
         secondary: { usedPercent: 8, windowDurationMins: 43_200 },
@@ -420,10 +527,12 @@ describe.sequential("GrokAgentClient", () => {
     process.env.OPENBOT_FAKE_GROK_MODE = "unified-billing";
     client = new GrokAgentClient({ executable, version: "1.0.13" }, 5_000);
     client.start();
-    await client.request("initialize", {}, decodeRecordResponse);
+    await runCauseEffect(client.request("initialize", {}, decodeRecordResponse));
 
     await expect(
-      client.request("account/rateLimits/read", { model: "grok-4.5" }, decodeAccountRateLimitsReadResult),
+      runCauseEffect(
+        client.request("account/rateLimits/read", { model: "grok-4.5" }, decodeAccountRateLimitsReadResult),
+      ),
     ).resolves.toMatchObject({
       rateLimits: { secondary: { usedPercent: 0, windowDurationMins: 10_080, resetsAt: 1_788_825_600 } },
     });
@@ -433,10 +542,12 @@ describe.sequential("GrokAgentClient", () => {
     process.env.OPENBOT_FAKE_GROK_MODE = "hung-billing";
     client = new GrokAgentClient({ executable, version: "1.0.13" }, 1_000);
     client.start();
-    await client.request("initialize", {}, decodeRecordResponse);
+    await runCauseEffect(client.request("initialize", {}, decodeRecordResponse));
 
     await expect(
-      client.request("account/rateLimits/read", { model: "grok-4.5" }, decodeAccountRateLimitsReadResult),
+      runCauseEffect(
+        client.request("account/rateLimits/read", { model: "grok-4.5" }, decodeAccountRateLimitsReadResult),
+      ),
     ).rejects.toThrow("Grok request timed out: account/rateLimits/read");
   });
 
@@ -459,11 +570,11 @@ describe.sequential("GrokAgentClient", () => {
       client.on("request", (request) => requests.push(request));
       client.start();
 
-      await client.request("initialize", {}, decodeRecordResponse);
-      await expect(client.request("account/read", {}, decodeAccountReadResult)).resolves.toMatchObject({
+      await runCauseEffect(client.request("initialize", {}, decodeRecordResponse));
+      await expect(runCauseEffect(client.request("account/read", {}, decodeAccountReadResult))).resolves.toMatchObject({
         account: { type: provider, email: provider === "grok" ? "grok@example.com" : null },
       });
-      const models = await client.request("model/list", {}, decodeModelListResponse);
+      const models = await runCauseEffect(client.request("model/list", {}, decodeModelListResponse));
       expect(models.data).toEqual([
         expect.objectContaining({
           model: "grok-4.5",
@@ -473,47 +584,53 @@ describe.sequential("GrokAgentClient", () => {
         expect.objectContaining({ model: "grok-fast" }),
       ]);
 
-      const started = await client.request(
-        "thread/start",
-        {
-          cwd: root,
-          runtimeWorkspaceRoots: [root],
-          developerInstructions: "Use OpenBot tools.",
-          dynamicTools: [],
-          model: "grok-fast",
-          effort: "xhigh",
-        },
-        decodeThreadResponse,
+      const started = await runCauseEffect(
+        client.request(
+          "thread/start",
+          {
+            cwd: root,
+            runtimeWorkspaceRoots: [root],
+            developerInstructions: "Use OpenBot tools.",
+            dynamicTools: [],
+            model: "grok-fast",
+            effort: "xhigh",
+          },
+          decodeThreadResponse,
+        ),
       );
       const threadId = started.thread.id;
       const imagePath = join(root, "input.png");
       const imageData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9X8AAAAASUVORK5CYII=";
       await writeFile(imagePath, Buffer.from(imageData, "base64"));
-      const turn = await client.request(
-        "turn/start",
-        {
-          threadId,
-          model: "grok-fast",
-          effort: "xhigh",
-          clientUserMessageId: "turn-1",
-          input: [
-            { type: "text", text: "Build it" },
-            { type: "localImage", path: imagePath },
-          ],
-        },
-        decodeTurnResponse,
+      const turn = await runCauseEffect(
+        client.request(
+          "turn/start",
+          {
+            threadId,
+            model: "grok-fast",
+            effort: "xhigh",
+            clientUserMessageId: "turn-1",
+            input: [
+              { type: "text", text: "Build it" },
+              { type: "localImage", path: imagePath },
+            ],
+          },
+          decodeTurnResponse,
+        ),
       );
       expect(turn.turn.status).toBe("inProgress");
       await waitFor(() => requests.some((request) => request.method.includes("requestApproval")));
 
-      await client.request(
-        "turn/steer",
-        {
-          threadId,
-          expectedTurnId: "turn-1",
-          input: [{ type: "text", text: "Also add tests" }],
-        },
-        decodeRecordResponse,
+      await runCauseEffect(
+        client.request(
+          "turn/steer",
+          {
+            threadId,
+            expectedTurnId: "turn-1",
+            input: [{ type: "text", text: "Also add tests" }],
+          },
+          decodeRecordResponse,
+        ),
       );
       const approval = requests.find((request) => request.method.includes("requestApproval"));
       if (!approval) throw new Error("The fake ACP permission request was not surfaced.");
@@ -554,12 +671,16 @@ describe.sequential("GrokAgentClient", () => {
         ]),
       );
 
-      const secondTurn = await client.request(
-        "turn/start",
-        { threadId, clientUserMessageId: "turn-2", input: [{ type: "text", text: "Wait" }] },
-        decodeTurnResponse,
+      const secondTurn = await runCauseEffect(
+        client.request(
+          "turn/start",
+          { threadId, clientUserMessageId: "turn-2", input: [{ type: "text", text: "Wait" }] },
+          decodeTurnResponse,
+        ),
       );
-      await client.request("turn/interrupt", { threadId, turnId: secondTurn.turn.id }, decodeRecordResponse);
+      await runCauseEffect(
+        client.request("turn/interrupt", { threadId, turnId: secondTurn.turn.id }, decodeRecordResponse),
+      );
       await waitFor(() =>
         notifications.some(
           (notification) =>
@@ -592,12 +713,14 @@ describe.sequential("GrokAgentClient", () => {
         ]),
       );
 
-      await client.stop();
+      await runCauseEffect(client.stop());
       client = createClient();
       client.start();
-      await client.request("initialize", {}, decodeRecordResponse);
+      await runCauseEffect(client.request("initialize", {}, decodeRecordResponse));
       await expect(
-        client.request("thread/resume", { threadId, cwd: root, dynamicTools: [] }, decodeRecordResponse),
+        runCauseEffect(
+          client.request("thread/resume", { threadId, cwd: root, dynamicTools: [] }, decodeRecordResponse),
+        ),
       ).resolves.toEqual(expect.any(Object));
       expect(await readLog()).toEqual(
         expect.arrayContaining([expect.objectContaining({ method: "session/load", sessionId: threadId })]),
@@ -609,22 +732,24 @@ describe.sequential("GrokAgentClient", () => {
     process.env.OPENBOT_FAKE_GROK_MODE = "refresh-models";
     client = new GrokAgentClient({ executable, version: "1.0.13" }, 5_000);
     client.start();
-    await client.request("initialize", {}, decodeRecordResponse);
-    const models = await client.request("model/list", {}, decodeModelListResponse);
+    await runCauseEffect(client.request("initialize", {}, decodeRecordResponse));
+    const models = await runCauseEffect(client.request("model/list", {}, decodeModelListResponse));
     expect(models.data).toContainEqual(expect.objectContaining({ model: "grok-future-2", displayName: "Future Grok" }));
-    expect(await readLog()).toContainEqual({ method: "session/close", sessionId: "grok-session-2" });
-    await expect(client.request("model/list", {}, decodeModelListResponse)).rejects.toThrow("Discovery unavailable");
-    const refreshed = await client.request("model/list", {}, decodeModelListResponse);
+    await expectLogged({ method: "session/close", sessionId: "grok-session-2" });
+    await expect(runCauseEffect(client.request("model/list", {}, decodeModelListResponse))).rejects.toThrow(
+      "Discovery unavailable",
+    );
+    const refreshed = await runCauseEffect(client.request("model/list", {}, decodeModelListResponse));
     expect(refreshed.data.map((model) => model.model)).toEqual(["grok-4.5", "grok-fast", "grok-future-4"]);
-    expect(await readLog()).toContainEqual({ method: "session/close", sessionId: "grok-session-4" });
+    await expectLogged({ method: "session/close", sessionId: "grok-session-4" });
   });
 
   it("bounds Grok model discovery by the caller timeout", async () => {
     process.env.OPENBOT_FAKE_GROK_MODE = "hung-models";
     client = new GrokAgentClient({ executable, version: "1.0.13" }, 5_000);
     client.start();
-    await client.request("initialize", {}, decodeRecordResponse);
-    await expect(client.request("model/list", {}, decodeModelListResponse, 10)).rejects.toThrow(
+    await runCauseEffect(client.request("initialize", {}, decodeRecordResponse));
+    await expect(runCauseEffect(client.request("model/list", {}, decodeModelListResponse, 10))).rejects.toThrow(
       "Grok request timed out: model/list",
     );
   });
@@ -633,8 +758,8 @@ describe.sequential("GrokAgentClient", () => {
     process.env.OPENBOT_FAKE_GROK_MODE = "no-thought";
     client = new GrokAgentClient({ executable, version: "1.0.5" }, 5_000);
     client.start();
-    await client.request("initialize", {}, decodeRecordResponse);
-    const models = await client.request("model/list", {}, decodeModelListResponse);
+    await runCauseEffect(client.request("initialize", {}, decodeRecordResponse));
+    const models = await runCauseEffect(client.request("model/list", {}, decodeModelListResponse));
     expect(models.data).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -649,9 +774,9 @@ describe.sequential("GrokAgentClient", () => {
     process.env.OPENBOT_FAKE_GROK_MODE = "model-metadata";
     client = new GrokAgentClient({ executable, version: "1.0.13" }, 5_000);
     client.start();
-    await client.request("initialize", {}, decodeRecordResponse);
+    await runCauseEffect(client.request("initialize", {}, decodeRecordResponse));
 
-    const models = await client.request("model/list", {}, decodeModelListResponse);
+    const models = await runCauseEffect(client.request("model/list", {}, decodeModelListResponse));
     expect(models.data).toEqual([
       expect.objectContaining({
         model: "grok-4.6",
@@ -670,10 +795,12 @@ describe.sequential("GrokAgentClient", () => {
       }),
     ]);
 
-    await client.request(
-      "thread/start",
-      { cwd: root, dynamicTools: [], model: "grok-4.6", effort: "xhigh" },
-      decodeThreadResponse,
+    await runCauseEffect(
+      client.request(
+        "thread/start",
+        { cwd: root, dynamicTools: [], model: "grok-4.6", effort: "xhigh" },
+        decodeThreadResponse,
+      ),
     );
     expect(await readLog()).toEqual(
       expect.arrayContaining([
@@ -689,10 +816,12 @@ describe.sequential("GrokAgentClient", () => {
     );
 
     const previousLogLength = (await readLog()).length;
-    await client.request(
-      "thread/start",
-      { cwd: root, dynamicTools: [], model: "grok-4.5", effort: "medium" },
-      decodeThreadResponse,
+    await runCauseEffect(
+      client.request(
+        "thread/start",
+        { cwd: root, dynamicTools: [], model: "grok-4.5", effort: "medium" },
+        decodeThreadResponse,
+      ),
     );
     const unsupportedModelLog = (await readLog()).slice(previousLogLength);
     expect(unsupportedModelLog).toEqual(
@@ -710,17 +839,19 @@ describe.sequential("GrokAgentClient", () => {
     process.env.OPENBOT_FAKE_GROK_MODE = "legacy-models";
     client = new GrokAgentClient({ executable, version: "1.0.5" }, 5_000);
     client.start();
-    await client.request("initialize", {}, decodeRecordResponse);
-    const models = await client.request("model/list", {}, decodeModelListResponse);
+    await runCauseEffect(client.request("initialize", {}, decodeRecordResponse));
+    const models = await runCauseEffect(client.request("model/list", {}, decodeModelListResponse));
     expect(models.data).toEqual([
       expect.objectContaining({ model: "grok-4.5", displayName: "Grok 4.5" }),
       expect.objectContaining({ model: "grok-fast", displayName: "Grok Fast" }),
     ]);
 
-    await client.request(
-      "thread/start",
-      { cwd: root, dynamicTools: [], model: "grok-fast", effort: "xhigh" },
-      decodeThreadResponse,
+    await runCauseEffect(
+      client.request(
+        "thread/start",
+        { cwd: root, dynamicTools: [], model: "grok-fast", effort: "xhigh" },
+        decodeThreadResponse,
+      ),
     );
     expect(await readLog()).toEqual(
       expect.arrayContaining([expect.objectContaining({ method: "session/set_model", modelId: "grok-fast" })]),
@@ -731,15 +862,17 @@ describe.sequential("GrokAgentClient", () => {
     process.env.OPENBOT_FAKE_GROK_MODE = "auth-error";
     client = new GrokAgentClient({ executable, version: "1.0.5" }, 5_000);
     client.start();
-    await client.request("initialize", {}, decodeRecordResponse);
-    await expect(client.request("account/read", {}, decodeAccountReadResult)).resolves.toMatchObject({ account: null });
+    await runCauseEffect(client.request("initialize", {}, decodeRecordResponse));
+    await expect(runCauseEffect(client.request("account/read", {}, decodeAccountReadResult))).resolves.toMatchObject({
+      account: null,
+    });
     expect((await readLog()).some((entry) => entry.method === "_x.ai/auth/info")).toBe(false);
-    await client.stop();
+    await runCauseEffect(client.stop());
 
     process.env.OPENBOT_FAKE_GROK_MODE = "no-model";
     client = new GrokAgentClient({ executable, version: "1.0.5" }, 5_000);
     client.start();
-    await expect(client.request("initialize", {}, decodeRecordResponse)).rejects.toThrow(
+    await expect(runCauseEffect(client.request("initialize", {}, decodeRecordResponse))).rejects.toThrow(
       "did not advertise any ACP models",
     );
   });
@@ -750,9 +883,9 @@ describe.sequential("GrokAgentClient", () => {
       process.env.OPENBOT_FAKE_GROK_MODE = mode;
       client = new GrokAgentClient({ executable, version: "1.0.22" }, 5_000);
       client.start();
-      await client.request("initialize", {}, decodeRecordResponse);
+      await runCauseEffect(client.request("initialize", {}, decodeRecordResponse));
 
-      await expect(client.request("account/read", {}, decodeAccountReadResult)).resolves.toEqual({
+      await expect(runCauseEffect(client.request("account/read", {}, decodeAccountReadResult))).resolves.toEqual({
         account: { type: "grok", email: null, planType: null },
         requiresOpenaiAuth: false,
       });
@@ -760,6 +893,11 @@ describe.sequential("GrokAgentClient", () => {
     },
   );
 });
+
+/** Discovery closes its session in the background after `model/list` returns, so wait for the close. */
+async function expectLogged(entry: DynamicRecord): Promise<void> {
+  await vi.waitFor(async () => expect(await readLog()).toContainEqual(entry), { timeout: 3_000 });
+}
 
 async function readLog(): Promise<DynamicRecord[]> {
   const text = await readFile(logPath, "utf8").catch(() => "");
@@ -1061,6 +1199,9 @@ createInterface({ input: process.stdin }).on("line", (line) => {
         { sessionUpdate: "tool_call", toolCallId: "read-1", title: "Read files", status: "in_progress" },
         { sessionUpdate: "tool_call_update", toolCallId: "read-1", status: "completed" },
         { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Reviewing findings." } },
+        { sessionUpdate: "tool_call", toolCallId: "read-3", title: "Read more", status: "in_progress" },
+        { sessionUpdate: "tool_call_update", toolCallId: "read-3", status: "completed" },
+        { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Comparing results." } },
         { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Checking results." } },
         { sessionUpdate: "tool_call", toolCallId: "read-2", title: "Check results", status: "in_progress" },
         { sessionUpdate: "tool_call_update", toolCallId: "read-2", status: "completed" },

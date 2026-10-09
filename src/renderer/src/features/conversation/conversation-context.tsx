@@ -48,9 +48,15 @@ import {
   readStateForMessages,
   retainedAutoReadState,
 } from "./conversation-read-state";
+import type { SendMessageResult } from "./conversation-types";
 import { useDirectMessages } from "./direct-messages-context";
 
 const LATEST_PAGE_SIZE = 50;
+/**
+ * How much of a snapshot an agent that is not open converts. Commentary of one turn becomes one
+ * message and queued messages none, so a page needs more than a page of the thread.
+ */
+const INACTIVE_SNAPSHOT_TAIL = LATEST_PAGE_SIZE * 4;
 
 function trimToLatestPage(conversation: ConversationState): void {
   if (conversation.messages.length <= LATEST_PAGE_SIZE) return;
@@ -62,6 +68,8 @@ function trimToLatestPage(conversation: ConversationState): void {
 interface ConversationState {
   messages: AgentMessage[];
   loaded?: boolean;
+  loading?: boolean;
+  loadError?: string | null;
   revision?: number;
   page?: ConversationPageInfo;
   windowMode?: "latest" | "around";
@@ -89,7 +97,7 @@ const Conversation = createSimpleContext({
   init: () => {
     const usage = useUsage();
     const { appFocused } = usePlatform();
-    const { activeServerId } = useServers();
+    const { activeServerId, activeServer } = useServers();
     const { agentChatsToMarkRead, agentChatsToRetryRead, autoReadAgentMessages } = useAgentReadTracking();
     const scopeIsCurrent = createScopeGuard();
     const { activeDirectMemberId } = useDirectMessages();
@@ -163,17 +171,32 @@ const Conversation = createSimpleContext({
     });
 
     createEffect(
-      () => ({ agentId: activeAgentId(), agentPhase: agentStatus().phase, openRevision: agentChatOpenRevision() }),
+      () => ({
+        agentId: activeAgentId(),
+        agentPhase: agentStatus().phase,
+        openRevision: agentChatOpenRevision(),
+        serverState: activeServer()?.state,
+        sequence: activeServer()?.connectionSequence,
+      }),
       ({ agentId }) => {
         if (!agentId) return;
         const serverId = untrack(activeServerId);
         const trackingKey = agentConversationKey(serverId, agentId);
         const pageRequest = (conversationPageRequests.get(agentId) ?? 0) + 1;
         conversationPageRequests.set(agentId, pageRequest);
+        const server = untrack(activeServer);
+        if (server?.kind === "remote" && server.state !== "online") return;
+        updateConversation(agentId, (conversation) => {
+          conversation.loading = true;
+          conversation.loadError = null;
+        });
         void conversationPort()
           .agent.readConversationPage({ agentId, anchor: { type: "latest" }, limit: 50 }, serverId)
           .then((page) => {
             if (!scopeIsCurrent() || conversationPageRequests.get(agentId) !== pageRequest) return;
+            updateConversation(agentId, (conversation) => {
+              conversation.loading = false;
+            });
             const pageApplied = applyConversationPage(page, "replace", "latest");
             if (!pageApplied) {
               if (agentChatsToMarkRead.has(trackingKey)) {
@@ -198,9 +221,12 @@ const Conversation = createSimpleContext({
               if (latestIncomingMessage) autoMarkAgentMessageRead(agentId, latestIncomingMessage.id);
             }
           })
-          .catch((error) => {
+          .catch(() => {
             if (!scopeIsCurrent() || conversationPageRequests.get(agentId) !== pageRequest) return;
-            appendUiError(agentId, error, currentText().t("chat.errorStatus.load"), serverId);
+            updateConversation(agentId, (conversation) => {
+              conversation.loading = false;
+              conversation.loadError = currentText().t("server.connection.conversationFailed");
+            });
             if (agentChatsToMarkRead.delete(trackingKey)) markLatestVisibleAgentMessageRead(agentId, serverId);
           });
       },
@@ -234,6 +260,7 @@ const Conversation = createSimpleContext({
         for (const agentId of agentIds) {
           current[agentId] ??= { messages: [] };
           current[agentId].messages = next[agentId] ?? [];
+          if (agentId !== activeAgentId()) trimToLatestPage(current[agentId]);
         }
       });
       for (const agentId of agentIds) deleteAgentMessageBodies(rawAgentMessageBodies, agentId);
@@ -461,6 +488,7 @@ const Conversation = createSimpleContext({
         });
         appended = true;
         conversation.messages = [...messages, message];
+        if (event.agentId !== activeAgentId()) trimToLatestPage(conversation);
       });
       if (appended) {
         const readState = conversations[event.agentId]?.read;
@@ -483,14 +511,22 @@ const Conversation = createSimpleContext({
       const agentId = snapshot.agentId;
       if (snapshot.revision < (conversations[agentId]?.revision ?? -1)) return;
       const initialLoad = conversations[agentId]?.loaded !== true;
+      const inactive = agentId !== activeAgentId();
+      const windowMode = conversations[agentId]?.windowMode ?? "latest";
+      // A snapshot carries the whole thread. An agent that is not open shows none of it, and opening
+      // it reads the latest page again, so only the tail is converted and kept. A window around an
+      // older message, from a search, is not in the tail, so it keeps the whole snapshot.
+      const sourceMessages =
+        inactive && windowMode === "latest" && snapshot.messages.length > INACTIVE_SNAPSHOT_TAIL
+          ? snapshot.messages.slice(-INACTIVE_SNAPSHOT_TAIL)
+          : snapshot.messages;
       updateConversation(agentId, (conversation) => {
         conversation.revision = snapshot.revision;
         conversation.loaded = true;
         const previous = conversation.messages;
         const previousById = new Map(previous.map((message) => [message.id, message]));
-        const allMappedMessages = toAgentMessages(snapshot.messages, snapshot.agentId);
+        const allMappedMessages = toAgentMessages(sourceMessages, snapshot.agentId);
         const pageInfo = conversations[agentId]?.page;
-        const windowMode = conversations[agentId]?.windowMode ?? "latest";
         const mappedMessages = retainThinkingMessages(
           previous,
           windowedSnapshotMessages(previous, allMappedMessages, {
@@ -508,9 +544,9 @@ const Conversation = createSimpleContext({
           return;
         }
         conversation.messages = next;
-        // A snapshot carries the whole thread. An agent that is not open shows none of it, and
-        // opening it reads the latest page again, so only that page's worth stays in memory.
-        if (agentId !== activeAgentId()) trimToLatestPage(conversation);
+        if (!inactive) return;
+        trimToLatestPage(conversation);
+        if (sourceMessages !== snapshot.messages) conversation.page = { hasOlder: true, olderCursor: null };
       });
       const presentedRequestKey = presentedPromptResolutions()[agentId];
       const pendingPrompt = pendingPrompts()[agentId];
@@ -717,20 +753,24 @@ const Conversation = createSimpleContext({
       attachmentDraftIds: string[],
       replyToMessageId: string | null,
       target?: { agentId: string; serverId: string },
-    ): Promise<boolean> {
+      clientMessageId?: string,
+    ): Promise<SendMessageResult> {
       const agentId = target?.agentId ?? activeAgent()?.id;
       const serverId = target?.serverId ?? activeServerId();
-      if (!agentId || (!body.trim() && attachmentDraftIds.length === 0)) return false;
-      return sendMessageToAgent(agentId, body, attachmentDraftIds, replyToMessageId, serverId);
+      if (!agentId || (!body.trim() && attachmentDraftIds.length === 0))
+        return { error: currentText().t("chat.errorStatus.send") };
+      return sendMessageToAgent(agentId, body, attachmentDraftIds, replyToMessageId, serverId, clientMessageId);
     }
 
+    /** The failure goes back to the pending message, which shows it with Retry. */
     async function sendMessageToAgent(
       agentId: string,
       body: string,
       attachmentDraftIds: string[],
       replyToMessageId: string | null = null,
       serverId = activeServerId(),
-    ): Promise<boolean> {
+      clientMessageId?: string,
+    ): Promise<SendMessageResult> {
       const analytics = desktopAnalytics.scope();
       const properties = analyticsAgentProperties(agentId);
       try {
@@ -739,6 +779,7 @@ const Conversation = createSimpleContext({
           text: body.trim(),
           attachmentDraftIds,
           ...(replyToMessageId ? { replyToMessageId } : {}),
+          ...(clientMessageId ? { clientMessageId } : {}),
         };
         const receipt = await conversationPort().agent.sendMessage(input, serverId);
         const errorKey = agentConversationKey(serverId, agentId);
@@ -751,12 +792,12 @@ const Conversation = createSimpleContext({
           result: "succeeded",
           delivery_count: receipt.deliveries.length,
         });
-        try {
-          await markAgentMessagesRead(agentId, receipt.deliveries[0]?.id ?? receipt.messageId, serverId);
-        } catch (error) {
+        const messageId = receipt.deliveries[0]?.id ?? receipt.messageId;
+        // The pending message does not wait for read state: it is the user's own message.
+        markAgentMessagesRead(agentId, messageId, serverId).catch((error: unknown) => {
           appendUiError(agentId, error, currentText().t("chat.errorStatus.readState"), serverId);
-        }
-        return true;
+        });
+        return { messageId };
       } catch (error) {
         analytics.track("message_send", {
           ...(properties ?? {}),
@@ -766,8 +807,8 @@ const Conversation = createSimpleContext({
           result: "failed",
           failure_code: "send_failed",
         });
-        appendUiError(agentId, error, currentText().t("chat.errorStatus.send"), serverId);
-        return false;
+        const { t, errorMessage } = currentText();
+        return { error: errorMessage(error, t("chat.errorStatus.send")) };
       }
     }
 
@@ -895,6 +936,7 @@ const Conversation = createSimpleContext({
 
     return {
       conversations,
+      retryConversation: () => setAgentChatOpenRevision((current) => current + 1),
       unreadReplies,
       recentReplies,
       activeMessages,

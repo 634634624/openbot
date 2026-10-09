@@ -1,3 +1,5 @@
+import { Effect } from "effect";
+import type { RemoteWorkflowError } from "../remote-service-effects";
 // MCP servers: the model-context servers an agent on this server may use.
 //
 // "Server" here is a joined team server or the local host; the MCP server is an unrelated thing, so
@@ -9,37 +11,50 @@ import {
   decodeMcpTestResult,
   MCP_SERVERS_CAPABILITY,
   type McpServerConfig,
-  type McpTestResult,
-  type RemoveMcpServerInput,
-  type SaveMcpServerInput,
-  type SetMcpServerEnabledInput,
-  type TestMcpServerInput,
 } from "@openbot/contracts/ipc";
 import type { TeamCurrentCapability } from "@openbot/contracts/team-protocol/current";
 import { MCP_ROUTES } from "@openbot/contracts/team-protocol/mcp-v1";
 import { sourceText } from "@openbot/i18n/source";
-import type { TestMcpServerOptions } from "../../backend/agent-service";
+import type { AgentService } from "../../backend/agent-service";
+import { runCauseEffect } from "../../backend/effect-boundary";
 import { MCP_PROBE_TIMEOUT_MS } from "../../backend/mcp-probe";
 import { type McpToolRuntimes, needsManagedRuntime } from "../../backend/mcp-provider-shapes";
+import type { ProviderRuntimeManager } from "../provider-runtime-manager";
 import type { ResponseDecoder } from "../remote-host-decoding";
 import type { RemoteRequestInit } from "../remote-server-client";
 import type { IpcGroupHandlers } from "./define-ipc-group";
-import { parseRemoveMcpServer, parseSaveMcpServer, parseSetMcpServerEnabled, parseTestMcpServer } from "./mcp-inputs";
+import {
+  parseCancelMcpSignIn,
+  parseRemoveMcpServer,
+  parseSaveMcpServer,
+  parseSetMcpServerEnabled,
+  parseTestMcpServer,
+} from "./mcp-inputs";
 import { scopedHandler, scopedQueryHandler } from "./scoped-handler";
 
 /** The AgentService members this registrar reaches, and nothing else. */
-interface McpServerService {
-  listMcpServers(): McpServerConfig[];
-  saveMcpServer(input: SaveMcpServerInput): McpServerConfig[];
-  removeMcpServer(input: RemoveMcpServerInput): McpServerConfig[];
-  setMcpServerEnabled(input: SetMcpServerEnabledInput): McpServerConfig[];
-  testMcpServer(input: TestMcpServerInput, options?: TestMcpServerOptions): Promise<McpTestResult>;
-}
+type McpServerService = Pick<
+  AgentService,
+  | "listMcpServers"
+  | "saveMcpServer"
+  | "removeMcpServer"
+  | "setMcpServerEnabled"
+  | "testMcpServer"
+  | "signInMcpServer"
+  | "cancelMcpSignIn"
+  | "signOutMcpServer"
+  | "listMcpSignIns"
+>;
 
 /** The RemoteServerManager members this registrar reaches, and nothing else. */
 interface McpRemoteServers {
   supportsCapability(serverId: string, capability: TeamCurrentCapability): boolean;
-  request<T>(serverId: string, path: string, decoder: ResponseDecoder<T>, init?: RemoteRequestInit): Promise<T>;
+  request<T>(
+    serverId: string,
+    path: string,
+    decoder: ResponseDecoder<T>,
+    init?: RemoteRequestInit,
+  ): Effect.Effect<T, RemoteWorkflowError>;
 }
 
 /**
@@ -49,7 +64,7 @@ interface McpRemoteServers {
  */
 export interface McpToolRuntimePreparation {
   startToolRuntimes: () => void;
-  ensureToolRuntimesReady: () => Promise<void>;
+  ensureToolRuntimesReady: OmitThisParameter<ProviderRuntimeManager["ensureToolRuntimesReady"]>;
   toolRuntimes: () => McpToolRuntimes;
 }
 
@@ -58,14 +73,17 @@ export interface McpToolRuntimePreparation {
  * download for a command nothing names. Shared by the local Test button and the host route that
  * answers a remote Test.
  */
-export async function prepareToolRuntimeForTest(
+export const prepareToolRuntimeForTest = Effect.fn("Mcp.prepareToolRuntimeForTest")(function* (
   config: McpServerConfig,
   preparation: McpToolRuntimePreparation,
-): Promise<void> {
-  if (await needsManagedRuntime(config, preparation.toolRuntimes())) {
-    await awaitToolRuntimes(preparation.ensureToolRuntimesReady);
+) {
+  if (yield* needsManagedRuntime(config, preparation.toolRuntimes())) {
+    yield* preparation.ensureToolRuntimesReady().pipe(
+      Effect.timeout(TOOL_RUNTIME_TEST_WAIT_MS),
+      Effect.catch(() => Effect.void),
+    );
   }
-}
+});
 
 interface McpServerIpcDependencies {
   service: McpServerService;
@@ -83,7 +101,7 @@ interface McpServerIpcDependencies {
    * only needs a download. A failed download is not a test failure: the test still runs and
    * reports what the machine can actually start.
    */
-  ensureToolRuntimesReady: () => Promise<void>;
+  ensureToolRuntimesReady: OmitThisParameter<ProviderRuntimeManager["ensureToolRuntimesReady"]>;
   /** What the managed store holds right now, so an installed command waits for no download. */
   toolRuntimes: () => McpToolRuntimes;
 }
@@ -97,19 +115,6 @@ const TOOL_RUNTIME_TEST_WAIT_MS = 60_000;
  * request limit reports a timeout for a download that is still running, before the host probes.
  */
 const REMOTE_TEST_TIMEOUT_MS = TOOL_RUNTIME_TEST_WAIT_MS + MCP_PROBE_TIMEOUT_MS + 20_000;
-
-/**
- * Waits for the download, but never past the deadline, and never as an error. Failure and
- * timeout both continue to the probe, which reports what this machine starts: the download keeps
- * running for the next attempt, and a command the runtime was never going to provide - `python`
- * on a machine without it - is still tested on its own merits.
- */
-async function awaitToolRuntimes(ensure: () => Promise<void>): Promise<void> {
-  // Caught before the race: a rejection that reaches `Promise.race` itself would skip the probe
-  // and report a runtime download error instead of checking the configured command.
-  const ready = ensure().catch(() => undefined);
-  await Promise.race([ready, new Promise((resolve) => setTimeout(resolve, TOOL_RUNTIME_TEST_WAIT_MS))]);
-}
 
 export function mcpServerIpcHandlers({
   service,
@@ -128,7 +133,7 @@ export function mcpServerIpcHandlers({
   // of every configuration, so a `FromHost` twin would be the same checks under a second name.
   function remoteList(serverId: string, path: string, body: unknown): Promise<McpServerConfig[]> {
     requireRemoteSupport(serverId);
-    return remoteServers.request(serverId, path, decodeMcpServerConfigs, { method: "POST", body });
+    return runCauseEffect(remoteServers.request(serverId, path, decodeMcpServerConfigs, { method: "POST", body }));
   }
 
   return {
@@ -138,50 +143,79 @@ export function mcpServerIpcHandlers({
         // The one read route, and the only one the host answers to a GET.
         remote: (serverId) => {
           requireRemoteSupport(serverId);
-          return remoteServers.request(serverId, MCP_ROUTES.list, decodeMcpServerConfigs);
+          return runCauseEffect(remoteServers.request(serverId, MCP_ROUTES.list, decodeMcpServerConfigs));
         },
       }),
       saveMcpServer: scopedHandler(parseSaveMcpServer, {
         local: (parsed) => {
           startToolRuntimes();
-          return service.saveMcpServer(parsed);
+          return runCauseEffect(service.saveMcpServer(parsed));
         },
         remote: (parsed, serverId) => remoteList(serverId, MCP_ROUTES.save, parsed),
       }),
       removeMcpServer: scopedHandler(parseRemoveMcpServer, {
-        local: (parsed) => service.removeMcpServer(parsed),
+        local: (parsed) => runCauseEffect(service.removeMcpServer(parsed)),
         remote: (parsed, serverId) => remoteList(serverId, MCP_ROUTES.remove, parsed),
       }),
       setMcpServerEnabled: scopedHandler(parseSetMcpServerEnabled, {
         local: (parsed) => {
           if (parsed.enabled) startToolRuntimes();
-          return service.setMcpServerEnabled(parsed);
+          return runCauseEffect(service.setMcpServerEnabled(parsed));
         },
         remote: (parsed, serverId) => remoteList(serverId, MCP_ROUTES.toggle, parsed),
       }),
       // The machine that holds the configuration is the machine that must make the connection, so a
       // test against a remote server runs on that host and not here.
       testMcpServer: scopedHandler(parseTestMcpServer, {
-        // Interactive: the user pressed Test and is in front of the browser a sign-in opens. The
-        // remote branch below carries no such flag; the route it reaches spends the host's stored
-        // credentials instead, and still opens nothing.
+        // Silent: a test spends the sign-in this computer holds and never opens a browser. A server
+        // that asks for one is answered with a sentence that points at Sign in, which the user then
+        // chooses, knowing a browser opens. The remote branch reaches the host's route, which spends
+        // the host's stored credentials in the same way.
         local: async (parsed) => {
-          await prepareToolRuntimeForTest(parsed.config, {
-            startToolRuntimes,
-            ensureToolRuntimesReady,
-            toolRuntimes,
-          });
-          return service.testMcpServer(parsed, { interactive: true });
+          await runCauseEffect(
+            prepareToolRuntimeForTest(parsed.config, {
+              startToolRuntimes,
+              ensureToolRuntimesReady,
+              toolRuntimes,
+            }),
+          );
+          return runCauseEffect(service.testMcpServer(parsed, { storedCredentials: true, signInPlace: "here" }));
         },
         remote: (parsed, serverId) => {
           requireRemoteSupport(serverId);
-          return remoteServers.request(serverId, MCP_ROUTES.test, decodeMcpTestResult, {
-            method: "POST",
-            body: parsed,
-            timeoutMs: REMOTE_TEST_TIMEOUT_MS,
-          });
+          return runCauseEffect(
+            remoteServers.request(serverId, MCP_ROUTES.test, decodeMcpTestResult, {
+              method: "POST",
+              body: parsed,
+              timeoutMs: REMOTE_TEST_TIMEOUT_MS,
+            }),
+          );
         },
+      }),
+      // A sign-in opens the browser of the computer that runs OpenBot, so it exists on that computer
+      // only. A remote host has no Team API route for it: nobody sits in front of the host's browser.
+      signInMcpServer: scopedHandler(parseTestMcpServer, {
+        local: (parsed) => runCauseEffect(service.signInMcpServer(parsed)),
+        remote: () => signInOnHost(),
+      }),
+      cancelMcpSignIn: scopedHandler(parseCancelMcpSignIn, {
+        local: (parsed) => service.cancelMcpSignIn(parsed),
+        remote: () => signInOnHost(),
+      }),
+      // A sign-out names its row the way a removal does, so it is read by the same parser.
+      signOutMcpServer: scopedHandler(parseRemoveMcpServer, {
+        local: (parsed) => runCauseEffect(service.signOutMcpServer(parsed)),
+        remote: () => signInOnHost(),
+      }),
+      // A remote list holds no sign-in state to show, which is not an error.
+      listMcpSignIns: scopedQueryHandler({
+        local: () => service.listMcpSignIns(),
+        remote: () => [],
       }),
     },
   };
+}
+
+function signInOnHost(): never {
+  throw new Error(sourceText("error.mcp.signInOnHost"));
 }

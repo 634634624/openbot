@@ -8,12 +8,23 @@ import { AGENT_INSTALL_CAPABILITY } from "./agent-install-v1";
 import { AGENT_PUBLISH_CAPABILITY } from "./agent-publish-v1";
 import { AGENT_UPDATE_CAPABILITY } from "./agent-update-v1";
 import { TEAM_BROWSER_NAVIGATION_CAPABILITY } from "./browser-navigation-v1";
-import { TEAM_BROWSER_VIEW_CAPABILITY, TEAM_BROWSER_VIEW_FRAME_POINT_CAPABILITY } from "./browser-view-v1";
+import {
+  TEAM_BROWSER_VIEW_CAPABILITY,
+  TEAM_BROWSER_VIEW_CLIPBOARD_CAPABILITY,
+  TEAM_BROWSER_VIEW_CONTEXT_MENU_CAPABILITY,
+  TEAM_BROWSER_VIEW_CURSOR_CAPABILITY,
+  TEAM_BROWSER_VIEW_FRAME_POINT_CAPABILITY,
+  TEAM_BROWSER_VIEW_VIEWPORT_CAPABILITY,
+} from "./browser-view-v1";
 import { CONTEXT_RESET_CAPABILITY } from "./context-reset-v1";
+import { EVENTS_CAPABILITY } from "./events-v1";
 import { HOST_ADMIN_CAPABILITY } from "./host-admin-v1";
+import { HOST_MEMBER_UPDATE_CAPABILITY } from "./host-member-update-v1";
+import { HOST_RELEASE_CAPABILITY } from "./host-release-v1";
 import { HOST_UPDATE_CAPABILITY } from "./host-update-v1";
 import { HOSTED_SITES_CAPABILITY } from "./hosted-sites-v1";
 import { LIVE_ACTIVITY_PUSH_CAPABILITY } from "./live-activity-push-v1";
+import { TEAM_MESSAGE_CLIENT_ID_CAPABILITY } from "./message-client-id-v1";
 import { PROVIDERS_ADMIN_CAPABILITY } from "./providers-v1";
 import { PROVIDERS_RUNTIMES_V2_CAPABILITY } from "./providers-v2";
 import { PROVIDERS_SIGN_IN_V3_CAPABILITY } from "./providers-v3";
@@ -23,6 +34,7 @@ import { SHARED_TABLES_CAPABILITY } from "./shared-tables-v1";
 import { SKILLS_ADMIN_CAPABILITY } from "./skills-admin-v1";
 import { SKILLS_EVENTS_CAPABILITY } from "./skills-events-v1";
 import { TEAM_PROTOCOL_V6_CAPABILITIES } from "./v6";
+import { WORKSPACE_DIRECTORY_CAPABILITY } from "./workspace-directory-v1";
 
 export const TEAM_SEMANTIC_TAGS_CAPABILITY = "installed-skills";
 export const TEAM_AGENT_ACTIVITY_CAPABILITY = "agent-activity";
@@ -52,7 +64,10 @@ export {
   AGENT_UPDATE_CAPABILITY,
   CHANNEL_DELETE_CAPABILITY,
   CONTEXT_RESET_CAPABILITY,
+  EVENTS_CAPABILITY,
   HOST_ADMIN_CAPABILITY,
+  HOST_MEMBER_UPDATE_CAPABILITY,
+  HOST_RELEASE_CAPABILITY,
   HOST_UPDATE_CAPABILITY,
   HOSTED_SITES_CAPABILITY,
   LIVE_ACTIVITY_PUSH_CAPABILITY,
@@ -67,7 +82,13 @@ export {
   STORAGE_CAPABILITY,
   TEAM_BROWSER_NAVIGATION_CAPABILITY,
   TEAM_BROWSER_VIEW_CAPABILITY,
+  TEAM_BROWSER_VIEW_CLIPBOARD_CAPABILITY,
+  TEAM_BROWSER_VIEW_CONTEXT_MENU_CAPABILITY,
+  TEAM_BROWSER_VIEW_CURSOR_CAPABILITY,
   TEAM_BROWSER_VIEW_FRAME_POINT_CAPABILITY,
+  TEAM_BROWSER_VIEW_VIEWPORT_CAPABILITY,
+  TEAM_MESSAGE_CLIENT_ID_CAPABILITY,
+  WORKSPACE_DIRECTORY_CAPABILITY,
 };
 
 export const TEAM_CURRENT_CAPABILITIES = [
@@ -78,6 +99,10 @@ export const TEAM_CURRENT_CAPABILITIES = [
   TEAM_BROWSER_NAVIGATION_CAPABILITY,
   TEAM_BROWSER_VIEW_CAPABILITY,
   TEAM_BROWSER_VIEW_FRAME_POINT_CAPABILITY,
+  TEAM_BROWSER_VIEW_CURSOR_CAPABILITY,
+  TEAM_BROWSER_VIEW_CLIPBOARD_CAPABILITY,
+  TEAM_BROWSER_VIEW_VIEWPORT_CAPABILITY,
+  TEAM_BROWSER_VIEW_CONTEXT_MENU_CAPABILITY,
   "agent-profile-generation",
   "agent-analytics",
   "host-analytics",
@@ -105,11 +130,16 @@ export const TEAM_CURRENT_CAPABILITIES = [
   AGENT_UPDATE_CAPABILITY,
   TEAM_MEMBER_LEAVE_CAPABILITY,
   CONTEXT_RESET_CAPABILITY,
+  EVENTS_CAPABILITY,
   HOST_UPDATE_CAPABILITY,
+  HOST_RELEASE_CAPABILITY,
+  HOST_MEMBER_UPDATE_CAPABILITY,
   AGENT_IMPORT_CAPABILITY,
   AGENT_PUBLISH_CAPABILITY,
   LIVE_ACTIVITY_PUSH_CAPABILITY,
   HOSTED_SITES_CAPABILITY,
+  TEAM_MESSAGE_CLIENT_ID_CAPABILITY,
+  WORKSPACE_DIRECTORY_CAPABILITY,
 ] as const;
 
 export type TeamCurrentCapability = (typeof TEAM_CURRENT_CAPABILITIES)[number];
@@ -166,7 +196,10 @@ export function isAgentCreateRoute(method: string, path: string): boolean {
   return method === "POST" && new URL(path, "http://openbot.invalid").pathname === "/v1/agents";
 }
 
-/** The agent message route. Its request carries the sender's `timezone` beside the frozen keys. */
+/**
+ * The agent message route. Its request carries the sender's `timezone` and `clientMessageId` beside
+ * the frozen keys.
+ */
 export function isAgentMessageRoute(method: string, path: string): boolean {
   return method === "POST" && /^\/v1\/agents\/[^/]+\/messages$/u.test(new URL(path, "http://openbot.invalid").pathname);
 }

@@ -1,5 +1,6 @@
 import { type AgentSummary, decodeChannelPage, isAgentSummary } from "@openbot/contracts/ipc";
-import { afterEach, describe, expect, it } from "vitest";
+import { Effect } from "effect";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import agentFixture from "../../packages/contracts/src/team-protocol/fixtures/v4/host-http-response.json";
 import { stores } from "../backend/agent-service-test-harness";
 import { ChannelService } from "../backend/channel-service";
@@ -15,19 +16,19 @@ describe("Team API channel access", () => {
   it("requires the capability and derives authorship from the signed-in caller", async () => {
     const fixture = await createTeamApiFixture("channels", { configure: true });
     const data = stores(fixture.root);
-    await data.store.initialize();
-    await data.mailbox.initialize();
+    await Effect.runPromise(data.store.initialize());
+    await Effect.runPromise(data.mailbox.initialize());
     const channels = new ChannelService(data.store.database, data.mailbox, {
       agents: () => [],
-      generate: async () => "",
+      generate: () => Effect.sync(() => ""),
       schedule: () => undefined,
-      interrupt: async () => undefined,
+      interrupt: () => Effect.sync(() => undefined),
       busy: () => false,
       changed: () => undefined,
       error: () => undefined,
     });
     cleanups.push(async () => {
-      await channels.stop();
+      await Effect.runPromise(channels.stop());
       data.store.database.close();
     });
     const { base } = await fixture.start({ channels });
@@ -85,8 +86,8 @@ describe("Team API channel access", () => {
       body: deleteBody,
     });
     expect(withoutDeleteCapability.status).toBe(400);
-    const invite = await fixture.store.createInvite("member");
-    const member = await fixture.store.acceptInvite(invite.token, "member", "member password");
+    const invite = await Effect.runPromise(fixture.store.createInvite("member"));
+    const member = await Effect.runPromise(fixture.store.acceptInvite(invite.token, "member", "member password"));
     const memberDelete = await fetch(`${base}/v1/channels/delete`, {
       method: "POST",
       headers: {
@@ -127,39 +128,43 @@ describe("Team API channel access", () => {
       const agents: AgentSummary[] = [chief, hiddenAgent];
       const fixture = await createTeamApiFixture(`channels-${hiddenAgent.provider}`, { configure: true });
       const data = stores(fixture.root);
-      await data.store.initialize();
-      await data.mailbox.initialize();
+      await Effect.runPromise(data.store.initialize());
+      await Effect.runPromise(data.mailbox.initialize());
       const channels = new ChannelService(data.store.database, data.mailbox, {
         agents: () => agents,
-        generate: async () => "",
+        generate: () => Effect.sync(() => ""),
         schedule: () => undefined,
-        interrupt: async () => undefined,
+        interrupt: () => Effect.sync(() => undefined),
         busy: () => false,
         changed: () => undefined,
         error: () => undefined,
       });
       cleanups.push(async () => {
-        await channels.stop();
+        await Effect.runPromise(channels.stop());
         data.store.database.close();
       });
       const draft = { title: "", instructions: "", leadAgentId: hiddenAgent.id };
-      await channels.command(
-        {
-          type: "save",
-          operationId: "shared",
-          channelId: "shared",
-          draft: { ...draft, name: "Shared", members: [{ agentId: chief.id }, { agentId: hiddenAgent.id }] },
-        },
-        { id: "owner", name: "Owner" },
+      await Effect.runPromise(
+        channels.command(
+          {
+            type: "save",
+            operationId: "shared",
+            channelId: "shared",
+            draft: { ...draft, name: "Shared", members: [{ agentId: chief.id }, { agentId: hiddenAgent.id }] },
+          },
+          { id: "owner", name: "Owner" },
+        ),
       );
-      await channels.command(
-        {
-          type: "save",
-          operationId: "alone",
-          channelId: "alone",
-          draft: { ...draft, name: "Alone", members: [{ agentId: hiddenAgent.id }] },
-        },
-        { id: "owner", name: "Owner" },
+      await Effect.runPromise(
+        channels.command(
+          {
+            type: "save",
+            operationId: "alone",
+            channelId: "alone",
+            draft: { ...draft, name: "Alone", members: [{ agentId: hiddenAgent.id }] },
+          },
+          { id: "owner", name: "Owner" },
+        ),
       );
       const { base } = await fixture.start({ channels, agents: createAgents({ listAgents: () => agents }) });
       const headers = {
@@ -228,50 +233,54 @@ describe("Team API channel access", () => {
     const agents = [chief, first, second];
     const fixture = await createTeamApiFixture("channels-queued-save", { configure: true });
     const data = stores(fixture.root);
-    await data.store.initialize();
-    await data.mailbox.initialize();
+    await Effect.runPromise(data.store.initialize());
+    await Effect.runPromise(data.mailbox.initialize());
     const channels = new ChannelService(data.store.database, data.mailbox, {
       agents: () => agents,
-      generate: async () => "",
+      generate: () => Effect.sync(() => ""),
       schedule: () => undefined,
-      interrupt: async () => undefined,
+      interrupt: () => Effect.sync(() => undefined),
       busy: () => false,
       changed: () => undefined,
       error: () => undefined,
     });
     cleanups.push(async () => {
-      await channels.stop();
+      await Effect.runPromise(channels.stop());
       data.store.database.close();
     });
     const owner = { id: "owner", name: "Owner" };
     const draft = { name: "Shared", title: "", instructions: "", leadAgentId: first.id };
-    await channels.command(
-      {
-        type: "save",
-        operationId: "create",
-        channelId: "shared",
-        draft: { ...draft, members: [{ agentId: chief.id }, { agentId: first.id }] },
-      },
-      owner,
+    await Effect.runPromise(
+      channels.command(
+        {
+          type: "save",
+          operationId: "create",
+          channelId: "shared",
+          draft: { ...draft, members: [{ agentId: chief.id }, { agentId: first.id }] },
+        },
+        owner,
+      ),
     );
     // The desktop save goes into the queue after the peer's request arrived and before the peer's
     // save gets its turn: the channel that the request could read does not have the second agent.
-    const command = channels.command.bind(channels);
+    const command = channels.command;
     let desktopSave: Promise<unknown> | undefined;
-    channels.command = (input, actor, beforeApply) => {
+    vi.spyOn(channels, "command").mockImplementation((input, actor, beforeApply) => {
       if (input.operationId === "rename")
-        desktopSave = command(
-          {
-            type: "save",
-            operationId: "add",
-            channelId: "shared",
-            update: true,
-            draft: { ...draft, members: [{ agentId: chief.id }, { agentId: first.id }, { agentId: second.id }] },
-          },
-          owner,
+        desktopSave = Effect.runPromise(
+          command(
+            {
+              type: "save",
+              operationId: "add",
+              channelId: "shared",
+              update: true,
+              draft: { ...draft, members: [{ agentId: chief.id }, { agentId: first.id }, { agentId: second.id }] },
+            },
+            owner,
+          ),
         );
       return command(input, actor, beforeApply);
-    };
+    });
     const { base } = await fixture.start({ channels, agents: createAgents({ listAgents: () => agents }) });
     const save = await fetch(`${base}/v1/channels/commands`, {
       method: "POST",

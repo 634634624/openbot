@@ -23,6 +23,8 @@ const HOSTED_UNITS = [
   "openbot-update.service",
   "openbot-update.timer",
   "openbot-update-apply.service",
+  "openbot-update-request.path",
+  "openbot-update-request.service",
 ];
 
 const FUSE_DISABLED = 48;
@@ -55,6 +57,8 @@ const asarPath = resolve(resourcesPath, "app.asar");
 
 await Promise.all([
   access(executablePath),
+  access(resolve(resourcesPath, "app.asar.unpacked/node_modules/effect/package.json")),
+  access(resolve(resourcesPath, "app.asar.unpacked/node_modules/effect/dist/index.js")),
   access(asarPath),
   access(resolve(resourcesPath, "managed-skills")),
   access(resolve(resourcesPath, "licenses/Electron-LICENSE")),

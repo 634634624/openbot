@@ -1,3 +1,4 @@
+import { Effect } from "effect";
 /**
  * Every `BrowserWindow` the desktop app opens, the renderer URLs they load, and the application
  * menu. It is the one surface that legitimately keeps a mutable window handle: macOS destroys the
@@ -39,6 +40,7 @@ import {
   writeMainWindowBounds,
 } from "./main-window-state";
 import type { RemoteServerManager } from "./remote-server-manager";
+import type { RemoteWorkflowError } from "./remote-service-effects";
 import { sendToRenderer } from "./renderer-ipc";
 import { isTrustedRendererUrl } from "./trusted-renderer";
 import type { UpdateService } from "./update-service";
@@ -90,8 +92,8 @@ export interface MainWindowController {
   openMainWindow: () => BrowserWindow;
   ensureMainWindow: () => Promise<BrowserWindow>;
   loadRenderer: (window: BrowserWindow) => Promise<void>;
-  restoreMainWindowBounds: () => Promise<void>;
-  flushMainWindowBounds: () => Promise<void>;
+  restoreMainWindowBounds: () => Effect.Effect<void>;
+  flushMainWindowBounds: () => Effect.Effect<void, RemoteWorkflowError>;
 }
 
 export function createMainWindowController({
@@ -157,6 +159,7 @@ export function createMainWindowController({
     });
 
     window.once("ready-to-show", () => {
+      performance.mark("openbot:window-ready");
       if (
         shouldShowDevelopmentWindow({
           remoteRole: developmentRemoteRole,
@@ -200,6 +203,13 @@ export function createMainWindowController({
               active.select();
               return;
             }
+            // A focused canvas is a remote browser page, which selects its own text when it gets the key.
+            // Only the key down is held here; the real key up still reaches it.
+            if (active instanceof HTMLCanvasElement) {
+              const key = { key: "a", code: "KeyA", ctrlKey: ${input.control}, metaKey: ${input.meta}, bubbles: true };
+              active.dispatchEvent(new KeyboardEvent("keydown", key));
+              return;
+            }
             if (!(active instanceof HTMLElement) || !active.isContentEditable) return;
             const range = document.createRange();
             range.selectNodeContents(active);
@@ -223,7 +233,7 @@ export function createMainWindowController({
         return;
       }
       event.preventDefault();
-      setImmediate(() => void services.browser.close(tabId).catch(() => undefined));
+      setImmediate(() => void Effect.runPromise(services.browser.close(tabId)).catch(() => undefined));
     });
     window.webContents.on("context-menu", (event, params) => {
       if (inspectElementModifierPressed) {
@@ -263,7 +273,7 @@ export function createMainWindowController({
       const services = getServices();
       if (services) {
         forwardAgentEvent("local", { type: "runtime-snapshot", snapshot: services.service.getRuntimeSnapshot() });
-        services.remoteServers.refreshRuntimeSnapshots();
+        Effect.runFork(services.remoteServers.refreshRuntimeSnapshots());
       }
     });
 
@@ -391,8 +401,10 @@ export function createComputerUseHighlightWindow(bounds: Rectangle): BrowserWind
   window.setAlwaysOnTop(true, "floating");
   // The agent works wherever the user left the window, which can be another Space or another
   // application's full screen. One overlay on every Space is what lets the rim follow it there
-  // without a second window and without pulling the user out of the Space they are on.
-  window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  // without a second window and without pulling the user out of the Space they are on. The
+  // overlays are built again after each idle period, and without `skipTransformProcessType` each
+  // build would hide the Dock icon and every OpenBot window for a moment.
+  window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
   // Nothing on this surface may be pressed, and it covers another application's whole window, so
   // every event is handed straight on to the window below it.
   window.setIgnoreMouseEvents(true, { forward: true });
@@ -505,6 +517,23 @@ export function computerUseDesktopRect(rect: Rectangle): Rectangle {
   return process.platform === "win32" ? screen.screenToDipRect(null, rect) : rect;
 }
 
+/**
+ * The driver ids of OpenBot's windows that cover the rim, such as the conversation.
+ *
+ * The overlays - the rim's own and the dynamic island - can never take focus, and every window the
+ * user reads can. The id in a media source id is the one the driver lists a window by: the
+ * `CGWindowID` on macOS and the `HWND` on Windows.
+ */
+export function computerUseCoveringWindowIds(): Set<number> {
+  const ids = new Set<number>();
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (window.isDestroyed() || !window.isVisible() || window.isMinimized() || !window.isFocusable()) continue;
+    const id = Number(window.getMediaSourceId().split(":")[1]);
+    if (Number.isSafeInteger(id)) ids.add(id);
+  }
+  return ids;
+}
+
 /** One point the driver was asked for, in the same units as `computerUseDesktopRect`. */
 export function computerUseDesktopPoint(point: Point): Point {
   return process.platform === "win32" ? screen.screenToDipPoint(point) : point;
@@ -556,12 +585,16 @@ export function configureApplicationMenu(service: AgentService, updater: UpdateS
           {
             label: translate("menu.stopAllAgents"),
             accelerator: "CommandOrControl+.",
-            click: () => void service.interruptAll(),
+            click: () => {
+              Effect.runFork(service.interruptAll());
+            },
           },
           { type: "separator" },
           {
             label: translate("menu.checkForUpdates"),
-            click: () => void updater.checkForUpdates(),
+            click: () => {
+              Effect.runFork(updater.checkForUpdates());
+            },
           },
           { type: "separator" },
           {

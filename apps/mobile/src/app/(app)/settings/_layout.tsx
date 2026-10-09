@@ -2,6 +2,7 @@ import { Stack } from "expo-router/stack";
 import { useCSSVariable } from "uniwind";
 import { isIOS } from "@/shared/lib/platform";
 import { sheetBackHaptics } from "@/shared/lib/sheet-back-haptics";
+import { sheetHeaderInsetOptions } from "@/shared/lib/sheet-header";
 import { useText } from "@/shared/lib/text";
 
 export const unstable_settings = { initialRouteName: "index" };
@@ -13,6 +14,7 @@ export default function SettingsLayout() {
     <Stack
       screenListeners={sheetBackHaptics}
       screenOptions={{
+        ...sheetHeaderInsetOptions,
         presentation: "card",
         headerBackButtonDisplayMode: "minimal",
         headerShadowVisible: false,
@@ -25,7 +27,12 @@ export default function SettingsLayout() {
     >
       <Stack.Screen name="index" options={{ title: t("mobile.app.route.settings") }} />
       <Stack.Screen name="profile" options={{ title: t("mobile.app.route.profile") }} />
-      <Stack.Screen name="general" options={{ title: t("mobile.app.route.general") }} />
+      <Stack.Screen name="appearance" options={{ title: t("mobile.settings.appearance.title") }} />
+      <Stack.Screen name="animations" options={{ title: t("mobile.settings.animations.title") }} />
+      <Stack.Screen name="language" options={{ title: t("mobile.settings.language.title") }} />
+      <Stack.Screen name="haptics" options={{ title: t("mobile.settings.feedback.haptics") }} />
+      <Stack.Screen name="live-activities" options={{ title: t("mobile.settings.liveActivities.title") }} />
+      <Stack.Screen name="privacy" options={{ title: t("mobile.settings.privacy.title") }} />
       <Stack.Screen name="sessions" options={{ title: t("mobile.app.route.accountSessions") }} />
       <Stack.Screen name="about" options={{ title: t("mobile.app.route.about") }} />
       <Stack.Screen name="support" options={{ title: t("mobile.app.route.support") }} />

@@ -8,6 +8,7 @@ import type {
   AvatarImageInput,
   BrowserControlState,
   BrowserTab,
+  BusyMessageMode,
   CustomAgentSummary,
   CustomProviderSummary,
   DraftAttachment,
@@ -18,9 +19,11 @@ import type {
   ServerSummary,
   TeamPresenceSnapshot,
   UpdateAgentInput,
+  WorkspaceDirectory,
 } from "@openbot/contracts/ipc";
 import type { AgentMessage, AgentProfile } from "@openbot/ui/data";
 import type { BrowserViewRuntime } from "@openbot/ui/features/browser/BrowserLiveView";
+import type { UnloadedHistory } from "@openbot/ui/features/conversation/ChatScrollRail";
 import type { AccountProfilePanelProps } from "@openbot/ui/features/settings/AccountProfilePanel";
 import type { JSX } from "@solidjs/web";
 import type { ConversationRuntime } from "./conversation-runtime";
@@ -59,6 +62,8 @@ export interface ConversationProps {
   platform?: import("@openbot/contracts/ipc").AppInfo["platform"];
 
   agentStatus: AgentStatus;
+  /** A joined server's agents are still on their way, so the composer says that it connects. */
+  agentsConnecting?: boolean;
   /**
    * The plan windows for the active agent's provider and model, when the account dock has them.
    * The composer reads them for one thing only: a window at 100% means the next send is refused by
@@ -84,6 +89,8 @@ export interface ConversationProps {
    * needs a way in whether or not OpenBot manages its CLI.
    */
   onSignInProvider?: (provider: AgentProviderId) => void | Promise<void>;
+  /** Open the Providers section of this server's settings, where the user adds an endpoint. */
+  onManageProviders?: (trigger: HTMLElement) => void;
   agent: AgentProfile | undefined;
   agents: AgentProfile[];
   availableRoutineIds?: readonly string[];
@@ -96,6 +103,8 @@ export interface ConversationProps {
   firstUnreadMessageId: string | null;
   loaded: boolean;
   hasOlder?: boolean;
+  /** The messages above the loaded page, for the day rail. Absent when the host does not count them. */
+  unloadedHistory?: UnloadedHistory | undefined;
   discontinuous?: boolean;
   loadingOlder?: boolean;
   olderError?: string | null;
@@ -149,12 +158,17 @@ export interface ConversationProps {
   onSelectAgent: (agentId: string) => void;
   onUpdateAgent: (agentId: string, updates: Omit<UpdateAgentInput, "agentId">) => Promise<void>;
   onSetAgentAvatar: (agentId: string, image: AvatarImageInput | null) => Promise<void>;
+  /**
+   * Sends one message. `clientMessageId` names it for the host, so a retry with the same id
+   * returns the first receipt; the answer carries the host's id for the message, or why it failed.
+   */
   onSendMessage: (
     body: string,
     attachmentDraftIds: string[],
     replyToMessageId: string | null,
     target?: ConversationTarget,
-  ) => Promise<boolean>;
+    clientMessageId?: string,
+  ) => Promise<SendMessageResult>;
   onMarkRead: () => Promise<void>;
   onLoadOlder?: () => void;
   onLoadLatest?: () => Promise<void>;
@@ -177,6 +191,8 @@ export interface ConversationProps {
   agentAutoApproves?: boolean;
   /** Turbo mode covers every agent, so the per-agent switch is read-only while it is on. */
   agentAutoApproveLocked?: boolean;
+  /** The app default an agent without its own busy-message setting follows. Local agents only. */
+  defaultBusyMessageMode?: BusyMessageMode;
   /** Absent for a remote agent: its own computer holds that choice. */
   onSetAgentAutoApprove?: (autoApprove: boolean) => Promise<void>;
   /** Starts a new chat with the agent. Absent when its host does not serve `context-reset-v1`. */
@@ -198,6 +214,9 @@ export interface ConversationProps {
   onStop: () => void;
 }
 
+/** `messageId` is the conversation message the host stored: the delivery id of the receipt. */
+export type SendMessageResult = { messageId: string } | { error: string };
+
 export interface ComposerDraft {
   text: string;
   attachments: DraftAttachment[];
@@ -211,14 +230,18 @@ export interface ComposerDraft {
  */
 type SidebarFilePreviewSource =
   | { kind: "shared"; path: string }
-  | { kind: "workspace"; path: string }
+  /** `folder` is the folder view the file was opened from, so the panel can go back to it. */
+  | { kind: "workspace"; path: string; folder?: string | undefined }
   | { kind: "attachment"; attachment: AttachmentSummary };
 
-export interface SidebarFilePreview {
-  ownerAgentId: string;
-  source: SidebarFilePreviewSource;
-  preview: FilePreview;
-}
+export type SidebarFilePreview =
+  | { ownerAgentId: string; source: SidebarFilePreviewSource; preview: FilePreview; directory?: undefined }
+  | {
+      ownerAgentId: string;
+      source: { kind: "workspace-folder"; path: string };
+      preview: null;
+      directory: WorkspaceDirectory;
+    };
 
 export type RightPanelMode =
   | "none"

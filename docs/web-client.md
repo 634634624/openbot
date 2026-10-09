@@ -135,14 +135,28 @@ mock. The separate web preview implements the browser runtime with that same moc
   An open edit stays in local storage after a reload or a host change, so the user can release the
   hold on its host. Sign-out cancels the hold and removes the edit. When the host does not confirm, the
   edit stays for the same account. Another account and a revoked session remove it.
-- Reconnect reads authoritative state. It never resends uncertain messages. A user must check
-  the conversation and acknowledge the uncertain result. New-agent requests with an unknown
-  result require closing the form and refreshing before another attempt.
+- Reconnect reads authoritative state. It never resends a message. A sent message shows in the
+  chat as pending, and the composer stays free. A failed send stays in the chat with its reason and
+  Edit and Dismiss; Retry is offered only when the host has `message-client-id-v1`, which answers a
+  repeated `clientMessageId` with the first receipt. New-agent requests with an unknown result
+  require closing the form and refreshing before another attempt.
 - The browser-view transport uses the existing host stream and input protocol. The shared
   panel is available only when the host advertises browser control and browser view.
   Tabs, back, forward, reload, and the address bar use the same Team API routes as a desktop
   client of a remote host. Picture in Picture is desktop only. The expanded live view is a card
   with the shape of the host frame.
+- Copy and paste in the live view use the member's clipboard, not the host's, when the host
+  advertises `browser-view-clipboard`. The client sends pasted text as one `paste` input; the host
+  fires a `paste` event on the focused element and, when the page does not cancel it, inserts the
+  text with CDP `Input.insertText`. A copy starts in the key press with a `ClipboardItem` that waits
+  for the host's answer, the one text message on the view socket. The host answers every `copy`.
+  A cut is a copy, then a `cut` input once the text is on the clipboard; the host deletes only the
+  same selection. The host runs one input of a view at a time, in order. The host never reads or
+  writes its own clipboard. Password fields give no text. The host follows focus through open
+  shadow roots and frames: it walks into a frame of the page's own origin, and it finds a frame of
+  another origin through CDP (`DOM.describeNode` on the focused frame element gives its frame ID,
+  and a frame in another process is a target of its own). An `email` or `number` input has no
+  selection to read, so copy gets no text there; paste works.
 - No full remote desktop, push notifications, or offline operation is included. See
   [Remote desktop](#remote-desktop) for the reason.
 - These stay desktop only: the application Settings dialog (permissions, app updates),
@@ -172,7 +186,7 @@ to one remote-screen session. On 2026-09-23 the user decided not to add this ori
 ## Local checks
 
 Run `bun install --frozen-lockfile` in a fresh worktree. Start the API with
-`bun run dev:api --isolated`. The supervisor chooses and prints the port.
+`bun run dev:api`. The supervisor chooses and prints the port.
 For synthetic local email checks, `AUTH_EXPOSE_DEVELOPMENT_CODE=true` returns development codes;
 do not enable it in production or print codes and cookies in logs. Keep the cookie's security
 attributes in development. A browser that refuses secure loopback cookies needs a local HTTPS
@@ -223,7 +237,7 @@ Before enabling the deployed flag:
   single-host tab lock. The Chrome, Edge, Firefox and Safari matrix is deferred by the user.
 - Check invitation expiry, revocation, prior use and wrong-account errors; no-host guidance;
   offline and incompatible hosts; host key mismatch; host switching; and reconnection.
-- Check history pagination, live output, uncertain sends, stop, approvals, answered/expired
+- Check history pagination, live output, pending and failed sends, stop, approvals, answered/expired
   prompts and subscription cleanup against the host.
 - Check file bytes, previews, limits, cancellation during transfer, interrupted downloads,
   creation/settings permissions, older-host capability gates and takeover ownership/release.

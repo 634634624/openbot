@@ -1352,10 +1352,28 @@
   background: var(--openbot-qr-background);
 }
 
+.ui-qr-code > * {
+  grid-area: 1 / 1;
+}
+
 .ui-qr-code > img {
   width: 100%;
   height: 100%;
   display: block;
+}
+
+/* The logos sit in a hole that the code leaves clear, so no module is cut at their edge. They show
+   once the code is drawn around them. */
+.ui-qr-code-mark {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--openbot-space-1);
+  color: var(--openbot-text-on-light);
+  visibility: hidden;
+}
+
+.ui-qr-code-mark[data-ready] {
+  visibility: visible;
 }
 
 .ui-alert {
@@ -1935,7 +1953,7 @@
 }
 
 /* The standard confirmation: the icon beside a left-aligned title and description, and the actions
- * on a footer below a divider. The surface uses the dialog ring and shadow of the other dialogs.
+ * on a footer below a divider. The surface has a thin border and no shadow.
  * A confirmation always answers the surface that opened it, so it takes the top nested dialog step:
  * it also opens over the marketplace and skills modals on `--openbot-layer-dialog-host`. */
 .ui-confirm-dialog-overlay {
@@ -1958,9 +1976,8 @@
   border-radius: var(--openbot-radius-xl);
   background: var(--openbot-bg-sidebar);
   color: var(--openbot-text-primary);
-  box-shadow:
-    0 0 0 1px var(--openbot-dialog-ring),
-    0 24px 64px var(--openbot-shadow-dialog);
+  border: 1px solid var(--openbot-dialog-ring);
+  box-shadow: none;
   animation: ui-confirm-dialog-in var(--openbot-duration-slow) var(--openbot-ease-out);
 }
 

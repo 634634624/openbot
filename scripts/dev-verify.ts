@@ -2,6 +2,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { extname, resolve } from "node:path";
 import { supportedBunVersion } from "./prepare-dev-environment";
+import { readScriptArguments } from "./script-arguments";
 
 export type VerificationSurface = "desktop" | "renderer" | "mobile" | "api" | "remote" | "contracts" | "docs";
 
@@ -81,6 +82,7 @@ function isDesktopTest(file: string): boolean {
     "packages/contracts/",
     "packages/i18n/",
     "packages/logging/",
+    "packages/telemetry/",
     "packages/user-errors/",
     "packages/team-client/",
     "apps/mobile/src/",
@@ -246,7 +248,7 @@ function createVerificationCommandPlan(
     commands.push("bun run check:ui");
     runnableCommandArgs.push(["run", "check:ui"]);
   }
-  if (surfaces.includes("renderer") && !isolatedApp) commands.push("bun run dev --isolated");
+  if (surfaces.includes("renderer") && !isolatedApp) commands.push("bun run dev");
   if (surfaces.includes("renderer")) {
     qaCommands.push("bun run dev:automation snapshot", "bun run dev:automation screenshot");
     commands.push(...qaCommands);
@@ -280,7 +282,7 @@ function readinessReasons(setup: DevVerificationReport["setup"], runtime: DevVer
   const reasons: string[] = [];
   if (!setup.bun.ready) reasons.push(`Bun ${setup.bun.expected} is required; current version is ${setup.bun.current}.`);
   if (!setup.dependencies) reasons.push("node_modules is missing. Run bun run dev:prepare.");
-  if (!setup.developmentEnv) reasons.push("apps/auth-api/.env.dev is missing. Run bun run dev:prepare.");
+  if (!setup.developmentEnv) reasons.push(".openbot/dev-state.json is missing. Run bun run dev:prepare.");
   if (runtime.orphanedStack) reasons.push("This worktree has an orphaned dev stack. Inspect bun run dev:status.");
   if (runtime.ambiguousApp) reasons.push("More than one app instance matches this worktree.");
   return reasons;
@@ -299,7 +301,9 @@ export function qaReadinessReasons(
   if (runtime.ambiguousApp) reasons.push("More than one app instance matches this worktree.");
   if (!runtime.appRunning && !runtime.ambiguousApp) reasons.push("No running app matches this worktree.");
   if (runtime.appRunning && !runtime.isolatedApp) {
-    reasons.push("The running app uses the default profile. Start bun run dev --isolated for isolated renderer QA.");
+    reasons.push(
+      "The running app uses the shared profile. Start bun run dev without --shared for isolated renderer QA.",
+    );
   }
   return reasons;
 }
@@ -313,7 +317,7 @@ async function createDevVerificationState(
   const setup = {
     bun: { ready: bunCurrent === supportedBunVersion, current: bunCurrent, expected: supportedBunVersion },
     dependencies: existsSync(resolve(projectRoot, "node_modules")),
-    developmentEnv: existsSync(resolve(projectRoot, "apps/auth-api/.env.dev")),
+    developmentEnv: existsSync(resolve(projectRoot, ".openbot/dev-state.json")),
   };
   const setupReady = setup.bun.ready && setup.dependencies && setup.developmentEnv;
 
@@ -381,9 +385,19 @@ function runRecommendedChecks(commandArgs: string[][], projectRoot: string): voi
   for (const args of commandArgs) runBun(projectRoot, args);
 }
 
+const USAGE = [
+  "Usage: bun run dev:verify [--run]",
+  "",
+  "Prints a JSON verification plan for the uncommitted changes in this worktree.",
+  "  --run  Also run the safe checks in the plan that change nothing.",
+].join("\n");
+
 if (import.meta.main) {
-  const projectRoot = process.cwd();
-  const { report, runnableCommandArgs, setupReady } = await createDevVerificationState(projectRoot);
-  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
-  if (process.argv.includes("--run") && setupReady) runRecommendedChecks(runnableCommandArgs, projectRoot);
+  const parsed = readScriptArguments({ usage: USAGE, options: { run: { type: "boolean" } } });
+  if (parsed !== null) {
+    const projectRoot = process.cwd();
+    const { report, runnableCommandArgs, setupReady } = await createDevVerificationState(projectRoot);
+    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    if (parsed.values.run && setupReady) runRecommendedChecks(runnableCommandArgs, projectRoot);
+  }
 }

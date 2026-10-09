@@ -7,6 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import type { ConversationSnapshot } from "@openbot/contracts/ipc";
 import { afterEach, describe, expect, it } from "vitest";
 import { ConversationReadStore } from "./conversation-read-store";
+import { runCauseEffect } from "./effect-boundary";
 import { OpenBotDatabase } from "./openbot-database";
 import { migrateOpenBotDatabase } from "./openbot-database-schema";
 import { directThreadId, TeamChatStore } from "./team-chat-store";
@@ -22,7 +23,7 @@ describe("ConversationReadStore", () => {
     const root = await mkdtemp(join(tmpdir(), "openbot-conversation-read-"));
     roots.push(root);
     const database = new OpenBotDatabase(root);
-    await database.initialize();
+    await runCauseEffect(database.initialize());
     database.connection
       .prepare(
         `INSERT INTO projection_threads (
@@ -66,7 +67,7 @@ describe("ConversationReadStore", () => {
     database.close();
 
     const restoredDatabase = new OpenBotDatabase(root);
-    await restoredDatabase.initialize();
+    await runCauseEffect(restoredDatabase.initialize());
     const restored = new ConversationReadStore(restoredDatabase);
     expect(restored.readState("member-a", third).throughMessageId).toBe("message-2");
     // Mark-unread is an explicit reset, distinct from a stale read acknowledgement.
@@ -80,7 +81,7 @@ describe("ConversationReadStore", () => {
     expect(restored.readState("member-owner", third).throughMessageId).toBe("message-2");
     restoredDatabase.close();
     const reopenedDatabase = new OpenBotDatabase(root);
-    await reopenedDatabase.initialize();
+    await runCauseEffect(reopenedDatabase.initialize());
     expect(new ConversationReadStore(reopenedDatabase).readState("member-a", third)).toMatchObject({
       unreadCount: 3,
       throughMessageId: null,
@@ -92,7 +93,7 @@ describe("ConversationReadStore", () => {
     const root = await mkdtemp(join(tmpdir(), "openbot-conversation-read-filter-"));
     roots.push(root);
     const database = new OpenBotDatabase(root);
-    await database.initialize();
+    await runCauseEffect(database.initialize());
     database.connection
       .prepare(
         `INSERT INTO projection_threads (
@@ -142,6 +143,41 @@ describe("ConversationReadStore", () => {
         excludeHostedSiteEvents: true,
       }),
     ).toMatchObject({ unreadCount: 0, throughMessageId: visible.id });
+    database.close();
+  });
+
+  it("marks an older paged boundary without loading the full thread", async () => {
+    const root = await mkdtemp(join(tmpdir(), "openbot-conversation-read-paged-"));
+    roots.push(root);
+    const database = new OpenBotDatabase(root);
+    await runCauseEffect(database.initialize());
+    database.connection
+      .prepare(
+        `INSERT INTO projection_threads (
+          thread_id, agent_id, title, active_turn_id, created_at, updated_at, last_event_sequence
+        ) VALUES (?, ?, ?, NULL, ?, ?, ?)`,
+      )
+      .run("thread-chief", "chief", "Chief", "2026-08-19T09:00:00.000Z", "2026-08-19T09:00:00.000Z", 1);
+    const insert = database.connection.prepare(
+      `INSERT INTO projection_thread_messages (
+        thread_id, message_id, turn_id, author, status, item_type, created_at,
+        ordinal, message_json, last_event_sequence
+      ) VALUES (?, ?, NULL, ?, 'completed', NULL, ?, ?, ?, ?)`,
+    );
+    for (let index = 0; index < 125; index += 1) {
+      const entry = message(`paged-${index}`, "assistant");
+      entry.createdAt = new Date(Date.UTC(2026, 7, 19, 9, 0, index)).toISOString();
+      insert.run("thread-chief", entry.id, entry.author, entry.createdAt, index, JSON.stringify(entry), index + 1);
+    }
+
+    const reads = new ConversationReadStore(database);
+    const first = reads.markReadForThread("member-a", "thread-chief", "paged-5");
+    expect(first).toMatchObject({ throughMessageId: "paged-5", unreadCount: 119, firstUnreadMessageId: "paged-6" });
+    const older = reads.markReadForThread("member-a", "thread-chief", "paged-2");
+    expect(older).toMatchObject({ throughMessageId: "paged-5", unreadCount: 119, firstUnreadMessageId: "paged-6" });
+
+    const unread = reads.markUnreadForThread("member-a", "thread-chief");
+    expect(unread).toMatchObject({ throughMessageId: null, unreadCount: 125, firstUnreadMessageId: "paged-0" });
     database.close();
   });
 
@@ -217,7 +253,7 @@ describe("ConversationReadStore", () => {
     legacy.close();
 
     const database = new OpenBotDatabase(root);
-    await database.initialize();
+    await runCauseEffect(database.initialize());
     const reads = new ConversationReadStore(database);
     const legacySnapshot = snapshot([message("legacy-answer", "assistant")]);
     expect(reads.readState("member-new", legacySnapshot)).toEqual({

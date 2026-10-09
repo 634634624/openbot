@@ -1,27 +1,36 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { mkdir, rm } from "node:fs/promises";
 import { basename, join } from "node:path";
+import { DISCORD_ORCHESTRATOR_AVATAR } from "@openbot/contracts/discord-app";
 import { ATTACHMENT_LIMITS, INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import type {
-  AddSlackOrchestratorInput,
-  AddSlackOrchestratorResult,
+  AddMessagingOrchestratorInput,
+  AddTelegramOrchestratorInput,
   AgentApproval,
   AgentEvent,
   AgentSummary,
+  ConnectTelegramChatInput,
   MessagingConnection,
   MessagingConnectionState,
   MessagingCredentialState,
+  MessagingOverview,
   MessagingPlatform,
   RespondToApprovalInput,
-  SlackOverview,
 } from "@openbot/contracts/ipc";
 import { MESSAGING_CONNECTION_STATES } from "@openbot/contracts/ipc";
 import { isDynamicRecord, isOneOf, isString } from "@openbot/contracts/runtime-values";
+import { TELEGRAM_LINK_CODE_TTL_SECONDS } from "@openbot/contracts/signal-protocol/telegram-route";
 import { SLACK_ORCHESTRATOR_AVATAR } from "@openbot/contracts/slack-app";
+import { TELEGRAM_ORCHESTRATOR_AVATAR } from "@openbot/contracts/telegram-app";
 import { sourceText } from "@openbot/i18n/source";
 import { createOpenBotLogger, redactText } from "@openbot/logging";
+import { Deferred, Effect, Exit, Result, Schema, Scope } from "effect";
+import type { AgentLifecycleFailed } from "../agent-service";
+import { causeHelpers } from "../effect-boundary";
 import type { MessagingOrigin } from "../mailbox-store";
 import type { SidebarLayoutStore } from "../sidebar-layout-store";
+import { type DiscordAppPort, DiscordConnect, type DiscordConnectFailed } from "./discord/discord-connect";
+import { discordOrchestratorMemories, discordOrchestratorProfile } from "./discord/discord-orchestrator";
 import type { MessagingConnectionRecord, MessagingLink } from "./messaging-store";
 import type { MessagingActivity, MessagingThreads } from "./messaging-threads";
 import {
@@ -37,9 +46,12 @@ import {
   type MessagingIngress,
   type MessagingTransport,
 } from "./messaging-types";
-import { type SlackAppPort, SlackConnect } from "./slack/slack-connect";
+import { type SlackAppPort, SlackConnect, type SlackConnectFailed } from "./slack/slack-connect";
 import { slackOrchestratorMemories, slackOrchestratorProfile } from "./slack/slack-orchestrator";
 import { SlackWebApi } from "./slack/slack-web-api";
+import { type TelegramAppPort, telegramLinkUrl } from "./telegram/telegram-connect";
+import { telegramOrchestratorMemories, telegramOrchestratorProfile } from "./telegram/telegram-orchestrator";
+import { parseTelegramUpdate, telegramLink, telegramRemoval } from "./telegram/telegram-updates";
 
 const logger = createOpenBotLogger("messaging");
 
@@ -48,26 +60,26 @@ export interface MessagingCredentials {
   keys(): string[];
   status(connectionId: string): MessagingCredentialState;
   get(connectionId: string): Record<string, string> | null;
-  set(connectionId: string, values: Record<string, string>): Promise<void>;
-  clear(connectionId: string): Promise<void>;
+  set(connectionId: string, values: Record<string, string>): Effect.Effect<void, MessagingOperationFailed>;
+  clear(connectionId: string): Effect.Effect<void, MessagingOperationFailed>;
   /** Removes the tokens of every key that is not listed. */
-  retain(connectionIds: ReadonlySet<string>): Promise<void>;
+  retain(connectionIds: ReadonlySet<string>): Effect.Effect<void, MessagingOperationFailed>;
 }
 
 export interface MessagingAgents {
   listAgents(): AgentSummary[];
-  respondToApproval(input: RespondToApprovalInput): Promise<void>;
+  respondToApproval(input: RespondToApprovalInput): Effect.Effect<void, AgentLifecycleFailed>;
   onEvent(listener: (event: AgentEvent) => void): () => void;
   /** Creates an agent with no first message, on the named model or a new agent's default. */
   createAgentProfile(
-    input: Pick<AddSlackOrchestratorInput, "provider" | "model" | "reasoningEffort"> & {
+    input: Pick<AddMessagingOrchestratorInput, "provider" | "model" | "reasoningEffort"> & {
       name: string;
       title: string;
       description: string;
       avatarSeed: string;
       avatarHue: AgentSummary["avatarHue"];
     },
-  ): Promise<AgentSummary>;
+  ): Effect.Effect<AgentSummary, AgentLifecycleFailed>;
   createMemory(input: { agentId: string; text: string }): unknown;
 }
 
@@ -78,12 +90,18 @@ export interface MessagingServiceOptions {
   drivers: readonly MessagingDriver[];
   /** A private folder for files that arrive, until the mailbox has copied them. */
   downloadsRoot: string;
-  /** The Signal relay of the OpenBot Slack app. Without it and `slackApp`, no workspace can connect. */
+  /**
+   * The Signal relay of the OpenBot Slack and Discord apps. Without it and `slackApp` or
+   * `discordApp`, no workspace of that platform can connect.
+   */
   ingress?: MessagingIngress;
   slackApp?: SlackAppPort;
+  discordApp?: DiscordAppPort;
   /** Only tests change this. */
   slackOrigin?: string;
-  /** Where the Slack Orchestrator goes in the sidebar: an Integrations section. */
+  /** The account service half of the OpenBot Telegram bot. Without it and `ingress`, no chat can connect. */
+  telegramApp?: TelegramAppPort;
+  /** Where the Slack, Discord and Telegram Orchestrators go in the sidebar: an Integrations section. */
   sidebar?: Pick<SidebarLayoutStore, "getSnapshot" | "mutate">;
 }
 
@@ -93,6 +111,8 @@ interface LiveConnection {
   transport: MessagingTransport | null;
   identity: ConnectionIdentity | null;
   state: MessagingConnectionState;
+  /** The last state the transport reported. A rate limit ends in it. */
+  reported: MessagingConnectionState;
   retryAt: string | null;
 }
 
@@ -116,11 +136,13 @@ interface PendingApproval {
   answered: boolean;
 }
 
-const FATAL_STATES = new Set<MessagingConnectionState>(["invalid_token"]);
+const FATAL_STATES = new Set<MessagingConnectionState>(["invalid_token", "removed"]);
 const LIVE_STATES = new Set<MessagingConnectionState>(["connecting", "connected", "reconnecting", "rate_limited"]);
 const APPROVAL_TEXT_LIMIT = 2_500;
 const CANCEL_TEXT = /^(cancel|stop)$/i;
 const RECENT_MESSAGES = 2_000;
+/** How long a Telegram link waits for the Signal socket. */
+const TELEGRAM_READY_TIMEOUT_MS = 15_000;
 /** How long a connection waits before it tries Slack again after Slack was unreachable. */
 const IDENTIFY_RETRY_MS = 30_000;
 /** The marker `mention` uses. Text that did not come from the host has it taken out. */
@@ -146,14 +168,19 @@ export class MessagingService {
   readonly #targets = new Map<string, MessageTarget>();
   readonly #approvals = new Map<string, PendingApproval>();
   readonly #stops = new Map<string, { linkId: string; authorId: string; connectionId: string }>();
-  readonly #chains = new Map<string, Promise<void>>();
+  readonly #chains = new Map<string, Deferred.Deferred<void>>();
   readonly #recent = new Set<string>();
   readonly #unsubscribe: Array<() => void> = [];
   readonly #ingress: MessagingIngress | null;
   readonly #connect: SlackConnect | null;
+  readonly #discordConnect: DiscordConnect | null;
   readonly #slackOrigin: string | undefined;
+  readonly #telegramApp: TelegramAppPort | null;
   readonly #sidebar: Pick<SidebarLayoutStore, "getSnapshot" | "mutate"> | null;
   #started = false;
+  /** Holds the ingress socket open while a Telegram link code waits for its chat. */
+  #telegramLinkLease: { release: () => void; timer: ReturnType<typeof setTimeout> } | null = null;
+  #scope = Scope.makeUnsafe();
 
   constructor(options: MessagingServiceOptions) {
     this.#threads = options.threads;
@@ -163,32 +190,54 @@ export class MessagingService {
     this.#downloadsRoot = options.downloadsRoot;
     this.#ingress = options.ingress ?? null;
     this.#connect = options.ingress && options.slackApp ? new SlackConnect(options.slackApp) : null;
+    this.#discordConnect = options.ingress && options.discordApp ? new DiscordConnect(options.discordApp) : null;
     this.#slackOrigin = options.slackOrigin;
+    this.#telegramApp = options.ingress && options.telegramApp ? options.telegramApp : null;
     this.#sidebar = options.sidebar ?? null;
   }
 
-  async start(): Promise<void> {
+  readonly start = Effect.fn("MessagingService.start")(function* (
+    this: MessagingService,
+  ): Effect.fn.Return<void, MessagingOperationFailed> {
     if (this.#started) return;
     this.#started = true;
+    this.#scope = Scope.makeUnsafe();
     this.#unsubscribe.push(
-      this.#threads.onActivity((activity) => this.#serial(activity.link.linkId, () => this.#activity(activity))),
+      this.#threads.onActivity((activity) => {
+        this.#dispatch(this.#serial(activity.link.linkId, this.#activity(activity)));
+      }),
       this.#agents.onEvent((event) => this.#agentEvent(event)),
     );
     this.#threads.setContextSource((link, origin) => this.#promptContext(link, origin));
-    this.#ingress?.handle((workspaceId, delivery) => this.deliverSlack(workspaceId, delivery));
+    this.#ingress?.handle((workspaceId, delivery) => this.deliver(workspaceId, delivery));
     const records = this.#threads.store.connections();
-    await this.#credentials.retain(new Set(records.map((record) => record.connectionId)));
-    await Promise.all(records.filter((record) => record.enabled).map((record) => this.#startConnection(record)));
-  }
+    yield* this.#credentials.retain(new Set(records.map((record) => record.connectionId)));
+    yield* Effect.forEach(
+      records.filter((record) => record.enabled),
+      (record) => this.#startConnection(record),
+      { concurrency: "unbounded", discard: true },
+    );
+  }).bind(this);
 
-  async stop(): Promise<void> {
+  readonly stop = Effect.fn("MessagingService.stop")(function* (
+    this: MessagingService,
+  ): Effect.fn.Return<void, MessagingOperationFailed> {
     this.#started = false;
     for (const unsubscribe of this.#unsubscribe.splice(0)) unsubscribe();
     this.#threads.setContextSource(null);
     this.#ingress?.handle(null);
-    await Promise.all([...this.#live.values()].map((live) => live.transport?.stop()));
+    this.#endTelegramLinkLease();
+    yield* Effect.forEach(
+      [...this.#live.values()],
+      (live) => {
+        const transport = live.transport;
+        return transport ? transport.stop() : Effect.void;
+      },
+      { concurrency: "unbounded", discard: true },
+    );
     this.#live.clear();
-  }
+    yield* Scope.close(this.#scope, Exit.void);
+  }, Effect.uninterruptible).bind(this);
 
   /** After the computer wakes, every socket may be dead without knowing it. */
   resume(): void {
@@ -201,91 +250,131 @@ export class MessagingService {
   }
 
   /** The Slack workspaces of this computer, for Server settings > Connectors. A disconnected one is left out. */
-  slackOverview(): SlackOverview {
+  slackOverview(): MessagingOverview {
+    return this.#overview("slack");
+  }
+
+  /** The Discord guilds of this computer, for Server settings > Connectors. A disconnected one is left out. */
+  discordOverview(): MessagingOverview {
+    return this.#overview("discord");
+  }
+
+  /** The Telegram chats linked to this computer. A disconnected one is left out. */
+  telegramOverview(): MessagingOverview {
+    return this.#overview("telegram");
+  }
+
+  #overview(platform: MessagingPlatform): MessagingOverview {
     return {
       connections: this.#threads.store
         .connections()
-        .filter((record) => record.platform === "slack" && this.#credentials.status(record.connectionId) !== "missing")
+        .filter((record) => record.platform === platform && this.#credentials.status(record.connectionId) !== "missing")
         .map((record) => this.#summary(record)),
     };
   }
 
-  async reconnect(workspaceId: string): Promise<void> {
-    const record = this.#requireConnection(workspaceId);
-    await this.#stopConnection(record.connectionId);
+  readonly reconnect = Effect.fn("MessagingService.reconnect")(function* (
+    this: MessagingService,
+    platform: MessagingPlatform,
+    workspaceId: string,
+  ): Effect.fn.Return<void, MessagingOperationFailed> {
+    const record = yield* messagingStep(() => this.#requireLinked(platform, workspaceId));
+    // A guild that removed the bot has no bot to reconnect to and no link: it must install it again.
+    if (platform === "discord" && record.lastErrorCode === "invalid_token") return yield* this.connectDiscordGuild();
+    yield* this.#stopConnection(record.connectionId);
     this.#threads.store.updateConnection(record.connectionId, { enabled: true, lastErrorCode: null });
     const updated = this.#threads.store.connection(record.connectionId);
-    if (updated) await this.#startConnection(updated);
+    if (updated) yield* this.#startConnection(updated);
     this.#ingress?.reconnect();
-  }
+  }, Effect.uninterruptible).bind(this);
 
-  async setEnabled(workspaceId: string, enabled: boolean): Promise<void> {
-    const record = this.#requireConnection(workspaceId);
-    await this.#stopConnection(record.connectionId);
+  readonly setEnabled = Effect.fn("MessagingService.setEnabled")(function* (
+    this: MessagingService,
+    platform: MessagingPlatform,
+    workspaceId: string,
+    enabled: boolean,
+  ): Effect.fn.Return<void, MessagingOperationFailed> {
+    const record = yield* messagingStep(() => this.#requireLinked(platform, workspaceId));
+    yield* this.#stopConnection(record.connectionId);
     this.#threads.store.updateConnection(record.connectionId, { enabled, lastErrorCode: null });
     const updated = this.#threads.store.connection(record.connectionId);
-    if (enabled && updated) await this.#startConnection(updated);
-  }
+    if (enabled && updated) yield* this.#startConnection(updated);
+  }, Effect.uninterruptible).bind(this);
 
-  /**
-   * Adds the workspace's Slack Orchestrator: a new agent with its standing remit and the facts it
-   * starts with, on the model the user picked. It receives every new conversation of the workspace.
-   * A workspace that already has one keeps it.
-   */
-  async addOrchestrator(input: AddSlackOrchestratorInput): Promise<AddSlackOrchestratorResult> {
-    const record = this.#requireConnection(input.workspaceId);
+  readonly addOrchestrator = Effect.fn("MessagingService.addOrchestrator")(function* (
+    this: MessagingService,
+    platform: MessagingPlatform,
+    input: AddMessagingOrchestratorInput,
+  ) {
+    const record = yield* messagingStep(() => this.#requireConnection(platform, input.workspaceId));
     const current = this.#agents.listAgents().find((agent) => agent.id === record.orchestratorAgentId);
     if (current) return { agentId: current.id, sectionId: null };
-    const agent = await this.#agents.createAgentProfile({
-      ...slackOrchestratorProfile(),
-      ...SLACK_ORCHESTRATOR_AVATAR,
-      ...(input.provider ? { provider: input.provider } : {}),
-      ...(input.model ? { model: input.model } : {}),
-      ...(input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {}),
-    });
-    for (const text of slackOrchestratorMemories(record.workspaceName))
-      this.#agents.createMemory({ agentId: agent.id, text });
+    const discord = platform === "discord";
+    const agent = yield* this.#agents
+      .createAgentProfile({
+        ...(discord ? discordOrchestratorProfile() : slackOrchestratorProfile()),
+        ...(discord ? DISCORD_ORCHESTRATOR_AVATAR : SLACK_ORCHESTRATOR_AVATAR),
+        ...(input.provider ? { provider: input.provider } : {}),
+        ...(input.model ? { model: input.model } : {}),
+        ...(input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {}),
+      })
+      .pipe(toMessagingOperationFailed);
+    const memories = discord
+      ? discordOrchestratorMemories(record.workspaceName)
+      : slackOrchestratorMemories(record.workspaceName);
+    for (const text of memories) this.#agents.createMemory({ agentId: agent.id, text });
     this.#threads.store.updateConnection(record.connectionId, { orchestratorAgentId: agent.id });
     // A sidebar it cannot reach leaves the agent where new agents go; the orchestrator still answers.
-    const sectionId = await this.#placeInIntegrations(agent.id).catch((error) => {
-      this.#warn(error);
-      return null;
-    });
+    const sectionId = yield* this.#placeInIntegrations(agent.id).pipe(
+      Effect.catch((failure) => {
+        this.#warn(failure.cause);
+        return Effect.succeed(null);
+      }),
+    );
     return { agentId: agent.id, sectionId };
-  }
+  }, Effect.uninterruptible).bind(this);
 
   /**
    * Puts the orchestrator in the sidebar's Integrations section, which it creates the first time, so
    * the agents that serve an integration stay apart from the user's own. Returns the section id.
    */
-  async #placeInIntegrations(agentId: string): Promise<string | null> {
+  readonly #placeInIntegrations = Effect.fn("MessagingService.placeInIntegrations")(function* (
+    this: MessagingService,
+    agentId: string,
+  ) {
     const sidebar = this.#sidebar;
     if (!sidebar) return null;
     const name = sourceText("status.messaging.integrationsSection");
     const agentIds = new Set(this.#agents.listAgents().map((agent) => agent.id));
     const existing = sidebar.getSnapshot().sections.find((section) => section.name === name);
-    const layout = await sidebar.mutate(
-      existing ? { type: "assign", agentId, sectionId: existing.id } : { type: "create", name, agentId },
-      agentIds,
-    );
+    const layout = yield* sidebar
+      .mutate(
+        existing ? { type: "assign", agentId, sectionId: existing.id } : { type: "create", name, agentId },
+        agentIds,
+      )
+      .pipe(toMessagingOperationFailed);
     return layout.agentAssignments[agentId] ?? null;
-  }
+  });
 
   /** Opens the OpenBot Slack app's install in the browser. A deep link to `completeSlackWorkspace` ends it. */
-  async connectSlackWorkspace(): Promise<void> {
-    await this.#requireConnect().start();
-  }
+  readonly connectSlackWorkspace = Effect.fn("MessagingService.connectSlackWorkspace")(function* (
+    this: MessagingService,
+  ) {
+    const connect = yield* messagingStep(() => this.#requireConnect());
+    yield* connect.start().pipe(toMessagingOperationFailed);
+  }).bind(this);
 
-  /**
-   * Saves the bot token of a workspace that installed the OpenBot app, and starts its connection. A
-   * workspace connected before keeps its conversations. False for a link that this run did not start.
-   */
-  async completeSlackWorkspace(nonce: string, grant: string): Promise<boolean> {
-    const opened = await this.#requireConnect().complete(nonce, grant);
+  readonly completeSlackWorkspace = Effect.fn("MessagingService.completeSlackWorkspace")(function* (
+    this: MessagingService,
+    nonce: string,
+    grant: string,
+  ): Effect.fn.Return<boolean, MessagingOperationFailed> {
+    const connect = yield* messagingStep(() => this.#requireConnect());
+    const opened = yield* connect.complete(nonce, grant).pipe(toMessagingOperationFailed);
     if (!opened) return false;
     const record = this.#threads.store.ensureConnection("slack", opened.workspaceId, opened.workspaceName);
-    await this.#stopConnection(record.connectionId);
-    await this.#credentials.set(record.connectionId, {
+    yield* this.#stopConnection(record.connectionId);
+    yield* this.#credentials.set(record.connectionId, {
       botToken: opened.botToken,
       botUserId: opened.botUserId,
       appId: opened.appId,
@@ -299,80 +388,384 @@ export class MessagingService {
       lastErrorCode: null,
     });
     const updated = this.#threads.store.connection(record.connectionId);
-    if (updated) await this.#startConnection(updated);
+    if (updated) yield* this.#startConnection(updated);
     // Signal learns the workspaces of this host when the socket connects.
     this.#ingress?.reconnect();
     return true;
-  }
+  }, Effect.uninterruptible).bind(this);
 
-  /**
-   * Stops the workspace's connection, asks Slack to revoke the bot token, removes it, and unlinks the
-   * workspace from this host. The conversations stay, for a later connect.
-   */
-  async disconnectSlackWorkspace(workspaceId: string): Promise<void> {
-    const record = this.#requireConnection(workspaceId);
-    await this.#stopConnection(record.connectionId);
+  readonly disconnectSlackWorkspace = Effect.fn("MessagingService.disconnectSlackWorkspace")(function* (
+    this: MessagingService,
+    workspaceId: string,
+  ) {
+    const record = yield* messagingStep(() => this.#requireConnection("slack", workspaceId));
+    yield* this.#stopConnection(record.connectionId);
     const botToken = this.#credentials.get(record.connectionId)?.botToken;
     if (botToken)
-      await new SlackWebApi({ token: botToken, origin: this.#slackOrigin })
+      yield* new SlackWebApi({ token: botToken, origin: this.#slackOrigin })
         .call("auth.revoke")
-        .catch((error) => this.#warn(error));
-    await this.#credentials.clear(record.connectionId);
-    this.#threads.store.updateConnection(record.connectionId, { enabled: false, lastErrorCode: null });
-    await this.#connect?.unlink(workspaceId).catch((error) => this.#warn(error));
+        .pipe(Effect.catch((failure) => Effect.sync(() => this.#warn(failure.cause))));
+    yield* this.#credentials.clear(record.connectionId);
+    yield* messagingStep(() =>
+      this.#threads.store.updateConnection(record.connectionId, { enabled: false, lastErrorCode: null }),
+    );
+    if (this.#connect)
+      yield* this.#connect
+        .unlink(workspaceId)
+        .pipe(Effect.catch((failure) => Effect.sync(() => this.#warn(failure.cause))));
     this.#ingress?.reconnect();
-  }
+  }, Effect.uninterruptible).bind(this);
+
+  /** Opens the OpenBot Discord app's install in the browser. A deep link to `completeDiscordGuild` ends it. */
+  readonly connectDiscordGuild = Effect.fn("MessagingService.connectDiscordGuild")(function* (this: MessagingService) {
+    const connect = yield* messagingStep(() => this.#requireDiscordConnect());
+    yield* connect.start().pipe(toMessagingOperationFailed);
+  }).bind(this);
 
   /**
-   * One request that Slack sent for a workspace, which Signal has checked. A paused connection answers
-   * 200, so Slack does not send it again, and does nothing. An unknown workspace answers 404.
+   * Stores the guild that the account service linked to this host, and starts its connection. The
+   * grant holds no token: the bot token stays in Signal.
    */
-  async deliverSlack(workspaceId: string, delivery: IngressDelivery): Promise<IngressAnswer> {
-    const record = this.#threads.store.connectionForWorkspace("slack", workspaceId);
+  readonly completeDiscordGuild = Effect.fn("MessagingService.completeDiscordGuild")(function* (
+    this: MessagingService,
+    nonce: string,
+    grant: string,
+  ): Effect.fn.Return<boolean, MessagingOperationFailed> {
+    const connect = yield* messagingStep(() => this.#requireDiscordConnect());
+    const opened = yield* connect.complete(nonce, grant).pipe(toMessagingOperationFailed);
+    if (!opened) return false;
+    const record = this.#threads.store.ensureConnection("discord", opened.guildId, opened.guildName);
+    yield* this.#stopConnection(record.connectionId);
+    yield* this.#credentials.set(record.connectionId, {
+      guildId: opened.guildId,
+      guildName: opened.guildName,
+      appId: opened.appId,
+    });
+    this.#threads.store.updateConnection(record.connectionId, {
+      enabled: true,
+      workspaceName: opened.guildName,
+      appId: opened.appId,
+      lastErrorCode: null,
+    });
+    const updated = this.#threads.store.connection(record.connectionId);
+    if (updated) yield* this.#startConnection(updated);
+    // Signal learns the guilds of this host when the socket connects.
+    this.#ingress?.reconnect();
+    return true;
+  }, Effect.uninterruptible).bind(this);
+
+  /**
+   * Unlinks the guild, then stops its connection and forgets it. OpenBot stays in the guild until a
+   * guild admin removes it. When the unlink fails, nothing changes, so the user can try again: the
+   * guild stays linked to this host until the account service unlinks it.
+   */
+  readonly disconnectDiscordGuild = Effect.fn("MessagingService.disconnectDiscordGuild")(function* (
+    this: MessagingService,
+    guildId: string,
+  ) {
+    const record = yield* messagingStep(() => this.#requireConnection("discord", guildId));
+    if (this.#discordConnect) yield* this.#discordConnect.unlink(guildId).pipe(toMessagingOperationFailed);
+    yield* this.#stopConnection(record.connectionId);
+    yield* this.#credentials.clear(record.connectionId);
+    yield* messagingStep(() =>
+      this.#threads.store.updateConnection(record.connectionId, { enabled: false, lastErrorCode: null }),
+    );
+    this.#ingress?.reconnect();
+  }, Effect.uninterruptible).bind(this);
+
+  /**
+   * One event that Signal passed on for a workspace: a Slack request, whose signature Signal has
+   * checked, a Discord event, or a Telegram update. A paused connection answers 200, so Slack does not
+   * send it again, and does nothing. An unknown workspace answers 404.
+   */
+  readonly deliver = Effect.fn("MessagingService.deliver")(function* (
+    this: MessagingService,
+    workspaceId: string,
+    delivery: IngressDelivery,
+  ): Effect.fn.Return<IngressAnswer> {
+    if (delivery.platform === "telegram") {
+      yield* this.#deliverTelegram(workspaceId, delivery).pipe(
+        Effect.catch((failure) => Effect.sync(() => this.#warn(failure.cause))),
+      );
+      return { status: 200 };
+    }
+    const record = this.#threads.store.connectionForWorkspace(delivery.platform, workspaceId);
     if (!record) return { status: 404 };
     if (!record.enabled) return { status: 200 };
     const transport = this.#live.get(record.connectionId)?.transport;
     if (!transport?.deliver) return { status: 503 };
-    return transport.deliver(delivery);
+    return yield* transport.deliver(delivery);
+  }).bind(this);
+
+  /**
+   * Creates the Telegram Orchestrator, or gives the one that exists to every Telegram chat. One agent
+   * answers every chat, so a chat linked later gets it too.
+   */
+  readonly addTelegramOrchestrator = Effect.fn("MessagingService.addTelegramOrchestrator")(function* (
+    this: MessagingService,
+    input: AddTelegramOrchestratorInput,
+  ) {
+    const records = this.#threads.store.connections().filter((record) => record.platform === "telegram");
+    if (!records.length)
+      return yield* new MessagingOperationFailed({
+        cause: new Error(sourceText("error.messaging.telegramNotConnected")),
+      });
+    const current = this.#telegramOrchestrator();
+    if (current) {
+      this.#assignTelegramOrchestrator(current);
+      return { agentId: current, sectionId: null };
+    }
+    const agent = yield* this.#agents
+      .createAgentProfile({
+        ...telegramOrchestratorProfile(),
+        ...TELEGRAM_ORCHESTRATOR_AVATAR,
+        ...(input.provider ? { provider: input.provider } : {}),
+        ...(input.model ? { model: input.model } : {}),
+        ...(input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {}),
+      })
+      .pipe(toMessagingOperationFailed);
+    for (const text of telegramOrchestratorMemories()) this.#agents.createMemory({ agentId: agent.id, text });
+    this.#assignTelegramOrchestrator(agent.id);
+    const sectionId = yield* this.#placeInIntegrations(agent.id).pipe(
+      Effect.catch((failure) => {
+        this.#warn(failure.cause);
+        return Effect.succeed(null);
+      }),
+    );
+    return { agentId: agent.id, sectionId };
+  }, Effect.uninterruptible).bind(this);
+
+  /**
+   * Opens a `t.me` link with a one-use code in the browser. Telegram sends the code in the chat that
+   * the user adds the bot to, and Signal links that chat to this host (`#deliverTelegram`).
+   */
+  readonly connectTelegramChat = Effect.fn("MessagingService.connectTelegramChat")(function* (
+    this: MessagingService,
+    place: ConnectTelegramChatInput["place"],
+  ) {
+    const { app, ingress } = yield* messagingStep(() => this.#requireTelegram());
+    // Signal routes the new chat to this host's socket when the chat sends the code. With no
+    // connection running, nothing else holds the socket open, so the code holds it until it expires.
+    this.#endTelegramLinkLease();
+    const release = ingress.acquire("telegram");
+    const timer = setTimeout(() => this.#endTelegramLinkLease(), TELEGRAM_LINK_CODE_TTL_SECONDS * 1_000);
+    timer.unref?.();
+    this.#telegramLinkLease = { release, timer };
+    // Opened before the socket is ready, Telegram could send the code while Signal has no socket to
+    // route the new chat to.
+    const link = yield* Effect.all([this.#telegramReady(ingress), app.createLink()], { concurrency: "unbounded" }).pipe(
+      Effect.map(([, created]) => created),
+      Effect.onError(() => Effect.sync(() => this.#endTelegramLinkLease())),
+    );
+    yield* messagingIo(() => app.openExternal(telegramLinkUrl(link.botUsername, link.code, place)));
+  }).bind(this);
+
+  /** Waits a short time for the socket to be open with a Signal that has Telegram. */
+  #telegramReady(ingress: MessagingIngress): Effect.Effect<void, MessagingOperationFailed> {
+    const unavailable = () =>
+      new MessagingOperationFailed({ cause: new Error(sourceText("error.messaging.telegramRelayUnavailable")) });
+    if (ingress.telegram.available()) return Effect.void;
+    // A Signal that answered without Telegram does not gain it on this socket.
+    if (ingress.state() === "online") return Effect.fail(unavailable());
+    return Effect.callback<void>((resume) => {
+      const stop = ingress.onState(() => {
+        if (!ingress.telegram.available()) return;
+        stop();
+        resume(Effect.void);
+      });
+      return Effect.sync(stop);
+    }).pipe(Effect.timeoutOrElse({ duration: TELEGRAM_READY_TIMEOUT_MS, orElse: () => Effect.fail(unavailable()) }));
+  }
+
+  #endTelegramLinkLease(): void {
+    const lease = this.#telegramLinkLease;
+    this.#telegramLinkLease = null;
+    if (!lease) return;
+    clearTimeout(lease.timer);
+    lease.release();
+  }
+
+  /**
+   * The bot leaves the chat, and the chat is unlinked from this host. The conversations stay in
+   * OpenBot, and a later link of the same chat gives them back their agents.
+   */
+  readonly disconnectTelegramChat = Effect.fn("MessagingService.disconnectTelegramChat")(function* (
+    this: MessagingService,
+    chatId: string,
+  ) {
+    const { app, ingress } = yield* messagingStep(() => this.#requireTelegram());
+    const record = yield* messagingStep(() => this.#requireConnection("telegram", chatId));
+    const botId = this.#credentials.get(record.connectionId)?.botId;
+    // The chat's transport may be the last holder of the socket. The call needs it open, and it must
+    // come before the unlink: Signal accepts a call only for a chat that is routed to this host.
+    yield* Effect.acquireUseRelease(
+      Effect.sync(() => ingress.acquire("telegram")),
+      () =>
+        Effect.gen({ self: this }, function* () {
+          yield* this.#stopConnection(record.connectionId);
+          if (botId && record.lastErrorCode !== "removed")
+            yield* ingress.telegram
+              .call(botId, "leaveChat", { chat_id: Number(chatId) })
+              .pipe(Effect.catch((failure) => Effect.sync(() => this.#warn(failure.cause))));
+        }),
+      (release) => Effect.sync(release),
+    );
+    yield* this.#credentials.clear(record.connectionId);
+    yield* messagingStep(() =>
+      this.#threads.store.updateConnection(record.connectionId, { enabled: false, lastErrorCode: null }),
+    );
+    yield* app.unlink(chatId).pipe(Effect.catch((failure) => Effect.sync(() => this.#warn(failure.cause))));
+  }, Effect.uninterruptible).bind(this);
+
+  /**
+   * One Telegram update of a chat routed to this host, which Signal has checked. A `/start <code>`
+   * links the chat only when Signal marks it `linked`: the account service matched the code to this
+   * host. Anyone in a routed chat can send a `/start` with a made-up code.
+   */
+  readonly #deliverTelegram = Effect.fn("MessagingService.deliverTelegram")(function* (
+    this: MessagingService,
+    chatId: string,
+    delivery: Extract<IngressDelivery, { platform: "telegram" }>,
+  ): Effect.fn.Return<void, MessagingOperationFailed> {
+    const { botId } = delivery;
+    const update = parseTelegramUpdate(delivery.body);
+    if (!update) return;
+    const link = delivery.linked ? telegramLink(update) : null;
+    if (link) return yield* this.#linkTelegramChat(botId, chatId, link.title);
+    const record = this.#threads.store.connectionForWorkspace("telegram", chatId);
+    // A chat that both the production and the development bot are in answers only its own bot.
+    if (!record || (record.appId && record.appId !== botId)) return;
+    const transport = record.enabled ? this.#live.get(record.connectionId)?.transport : undefined;
+    if (transport?.deliver) {
+      yield* transport.deliver(delivery);
+      return;
+    }
+    // A paused chat has no transport, and Telegram does not send a removal again. Without this, a
+    // resume shows the chat as connected, and Signal keeps routing it here. A disconnected chat has no
+    // credentials, and the removal is the echo of its `leaveChat`.
+    if (
+      record.lastErrorCode === "removed" ||
+      this.#credentials.status(record.connectionId) === "missing" ||
+      !telegramRemoval(update, botId, chatId)
+    )
+      return;
+    yield* this.#stopConnection(record.connectionId);
+    // As for a running chat: the summary shows `removed` rather than `paused`, with no Resume.
+    this.#threads.store.updateConnection(record.connectionId, { enabled: true, lastErrorCode: "removed" });
+    if (this.#telegramApp)
+      yield* this.#telegramApp
+        .unlink(chatId)
+        .pipe(Effect.catch((failure) => Effect.sync(() => this.#warn(failure.cause))));
+  });
+
+  readonly #linkTelegramChat = Effect.fn("MessagingService.linkTelegramChat")(function* (
+    this: MessagingService,
+    botId: string,
+    chatId: string,
+    title: string,
+  ) {
+    const { ingress } = yield* messagingStep(() => this.#requireTelegram());
+    const record = yield* messagingStep(() => this.#threads.store.ensureConnection("telegram", chatId, title));
+    yield* this.#stopConnection(record.connectionId);
+    const me = yield* ingress.telegram.call(botId, "getMe", {}).pipe(Effect.catch(() => Effect.succeed({})));
+    const botUsername = "username" in me && me.username ? me.username : "";
+    yield* this.#credentials.set(record.connectionId, {
+      botId,
+      chatId,
+      chatTitle: title,
+      ...(botUsername ? { botUsername } : {}),
+    });
+    this.#threads.store.updateConnection(record.connectionId, {
+      enabled: true,
+      workspaceName: title,
+      botUserId: botId,
+      appId: botId,
+      lastErrorCode: null,
+      orchestratorAgentId: this.#orchestrator(record) ?? this.#telegramOrchestrator(),
+    });
+    const updated = this.#threads.store.connection(record.connectionId);
+    if (updated) yield* this.#startConnection(updated);
+    // The chat's transport holds the socket from here.
+    this.#endTelegramLinkLease();
+    const live = this.#live.get(record.connectionId);
+    if (live)
+      yield* live.adapter
+        .post(
+          { platformChannelId: chatId, replyThreadId: null },
+          { text: sourceText("status.messaging.telegramLinked", { bot: botUsername ? `@${botUsername}` : "OpenBot" }) },
+        )
+        .pipe(Effect.catch((failure) => Effect.sync(() => this.#warn(failure.cause))));
+  }, Effect.uninterruptible);
+
+  /** The Telegram Orchestrator: one agent for every Telegram chat, or null until the user adds it. */
+  #telegramOrchestrator(): string | null {
+    const agents = new Set(this.#agents.listAgents().map((agent) => agent.id));
+    for (const record of this.#threads.store.connections())
+      if (record.platform === "telegram" && record.orchestratorAgentId && agents.has(record.orchestratorAgentId))
+        return record.orchestratorAgentId;
+    return null;
+  }
+
+  #assignTelegramOrchestrator(agentId: string): void {
+    for (const record of this.#threads.store.connections())
+      if (record.platform === "telegram" && record.orchestratorAgentId !== agentId)
+        this.#threads.store.updateConnection(record.connectionId, { orchestratorAgentId: agentId });
   }
 
   // Connection lifecycle.
 
-  async #startConnection(record: MessagingConnectionRecord): Promise<void> {
+  readonly #startConnection = Effect.fn("MessagingService.startConnection")(function* (
+    this: MessagingService,
+    record: MessagingConnectionRecord,
+  ) {
     const credentials = this.#credentials.get(record.connectionId);
     const driver = this.#drivers.get(record.platform);
-    if (!credentials?.botToken || !driver) return;
+    if (!driver || !credentials?.[driver.requiredCredential]) return;
+    // A chat that removed the bot is unlinked: its transport would report the socket, not the chat.
+    if (record.lastErrorCode === "removed") return;
     const live: LiveConnection = {
       record,
       adapter: driver.createAdapter(credentials, {
         rateLimited: (retryAt) => {
           live.retryAt = retryAt;
-          this.#setState(live, "rate_limited");
+          this.#dispatch(this.#setState(live, "rate_limited"));
+          // The platform said when it can take calls again. A newer limit replaces this one.
+          const end = setTimeout(
+            () => {
+              if (this.#live.get(record.connectionId) !== live || live.retryAt !== retryAt) return;
+              live.retryAt = null;
+              if (live.state === "rate_limited") this.#dispatch(this.#setState(live, live.reported));
+            },
+            Math.max(0, Date.parse(retryAt) - Date.now()),
+          );
+          end.unref?.();
         },
       }),
       transport: null,
       identity: null,
       state: "connecting",
+      reported: "connecting",
       retryAt: null,
     };
     this.#live.set(record.connectionId, live);
-    try {
-      live.identity = await live.adapter.identify();
-    } catch (error) {
+    const identified = yield* Effect.result(live.adapter.identify().pipe(toMessagingOperationFailed));
+    if (Result.isFailure(identified)) {
+      const error = identified.failure.cause;
       if (this.#live.get(record.connectionId) !== live) return;
-      if (error instanceof MessagingConnectionError) return this.#setState(live, error.state);
+      if (error instanceof MessagingConnectionError) return yield* this.#setState(live, error.state);
       // Slack is unreachable now. Try again later; Reconnect and a wake from sleep do it at once.
       const retry = setTimeout(() => {
-        if (this.#live.get(record.connectionId) === live) void this.#restart(record.connectionId);
+        if (this.#live.get(record.connectionId) === live) this.#dispatch(this.#restart(record.connectionId));
       }, IDENTIFY_RETRY_MS);
       retry.unref?.();
       live.transport = {
         start: () => undefined,
-        reconnect: () => void this.#restart(record.connectionId),
-        stop: async () => clearTimeout(retry),
+        reconnect: () => this.#dispatch(this.#restart(record.connectionId)),
+        stop: () => Effect.sync(() => clearTimeout(retry)),
       };
-      return this.#setState(live, "reconnecting");
+      return yield* this.#setState(live, "reconnecting");
     }
+    live.identity = identified.success;
     if (this.#live.get(record.connectionId) !== live) return;
     const identity = live.identity;
     this.#threads.store.updateConnection(record.connectionId, {
@@ -385,49 +778,96 @@ export class MessagingService {
     live.transport = transport;
     transport.start({
       state: (state) => {
+        live.reported = state;
         if (state === "connected") live.retryAt = null;
-        this.#setState(live, state);
+        this.#dispatch(this.#setState(live, state));
       },
-      message: (message) => void this.#receive(live, message).catch((error) => this.#warn(error)),
-      action: (action) => void this.#action(live, action).catch((error) => this.#warn(error)),
-      placeCreated: (platformChannelId) =>
-        void live.adapter.joinPlace?.(platformChannelId).catch((error) => this.#warn(error)),
+      message: (message) => this.#dispatch(this.#receive(live, message)),
+      action: (action) => this.#dispatch(this.#action(live, action)),
+      renamed: (workspaceName) => this.#dispatch(this.#renamed(live, workspaceName)),
+      placeCreated: (platformChannelId) => {
+        const join = live.adapter.joinPlace?.(platformChannelId);
+        if (join) this.#dispatch(join.pipe(toMessagingOperationFailed));
+      },
     });
     // So people can mention OpenBot in any public channel without inviting it first. Channels made
     // while the host was off are joined here too.
-    void live.adapter.joinPublicPlaces?.().catch((error) => this.#warn(error));
-  }
+    const join = live.adapter.joinPublicPlaces?.();
+    if (join)
+      yield* Effect.forkIn(
+        join.pipe(Effect.catch((error) => Effect.sync(() => this.#warn(error.cause)))),
+        this.#scope,
+        { startImmediately: true },
+      );
+  });
 
-  async #restart(connectionId: string): Promise<void> {
-    await this.#stopConnection(connectionId);
+  /** The chat has a new title. The credentials keep it too, so the next start does not take the old one. */
+  readonly #renamed = Effect.fn("MessagingService.renamed")(function* (
+    this: MessagingService,
+    live: LiveConnection,
+    workspaceName: string,
+  ) {
+    const name = workspaceName.slice(0, 256);
+    this.#threads.store.updateConnection(live.record.connectionId, { workspaceName: name });
+    const values = this.#credentials.get(live.record.connectionId);
+    if (values?.chatTitle !== undefined)
+      yield* this.#credentials.set(live.record.connectionId, { ...values, chatTitle: name });
+  });
+
+  readonly #restart = Effect.fn("MessagingService.restart")(function* (
+    this: MessagingService,
+    connectionId: string,
+  ): Effect.fn.Return<void, MessagingOperationFailed> {
+    yield* this.#stopConnection(connectionId);
     const record = this.#threads.store.connection(connectionId);
-    if (record?.enabled) await this.#startConnection(record);
-  }
+    if (record?.enabled) yield* this.#startConnection(record);
+  });
 
-  async #stopConnection(connectionId: string): Promise<void> {
+  readonly #stopConnection = Effect.fn("MessagingService.stopConnection")(function* (
+    this: MessagingService,
+    connectionId: string,
+  ): Effect.fn.Return<void, MessagingOperationFailed> {
     const live = this.#live.get(connectionId);
     this.#live.delete(connectionId);
-    await live?.transport?.stop();
-  }
+    const transport = live?.transport;
+    if (transport) yield* transport.stop();
+  });
 
-  #setState(live: LiveConnection, state: MessagingConnectionState): void {
+  readonly #setState = Effect.fn("MessagingService.setState")(function* (
+    this: MessagingService,
+    live: LiveConnection,
+    state: MessagingConnectionState,
+  ) {
     live.state = state;
     if (FATAL_STATES.has(state)) {
       this.#threads.store.updateConnection(live.record.connectionId, { lastErrorCode: state });
       logger.warn("A messaging connection stopped.", { platform: live.record.platform, state });
-      // The workspace uninstalled OpenBot or revoked its token: Signal stops routing it here.
-      void this.#connect?.unlink(live.record.workspaceId).catch((error) => this.#warn(error));
+      // The workspace uninstalled OpenBot or revoked its token, or the bot left the Telegram chat:
+      // Signal stops routing it here.
+      const unlink:
+        | Effect.Effect<void, DiscordConnectFailed | SlackConnectFailed | MessagingOperationFailed>
+        | undefined =
+        live.record.platform === "telegram"
+          ? this.#telegramApp?.unlink(live.record.workspaceId)
+          : live.record.platform === "discord"
+            ? this.#discordConnect?.unlink(live.record.workspaceId)
+            : this.#connect?.unlink(live.record.workspaceId);
+      if (unlink) yield* unlink.pipe(Effect.catch((error) => Effect.sync(() => this.#warn(error.cause))));
+      // The summary then shows the stored state, which a reconnect of the socket cannot change.
+      if (state === "removed" && this.#live.get(live.record.connectionId) === live)
+        yield* this.#stopConnection(live.record.connectionId);
     }
-  }
+  });
 
   #summary(record: MessagingConnectionRecord): MessagingConnection {
     const live = this.#live.get(record.connectionId);
     const credentials = this.#credentials.status(record.connectionId);
     const values = credentials === "saved" ? this.#credentials.get(record.connectionId) : null;
     const stored = isOneOf(MESSAGING_CONNECTION_STATES, record.lastErrorCode) ? record.lastErrorCode : null;
+    const required = this.#drivers.get(record.platform)?.requiredCredential;
     const state: MessagingConnectionState = !record.enabled
       ? "paused"
-      : credentials === "unreadable" || (values && !values.botToken)
+      : credentials === "unreadable" || (values && required && !values[required])
         ? "secret_storage_unavailable"
         : (live?.state ?? stored ?? "connecting");
     return {
@@ -444,9 +884,11 @@ export class MessagingService {
     };
   }
 
-  // Inbound.
-
-  async #receive(live: LiveConnection, message: InboundMessage): Promise<void> {
+  readonly #receive = Effect.fn("MessagingService.receive")(function* (
+    this: MessagingService,
+    live: LiveConnection,
+    message: InboundMessage,
+  ) {
     if (!live.identity) return;
     // Before any await: a redelivered event can arrive while the first copy is still downloading its
     // files, before the mailbox holds its idempotency key. The mailbox key covers a restart.
@@ -462,64 +904,90 @@ export class MessagingService {
       if (oldest !== undefined) this.#recent.delete(oldest);
     }
     if (existing && CANCEL_TEXT.test(message.text) && message.files.length === 0) {
-      if (await this.#threads.stop(existing.linkId, message.authorId)) {
-        await live.adapter.react(message.target, message.platformMessageId, "stopped", true).catch(() => undefined);
+      if (yield* this.#threads.stop(existing.linkId, message.authorId).pipe(toMessagingOperationFailed)) {
+        yield* live.adapter
+          .react(message.target, message.platformMessageId, "stopped", true)
+          .pipe(Effect.catch(() => Effect.void));
         return;
       }
     }
     const { adapter } = live;
-    const authorName = await adapter.authorName(message.authorId);
-    const place = message.isDirect ? null : await adapter.placeName(message.platformChannelId);
+    const authorName = yield* adapter.authorName(message.authorId).pipe(toMessagingOperationFailed);
+    const place = message.isDirect
+      ? null
+      : yield* adapter.placeName(message.platformChannelId).pipe(toMessagingOperationFailed);
     // A conversation keeps its agent. A new one goes to the workspace's orchestrator, which asks its
     // teammates; without one, nothing answers.
     const agentId = existing?.agentId ?? this.#orchestrator(live.record);
     if (!agentId) {
-      await adapter.post(message.target, { text: sourceText("status.messaging.noAgent") });
+      const noAgent =
+        live.record.platform === "discord"
+          ? "status.messaging.discordNoAgent"
+          : live.record.platform === "telegram"
+            ? "status.messaging.telegramNoAgent"
+            : "status.messaging.noAgent";
+      yield* adapter.post(message.target, { text: sourceText(noAgent) }).pipe(toMessagingOperationFailed);
       return;
     }
     const staging = join(this.#downloadsRoot, randomUUID());
-    try {
-      const { paths, skipped } = await this.#download(adapter, message, staging);
-      const text = skipped.length
-        ? `${message.text}\n\n(Files that did not arrive: ${skipped.join(", ")})`
-        : message.text;
-      const result = await this.#threads.receive({
-        connectionId: live.record.connectionId,
-        agentId,
-        platformChannelId: message.platformChannelId,
-        threadKey: message.threadKey,
-        isDirect: message.isDirect,
-        title: message.isDirect ? authorName : `${place} · ${message.text.slice(0, 80) || authorName}`,
-        text,
-        sourcePaths: paths,
-        origin: { authorId: message.authorId, authorName, platformMessageId: message.platformMessageId },
-        idempotencyKey: `messaging:${live.record.connectionId}:${message.dedupKey}`,
-      });
-      if (result.status === "duplicate") return;
-      const key = `${result.link.linkId}:${message.platformMessageId}`;
-      if (result.status === "busy") {
-        await adapter.post(message.target, { text: sourceText("status.messaging.busy") });
-        await adapter.react(message.target, message.platformMessageId, "failed", true).catch(() => undefined);
-        return;
-      }
-      this.#targets.set(key, message.target);
-      await adapter.react(message.target, message.platformMessageId, "received", true).catch(() => undefined);
-      // In the same order as the turn's own posts: a turn that already started has its status post.
-      if (result.waiting)
-        this.#serial(result.link.linkId, async () => {
-          if (this.#posts.has(key) || !this.#targets.has(key)) return;
-          const messageId = await adapter.post(message.target, { text: sourceText("status.messaging.queued") });
-          this.#posts.set(key, {
-            connectionId: live.record.connectionId,
-            target: message.target,
-            messageId,
-            stopToken: null,
-          });
-        });
-    } finally {
-      await rm(staging, { recursive: true, force: true });
-    }
-  }
+    yield* Effect.acquireUseRelease(
+      Effect.succeed(staging),
+      () =>
+        Effect.gen({ self: this }, function* () {
+          const { paths, skipped } = yield* this.#download(adapter, message, staging);
+          const text = skipped.length
+            ? `${message.text}\n\n(Files that did not arrive: ${skipped.join(", ")})`
+            : message.text;
+          const result = yield* this.#threads
+            .receive({
+              connectionId: live.record.connectionId,
+              agentId,
+              platformChannelId: message.platformChannelId,
+              threadKey: message.threadKey,
+              isDirect: message.isDirect,
+              title: message.isDirect ? authorName : `${place} · ${message.text.slice(0, 80) || authorName}`,
+              text,
+              sourcePaths: paths,
+              origin: { authorId: message.authorId, authorName, platformMessageId: message.platformMessageId },
+              idempotencyKey: `messaging:${live.record.connectionId}:${message.dedupKey}`,
+            })
+            .pipe(toMessagingOperationFailed);
+          if (result.status === "duplicate") return;
+          const key = `${result.link.linkId}:${message.platformMessageId}`;
+          if (result.status === "busy") {
+            yield* adapter
+              .post(message.target, { text: sourceText("status.messaging.busy") })
+              .pipe(toMessagingOperationFailed);
+            yield* adapter
+              .react(message.target, message.platformMessageId, "failed", true)
+              .pipe(Effect.catch(() => Effect.void));
+            return;
+          }
+          this.#targets.set(key, message.target);
+          yield* adapter
+            .react(message.target, message.platformMessageId, "received", true)
+            .pipe(Effect.catch(() => Effect.void));
+          // In the same order as the turn's own posts: a turn that already started has its status post.
+          if (result.waiting)
+            yield* this.#serial(
+              result.link.linkId,
+              Effect.gen({ self: this }, function* () {
+                if (this.#posts.has(key) || !this.#targets.has(key)) return;
+                const messageId = yield* adapter
+                  .post(message.target, { text: sourceText("status.messaging.queued") })
+                  .pipe(toMessagingOperationFailed);
+                this.#posts.set(key, {
+                  connectionId: live.record.connectionId,
+                  target: message.target,
+                  messageId,
+                  stopToken: null,
+                });
+              }),
+            );
+        }),
+      () => messagingIo(() => rm(staging, { recursive: true, force: true })).pipe(Effect.orDie),
+    );
+  }, Effect.uninterruptible);
 
   #orchestrator(record: MessagingConnectionRecord): string | null {
     const id = this.#threads.store.connection(record.connectionId)?.orchestratorAgentId ?? null;
@@ -527,11 +995,12 @@ export class MessagingService {
   }
 
   /** Downloads the files of a message into `staging`, within the attachment limits. */
-  async #download(
+  readonly #download = Effect.fn("MessagingService.download")(function* (
+    this: MessagingService,
     adapter: MessagingAdapter,
     message: InboundMessage,
     staging: string,
-  ): Promise<{ paths: string[]; skipped: string[] }> {
+  ) {
     const paths: string[] = [];
     const skipped: string[] = [];
     let total = 0;
@@ -544,58 +1013,72 @@ export class MessagingService {
         skipped.push(file.name);
         continue;
       }
-      try {
-        await mkdir(join(staging, String(index)), { recursive: true, mode: 0o700 });
-        // The name comes from another person, so only its last segment is used.
-        const destination = join(staging, String(index), basename(file.name) || "file");
-        await adapter.download(
-          file,
-          destination,
-          Math.min(ATTACHMENT_LIMITS.fileBytes, ATTACHMENT_LIMITS.totalBytes - total),
-        );
+      const downloaded = yield* Effect.result(
+        Effect.gen(function* () {
+          yield* messagingIo(() => mkdir(join(staging, String(index)), { recursive: true, mode: 0o700 }));
+          // Only the final path segment can come from the external file name.
+          const destination = join(staging, String(index), basename(file.name) || "file");
+          yield* adapter
+            .download(file, destination, Math.min(ATTACHMENT_LIMITS.fileBytes, ATTACHMENT_LIMITS.totalBytes - total))
+            .pipe(toMessagingOperationFailed);
+          return destination;
+        }),
+      );
+      if (Result.isFailure(downloaded)) skipped.push(file.name);
+      else {
         total += file.size;
-        paths.push(destination);
-      } catch {
-        skipped.push(file.name);
+        paths.push(downloaded.success);
       }
     }
     return { paths, skipped };
-  }
+  });
 
-  async #promptContext(link: MessagingLink, origin: MessagingOrigin) {
+  readonly #promptContext = Effect.fn("MessagingService.promptContext")(function* (
+    this: MessagingService,
+    link: MessagingLink,
+    origin: MessagingOrigin,
+  ) {
     const live = this.#live.get(link.connectionId);
     const workspaceName = live?.record.workspaceName ?? null;
     if (!live) return { workspaceName, place: link.title, messages: [], cursor: null, skippedFiles: [] };
-    const place = link.isDirect ? "direct message" : await live.adapter.placeName(link.platformChannelId);
-    const messages = await live.adapter
+    const place = link.isDirect
+      ? "direct message"
+      : yield* live.adapter.placeName(link.platformChannelId).pipe(toMessagingOperationFailed);
+    const messages = yield* live.adapter
       .history(link.platformChannelId, link.threadKey, link.historyCursor, origin.platformMessageId)
-      .catch(() => []);
+      .pipe(Effect.catch(() => Effect.succeed([])));
     return { workspaceName, place, messages, cursor: origin.platformMessageId, skippedFiles: [] };
-  }
+  });
 
-  // Outbound.
-
-  async #activity(activity: MessagingActivity): Promise<void> {
+  readonly #activity = Effect.fn("MessagingService.activity")(function* (
+    this: MessagingService,
+    activity: MessagingActivity,
+  ) {
     const live = this.#live.get(activity.link.connectionId);
     if (!live || !activity.origin) return;
     const { adapter } = live;
-    const key = `${activity.link.linkId}:${activity.origin.platformMessageId}`;
+    const origin = activity.origin;
+    const key = `${activity.link.linkId}:${origin.platformMessageId}`;
     const target = this.#targets.get(key) ?? linkTarget(activity.link);
     const post = this.#posts.get(key);
     if (activity.type === "started") {
       const stopToken = token();
       this.#stops.set(stopToken, {
         linkId: activity.link.linkId,
-        authorId: activity.origin.authorId,
+        authorId: origin.authorId,
         connectionId: live.record.connectionId,
       });
       const body = {
         text: sourceText("status.messaging.working"),
         buttons: [{ action: "stop" as const, label: sourceText("status.messaging.stop"), token: stopToken }],
       };
-      const messageId = post?.messageId
-        ? await adapter.edit(target, post.messageId, body).then(() => post.messageId)
-        : await adapter.post(target, body);
+      const existingMessageId = post?.messageId;
+      const messageId = existingMessageId
+        ? yield* adapter
+            .edit(target, existingMessageId, body)
+            .pipe(toMessagingOperationFailed)
+            .pipe(Effect.as(existingMessageId))
+        : yield* adapter.post(target, body).pipe(toMessagingOperationFailed);
       this.#posts.set(key, { connectionId: live.record.connectionId, target, messageId, stopToken });
       return;
     }
@@ -613,50 +1096,70 @@ export class MessagingService {
             : "failed";
     // A follow-up turn answers a teammate's reply: the person's message already shows how its own turn ended.
     if (activity.type === "cancelled" || !activity.followUp) {
-      await adapter.react(target, activity.origin.platformMessageId, "received", false).catch(() => undefined);
-      await adapter.react(target, activity.origin.platformMessageId, reaction, true).catch(() => undefined);
+      yield* adapter.react(target, origin.platformMessageId, "received", false).pipe(Effect.catch(() => Effect.void));
+      yield* adapter.react(target, origin.platformMessageId, reaction, true).pipe(Effect.catch(() => Effect.void));
     }
     if (activity.type === "cancelled" || activity.status === "interrupted") {
-      await this.#say(adapter, target, placeholder, sourceText("status.messaging.stopped"));
+      yield* this.#say(adapter, target, placeholder, sourceText("status.messaging.stopped"));
       return;
     }
     if (activity.status === "failed") {
       // The provider's error can hold local paths or MCP values, so Slack gets a fixed sentence.
-      await this.#say(adapter, target, placeholder, sourceText("status.messaging.failed"));
+      yield* this.#say(adapter, target, placeholder, sourceText("status.messaging.failed"));
       return;
     }
     // Slack is outside this computer, so a secret in the answer must not reach it.
-    if (activity.answer) await adapter.postAnswer(target, redactText(activity.answer), placeholder);
+    if (activity.answer) {
+      const answer = redactText(activity.answer);
+      yield* adapter.postAnswer(target, answer, placeholder).pipe(toMessagingOperationFailed);
+    }
     // A turn that only asked a teammate has nothing to say yet: the answer comes back to this thread.
     else if (!activity.followUp && this.#threads.awaitsTeammate(activity.link.linkId))
-      await this.#say(adapter, target, placeholder, sourceText("status.messaging.delegated"));
-    else await this.#say(adapter, target, placeholder, sourceText("status.messaging.noAnswer"));
+      yield* this.#say(adapter, target, placeholder, sourceText("status.messaging.delegated"));
+    else yield* this.#say(adapter, target, placeholder, sourceText("status.messaging.noAnswer"));
     if (activity.files.length) {
-      const skipped = await adapter.upload(target, activity.files);
+      const skipped = yield* adapter.upload(target, activity.files).pipe(toMessagingOperationFailed);
       if (skipped.length)
-        await adapter.post(target, {
-          text: sourceText("status.messaging.filesSkipped", { names: skipped.join(", ") }),
-        });
+        yield* adapter
+          .post(target, {
+            text: sourceText("status.messaging.filesSkipped", { names: skipped.join(", ") }),
+          })
+          .pipe(toMessagingOperationFailed);
     }
-  }
+  });
 
-  async #say(
+  readonly #say = Effect.fn("MessagingService.say")(function* (
+    this: MessagingService,
     adapter: MessagingAdapter,
     target: MessageTarget,
     placeholder: string | null,
     text: string,
-  ): Promise<void> {
-    if (placeholder) await adapter.edit(target, placeholder, { text });
-    else await adapter.post(target, { text });
+  ) {
+    if (placeholder) yield* adapter.edit(target, placeholder, { text }).pipe(toMessagingOperationFailed);
+    else yield* adapter.post(target, { text }).pipe(toMessagingOperationFailed);
+  });
+
+  #dispatch<A>(operation: Effect.Effect<A, MessagingOperationFailed>): void {
+    if (!this.#started) return;
+    Effect.runFork(
+      operation.pipe(
+        Effect.catch((error) => Effect.sync(() => this.#warn(error.cause))),
+        Effect.uninterruptible,
+        Effect.forkIn(this.#scope, { startImmediately: true }),
+      ),
+    );
   }
 
   #agentEvent(event: AgentEvent): void {
-    if (event.type === "approval") void this.#approval(event.approval).catch((error) => this.#warn(error));
+    if (event.type === "approval") this.#dispatch(this.#approval(event.approval));
     else if (event.type === "agent-input-resolved" && event.kind === "approval")
-      void this.#approvalResolved(event.requestId).catch((error) => this.#warn(error));
+      this.#dispatch(this.#approvalResolved(event.requestId));
   }
 
-  async #approval(approval: AgentApproval): Promise<void> {
+  readonly #approval = Effect.fn("MessagingService.approval")(function* (
+    this: MessagingService,
+    approval: AgentApproval,
+  ) {
     const link = this.#threads.store.linkForThread(approval.threadId);
     const live = link ? this.#live.get(link.connectionId) : undefined;
     if (!link || !live) return;
@@ -693,81 +1196,104 @@ export class MessagingService {
     };
     this.#approvals.set(accept, pending);
     this.#approvals.set(decline, pending);
-    try {
-      pending.messageId = await live.adapter.post(target, {
+    pending.messageId = yield* live.adapter
+      .post(target, {
         text,
         buttons: [
           { action: "accept", label: sourceText("status.messaging.approve"), token: accept, style: "primary" },
           { action: "decline", label: sourceText("status.messaging.deny"), token: decline, style: "danger" },
         ],
-      });
-    } catch (error) {
-      this.#approvals.delete(accept);
-      this.#approvals.delete(decline);
-      throw error;
-    }
-  }
+      })
+      .pipe(toMessagingOperationFailed)
+      .pipe(
+        Effect.onError(() =>
+          Effect.sync(() => {
+            this.#approvals.delete(accept);
+            this.#approvals.delete(decline);
+          }),
+        ),
+      );
+  });
 
-  async #approvalResolved(requestId: string | number): Promise<void> {
+  readonly #approvalResolved = Effect.fn("MessagingService.approvalResolved")(function* (
+    this: MessagingService,
+    requestId: string | number,
+  ) {
     const entries = [...this.#approvals.entries()].filter(([, pending]) => pending.requestId === requestId);
     const pending = entries[0]?.[1];
     for (const [key] of entries) this.#approvals.delete(key);
     if (!pending || pending.answered) return;
     const live = this.#live.get(pending.connectionId);
-    if (!pending.messageId) return;
-    await live?.adapter.edit(pending.target, pending.messageId, {
-      text: `${pending.text}\n${sourceText("status.messaging.answeredOnHost")}`,
-    });
-  }
+    const messageId = pending.messageId;
+    if (!messageId || !live) return;
+    yield* live.adapter
+      .edit(pending.target, messageId, {
+        text: `${pending.text}\n${sourceText("status.messaging.answeredOnHost")}`,
+      })
+      .pipe(toMessagingOperationFailed);
+  });
 
-  async #action(live: LiveConnection, action: InboundAction): Promise<void> {
+  readonly #action = Effect.fn("MessagingService.action")(function* (
+    this: MessagingService,
+    live: LiveConnection,
+    action: InboundAction,
+  ) {
     const { adapter } = live;
     if (action.type === "stop") {
       const stop = this.#stops.get(action.token);
       if (!stop || stop.connectionId !== live.record.connectionId) return;
       if (action.actorId !== stop.authorId) {
-        await adapter.postPrivate(
-          action.target,
-          action.actorId,
-          sourceText("status.messaging.onlyRequester", { user: adapter.mention(stop.authorId) }),
-        );
+        yield* adapter
+          .postPrivate(
+            action.target,
+            action.actorId,
+            sourceText("status.messaging.onlyRequester", { user: adapter.mention(stop.authorId) }),
+            action.replyHandle,
+          )
+          .pipe(toMessagingOperationFailed);
         return;
       }
-      await this.#threads.stop(stop.linkId, stop.authorId);
+      yield* this.#threads.stop(stop.linkId, stop.authorId).pipe(toMessagingOperationFailed);
       return;
     }
     const pending = this.#approvals.get(action.token);
     if (!pending || pending.connectionId !== live.record.connectionId) {
-      await adapter
+      yield* adapter
         .edit(action.target, action.platformMessageId, { text: sourceText("status.messaging.requestInactive") })
-        .catch(() => undefined);
+        .pipe(Effect.catch(() => Effect.void));
       return;
     }
     if (!pending.allowedUserId || action.actorId !== pending.allowedUserId) {
-      await adapter.postPrivate(
-        action.target,
-        action.actorId,
-        pending.allowedUserId
-          ? sourceText("status.messaging.onlyRequester", { user: adapter.mention(pending.allowedUserId) })
-          : sourceText("status.messaging.hostOnly"),
-      );
+      yield* adapter
+        .postPrivate(
+          action.target,
+          action.actorId,
+          pending.allowedUserId
+            ? sourceText("status.messaging.onlyRequester", { user: adapter.mention(pending.allowedUserId) })
+            : sourceText("status.messaging.hostOnly"),
+          action.replyHandle,
+        )
+        .pipe(toMessagingOperationFailed);
       return;
     }
     pending.answered = true;
-    let outcome: string;
-    try {
-      await this.#agents.respondToApproval({ requestId: pending.requestId, decision: action.decision });
-      outcome = sourceText(action.decision === "accept" ? "status.messaging.approvedBy" : "status.messaging.deniedBy", {
-        user: adapter.mention(action.actorId),
-      });
-    } catch {
-      outcome = sourceText("status.messaging.requestInactive");
-    }
+    const answered = yield* Effect.result(
+      this.#agents
+        .respondToApproval({ requestId: pending.requestId, decision: action.decision })
+        .pipe(toMessagingOperationFailed),
+    );
+    const outcome = Result.isFailure(answered)
+      ? sourceText("status.messaging.requestInactive")
+      : sourceText(action.decision === "accept" ? "status.messaging.approvedBy" : "status.messaging.deniedBy", {
+          user: adapter.mention(action.actorId),
+        });
     for (const [key, candidate] of this.#approvals) if (candidate === pending) this.#approvals.delete(key);
-    await adapter.edit(pending.target, pending.messageId ?? action.platformMessageId, {
-      text: `${pending.text}\n${outcome}`,
-    });
-  }
+    yield* adapter
+      .edit(pending.target, pending.messageId ?? action.platformMessageId, {
+        text: `${pending.text}\n${outcome}`,
+      })
+      .pipe(toMessagingOperationFailed);
+  }, Effect.uninterruptible);
 
   // Helpers.
 
@@ -775,25 +1301,66 @@ export class MessagingService {
    * Runs the posts of one conversation in order. A turn can start and end while the post that
    * announced it is still on its way, and the answer must replace that post, not race it.
    */
-  #serial(linkId: string, task: () => Promise<void>): void {
-    const next = (this.#chains.get(linkId) ?? Promise.resolve())
-      .then(task)
-      .catch((error) => this.#warn(error))
-      .finally(() => {
-        if (this.#chains.get(linkId) === next) this.#chains.delete(linkId);
-      });
+  readonly #serial = Effect.fn("MessagingService.serial")(function* (
+    this: MessagingService,
+    linkId: string,
+    task: Effect.Effect<void, MessagingOperationFailed>,
+  ) {
+    const previous = this.#chains.get(linkId);
+    const next = Deferred.makeUnsafe<void>();
     this.#chains.set(linkId, next);
+    yield* Effect.forkIn(
+      Effect.gen({ self: this }, function* () {
+        if (previous) yield* Deferred.await(previous);
+        yield* task.pipe(Effect.catch((error) => Effect.sync(() => this.#warn(error.cause))));
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            Deferred.doneUnsafe(next, Effect.void);
+            if (this.#chains.get(linkId) === next) this.#chains.delete(linkId);
+          }),
+        ),
+      ),
+      this.#scope,
+      { startImmediately: true, uninterruptible: true },
+    );
+  });
+
+  #requireConnection(platform: MessagingPlatform, workspaceId: string): MessagingConnectionRecord {
+    const record = this.#threads.store.connectionForWorkspace(platform, workspaceId);
+    if (!record)
+      throw new Error(
+        sourceText(
+          platform === "discord"
+            ? "error.messaging.discordNotConnected"
+            : platform === "telegram"
+              ? "error.messaging.telegramNotConnected"
+              : "error.messaging.notConnected",
+        ),
+      );
+    return record;
   }
 
-  #requireConnection(workspaceId: string): MessagingConnectionRecord {
-    const record = this.#threads.store.connectionForWorkspace("slack", workspaceId);
-    if (!record) throw new Error(sourceText("error.messaging.notConnected"));
+  /** A connection that can start again. A chat that removed the bot needs a new link first. */
+  #requireLinked(platform: MessagingPlatform, workspaceId: string): MessagingConnectionRecord {
+    const record = this.#requireConnection(platform, workspaceId);
+    if (record.lastErrorCode === "removed") throw new Error(sourceText("error.messaging.telegramNotConnected"));
     return record;
+  }
+
+  #requireTelegram(): { app: TelegramAppPort; ingress: MessagingIngress } {
+    if (!this.#telegramApp || !this.#ingress) throw new Error(sourceText("error.messaging.telegramUnsupported"));
+    return { app: this.#telegramApp, ingress: this.#ingress };
   }
 
   #requireConnect(): SlackConnect {
     if (!this.#connect) throw new Error(sourceText("error.messaging.unsupported"));
     return this.#connect;
+  }
+
+  #requireDiscordConnect(): DiscordConnect {
+    if (!this.#discordConnect) throw new Error(sourceText("error.messaging.discordUnsupported"));
+    return this.#discordConnect;
   }
 
   #warn(error: unknown): void {
@@ -815,3 +1382,16 @@ function linkTarget(link: MessagingLink): MessageTarget {
 function token(): string {
   return randomBytes(16).toString("hex");
 }
+
+export class MessagingOperationFailed extends Schema.TaggedError<MessagingOperationFailed>()(
+  "MessagingOperationFailed",
+  {
+    cause: Schema.Defect(),
+  },
+) {}
+
+const {
+  io: messagingIo,
+  sync: messagingStep,
+  rewrap: toMessagingOperationFailed,
+} = causeHelpers(MessagingOperationFailed);

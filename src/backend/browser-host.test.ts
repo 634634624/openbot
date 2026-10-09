@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import { isBrowserSecretRequest } from "@openbot/contracts/ipc";
+import { Effect, Fiber } from "effect";
 import {
   BrowserWindow,
   type HandlerDetails,
@@ -12,8 +13,10 @@ import {
   webContents,
 } from "electron";
 import { afterEach, assert, beforeEach, describe, expect, it, vi } from "vitest";
+import { browserCall, browserFailure } from "./browser-effects";
 import { BrowserHost } from "./browser-host";
 import type { BrowserContextMenuParams } from "./browser-shortcuts";
+
 import type { DynamicToolResult } from "./protocol";
 
 const windowOpenHandlers = vi.hoisted(
@@ -99,7 +102,7 @@ vi.mock("electron", async () => {
     navigationHistory = { clear() {}, canGoBack: () => false, canGoForward: () => false };
   }
   return {
-    app: { getPreferredSystemLanguages: () => ["en-US"] },
+    app: { getPreferredSystemLanguages: () => ["en-US"], userAgentFallback: "Chrome/144.0.0.0" },
     clipboard: {
       writeText(text: string) {
         clipboardWrites.push(text);
@@ -155,34 +158,58 @@ vi.mock("electron", async () => {
   };
 });
 
-import type { BrowserScreencastFrame, BrowserScreencastOptions } from "./browser-cdp";
+import { BrowserCdpEngine, type BrowserScreencastFrame, type BrowserScreencastOptions } from "./browser-cdp";
+import { runCauseEffect } from "./effect-boundary";
 
 const viewFrames = vi.hoisted((): Array<(frame: BrowserScreencastFrame) => void> => []);
 const secretEntry = vi.hoisted(() => vi.fn<(secret: string) => Promise<void>>());
-const secretClear = vi.hoisted(() => vi.fn<() => Promise<boolean>>());
+const secretClear = vi.hoisted(() => vi.fn<(secret: string) => Promise<boolean>>());
 
 vi.mock("./browser-cdp", () => ({
   BrowserCdpEngine: class {
     constructor(private readonly contents: WebContents) {}
-    destroy() {}
+    destroy() {
+      return Effect.void;
+    }
     invalidateReferences() {}
-    async prepareSecret() {
-      return { enter: secretEntry, clear: secretClear, fields: { password: true, oneTimeCode: false } };
+    releaseViewButton() {}
+    cancelPendingCommands() {
+      return true;
     }
-    async evaluate() {
-      return "page value";
+    click() {
+      return Effect.void;
     }
-    async settle() {}
-    async startScreencast(_options: BrowserScreencastOptions, onFrame: (frame: BrowserScreencastFrame) => void) {
+    screenshot() {
+      return Effect.fail(browserFailure(new Error("Preview unavailable in this fixture.")));
+    }
+    snapshot() {
+      return Effect.fail(browserFailure(new Error("Snapshot unavailable in this fixture.")));
+    }
+    prepareSecret() {
+      return Effect.succeed({
+        enter: (secret: string) => browserCall(() => secretEntry(secret)),
+        clear: (secret: string) => browserCall(() => secretClear(secret)),
+        fields: { password: true, oneTimeCode: false },
+      });
+    }
+    evaluate() {
+      return Effect.succeed("page value");
+    }
+    settle() {
+      return Effect.void;
+    }
+    startScreencast(_options: BrowserScreencastOptions, onFrame: (frame: BrowserScreencastFrame) => void) {
       viewFrames.push(onFrame);
-      return async () => undefined;
+      return Effect.succeed(() => Effect.void);
     }
-    async setEnvironment() {}
+    setEnvironment() {
+      return Effect.void;
+    }
     hasUploadDocuments() {
       return false;
     }
-    async navigate(url: string) {
-      await this.contents.loadURL(url);
+    navigate(url: string) {
+      return browserCall(() => this.contents.loadURL(url));
     }
   },
 }));
@@ -206,7 +233,7 @@ beforeEach(async () => {
   host = new BrowserHost(browserWindow, directory, statePath);
 });
 afterEach(async () => {
-  await host.destroy();
+  await runCauseEffect(host.destroy());
   await rm(directory, { recursive: true, force: true });
   vi.restoreAllMocks();
   vi.useRealTimers();
@@ -219,9 +246,11 @@ describe.each(["main", "picture-in-picture"] as const)("%s browser view bounds",
     const targetWindow = target === "main" ? browserWindow : pictureInPictureWindow;
     vi.spyOn(targetWindow.webContents, "getZoomFactor").mockReturnValue(zoomFactor);
     const setBounds = vi.spyOn(WebContentsView.prototype, "setBounds");
-    await host.open("https://example.com");
+    await runCauseEffect(host.open("https://example.com"));
 
-    await host.setVisible({ visible: true, target, bounds: { x: 40, y: 100, width: 1200, height: 600 } });
+    await runCauseEffect(
+      host.setVisible({ visible: true, target, bounds: { x: 40, y: 100, width: 1200, height: 600 } }),
+    );
 
     expect(setBounds).toHaveBeenLastCalledWith({
       x: Math.floor(40 * zoomFactor),
@@ -243,10 +272,10 @@ describe("browser Escape forwarding", () => {
   };
 
   it("collapses the expanded browser in the main window", async () => {
-    const tab = await host.open("https://example.com/escape");
+    const tab = await runCauseEffect(host.open("https://example.com/escape"));
     const page = contentsFor(tab.url);
     const sendInputEvent = vi.spyOn(browserWindow.webContents, "sendInputEvent");
-    await host.setVisible({ visible: true, target: "main", bounds: pageBounds });
+    await runCauseEffect(host.setVisible({ visible: true, target: "main", bounds: pageBounds }));
 
     page.emit("before-input-event", { preventDefault: () => undefined }, escapeInput);
 
@@ -257,11 +286,11 @@ describe("browser Escape forwarding", () => {
   it("leaves Escape in Picture in Picture, which has its own window", async () => {
     const pictureInPictureWindow = new BrowserWindow();
     host.setPictureInPictureWindow(pictureInPictureWindow);
-    const tab = await host.open("https://example.com/detached");
+    const tab = await runCauseEffect(host.open("https://example.com/detached"));
     const page = contentsFor(tab.url);
     const askedPage = vi.spyOn(page.mainFrame, "executeJavaScript");
     const sendInputEvent = vi.spyOn(browserWindow.webContents, "sendInputEvent");
-    await host.setVisible({ visible: true, target: "picture-in-picture", bounds: pageBounds });
+    await runCauseEffect(host.setVisible({ visible: true, target: "picture-in-picture", bounds: pageBounds }));
 
     page.emit("before-input-event", { preventDefault: () => undefined }, escapeInput);
 
@@ -272,11 +301,11 @@ describe("browser Escape forwarding", () => {
   });
 
   it("keeps Escape in the page while an editable element has focus", async () => {
-    const tab = await host.open("https://example.com/editable");
+    const tab = await runCauseEffect(host.open("https://example.com/editable"));
     const page = contentsFor(tab.url);
     const askedPage = vi.spyOn(page.mainFrame, "executeJavaScript").mockResolvedValue(true);
     const sendInputEvent = vi.spyOn(browserWindow.webContents, "sendInputEvent");
-    await host.setVisible({ visible: true, target: "main", bounds: pageBounds });
+    await runCauseEffect(host.setVisible({ visible: true, target: "main", bounds: pageBounds }));
 
     page.emit("before-input-event", { preventDefault: () => undefined }, escapeInput);
 
@@ -286,8 +315,127 @@ describe("browser Escape forwarding", () => {
 });
 
 describe("browser address navigation", () => {
+  it.each(["click", "evaluate"] as const)("stops active %s work before the next navigation", async (tool) => {
+    const tab = await runCauseEffect(host.open("https://example.com/tool-cancel", "thread-a", "agent-a"));
+    let started = false;
+    let stopped = false;
+    vi.spyOn(BrowserCdpEngine.prototype, tool).mockImplementationOnce(() =>
+      Effect.gen(function* () {
+        started = true;
+        return yield* Effect.never;
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            stopped = true;
+          }),
+        ),
+      ),
+    );
+    const pending = Effect.runFork(
+      host.handleDynamicTool({
+        namespace: "openbot_browser",
+        tool,
+        arguments:
+          tool === "click"
+            ? { tabId: tab.id, target: { kind: "point", x: 1, y: 1 } }
+            : { tabId: tab.id, expression: "1" },
+        threadId: "thread-a",
+        ownerAgentId: "agent-a",
+        turnId: "turn-a",
+        callId: "call-a",
+      }),
+    );
+    await vi.waitFor(() => expect(started).toBe(true));
+    await Effect.runPromise(Fiber.interrupt(pending));
+    await runCauseEffect(host.loadUrl(tab.id, "https://example.com/after-cancel"));
+    expect(stopped).toBe(true);
+    expect(host.listTabs()).toEqual([expect.objectContaining({ id: tab.id, url: "https://example.com/after-cancel" })]);
+  });
+
+  it("keeps the queue blocked when an external debugger cannot cancel a command before dispatch", async () => {
+    const tab = await runCauseEffect(host.open("https://example.com/external-debugger", "thread-a", "agent-a"));
+    const contents = webContents.getAllWebContents().find((candidate) => candidate.getURL() === tab.url);
+    if (!contents) throw new Error("Browser contents were not created.");
+    let started = false;
+    let inFlight = true;
+    let overlap = false;
+    let resolveCommand: () => void = () => undefined;
+    const command = new Promise<void>((resolve) => {
+      resolveCommand = () => {
+        resolve();
+      };
+    });
+    vi.spyOn(BrowserCdpEngine.prototype, "cancelPendingCommands").mockReturnValue(false);
+    vi.spyOn(BrowserCdpEngine.prototype, "click").mockImplementationOnce(() =>
+      browserCall(() => {
+        started = true;
+        return command;
+      }),
+    );
+    const loadUrl = contents.loadURL.bind(contents);
+    vi.spyOn(contents, "loadURL").mockImplementation((url, options) => {
+      overlap = inFlight;
+      return loadUrl(url, options);
+    });
+    const pending = Effect.runFork(
+      host.handleDynamicTool({
+        namespace: "openbot_browser",
+        tool: "click",
+        arguments: { tabId: tab.id, target: { kind: "point", x: 1, y: 1 } },
+        threadId: "thread-a",
+        ownerAgentId: "agent-a",
+        turnId: "turn-a",
+        callId: "call-a",
+      }),
+    );
+    await vi.waitFor(() => expect(started).toBe(true));
+    await Effect.runPromise(Fiber.interrupt(pending));
+    const next = Effect.runFork(host.loadUrl(tab.id, "https://example.com/after-external"));
+    inFlight = false;
+    resolveCommand();
+    await Effect.runPromise(Fiber.join(next));
+    expect(overlap).toBe(false);
+    expect(host.listTabs()).toEqual([
+      expect.objectContaining({ id: tab.id, url: "https://example.com/after-external" }),
+    ]);
+  });
+
+  it("closes only the tab whose opening was cancelled", async () => {
+    const existing = await runCauseEffect(host.open("https://example.com/existing"));
+    const prototype = Object.getPrototypeOf(new WebContentsView().webContents);
+    const load = vi.spyOn(prototype, "loadURL").mockImplementationOnce(() => new Promise(() => undefined));
+    const opening = Effect.runFork(host.open("https://example.com/pending", "thread-a", "agent-a"));
+    await vi.waitFor(() => expect(load).toHaveBeenCalled());
+    await Effect.runPromise(Fiber.interrupt(opening));
+    expect(host.listTabs()).toEqual([expect.objectContaining({ id: existing.id })]);
+    await expect(runCauseEffect(host.open("https://example.com/retry"))).resolves.toMatchObject({
+      url: "https://example.com/retry",
+    });
+  });
+
+  it("stops active navigation, skips cancelled queued navigation, and permits a retry", async () => {
+    const tab = await runCauseEffect(host.open("https://example.com/cancel-navigation"));
+    const contents = webContents.getAllWebContents().find((candidate) => candidate.getURL() === tab.url);
+    if (!contents) throw new Error("Browser contents were not created.");
+    const load = vi.spyOn(contents, "loadURL").mockImplementationOnce(() => new Promise(() => undefined));
+    const loading = vi.spyOn(contents, "isLoading").mockReturnValue(true);
+    const stop = vi.spyOn(contents, "stop").mockImplementation(() => {
+      loading.mockReturnValue(false);
+      contents.emit("did-stop-loading");
+    });
+    const active = Effect.runFork(host.loadUrl(tab.id, "https://example.com/pending"));
+    await vi.waitFor(() => expect(load).toHaveBeenCalledOnce());
+    const queued = Effect.runFork(host.loadUrl(tab.id, "https://example.com/cancelled"));
+    await Effect.runPromise(Fiber.interrupt(queued));
+    await Effect.runPromise(Fiber.interrupt(active));
+    await runCauseEffect(host.loadUrl(tab.id, "https://example.com/retry"));
+    expect(stop).toHaveBeenCalledOnce();
+    expect(load.mock.calls.map(([url]) => url)).toEqual(["https://example.com/pending", "https://example.com/retry"]);
+    expect(host.listTabs()).toEqual([expect.objectContaining({ id: tab.id, url: "https://example.com/retry" })]);
+  });
+
   it("releases the tab queue after an address navigation times out", async () => {
-    const tab = await host.open("https://example.com/timeout-test");
+    const tab = await runCauseEffect(host.open("https://example.com/timeout-test"));
     const contents = webContents.getAllWebContents().find((candidate) => candidate.getURL() === tab.url);
     if (!contents) throw new Error("Browser contents were not created.");
     let signalStarted: (() => void) | undefined;
@@ -307,10 +455,12 @@ describe("browser address navigation", () => {
       contents.emit("did-stop-loading");
       rejectLoading?.(new Error("Navigation stopped."));
     });
-    vi.useFakeTimers();
-    const failure = expect(host.loadUrl(tab.id, "https://example.com/slow")).rejects.toThrow("Navigation timed out.");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const failure = expect(runCauseEffect(host.loadUrl(tab.id, "https://example.com/slow"))).rejects.toThrow(
+      "Navigation timed out.",
+    );
     await started;
-    const recovery = host.loadUrl(tab.id, "https://example.com/recovered");
+    const recovery = runCauseEffect(host.loadUrl(tab.id, "https://example.com/recovered"));
     await vi.advanceTimersByTimeAsync(10_000);
     await failure;
     await recovery;
@@ -320,10 +470,10 @@ describe("browser address navigation", () => {
   });
 
   it("loads an address in the selected tab without adding a tab or changing its owner", async () => {
-    const first = await host.open("https://example.com/first", "thread-a", "agent-a");
-    const second = await host.open("https://example.com/second", "thread-a", "agent-a");
+    const first = await runCauseEffect(host.open("https://example.com/first", "thread-a", "agent-a"));
+    const second = await runCauseEffect(host.open("https://example.com/second", "thread-a", "agent-a"));
 
-    await host.loadUrl(second.id, "https://www.google.com/search?q=hello");
+    await runCauseEffect(host.loadUrl(second.id, "https://www.google.com/search?q=hello"));
 
     expect(host.getDisplayState()).toMatchObject({
       activeTabId: second.id,
@@ -338,7 +488,7 @@ describe("browser address navigation", () => {
       ],
     });
     expect(host.listTabs()).toHaveLength(2);
-    await expect(host.loadUrl(second.id, "file:///tmp/test")).rejects.toThrow("Only HTTP(S)");
+    await expect(runCauseEffect(host.loadUrl(second.id, "file:///tmp/test"))).rejects.toThrow("Only HTTP(S)");
     expect(host.listTabs()).toHaveLength(2);
   });
 });
@@ -356,7 +506,7 @@ describe("browser auth popups", () => {
     });
   }
   async function popupRequest(url = "https://accounts.example.com/auth") {
-    const opener = await host.open("https://example.com/start", "thread-a", "agent-a");
+    const opener = await runCauseEffect(host.open("https://example.com/start", "thread-a", "agent-a"));
     const handler = windowOpenHandlers.at(-1);
     if (!handler) throw new Error("Window open handler was not set.");
     return { opener, outcome: handler({ url }) };
@@ -383,9 +533,9 @@ describe("browser auth popups", () => {
     expect(host.listTabs()).toHaveLength(2);
     expect(popup).toMatchObject({ ownerThreadId: "thread-a", ownerAgentId: "agent-a", openerTabId: opener.id });
     expect(host.activeTabId).toBe(popup?.id);
-    const listed = await listTabsFor("agent-a", "thread-a");
+    const listed = await runCauseEffect(listTabsFor("agent-a", "thread-a"));
     expect(JSON.stringify(listed)).toContain(opener.id);
-    const other = await listTabsFor("agent-b", "thread-b");
+    const other = await runCauseEffect(listTabsFor("agent-b", "thread-b"));
     expect(JSON.stringify(other)).not.toContain(popup?.id);
     native.emit("destroyed");
     await vi.waitFor(() => expect(host.listTabs()).toHaveLength(1));
@@ -417,19 +567,19 @@ describe("browser auth popups", () => {
 
   it("requires takeover while a connected tab shows the secret's site", async () => {
     const { opener, popup } = await connectedPopup("https://accounts.example.com/auth");
-    await expect(prepareSecret(popup.id)).rejects.toThrow("Use takeover");
-    await expect(prepareSecret(opener.id)).rejects.toThrow("Use takeover");
+    await expect(runCauseEffect(prepareSecret(popup.id))).rejects.toThrow("Use takeover");
+    await expect(runCauseEffect(prepareSecret(opener.id))).rejects.toThrow("Use takeover");
     expect(secretEntry).not.toHaveBeenCalled();
-    await host.close(popup.id);
-    const prepared = await prepareSecret(opener.id);
+    await runCauseEffect(host.close(popup.id));
+    const prepared = await runCauseEffect(prepareSecret(opener.id));
     prepared.cancel();
   });
 
   it("allows secure input in a popup from another site until a connected tab reaches its site", async () => {
     const { opener, popup } = await connectedPopup("https://appleid.apple.com/auth");
-    const prepared = await prepareSecret(popup.id);
-    await host.loadUrl(opener.id, "https://idmsa.apple.com/start");
-    await expect(prepared.submit("password")).rejects.toThrow("Use takeover");
+    const prepared = await runCauseEffect(prepareSecret(popup.id));
+    await runCauseEffect(host.loadUrl(opener.id, "https://idmsa.apple.com/start"));
+    await expect(runCauseEffect(prepared.submit("password"))).rejects.toThrow("Use takeover");
     expect(secretEntry).not.toHaveBeenCalled();
     prepared.cancel();
   });
@@ -443,7 +593,7 @@ describe("browser auth popups", () => {
     const handler = windowOpenHandlers[windowOpenHandlers.length - 2];
     handler?.({ url: "https://example.com/independent" }).createWindow?.({});
     const independent = host.activeTabId;
-    await host.close(opener.id);
+    await runCauseEffect(host.close(opener.id));
     expect(host.listTabs().map((tab) => tab.id)).toEqual([independent]);
     expect(host.listTabs().some((tab) => tab.id === dependent)).toBe(false);
   });
@@ -480,13 +630,13 @@ describe("browser auth popups", () => {
     outcome.createWindow?.({ webContents: native });
     await native.loadURL("https://example.com/callback?code=private-code");
     const popupId = host.activeTabId;
-    await host.activate(opener.id);
+    await runCauseEffect(host.activate(opener.id));
     const state = await readFile(statePath, "utf8");
     expect(state).not.toContain("private-code");
     expect(state).not.toContain("openerTabId");
-    await host.destroy();
+    await runCauseEffect(host.destroy());
     host = new BrowserHost(browserWindow, directory, statePath);
-    await host.restore();
+    await runCauseEffect(host.restore());
     expect(host.listTabs().find((tab) => tab.id === popupId)).toMatchObject({ url: "https://example.com/callback" });
     expect(host.listTabs().every((tab) => tab.openerTabId === undefined)).toBe(true);
   });
@@ -498,7 +648,7 @@ describe("browser auth popups", () => {
     expect(host.listTabs().at(-1)?.popupFailure?.message).toContain("tab limit");
     const [first] = host.listTabs();
     assert(first);
-    await host.close(first.id);
+    await runCauseEffect(host.close(first.id));
     const outcome = handler?.({ url: "https://example.com/auth" });
     expect(outcome?.action).toBe("allow");
     outcome?.createWindow?.({});
@@ -508,44 +658,46 @@ describe("browser auth popups", () => {
 
 async function fill(ownerThreadId: string | null, ownerAgentId: string | null) {
   for (let index = 0; index < INPUT_LIMITS.browserTabs; index += 1) {
-    await host.open(`https://example.com/${index}`, ownerThreadId, ownerAgentId);
+    await runCauseEffect(host.open(`https://example.com/${index}`, ownerThreadId, ownerAgentId));
   }
 }
 
 describe("browser tab capacity", () => {
   it("opens Google from an empty state even when another agent fills its limit", async () => {
-    const first = await host.open("https://www.google.com", "thread-a", "agent-a");
-    await host.close(first.id);
+    const first = await runCauseEffect(host.open("https://www.google.com", "thread-a", "agent-a"));
+    await runCauseEffect(host.close(first.id));
     await fill("thread-b", "agent-b");
-    const tab = await host.open("https://www.google.com", "thread-a", "agent-a");
+    const tab = await runCauseEffect(host.open("https://www.google.com", "thread-a", "agent-a"));
     expect(tab).toMatchObject({ url: "https://www.google.com/", ownerAgentId: "agent-a" });
     expect(host.listTabs().filter((entry) => entry.ownerAgentId === "agent-a")).toEqual([tab]);
   });
 
   it("enforces 25 tabs per agent and frees capacity on close", async () => {
     await fill("thread-a", "agent-a");
-    await expect(host.open("https://www.google.com", "new-thread-a", "agent-a")).rejects.toThrow(
+    await expect(runCauseEffect(host.open("https://www.google.com", "new-thread-a", "agent-a"))).rejects.toThrow(
       "The browser can have up to 25 open tabs.",
     );
     const tab = host.listTabs()[0];
     assert(tab);
-    await host.close(tab.id);
-    await host.open("https://www.google.com", "thread-a", "agent-a");
+    await runCauseEffect(host.close(tab.id));
+    await runCauseEffect(host.open("https://www.google.com", "thread-a", "agent-a"));
     expect(host.listTabs()).toHaveLength(25);
   });
 
   it("counts legacy thread-only tabs with the agent that displays them", async () => {
     await fill("thread-a", null);
-    await expect(host.open("https://www.google.com", "thread-a", "agent-a")).rejects.toThrow("25 open tabs");
-    await expect(host.open("https://www.google.com", "thread-b", "agent-b")).resolves.toMatchObject({
+    await expect(runCauseEffect(host.open("https://www.google.com", "thread-a", "agent-a"))).rejects.toThrow(
+      "25 open tabs",
+    );
+    await expect(runCauseEffect(host.open("https://www.google.com", "thread-b", "agent-b"))).resolves.toMatchObject({
       ownerAgentId: "agent-b",
     });
   });
 
   it("keeps unowned tabs in a separate limited group", async () => {
     await fill(null, null);
-    await expect(host.open("https://www.google.com")).rejects.toThrow("25 open tabs");
-    await expect(host.open("https://www.google.com", "thread-a", "agent-a")).resolves.toMatchObject({
+    await expect(runCauseEffect(host.open("https://www.google.com"))).rejects.toThrow("25 open tabs");
+    await expect(runCauseEffect(host.open("https://www.google.com", "thread-a", "agent-a"))).resolves.toMatchObject({
       ownerAgentId: "agent-a",
     });
   });
@@ -558,11 +710,11 @@ describe("browser tab capacity", () => {
       ownerAgentId: index === 0 ? null : "agent-a",
     }));
     await writeFile(statePath, JSON.stringify({ version: 2, tabs, activeTabId: "tab-0" }));
-    await host.restore([{ id: "agent-a", threadId: "thread-a" }]);
+    await runCauseEffect(host.restore([{ id: "agent-a", threadId: "thread-a" }]));
     // Popups inherit the legacy tab's thread ID and null agent ID.
-    await expect(host.open("https://www.google.com", "thread-a", null)).rejects.toThrow("25 open tabs");
-    await host.close("tab-1");
-    await host.open("https://www.google.com", "thread-a", null);
+    await expect(runCauseEffect(host.open("https://www.google.com", "thread-a", null))).rejects.toThrow("25 open tabs");
+    await runCauseEffect(host.close("tab-1"));
+    await runCauseEffect(host.open("https://www.google.com", "thread-a", null));
     expect(host.listTabs()).toHaveLength(25);
   });
 
@@ -570,14 +722,14 @@ describe("browser tab capacity", () => {
     await fill("thread-a", "agent-a");
     await fill("thread-b", "agent-b");
     const before = host.getDisplayState();
-    await host.destroy();
+    await runCauseEffect(host.destroy());
     host = new BrowserHost(new BrowserWindow(), directory, statePath);
-    await host.restore();
+    await runCauseEffect(host.restore());
     const summary = (state: typeof before) =>
       state.tabs.map(({ id, url, ownerAgentId }) => ({ id, url, ownerAgentId }));
     expect(summary(host.getDisplayState())).toEqual(summary(before));
     expect(host.activeTabId).toBe(before.activeTabId);
-    await expect(host.open("https://www.google.com", "thread-c", "agent-c")).resolves.toMatchObject({
+    await expect(runCauseEffect(host.open("https://www.google.com", "thread-c", "agent-c"))).resolves.toMatchObject({
       ownerAgentId: "agent-c",
     });
   });
@@ -590,32 +742,32 @@ describe("browser tab capacity", () => {
       ownerAgentId: null,
     }));
     await writeFile(statePath, JSON.stringify({ version: 2, tabs, activeTabId: "tab-b" }));
-    await host.restore();
+    await runCauseEffect(host.restore());
     const title = (id: string) => host.listTabs().find((tab) => tab.id === id)?.title;
     await vi.waitFor(() => expect(title("tab-b")).toBe("https://example.com/b"));
     expect(title("tab-a")).toBe("example.com");
     expect(title("tab-c")).toBe("example.com");
 
-    await host.activate("tab-c");
+    await runCauseEffect(host.activate("tab-c"));
     await vi.waitFor(() => expect(title("tab-c")).toBe("https://example.com/c"));
     expect(title("tab-a")).toBe("example.com");
   });
 
   it("unloads an idle agent tab and loads it again on its next use", async () => {
-    vi.useFakeTimers();
-    await host.destroy();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    await runCauseEffect(host.destroy());
     host = new BrowserHost(browserWindow, directory, statePath);
     const url = "https://example.com/idle-agent-tab";
-    const idle = await host.open(url, "thread-a", "agent-a");
+    const idle = await runCauseEffect(host.open(url, "thread-a", "agent-a"));
     const page = webContents.getAllWebContents().find((contents) => contents.getURL() === url);
     assert(page);
-    await host.open("https://example.com/active-agent-tab", "thread-a", "agent-a");
+    await runCauseEffect(host.open("https://example.com/active-agent-tab", "thread-a", "agent-a"));
 
     await vi.advanceTimersByTimeAsync(31 * 60_000);
     expect(page.getURL()).toBe("about:blank");
     expect(host.listTabs().find((tab) => tab.id === idle.id)).toMatchObject({ url, title: url });
 
-    await host.activate(idle.id);
+    await runCauseEffect(host.activate(idle.id));
     await vi.waitFor(() => expect(page.getURL()).toBe(url));
   });
 
@@ -628,12 +780,12 @@ describe("browser tab capacity", () => {
       ownerBotId: `bot-${uuid}`,
     }));
     await writeFile(statePath, JSON.stringify({ version: 1, tabs, activeTabId: "tab-25" }));
-    await host.restore([{ id: `agent-${uuid}`, threadId: `openbot-thread-agent-${uuid}` }]);
+    await runCauseEffect(host.restore([{ id: `agent-${uuid}`, threadId: `openbot-thread-agent-${uuid}` }]));
     expect(host.listTabs()).toHaveLength(25);
     expect(host.activeTabId).toBe("tab-0");
-    await expect(host.open("https://www.google.com", `openbot-thread-agent-${uuid}`, `agent-${uuid}`)).rejects.toThrow(
-      "25 open tabs",
-    );
+    await expect(
+      runCauseEffect(host.open("https://www.google.com", `openbot-thread-agent-${uuid}`, `agent-${uuid}`)),
+    ).rejects.toThrow("25 open tabs");
   });
 
   it.each([false, true])(
@@ -646,26 +798,28 @@ describe("browser tab capacity", () => {
         ownerAgentId: index < 13 === threadOnlyFirst ? null : "agent-a",
       }));
       await writeFile(statePath, JSON.stringify({ version: 2, tabs, activeTabId: "tab-0" }));
-      await host.restore([{ id: "agent-a", threadId: "thread-a" }]);
+      await runCauseEffect(host.restore([{ id: "agent-a", threadId: "thread-a" }]));
       expect(host.listTabs()).toHaveLength(25);
-      await expect(host.open("https://www.google.com", "thread-a", "agent-a")).rejects.toThrow("25 open tabs");
+      await expect(runCauseEffect(host.open("https://www.google.com", "thread-a", "agent-a"))).rejects.toThrow(
+        "25 open tabs",
+      );
     },
   );
 
   it("keeps display events and saved URLs consistent through navigation, reload, and close", async () => {
     const changed = vi.fn();
     host.onChanged(changed);
-    const tab = await host.open("https://www.google.com", "thread-a", "agent-a");
+    const tab = await runCauseEffect(host.open("https://www.google.com", "thread-a", "agent-a"));
     const contents = webContents.getAllWebContents().at(-1);
     if (!contents) throw new Error("Missing tab contents");
     await contents.loadURL("https://example.com/next");
-    await host.reload(tab.id);
-    await host.flushPersistentStorage();
+    await runCauseEffect(host.reload(tab.id));
+    await runCauseEffect(host.flushPersistentStorage());
     expect(host.getDisplayState().tabs[0]).toMatchObject({ id: tab.id, url: "https://example.com/next" });
     expect(changed).toHaveBeenLastCalledWith(host.listTabs(), tab.id);
     const saved = JSON.parse(await readFile(statePath, "utf8"));
     expect(saved.tabs[0]).toMatchObject({ id: tab.id, url: "https://example.com/next" });
-    await host.close(tab.id);
+    await runCauseEffect(host.close(tab.id));
     expect(host.getDisplayState()).toEqual({ tabs: [], activeTabId: null });
     expect(changed).toHaveBeenLastCalledWith([], null);
   });
@@ -682,8 +836,8 @@ describe("browser clipboard", () => {
     params: Partial<BrowserContextMenuParams>,
   ): Promise<{ items: MenuEntry[]; page: WebContents }> => {
     nextPage += 1;
-    const tab = await host.open(`https://example.com/menu-${nextPage}`);
-    await host.setVisible({ visible: true, target: "main", bounds: pageBounds });
+    const tab = await runCauseEffect(host.open(`https://example.com/menu-${nextPage}`));
+    await runCauseEffect(host.setVisible({ visible: true, target: "main", bounds: pageBounds }));
     const page = contentsFor(tab.url);
     page.emit(
       "context-menu",
@@ -749,9 +903,9 @@ describe("agent tab cleanup", () => {
   }
 
   it("closes a tab the calling agent owns and frees its capacity", async () => {
-    const tab = await host.open("https://example.com/one", "thread-a", "agent-a");
+    const tab = await runCauseEffect(host.open("https://example.com/one", "thread-a", "agent-a"));
 
-    const result = await host.handleDynamicTool(toolCall("close_tab", { tabId: tab.id }));
+    const result = await runCauseEffect(host.handleDynamicTool(toolCall("close_tab", { tabId: tab.id })));
 
     expect(result.success).toBe(true);
     expect(resultText(result)).toContain('"closed":true');
@@ -759,9 +913,11 @@ describe("agent tab cleanup", () => {
   });
 
   it("refuses to close a tab owned by a different agent", async () => {
-    const tab = await host.open("https://example.com/one", "thread-a", "agent-a");
+    const tab = await runCauseEffect(host.open("https://example.com/one", "thread-a", "agent-a"));
 
-    const result = await host.handleDynamicTool(toolCall("close_tab", { tabId: tab.id }, "agent-b", "thread-b"));
+    const result = await runCauseEffect(
+      host.handleDynamicTool(toolCall("close_tab", { tabId: tab.id }, "agent-b", "thread-b")),
+    );
 
     expect(result.success).toBe(false);
     expect(resultText(result)).toContain("Unknown browser tab");
@@ -769,59 +925,59 @@ describe("agent tab cleanup", () => {
   });
 
   it("leaves a concurrent agent's tabs open when one agent closes its own", async () => {
-    const mine = await host.open("https://example.com/mine", "thread-a", "agent-a");
-    const theirs = await host.open("https://example.com/theirs", "thread-b", "agent-b");
+    const mine = await runCauseEffect(host.open("https://example.com/mine", "thread-a", "agent-a"));
+    const theirs = await runCauseEffect(host.open("https://example.com/theirs", "thread-b", "agent-b"));
 
-    await host.handleDynamicTool(toolCall("close_tab", { tabId: mine.id }));
+    await runCauseEffect(host.handleDynamicTool(toolCall("close_tab", { tabId: mine.id })));
 
     expect(host.listTabs()).toEqual([expect.objectContaining({ id: theirs.id })]);
-    const listed = await host.handleDynamicTool(toolCall("list_tabs", {}, "agent-b", "thread-b"));
+    const listed = await runCauseEffect(host.handleDynamicTool(toolCall("list_tabs", {}, "agent-b", "thread-b")));
     expect(resultText(listed)).toContain(theirs.id);
   });
 
   it("blocks the owning agent from closing a tab the user has taken over, and releases it again", async () => {
-    const tab = await host.open("https://example.com/login", "thread-a", "agent-a");
-    await host.beginTakeover(tab.id);
+    const tab = await runCauseEffect(host.open("https://example.com/login", "thread-a", "agent-a"));
+    await runCauseEffect(host.beginTakeover(tab.id));
 
-    const blocked = await host.handleDynamicTool(toolCall("close_tab", { tabId: tab.id }));
+    const blocked = await runCauseEffect(host.handleDynamicTool(toolCall("close_tab", { tabId: tab.id })));
 
     expect(blocked.success).toBe(false);
     expect(resultText(blocked)).toContain("under user takeover");
     expect(host.listTabs()).toEqual([expect.objectContaining({ id: tab.id })]);
 
     host.endTakeover(tab.id);
-    const allowed = await host.handleDynamicTool(toolCall("close_tab", { tabId: tab.id }));
+    const allowed = await runCauseEffect(host.handleDynamicTool(toolCall("close_tab", { tabId: tab.id })));
 
     expect(allowed.success).toBe(true);
     expect(host.listTabs()).toEqual([]);
   });
 
   it("blocks every tab tool during a takeover, not only the close", async () => {
-    const tab = await host.open("https://example.com/login", "thread-a", "agent-a");
-    await host.beginTakeover(tab.id);
+    const tab = await runCauseEffect(host.open("https://example.com/login", "thread-a", "agent-a"));
+    await runCauseEffect(host.beginTakeover(tab.id));
 
-    const result = await host.handleDynamicTool(toolCall("screenshot", { tabId: tab.id }));
+    const result = await runCauseEffect(host.handleDynamicTool(toolCall("screenshot", { tabId: tab.id })));
 
     expect(result.success).toBe(false);
     expect(resultText(result)).toContain("under user takeover");
   });
 
   it("still lets the user close a tab they have taken over", async () => {
-    const tab = await host.open("https://example.com/login", "thread-a", "agent-a");
-    await host.beginTakeover(tab.id);
+    const tab = await runCauseEffect(host.open("https://example.com/login", "thread-a", "agent-a"));
+    await runCauseEffect(host.beginTakeover(tab.id));
 
-    await host.close(tab.id);
+    await runCauseEffect(host.close(tab.id));
 
     expect(host.listTabs()).toEqual([]);
   });
 
   it("treats a repeated close and an unknown tab as an idempotent success", async () => {
-    const tab = await host.open("https://example.com/one", "thread-a", "agent-a");
+    const tab = await runCauseEffect(host.open("https://example.com/one", "thread-a", "agent-a"));
 
-    const first = await host.handleDynamicTool(toolCall("close_tab", { tabId: tab.id }));
-    const second = await host.handleDynamicTool(toolCall("close_tab", { tabId: tab.id }));
-    const missing = await host.handleDynamicTool(
-      toolCall("close_tab", { tabId: "11111111-2222-3333-4444-555555555555" }),
+    const first = await runCauseEffect(host.handleDynamicTool(toolCall("close_tab", { tabId: tab.id })));
+    const second = await runCauseEffect(host.handleDynamicTool(toolCall("close_tab", { tabId: tab.id })));
+    const missing = await runCauseEffect(
+      host.handleDynamicTool(toolCall("close_tab", { tabId: "11111111-2222-3333-4444-555555555555" })),
     );
 
     for (const result of [first, second, missing]) {
@@ -832,7 +988,7 @@ describe("agent tab cleanup", () => {
   });
 
   it("closes a tab whose navigation never settles, so an interrupted run leaves nothing behind", async () => {
-    const tab = await host.open("https://example.com/interrupted", "thread-a", "agent-a");
+    const tab = await runCauseEffect(host.open("https://example.com/interrupted", "thread-a", "agent-a"));
     const contents = webContents.getAllWebContents().find((candidate) => candidate.getURL() === tab.url);
     if (!contents) throw new Error("Browser contents were not created.");
     let signalStarted: (() => void) | undefined;
@@ -847,11 +1003,11 @@ describe("agent tab cleanup", () => {
     });
     // The load stays pending for the rest of the test, so take its rejection now.
     // The close drains the tab queue, so it waits out the navigation timeout the stuck load owns.
-    vi.useFakeTimers();
-    const pending = host.loadUrl(tab.id, "https://example.com/never-settles").catch(() => undefined);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const pending = runCauseEffect(host.loadUrl(tab.id, "https://example.com/never-settles")).catch(() => undefined);
     await started;
 
-    const closing = host.handleDynamicTool(toolCall("close_tab", { tabId: tab.id }));
+    const closing = runCauseEffect(host.handleDynamicTool(toolCall("close_tab", { tabId: tab.id })));
     await vi.advanceTimersByTimeAsync(10_000);
 
     await expect(closing).resolves.toMatchObject({ success: true });
@@ -862,14 +1018,16 @@ describe("agent tab cleanup", () => {
   it("drops a tab whose teardown fails, so the agent is never told to retry a tab that is gone", async () => {
     // A URL no other test uses: the electron mock keeps every contents it ever made, so looking one up
     // by URL would otherwise find a closed tab from an earlier test instead of this one.
-    const tab = await host.open("https://example.com/teardown-failure", "thread-a", "agent-a");
+    const tab = await runCauseEffect(host.open("https://example.com/teardown-failure", "thread-a", "agent-a"));
     const contents = webContents.getAllWebContents().find((candidate) => candidate.getURL() === tab.url);
     if (!contents) throw new Error("Browser contents were not created.");
     vi.spyOn(contents, "close").mockImplementation(() => {
       throw new Error("teardown failed");
     });
 
-    await expect(host.handleDynamicTool(toolCall("close_tab", { tabId: tab.id }))).resolves.toMatchObject({
+    await expect(
+      runCauseEffect(host.handleDynamicTool(toolCall("close_tab", { tabId: tab.id }))),
+    ).resolves.toMatchObject({
       success: false,
     });
 
@@ -882,22 +1040,24 @@ describe("agent tab cleanup", () => {
 
 describe("secure browser handoff", () => {
   async function prepare(method: "password" | "otp" | "authenticator" = "otp", digits?: number) {
-    const tab = await host.open("https://example.com/secure", "thread", "agent");
-    const prepared = await host.prepareSecret({
-      namespace: "openbot_browser",
-      tool: "submit_secret",
-      threadId: "thread",
-      ownerAgentId: "agent",
-      turnId: "turn",
-      callId: "secret",
-      arguments: {
-        tabId: tab.id,
-        method,
-        ...(digits === undefined ? {} : { digits }),
-        targets: [{ kind: "css", selector: "input" }],
-        submission: "on_input",
-      },
-    });
+    const tab = await runCauseEffect(host.open("https://example.com/secure", "thread", "agent"));
+    const prepared = await runCauseEffect(
+      host.prepareSecret({
+        namespace: "openbot_browser",
+        tool: "submit_secret",
+        threadId: "thread",
+        ownerAgentId: "agent",
+        turnId: "turn",
+        callId: "secret",
+        arguments: {
+          tabId: tab.id,
+          method,
+          ...(digits === undefined ? {} : { digits }),
+          targets: [{ kind: "css", selector: "input" }],
+          submission: "on_input",
+        },
+      }),
+    );
     const contents = webContents.getAllWebContents().findLast((item) => item.getURL() === tab.url);
     if (!contents) throw new Error("Missing browser tab.");
     return { tab, prepared, contents };
@@ -909,15 +1069,17 @@ describe("secure browser handoff", () => {
     expect(before.prepared.agentScriptedOrigin).toBe(false);
     before.prepared.cancel();
 
-    await host.handleDynamicTool({
-      namespace: "openbot_browser",
-      tool: "evaluate",
-      arguments: { tabId: before.tab.id, expression: "document.title" },
-      threadId: "thread",
-      ownerAgentId: "agent",
-      turnId: "turn",
-      callId: "evaluate",
-    });
+    await runCauseEffect(
+      host.handleDynamicTool({
+        namespace: "openbot_browser",
+        tool: "evaluate",
+        arguments: { tabId: before.tab.id, expression: "document.title" },
+        threadId: "thread",
+        ownerAgentId: "agent",
+        turnId: "turn",
+        callId: "evaluate",
+      }),
+    );
 
     const after = await prepare("password", 0);
     expect(after.prepared.agentScriptedOrigin).toBe(true);
@@ -925,32 +1087,36 @@ describe("secure browser handoff", () => {
   });
 
   it("marks the site that the script runs on when a navigation is queued before it", async () => {
-    const tab = await host.open("https://example.com/secure", "thread", "agent");
+    const tab = await runCauseEffect(host.open("https://example.com/secure", "thread", "agent"));
     const call = (tool: "navigate" | "evaluate", args: { url: string } | { expression: string }) =>
-      host.handleDynamicTool({
-        namespace: "openbot_browser",
-        tool,
-        arguments: { tabId: tab.id, ...args },
-        threadId: "thread",
-        ownerAgentId: "agent",
-        turnId: "turn",
-        callId: tool,
-      });
+      runCauseEffect(
+        host.handleDynamicTool({
+          namespace: "openbot_browser",
+          tool,
+          arguments: { tabId: tab.id, ...args },
+          threadId: "thread",
+          ownerAgentId: "agent",
+          turnId: "turn",
+          callId: tool,
+        }),
+      );
     const passwordCard = (tabId: string) =>
-      host.prepareSecret({
-        namespace: "openbot_browser",
-        tool: "submit_secret",
-        threadId: "thread",
-        ownerAgentId: "agent",
-        turnId: "turn",
-        callId: "secret",
-        arguments: {
-          tabId,
-          method: "password",
-          targets: [{ kind: "css", selector: "input" }],
-          submission: "on_input",
-        },
-      });
+      runCauseEffect(
+        host.prepareSecret({
+          namespace: "openbot_browser",
+          tool: "submit_secret",
+          threadId: "thread",
+          ownerAgentId: "agent",
+          turnId: "turn",
+          callId: "secret",
+          arguments: {
+            tabId,
+            method: "password",
+            targets: [{ kind: "css", selector: "input" }],
+            submission: "on_input",
+          },
+        }),
+      );
 
     // Sent together, as overlapping provider requests are: the script runs after the navigation.
     await Promise.all([call("navigate", { url: "https://example.org/login" }), call("evaluate", { expression: "1" })]);
@@ -959,7 +1125,7 @@ describe("secure browser handoff", () => {
     expect(scripted.request.origin).toBe("https://example.org");
     expect(scripted.agentScriptedOrigin).toBe(true);
     scripted.cancel();
-    const untouched = await host.open("https://example.com/secure", "thread", "agent");
+    const untouched = await runCauseEffect(host.open("https://example.com/secure", "thread", "agent"));
     const clean = await passwordCard(untouched.id);
     expect(clean.agentScriptedOrigin).toBe(false);
     clean.cancel();
@@ -985,47 +1151,47 @@ describe("secure browser handoff", () => {
   it("blocks every capture endpoint after entry, even if the request is cancelled", async () => {
     const { tab, prepared, contents } = await prepare();
     vi.spyOn(contents, "loadURL").mockResolvedValue(undefined);
-    vi.useFakeTimers();
-    const submitted = prepared.submit("123456");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const submitted = runCauseEffect(prepared.submit("123456"));
     await vi.waitFor(() => expect(secretEntry).toHaveBeenCalled());
     await vi.advanceTimersByTimeAsync(5_000);
     await submitted;
-    await expect(host.snapshot(tab.id)).rejects.toThrow("protected");
-    await expect(host.screenshot(tab.id)).rejects.toThrow("protected");
-    await expect(host.capturePreview(tab.id)).rejects.toThrow("protected");
-    await expect(host.startView(tab.id, () => undefined)).rejects.toThrow("protected");
+    await expect(runCauseEffect(host.snapshot(tab.id))).rejects.toThrow("protected");
+    await expect(runCauseEffect(host.screenshot(tab.id))).rejects.toThrow("protected");
+    await expect(runCauseEffect(host.capturePreview(tab.id))).rejects.toThrow("protected");
+    await expect(runCauseEffect(host.startView(tab.id, () => undefined))).rejects.toThrow("protected");
     expect(host.listTabs()[0]?.url).toBe("https://example.com");
     prepared.cancel();
-    await expect(host.startView(tab.id, () => undefined)).rejects.toThrow("protected");
+    await expect(runCauseEffect(host.startView(tab.id, () => undefined))).rejects.toThrow("protected");
     expect(secretEntry).toHaveBeenCalledTimes(1);
   });
 
   it("submits once and resumes only after document replacement", async () => {
     const { tab, prepared, contents } = await prepare();
-    const submitted = prepared.submit("123456");
+    const submitted = runCauseEffect(prepared.submit("123456"));
     await vi.waitFor(() => expect(secretEntry).toHaveBeenCalledWith("123456"));
-    await expect(prepared.submit("123456")).rejects.toThrow("expired");
-    await expect(host.startView(tab.id, () => undefined)).rejects.toThrow("protected");
+    await expect(runCauseEffect(prepared.submit("123456"))).rejects.toThrow("expired");
+    await expect(runCauseEffect(host.startView(tab.id, () => undefined))).rejects.toThrow("protected");
     contents.emit("did-navigate", {}, "https://example.com/account");
     await expect(submitted).resolves.toBe("submitted");
-    await expect(host.startView(tab.id, () => undefined)).resolves.toBeTypeOf("function");
+    await expect(runCauseEffect(host.startView(tab.id, () => undefined))).resolves.toBeTypeOf("function");
     expect(secretEntry).toHaveBeenCalledTimes(1);
   });
 
   it("automatically loads a new document after same-page submission without replaying the secret", async () => {
     const { tab, prepared, contents } = await prepare("password", 0);
     const load = vi.spyOn(contents, "loadURL");
-    vi.useFakeTimers();
-    const submitted = prepared.submit("fixture-password");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const submitted = runCauseEffect(prepared.submit("fixture-password"));
     await vi.waitFor(() => expect(secretEntry).toHaveBeenCalledWith("fixture-password"));
     contents.emit("did-navigate-in-page", {}, tab.url);
-    await expect(host.startView(tab.id, () => undefined)).rejects.toThrow("protected");
+    await expect(runCauseEffect(host.startView(tab.id, () => undefined))).rejects.toThrow("protected");
     await vi.advanceTimersByTimeAsync(5_000);
     await expect(submitted).resolves.toBe("submitted");
     expect(load).toHaveBeenCalledOnce();
     expect(load.mock.calls[0]?.[0]).toBe(tab.url);
     expect(secretEntry).toHaveBeenCalledOnce();
-    await expect(host.startView(tab.id, () => undefined)).resolves.toBeTypeOf("function");
+    await expect(runCauseEffect(host.startView(tab.id, () => undefined))).resolves.toBeTypeOf("function");
   });
 
   it("keeps a same-page sign-in step after clearing the fields and blocks evaluation until navigation", async () => {
@@ -1033,23 +1199,25 @@ describe("secure browser handoff", () => {
     const load = vi.spyOn(contents, "loadURL");
     secretClear.mockResolvedValue(true);
     const evaluate = () =>
-      host.handleDynamicTool({
-        namespace: "openbot_browser",
-        tool: "evaluate",
-        arguments: { tabId: tab.id, expression: "document.title" },
-        threadId: "thread",
-        ownerAgentId: "agent",
-        turnId: "turn",
-        callId: "evaluate",
-      });
-    vi.useFakeTimers();
-    const submitted = prepared.submit("fixture-password");
+      runCauseEffect(
+        host.handleDynamicTool({
+          namespace: "openbot_browser",
+          tool: "evaluate",
+          arguments: { tabId: tab.id, expression: "document.title" },
+          threadId: "thread",
+          ownerAgentId: "agent",
+          turnId: "turn",
+          callId: "evaluate",
+        }),
+      );
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const submitted = runCauseEffect(prepared.submit("fixture-password"));
     await vi.waitFor(() => expect(secretEntry).toHaveBeenCalledWith("fixture-password"));
     await vi.advanceTimersByTimeAsync(5_000);
     await expect(submitted).resolves.toBe("submitted");
     expect(secretClear).toHaveBeenCalledExactlyOnceWith("fixture-password");
     expect(load).not.toHaveBeenCalled();
-    await expect(host.startView(tab.id, () => undefined)).resolves.toBeTypeOf("function");
+    await expect(runCauseEffect(host.startView(tab.id, () => undefined))).resolves.toBeTypeOf("function");
     const blocked = await evaluate();
     expect(blocked.success).toBe(false);
     expect(JSON.stringify(blocked)).toContain("received a secret");
@@ -1060,53 +1228,60 @@ describe("secure browser handoff", () => {
   it("keeps protection when automatic navigation does not replace the document", async () => {
     const { tab, prepared, contents } = await prepare();
     vi.spyOn(contents, "loadURL").mockResolvedValue(undefined);
-    vi.useFakeTimers();
-    const submitted = prepared.submit("123456");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const submitted = runCauseEffect(prepared.submit("123456"));
     await vi.waitFor(() => expect(secretEntry).toHaveBeenCalled());
     contents.emit("did-navigate-in-page", {}, "https://example.com/secure#done");
     await vi.advanceTimersByTimeAsync(5_000);
     await expect(submitted).resolves.toBe("takeover");
     prepared.cancel();
     host.endTakeover(tab.id);
-    await expect(host.capturePreview(tab.id)).rejects.toThrow("protected");
-    await host.reload(tab.id);
-    await expect(host.capturePreview(tab.id)).rejects.toThrow("protected");
+    await expect(runCauseEffect(host.capturePreview(tab.id))).rejects.toThrow("protected");
+    await runCauseEffect(host.reload(tab.id));
+    await expect(runCauseEffect(host.capturePreview(tab.id))).rejects.toThrow("protected");
     contents.emit("did-navigate", {}, "https://example.com/account");
-    await expect(host.startView(tab.id, () => undefined)).resolves.toBeTypeOf("function");
+    await expect(runCauseEffect(host.startView(tab.id, () => undefined))).resolves.toBeTypeOf("function");
   });
 
   it("does not enter a value with the wrong code length", async () => {
     const { tab, prepared } = await prepare();
-    await expect(prepared.submit("123")).rejects.toThrow("digits");
+    await expect(runCauseEffect(prepared.submit("123"))).rejects.toThrow("digits");
     expect(secretEntry).not.toHaveBeenCalled();
     prepared.cancel();
-    await expect(host.startView(tab.id, () => undefined)).resolves.toBeTypeOf("function");
+    await expect(runCauseEffect(host.startView(tab.id, () => undefined))).resolves.toBeTypeOf("function");
   });
 });
 
 it("does not resume an existing stream after a secure handoff", async () => {
-  const tab = await host.open("https://example.com/stream", "thread", "agent");
+  const tab = await runCauseEffect(host.open("https://example.com/stream", "thread", "agent"));
   const receive = vi.fn();
   const invalidated = vi.fn();
-  await host.startView(tab.id, receive, invalidated);
+  await runCauseEffect(host.startView(tab.id, receive, invalidated));
   const frame = { sequence: 1, width: 1, height: 1, image: new Uint8Array([1]) };
   viewFrames[0]?.(frame);
   expect(receive).toHaveBeenCalledTimes(1);
-  const prepared = await host.prepareSecret({
-    namespace: "openbot_browser",
-    tool: "submit_secret",
-    threadId: "thread",
-    ownerAgentId: "agent",
-    turnId: "turn",
-    callId: "secret",
-    arguments: { tabId: tab.id, method: "otp", targets: [{ kind: "css", selector: "input" }], submission: "on_input" },
-  });
+  const prepared = await runCauseEffect(
+    host.prepareSecret({
+      namespace: "openbot_browser",
+      tool: "submit_secret",
+      threadId: "thread",
+      ownerAgentId: "agent",
+      turnId: "turn",
+      callId: "secret",
+      arguments: {
+        tabId: tab.id,
+        method: "otp",
+        targets: [{ kind: "css", selector: "input" }],
+        submission: "on_input",
+      },
+    }),
+  );
   expect(invalidated).toHaveBeenCalledOnce();
   viewFrames[0]?.(frame);
   prepared.cancel();
   viewFrames[0]?.(frame);
   expect(receive).toHaveBeenCalledTimes(1);
-  await host.startView(tab.id, receive);
+  await runCauseEffect(host.startView(tab.id, receive));
   viewFrames[1]?.(frame);
   expect(receive).toHaveBeenCalledTimes(2);
 });

@@ -6,6 +6,7 @@ import {
   isFileReference,
 } from "@openbot/brand/file-reference";
 import { chatMathStart } from "@openbot/contracts/chat-math";
+import { chatPreviewKind } from "@openbot/contracts/chat-preview";
 import { chatTagReferences } from "@openbot/contracts/chat-tag-references";
 import type { MobileTranslate } from "@openbot/i18n/mobile";
 import * as Linking from "expo-linking";
@@ -14,10 +15,10 @@ import { useThemeColor } from "heroui-native/hooks";
 import { FileText } from "lucide-react-native";
 import type { Token, Tokens } from "marked";
 import { Fragment, memo, type ReactNode, useMemo } from "react";
-import { Alert, type ColorValue, ScrollView, type TextStyle, useWindowDimensions, View } from "react-native";
-import { useReducedMotion } from "react-native-reanimated";
+import { type ColorValue, ScrollView, type TextStyle, useWindowDimensions, View } from "react-native";
 import { useCSSVariable } from "uniwind";
 import { BloubAvatarThumbnail } from "@/features/agents/components/bloub-avatar";
+import { showFailureAlert } from "@/features/analytics/failure-reports";
 import { ChatLinkIcon } from "@/features/chat/components/chat-link-icon";
 import {
   StreamingBlock,
@@ -25,12 +26,15 @@ import {
   StreamRevealProvider,
 } from "@/features/chat/components/streaming-tail-text";
 import type { MobileAgent } from "@/features/workspace/model/workspace-types";
+import { graphemes } from "@/shared/lib/graphemes";
 import { haptics } from "@/shared/lib/haptics";
+import { useMotionPreference } from "@/shared/lib/motion";
 import { currentText, useText } from "@/shared/lib/text";
 import { parseChatMarkdown } from "../model/chat-markdown-parser";
 import { plainMentionParts } from "../model/chat-mentions";
 import { createReplyReveal } from "../model/reply-reveal";
 import { ChatCodeBlock } from "./chat-code-block";
+import { ChatCodePreview } from "./chat-code-preview";
 import { ChatMath } from "./chat-math";
 import { type ReplyPlayback, useReplyPlayback } from "./use-reply-playback";
 
@@ -73,6 +77,8 @@ interface TextPresentation {
   style: TextStyle;
   codeColor: ColorValue;
   animateTail: boolean;
+  /** The reply still streams, so a preview card shows code until its block is complete. */
+  streaming: boolean;
   agents: readonly MobileAgent[];
   mentionOffset: number;
   fontScale: number;
@@ -169,17 +175,6 @@ function FileReference({ text, presentation }: { text: string; presentation: Tex
 // A view cannot break across lines, so code is a row of one-line chips that touch. A line can break
 // after a space or a separator, and a long run without one breaks after this many characters.
 const CODE_PIECE_MAX_LENGTH = 12;
-
-// Hermes may not have Intl.Segmenter. The fallback keeps flags, marks, skin tones and joined emoji whole.
-const GRAPHEME_FALLBACK =
-  /\p{Regional_Indicator}{2}|\P{M}[\p{M}\p{Emoji_Modifier}]*(?:\u200d\P{M}[\p{M}\p{Emoji_Modifier}]*)*/gu;
-
-function graphemes(text: string): string[] {
-  if (Intl.Segmenter) {
-    return Array.from(new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text), (part) => part.segment);
-  }
-  return text.match(GRAPHEME_FALLBACK) ?? [];
-}
 
 function codePieces(text: string): string[] {
   return (text.match(/[^\s\-/._]*(?:[\s\-/._]+|$)/gu) ?? []).flatMap((piece) => {
@@ -329,7 +324,12 @@ function inline(tokens: Token[], parentPresentation: TextPresentation): ReactNod
             void Linking.openURL(url).catch(() => {
               void haptics.notification("error");
               const { t } = currentText();
-              Alert.alert(t("mobile.chat.markdown.linkFailedTitle"), t("mobile.chat.markdown.linkFailedMessage"));
+              showFailureAlert(
+                undefined,
+                "browser",
+                t("mobile.chat.markdown.linkFailedTitle"),
+                t("mobile.chat.markdown.linkFailedMessage"),
+              );
             });
           }}
         >
@@ -471,9 +471,19 @@ function MarkdownBlocks({
           );
         }
         if (tokenIs(token, "code")) {
+          const preview = chatPreviewKind(token.lang);
           return (
             <StreamingBlock key={offset} enabled={presentation.animateTail}>
-              <ChatCodeBlock selectable={presentation.selectable} text={token.text} language={token.lang} />
+              {preview ? (
+                <ChatCodePreview
+                  kind={preview}
+                  text={token.text}
+                  language={token.lang}
+                  streaming={presentation.streaming}
+                />
+              ) : (
+                <ChatCodeBlock selectable={presentation.selectable} text={token.text} language={token.lang} />
+              )}
             </StreamingBlock>
           );
         }
@@ -580,7 +590,7 @@ export const ChatMarkdown = memo(function ChatMarkdown({
   selectable?: boolean;
   agents?: readonly MobileAgent[];
 }) {
-  const reducedMotion = useReducedMotion();
+  const textReveal = useMotionPreference("textReveal");
   const { fontScale } = useWindowDimensions();
   const tokens = useMemo(() => parseChatMarkdown(body), [body]);
   const reveal = useMemo(() => createReplyReveal(tokens), [tokens]);
@@ -600,7 +610,8 @@ export const ChatMarkdown = memo(function ChatMarkdown({
           mentionOffset: 4 * fontScale,
           fontScale,
           t,
-          animateTail: (streaming || Boolean(playback?.enabled)) && animationEnabled && !reducedMotion,
+          streaming,
+          animateTail: (streaming || Boolean(playback?.enabled)) && animationEnabled && textReveal,
         }}
       />
     </StreamRevealProvider>

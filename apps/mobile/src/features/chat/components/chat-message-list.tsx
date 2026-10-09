@@ -36,7 +36,6 @@ import Animated, {
   FadeInDown,
   ReduceMotion,
   useAnimatedStyle,
-  useReducedMotion,
   useSharedValue,
   withTiming,
 } from "react-native-reanimated";
@@ -45,6 +44,7 @@ import { BloubAvatarThumbnail } from "@/features/agents/components/bloub-avatar"
 import { ChatLinkPressable } from "@/features/agents/components/chat-link-pressable";
 import { getBloubAvatarColor } from "@/features/agents/model/bloub-activity";
 import { ChatActivityRow, type ChatActivitySpec } from "@/features/chat/components/chat-activity-row";
+import { type ApprovalDecision, approvalTitle, ChatApprovalCard } from "@/features/chat/components/chat-approval-card";
 import { ChatMarkdown } from "@/features/chat/components/chat-markdown";
 import { ChatPlan } from "@/features/chat/components/chat-plan";
 import { ChatQuestionPrompt } from "@/features/chat/components/chat-question-prompt";
@@ -57,7 +57,9 @@ import { useAgentColorMessages } from "@/features/settings/model/message-color";
 import { useConnectionAppearance } from "@/features/workspace/components/use-connection-appearance";
 import type { MobileAgent } from "@/features/workspace/context/mobile-workspace-context";
 import { agentActivityMood, type MobileAgentActivity } from "@/features/workspace/model/agent-activity";
+import type { PendingApproval } from "@/features/workspace/model/pending-approvals";
 import { haptics } from "@/shared/lib/haptics";
+import { useMotionPreference, useReducedMotion } from "@/shared/lib/motion";
 import { useText } from "@/shared/lib/text";
 import type { ChatBubbleMessage } from "../context/message-actions-context";
 import { CHAT_HISTORY_BATCH, type ChatHistoryBoundary, chatHistoryStart } from "../model/chat-layout";
@@ -125,11 +127,14 @@ function ChatBubble({
   children,
   agent,
   collapsed = false,
+  animateSize,
   className,
   style,
 }: PropsWithChildren<{
   agent: boolean;
   collapsed?: boolean;
+  /** Off when Settings turns reply animation off: the bubble takes each new size at once. */
+  animateSize: boolean;
   className: string;
   style: ComponentProps<typeof Animated.View>["style"];
 }>) {
@@ -141,10 +146,11 @@ function ChatBubble({
   const background = useAnimatedStyle(() => {
     const { width, height, measured } = size.get();
     // The first measurement is adopted without motion; only later growth during streaming animates.
+    const animate = measured && animateSize;
     return {
       opacity: shown.get(),
-      width: measured ? withTiming(width, REPLY_SIZE) : width,
-      height: measured ? withTiming(height, REPLY_SIZE) : height,
+      width: animate ? withTiming(width, REPLY_SIZE) : width,
+      height: animate ? withTiming(height, REPLY_SIZE) : height,
     };
   });
   return (
@@ -192,6 +198,8 @@ function exchangeLabel(exchange: AgentExchangeSummary, t: MobileTranslate) {
 
 interface ChatMessageListProps {
   target: ChatTarget;
+  /** Something covers the list, such as the voice mode, so screen readers skip it. */
+  accessibilityHidden?: boolean;
   activity?: MobileAgentActivity;
   activities?: MobileAgentActivity[];
   agents: MobileAgent[];
@@ -204,6 +212,10 @@ interface ChatMessageListProps {
   activeTurnId: string | null;
   questionForm?: QuestionPromptController;
   onSelectQuestion?: (messageId: string) => void;
+  /** The approvals that this chat's agents wait on, shown below the activity as on the desktop. */
+  approvals?: readonly PendingApproval[];
+  serverName?: string;
+  onRespondApproval?: (approval: PendingApproval, decision: ApprovalDecision) => Promise<void>;
   fieldBackground: ViewStyle["backgroundColor"];
   foreground: ViewStyle["backgroundColor"];
   historyState: "ready" | "connecting" | "waiting" | "loading" | "error";
@@ -259,6 +271,8 @@ interface MessageRowShared {
   animationActive: boolean;
   /** Arriving replies also play back word by word: motion and screen reader settings allow it. */
   playbackActive: boolean;
+  /** Replies animate as they arrive: Settings and reduced motion allow it. */
+  textReveal: boolean;
   replySession: { progress: Map<string, number>; revealed: Set<string> };
   /** Changes when a reply reveals its first word, so a waiting row renders its bubble. */
   revealedCount: number;
@@ -552,6 +566,7 @@ const MessageRow = memo(function MessageRow({
           <ChatBubble
             agent={message.author === "agent"}
             collapsed={waiting}
+            animateSize={shared.textReveal}
             className={
               message.author === "user"
                 ? `self-end rounded-[30px] px-4 py-3 ${userBubbleStyle || memberColor ? "" : "bg-control/60"} ${message.attachments?.length ? "max-w-[88%]" : "max-w-full"}`
@@ -644,9 +659,12 @@ function TurnFailure({ reason }: { reason: string | undefined }) {
   );
 }
 
+const NO_APPROVALS: readonly PendingApproval[] = [];
+
 export function ChatMessageList({
   upload,
   target,
+  accessibilityHidden = false,
   activity,
   activities,
   agents,
@@ -659,6 +677,9 @@ export function ChatMessageList({
   activeTurnId,
   questionForm,
   onSelectQuestion,
+  approvals = NO_APPROVALS,
+  serverName = "",
+  onRespondApproval,
   fieldBackground,
   foreground,
   historyState,
@@ -707,6 +728,20 @@ export function ChatMessageList({
       t("mobile.chat.question.inputRequired", { question: questionForm.question.question }),
     );
   }, [questionForm?.messageId, questionForm?.question, t]);
+  const announcedApprovals = useRef(new Set<string>());
+  useEffect(() => {
+    for (const approval of approvals) {
+      const key = String(approval.requestId);
+      if (announcedApprovals.current.has(key)) continue;
+      announcedApprovals.current.add(key);
+      AccessibilityInfo.announceForAccessibility(
+        t("mobile.chat.approval.inputRequired", {
+          name: agentsById.get(approval.agentId)?.name ?? target.name,
+          title: approvalTitle(approval, t),
+        }),
+      );
+    }
+  }, [approvals, agentsById, target.name, t]);
   const [userForegroundColor, themeForegroundColor, themeMutedColor] = useCSSVariable([
     "--openbot-text-on-light",
     "--openbot-text-primary",
@@ -716,6 +751,7 @@ export function ChatMessageList({
   const themeForeground = String(themeForegroundColor);
   const themeMuted = String(themeMutedColor);
   const reducedMotion = useReducedMotion();
+  const textReveal = useMotionPreference("textReveal");
   const animateMessages = isFocused && online && appActive;
   const replyHaptics = useReplyHaptics(animateMessages && historyState === "ready" && motion.responseVisible);
   const conversationKey = JSON.stringify([target.serverId, target.kind, target.id]);
@@ -798,7 +834,8 @@ export function ChatMessageList({
       screenReaderEnabled,
       arrivals,
       animationActive,
-      playbackActive: animationActive && !reducedMotion && !screenReaderEnabled,
+      playbackActive: animationActive && textReveal && !screenReaderEnabled,
+      textReveal,
       replySession,
       revealedCount,
       markRevealed,
@@ -824,7 +861,7 @@ export function ChatMessageList({
       screenReaderEnabled,
       arrivals,
       animationActive,
-      reducedMotion,
+      textReveal,
       replySession,
       revealedCount,
       markRevealed,
@@ -903,7 +940,9 @@ export function ChatMessageList({
               (message) => message.kind === "question" && !message.prompt.resolution && message.turnId === activeTurnId,
             )
             ? t("mobile.chat.activity.waitingForAnswer")
-            : t("mobile.chat.activity.waitingOnDesktop")
+            : approvals.some((approval) => approval.agentId === (activity?.agentId ?? target.id))
+              ? t("mobile.chat.activity.waitingForApproval")
+              : t("mobile.chat.activity.waitingOnDesktop")
           : thinkingDetail
             ? thinkingDetail
             : activity?.phase === "responding"
@@ -948,8 +987,10 @@ export function ChatMessageList({
   return (
     <Animated.View
       style={[{ flex: 1 }, historyState === "ready" ? motion.historyStyle : undefined]}
-      accessibilityElementsHidden={historyState === "ready" && !motion.historyVisible}
-      importantForAccessibility={historyState !== "ready" || motion.historyVisible ? "auto" : "no-hide-descendants"}
+      accessibilityElementsHidden={accessibilityHidden || (historyState === "ready" && !motion.historyVisible)}
+      importantForAccessibility={
+        !accessibilityHidden && (historyState !== "ready" || motion.historyVisible) ? "auto" : "no-hide-descendants"
+      }
     >
       <TailLayoutContext.Provider value={tailLayout}>
         <FlatList
@@ -1059,6 +1100,21 @@ export function ChatMessageList({
                   />
                 ))}
               </Animated.View>
+              {onRespondApproval && approvals.length ? (
+                <View className="gap-3 pb-3">
+                  {approvals.map((approval) => (
+                    <ChatApprovalCard
+                      key={String(approval.requestId)}
+                      approval={approval}
+                      agentName={agentsById.get(approval.agentId)?.name ?? target.name}
+                      showAgentName={target.kind === "channel"}
+                      serverName={serverName}
+                      canAnswer={canSend}
+                      respond={(decision) => onRespondApproval(approval, decision)}
+                    />
+                  ))}
+                </View>
+              ) : null}
               {showStarter ? (
                 <View
                   className="gap-4 rounded-[26px] p-4"

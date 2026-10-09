@@ -17,12 +17,9 @@ export const messages = {
   "webClient.pane.chat": "チャット",
   "webClient.pane.workspace": "ワークスペース",
   "webClient.notice.connecting": "コンピューターに接続しています",
-  "webClient.notice.disconnected": "コンピューターが切断されています",
   "webClient.notice.findingHosts": "コンピューターを探しています",
   "webClient.notice.hostsFailed": "コンピューターを読み込めませんでした",
   "webClient.notice.connectComputer": "コンピューターを接続してください",
-  "webClient.notice.keepOpen":
-    "コンピューターで OpenBot を開いたままにしてください。再接続中も下書きはここに残ります。",
   "webClient.connect.description":
     "コンピューターで OpenBot を実行すると、このブラウザーからエージェントとチャットできます。招待でコンピューターに参加することもできます。",
   "webClient.connect.stepInstall": "コンピューターに OpenBot をインストールして開きます。",
@@ -30,18 +27,11 @@ export const messages = {
   "webClient.connect.stepRemote": "リモートアクセスをオンにします。",
   "webClient.notice.download": "OpenBot をダウンロード",
   "webClient.notice.join": "招待で参加",
-  "webClient.notice.reconnect": "再接続",
   "webClient.notice.refreshHosts": "ホストを更新",
-  "webClient.uncertain.title": "メッセージが届いたか確認してください",
-  "webClient.uncertain.description":
-    "配信が確認される前に接続が切れました。もう一度送信する前に、更新して会話を確認してください。メッセージは自動では再送信されません。",
-  "webClient.uncertain.refresh": "会話を更新",
-  "webClient.uncertain.checked": "会話を確認しました",
   "webClient.agent.modelsFailed": "ホストのモデルを読み込めませんでした。",
   "webClient.agent.refreshFailed":
     "エージェントは作成されましたが、ワークスペースを更新できませんでした。再試行する前に再読み込みしてください。",
   "webClient.agent.unconfirmed": "結果が確認できません。再試行する前に、このフォームを閉じてホストを確認してください。",
-  "webClient.error.hostStatus": "ホストの状態を読み取れませんでした。",
   "webClient.error.usageOffline": "使用量を表示するには、ホストに接続してください。",
   "webClient.error.desktopOnly": "この操作はデスクトップアプリで使えます。",
   "webClient.settings.preferences.title": "環境設定",

@@ -56,6 +56,7 @@ function runtimeFixture(
     closeBrowserTab: async () => {},
     respondToTakeover: async () => {},
     listHosts: async () => [],
+    leaveHost: async () => {},
     previewInvite: async () => {
       throw new Error("unused");
     },
@@ -68,7 +69,7 @@ function runtimeFixture(
     conversation: async () => EMPTY_PAGE,
     markRead: async () => ({ unreadCount: 0, firstUnreadMessageId: null, throughMessageId: null }),
     conversationReads: async () => ({}),
-    send: async () => {},
+    send: async () => "delivery-1",
     stop: async () => {},
     setTyping: () => {},
     queue: async (agentId) => ({ agentId, deliveries: [] }),
@@ -87,6 +88,14 @@ function runtimeFixture(
     download: async () => ({ name: "unused", mimeType: "text/plain", base64: "" }),
     sharedFile: async () => ({ name: "unused", mimeType: "text/plain", base64: "" }),
     workspaceFile: async () => ({ name: "unused", mimeType: "text/plain", base64: "" }),
+    workspaceDirectory: async () => ({
+      name: "unused",
+      path: ".",
+      root: "/",
+      parentPath: null,
+      entries: [],
+      truncated: false,
+    }),
     react: async () => {},
     setAvatar: async () => {},
     models,

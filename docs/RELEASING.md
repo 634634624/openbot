@@ -1,14 +1,16 @@
 # Releasing OpenBot
 
 For iOS builds uploaded to TestFlight through GitHub Actions, see
-[the mobile release guide](../apps/mobile/README.md#github-actions-testflight-release).
-The mobile workflow is separate from the desktop tag release described below.
+[the mobile release guide](../apps/mobile/README.md#github-actions-testflight-release). For Android
+builds uploaded to Google Play, see
+[the Google Play release guide](../apps/mobile/README.md#github-actions-google-play-release).
+The mobile workflows are separate from the desktop tag release described below.
 
 OpenBot updates are published through GitHub Releases and installed with `electron-updater`.
 macOS requires every auto-updatable build to be signed with a Developer ID Application certificate.
-The release workflow also notarizes and staples the macOS application before publishing it. Windows
-x64 and Linux releases are currently unsigned, so Windows can show an Unknown publisher or
-SmartScreen warning and the Linux AppImage carries no signature.
+The release workflow also notarizes and staples the macOS application before publishing it. A Windows
+x64 tag release is signed with Azure Artifact Signing (see [Windows signing](#windows-signing)). Linux
+releases are unsigned, and the Linux AppImage carries no signature.
 All three platforms must pass before one release is published. A release also requires the pinned
 Sunshine and Moonlight Web runtime artifacts. GitHub Actions downloads those artifacts, checks SHA-256, and
 verifies their native executables as part of the final OpenBot package. Release packages are not built
@@ -21,7 +23,7 @@ OpenBot. Linux has no code-signature contract to check, so its provider artifact
 SHA-256 and version only.
 
 Installed apps do not wait for a release to get a new provider CLI: they offer the latest upstream
-release (see [Provider CLI updates](ARCHITECTURE.md#provider-cli-updates)). The pinned version is the
+release (see [Provider CLI updates](architecture/providers.md#provider-cli-updates)). The pinned version is the
 first-install fallback. To stop a broken upstream release, add its version to the provider's list in
 `provider-runtime-blocklist.json` and merge it to `main`. Apps read the list at their next check. A
 blocked version is no longer offered, but it stays on the computers that already installed it.
@@ -43,15 +45,109 @@ Create the `release` environment in `nightly-labs/openbot`, then add these envir
 Do not use an Apple Development certificate. Direct distribution and native macOS updates require a
 Developer ID Application certificate. Never commit signing credentials to the repository.
 
-The Docker image needs no secret: the `docker-publish` job pushes with `GITHUB_TOKEN`. After the
-first push, GHCR keeps the package `openbot` private. Open the package settings of
-`nightly-labs/openbot` once, make it public, and give the repository write access under **Manage
-Actions access**. (Not confirmed: a repository that pushes a new package usually gets this access
-already.)
+### Docker package access
 
-Windows signing credentials are not currently configured. The workflow explicitly verifies that the
-OpenBot executable and NSIS installer remain unsigned, while retaining package, runtime, updater,
-checksum, SBOM, and provenance checks.
+The Docker image needs no secret: the `docker-publish` job pushes with `GITHUB_TOKEN`.
+[GHCR makes new packages private](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry),
+even when the source repository is public. A successful push does not confirm public access.
+
+After the first push, a package administrator must open the
+[OpenBot package](https://github.com/orgs/nightly-labs/packages/container/package/openbot):
+
+1. Open **Package settings** and set **Change visibility** to **Public**.
+2. Check that the package is linked to `nightly-labs/openbot`. The Dockerfile sets the
+   `org.opencontainers.image.source` label for this link.
+3. Under **Manage Actions access**, check that `nightly-labs/openbot` has write access.
+
+If **Public** is disabled by organization administrators, an organization owner must enable
+**Public** under **Package creation** in the
+[organization package settings](https://github.com/organizations/nightly-labs/settings/packages).
+Make OpenBot public, then restore the previous organization policy. Existing public packages stay
+public when this creation permission is disabled again.
+
+If a release pushed its image but users cannot pull it, check these settings first. Changing
+visibility makes the existing tags public; no rebuild is needed. Tags `0.30.0` and `0.31.0` have
+no `v` prefix. Later releases also publish `v<version>` as an alias.
+
+Check access with an empty Docker configuration, so a saved login cannot hide the fault:
+
+```sh
+anonymous_config=$(mktemp -d)
+docker --config "$anonymous_config" manifest inspect ghcr.io/nightly-labs/openbot:latest
+docker --config "$anonymous_config" manifest inspect ghcr.io/nightly-labs/openbot:0.30.0
+rm -rf "$anonymous_config"
+```
+
+The release workflow checks anonymous access to the version, `v<version>` and `latest` tags,
+including both Linux architectures. A failure leaves the GitHub Release and pushed images in
+place. Correct the package settings, then run the failed job again.
+
+## Hosted-server snapshots
+
+After GitHub publication, `Publish boat server snapshot` builds the Linux x64 release into a boat
+named snapshot (`openbot-server-production-<version>` with dots replaced by hyphens), then selects
+it for new production servers. It uses the tagged hosting scripts,
+the published `SHA256SUMS-linux.txt`, and `https://api.openbot.run`. The builder checks the AppImage
+checksum and installed version and requires an empty host profile before saving the snapshot.
+Existing servers and the test Worker do not change.
+
+Before the first release with this job, configure the `cloudflare-production` GitHub Environment:
+
+- Add `BOAT_TEMPLATE_API_KEY`, a separate boat key with sandbox, file, command and named snapshot
+  access. Keep the limited `BOAT_API_KEY` on the Worker.
+- Keep `CLOUDFLARE_PRODUCTION_DEPLOY_TOKEN` and the `CLOUDFLARE_ACCOUNT_ID` variable used by deployment.
+- Permit the tag pattern `v*.*.*` in addition to the `main` branch. The release job runs on a tag.
+
+`release:preflight` checks these settings. The hosted job and production Worker deployment share
+one concurrency group. The job checks GitHub's latest stable release before building and again
+before selection. It writes only the Worker's `HOSTED_SERVER_TEMPLATE` secret. Normal CI and local
+production deployments preserve it; the old GitHub variable is ignored. `hosting:setup` now sets
+up billing and webhooks only and no longer accepts `--template`.
+
+A failed hosted job leaves the GitHub Release published and the previous template selected.
+Run the failed job again after correcting the cause. A ready snapshot is reused; a save in progress
+is polled; a failed snapshot requires operator inspection. The builder never replaces an existing
+snapshot or deletes old snapshots. It stops at 10 snapshots even if boat permits paid storage above
+that count. Confirm that neither Worker nor any pending create needs a snapshot before removing it.
+
+A successful job reports the selected version in its Actions summary. Verify the first rollout by
+creating a temporary production server and checking its initial installed version. Record the
+result under `.openbot-build/`; remove only that temporary server after the check. This remote check
+is separate from local checks and requires production access.
+
+## Windows signing
+
+A tag build signs the Windows release with Azure Artifact Signing. It needs no secret:
+
+- The Artifact Signing account `synthetifyartifactsign` (East US, `https://eus.codesigning.azure.net/`)
+  holds the Public Trust certificate profile `SYNTHETIFY`, issued to
+  `SYNTHETIFY LABS SPÓŁKA Z OGRANICZONĄ ODPOWIEDZIALNOŚCIĄ`. Microsoft issues a new short-lived
+  certificate each day with the same subject.
+- The Entra app registration `openbot-release-signing` has the **Artifact Signing Certificate Profile
+  Signer** role on that profile only. Its federated credential trusts the subject
+  `repo:nightly-labs@100160810/openbot@1332461149:environment:release`, because this repository uses
+  GitHub's immutable OIDC subject format. A dry run has no environment, so it cannot sign.
+- The `windows` job logs in with `azure/login`, caches a token for the signing service, and runs
+  `bun run dist:win --config electron-builder.windows-signing.yml`, then runs `az account clear`, so
+  the steps after the build have no Azure session. That overlay adds
+  `win.azureSignOptions` and `forceCodeSigning`. electron-builder signs `OpenBot.exe`, every `.exe` from
+  `extraResources` (Whisper, the remote desktop runtime, and the Computer Use driver), the NSIS
+  installer, and its uninstaller. The provider CLIs are not packaged on Windows, so their vendor
+  signatures do not change.
+- `verify:package:win --require-signature` requires a valid signature with the `app-update.yml`
+  publisher on each of those executables, and the next step requires the same signer on the
+  installer. A dry run requires `NotSigned` instead.
+- `-f mode=windows-signing` checks the login and the signing service without a release (see
+  [Publish a version](#publish-a-version) for the command).
+
+electron-builder writes `publisherName` to `app-update.yml`. An installed signed build accepts an
+update only when its installer certificate has that CN. A change of the legal name or of the identity
+validation therefore stops auto-updates for every signed install: ship a release that lists both names
+in `publisherName` before the certificate changes. An unsigned install has no `publisherName` and
+accepts the first signed update.
+
+The signature removes the Unknown publisher warning. SmartScreen can still warn until the new
+certificate builds download reputation.
 
 ## Build the remote desktop runtime
 
@@ -182,7 +278,7 @@ packages have no license file, so set `licenseSha256` to the SHA-256 of `LICENSE
 
 `native-runtime.lock.json` also pins the OpenCode CLI that OpenBot downloads for the OpenCode
 provider before its first update check answers, by npm platform package, asset SHA-256, extracted binary SHA-256, byte counts, and the
-MIT license file it fetches from `github.com/anomalyco/opencode`. Codex, Claude, and Grok are pinned
+MIT license file it takes from the `opencode-ai` npm package. Codex, Claude, and Grok are pinned
 in the same file by hand; OpenCode has a script, because the version, both platform packages, and
 the license have to agree:
 
@@ -200,7 +296,7 @@ entry and re-run it with that exact version: the command reports `already pins O
 when the committed block matches byte for byte.
 
 Run it on a version bump only. A bump also needs the Windows checks in
-[the OpenCode notes](ARCHITECTURE.md#opencode-and-acp): the `win32-x64` values come from the
+[the OpenCode notes](architecture/providers.md#opencode-and-acp): the `win32-x64` values come from the
 published tarball read on macOS, so a staged `opencode.exe --version` must be confirmed on Windows
 before release.
 
@@ -212,7 +308,7 @@ provider CLIs, the driver is packaged rather than downloaded on demand, so the r
 the user installs nothing.
 
 ```bash
-bun run pin:cua-driver 0.28.2
+bun run pin:cua-driver 0.34.0
 ```
 
 The script downloads all three `-binary` release assets, hashes each shipped file, and refuses a
@@ -284,7 +380,8 @@ A change to the desktop app or the web client and the iPhone app gets one file i
 `bun run mobile:release:patch`, `mobile:release:minor` and `mobile:release:major` move these files
 into `apps/mobile/CHANGELOG.md` and set the version in `apps/mobile/app.json`,
 `apps/mobile/package.json` and the copy of it in `bun.lock`. The pre-commit hook checks the new section when a commit changes the
-`app.json` version.
+`app.json` version. The new section is `## [x.y.z] - In review`, and `/changelog` does not show it
+until the store makes the build available. Then `bun run mobile:release:published` writes the date.
 
 `scripts/check-release-notes.ts` stops a release when the section is missing, empty or appears two
 times, or when it has an unknown group, a group with no items, an item with no text or outside a
@@ -347,7 +444,7 @@ The workflow:
    build machine. The Host PKG is ARM64 only;
    when `hdiutil create` fails with "Device not configured" or "Resource busy", it builds again,
    up to 3 attempts, because that runner error is not caused by the app;
-5. builds an unsigned Windows x64 NSIS installer on a GitHub Windows runner;
+5. builds a signed Windows x64 NSIS installer on a GitHub Windows runner (unsigned in a dry run);
 6. builds unsigned Linux x64 and arm64 AppImages on GitHub Ubuntu 24.04 runners of each architecture,
    with the launch check under `xvfb-run`;
 7. verifies all three unpacked applications, update metadata, included runtimes, provider control
@@ -361,8 +458,9 @@ The workflow:
     architecture, after it checks the AppImage against its `SHA256SUMS` file. It starts each image
     with `docker/seccomp.json`, waits for `openbot status`, and stops it, which must exit with 0;
 11. after the GitHub Release is published, pushes both images to `ghcr.io/nightly-labs/openbot`
-    with the tags `<version>-amd64` and `<version>-arm64`, joins them under `<version>`, `latest` and
-    `sha-<commit>`, and attests the build provenance of that image. See [Docker](docker.md).
+    with the tags `<version>-amd64` and `<version>-arm64`, joins them under `<version>`, `v<version>`,
+    `latest` and `sha-<commit>`, and attests the build provenance of that image. It then checks
+    anonymous access to both architectures. See [Docker](docker.md).
 
 Users can verify a downloaded artifact with
 `gh attestation verify <file> --repo nightly-labs/openbot`.
@@ -377,7 +475,24 @@ The dry run runs the tag validation (without the tag and `main` checks), the Win
 Docker builds, and all their verification steps. It does not run the macOS job or the publish jobs,
 and it makes no attestation: the macOS job needs the `release` secrets, which only tag runs receive,
 and an attestation of this public repository is a public Sigstore record. Use `-f mode=host-signing` on a
-tag ref to check the macOS Host signing keychain.
+tag ref to check the macOS Host signing keychain, and `-f mode=windows-signing` on a tag ref to check
+Windows signing. `--ref` selects the workflow and the overlay, so the tag must point to the commit
+to test. Use a temporary `v0.0.0-*` tag. It matches the `release` environment policy. Its push
+starts a release run, but `Validate release tag` stops that run, because the tag never matches the
+`package.json` version:
+
+```sh
+git tag v0.0.0-windows-signing-test <commit>
+git push origin v0.0.0-windows-signing-test
+gh workflow run release.yml --ref v0.0.0-windows-signing-test -f mode=windows-signing
+# After the run:
+git tag -d v0.0.0-windows-signing-test
+git push origin :refs/tags/v0.0.0-windows-signing-test
+```
+
+It logs in to Azure, then signs a throwaway executable once immediately and once 20 minutes later,
+the delay between login and signing in a release build. It uploads and publishes nothing. Run it once
+after a change to the Azure setup or to `electron-builder.windows-signing.yml`, before the next tag.
 
 Installed OpenBot builds check for updates shortly after launch and every four minutes. New versions
 download automatically while **Automatically download updates** is on, which is the default and is
@@ -413,8 +528,8 @@ Before creating the first tag or any later release:
 0. run the Team API compatibility matrix for every protocol that remains in the adapter registry. The matrix must cover an older client with the new host, the new client with an older host, matching versions, no shared protocol, capability omission, unknown optional events, and malformed known events. Do not reduce this matrix because a protocol is old or because many application versions separate the peers. Confirm that each supported protocol still has unchanged client and host fixtures;
 
 1. run `bun run release:preflight` and resolve every reported release-secret or repository gate;
-2. confirm the `release` environment contains all eight macOS secrets above; Windows and Linux remain
-   unsigned;
+2. confirm the `release` environment contains all eight macOS secrets above; Windows signs through
+   the Azure federated credential and needs no secret; Linux remains unsigned;
 3. confirm the production `/join` page and Apple association file pass the deployment checks in CI;
 4. run `bun install --frozen-lockfile` and `bun run check` from a clean clone;
 5. run `bun run package:verify` on macOS; Windows and Linux packaging and launch verification run on

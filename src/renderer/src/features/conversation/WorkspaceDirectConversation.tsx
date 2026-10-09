@@ -1,9 +1,11 @@
 import type { TeamPresenceMember } from "@openbot/contracts/ipc";
+import { unloadedHistory } from "@openbot/ui/features/conversation/ChatScrollRail";
 import { useText } from "@openbot/ui/text";
 import { Loading } from "solid-js";
 import { DirectConversation } from "../../lazy-views";
 import { usePlatform } from "../../platform";
 import { deviceSendShortcut } from "../../send-shortcut-preference";
+import { useServerScope } from "../servers/server-scope";
 import { useServers } from "../servers/servers-context";
 import { usePresence } from "../team/team-context";
 import { useDirectMessages } from "./direct-messages-context";
@@ -17,6 +19,7 @@ import { useDirectMessages } from "./direct-messages-context";
  */
 export function WorkspaceDirectConversation(props: { member: TeamPresenceMember }) {
   const platform = usePlatform();
+  const scope = useServerScope();
   const { activeServerSupportsCapability } = useServers();
   const { currentTeamMember } = usePresence();
   const {
@@ -46,6 +49,7 @@ export function WorkspaceDirectConversation(props: { member: TeamPresenceMember 
       }
     >
       <DirectConversation
+        connectionReady={scope.loaded()}
         member={props.member}
         currentMemberId={currentTeamMember()?.id ?? ""}
         snapshot={directConversations()[props.member.id]}
@@ -55,6 +59,7 @@ export function WorkspaceDirectConversation(props: { member: TeamPresenceMember 
           activeServerSupportsCapability("conversation-pagination") &&
           (directConversationPages()[props.member.id]?.hasOlder ?? false)
         }
+        unloadedHistory={unloadedHistory(directConversationPages()[props.member.id])}
         loadingOlder={directOlderLoading()[props.member.id] === true}
         olderError={directOlderErrors()[props.member.id] ?? null}
         typing={directTypingMemberIds().has(props.member.id)}

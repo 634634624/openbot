@@ -22,6 +22,7 @@ import type {
   CreateHostedServerInput,
   DeleteHostedServerInput,
   HostedServerCatalog,
+  HostedServerLifecycleInput,
   HostedServerList,
   HostedServerSummary,
 } from "./hosted-servers";
@@ -105,7 +106,9 @@ import type {
   OpenAttachmentInput,
   OpenSharedFileInput,
   OpenWorkspaceFileInput,
+  WorkspaceDirectory,
 } from "./ipc-attachments";
+import type { BitwardenConnectorStatus } from "./ipc-bitwarden-connector";
 import type {
   BrowserBounds,
   BrowserControlState,
@@ -173,8 +176,20 @@ import type {
   SetDynamicIslandInteractiveInput,
   SetDynamicIslandPreferenceInput,
 } from "./ipc-dynamic-island";
+import type {
+  EventActivity,
+  EventRoutine,
+  EventRoutineRef,
+  EventStatus,
+  ListEventActivityInput,
+  ListEventRoutinesInput,
+  SaveEventRoutineInput,
+  SaveEventRoutineResult,
+  WebhookSecret,
+} from "./ipc-events";
 import type { GitHubConnectorRepositories, GitHubConnectorStatus } from "./ipc-github-connector";
 import type { HostAnalytics, HostAnalyticsInput } from "./ipc-host-analytics";
+import type { HostReleaseStatus } from "./ipc-host-release";
 import type {
   DeleteHostedSiteInput,
   HostedSiteList,
@@ -193,19 +208,32 @@ import type {
   SubmitMarketplaceAgentInput,
 } from "./ipc-marketplace-agents";
 import type {
+  CancelMcpSignInInput,
   McpServerConfig,
+  McpSignInState,
   McpTestResult,
   RemoveMcpServerInput,
   SaveMcpServerInput,
   SetMcpServerEnabledInput,
+  SignOutMcpServerInput,
   TestMcpServerInput,
 } from "./ipc-mcp-servers";
 import type {
+  AddMessagingOrchestratorInput,
+  AddMessagingOrchestratorResult,
   AddSlackOrchestratorInput,
   AddSlackOrchestratorResult,
+  AddTelegramOrchestratorInput,
+  ConnectTelegramChatInput,
+  MessagingOverview,
+  MessagingWorkspaceInput,
+  SetMessagingEnabledInput,
   SetSlackEnabledInput,
+  SetTelegramEnabledInput,
   SlackOverview,
   SlackWorkspaceInput,
+  TelegramChatInput,
+  TelegramOverview,
 } from "./ipc-messaging";
 import type { NotificationOpenedEvent, NotificationPreference } from "./ipc-notifications";
 import type { OnePasswordConnectInput, OnePasswordConnectorStatus } from "./ipc-onepassword-connector";
@@ -217,6 +245,7 @@ import type {
 } from "./ipc-provider-detection";
 import type {
   AcknowledgeFailedTurnInput,
+  BusyMessageModePreference,
   CancelQueuedMessageInput,
   EditQueuedMessageInput,
   InterruptTurnInput,
@@ -232,6 +261,17 @@ import type {
   RemoteDesktopTestInput,
   RemoteDesktopTestStatus,
 } from "./ipc-remote-desktop-setup";
+import type { RemoteSessionReusePreference } from "./ipc-remote-sessions";
+import type {
+  ConnectRoutineFlowInput,
+  DisconnectRoutineFlowInput,
+  RemoveRoutineFlowPositionInput,
+  RoutineFlowCanvas,
+  RoutineFlowLink,
+  RoutineFlowsChanged,
+  SaveRoutineFlowPositionInput,
+  UpdateRoutineFlowLinkInput,
+} from "./ipc-routine-flows";
 import type {
   CreateRoutineInput,
   DeleteRoutineInput,
@@ -239,6 +279,7 @@ import type {
   Routine,
   RoutineCalendar,
   RoutineCalendarInput,
+  RoutineFeed,
   RoutineRun,
   TestRoutineInput,
   UpdateRoutineInput,
@@ -404,6 +445,14 @@ export const IPC_ENDPOINTS = {
     // A remote owner or admin can change a grant from a phone or the web client, so main tells the
     // window instead of the window only reading the value at start.
     approvalAutomation: event<ApprovalAutomationPreference>()("app:approval-automation"),
+    getBusyMessageModePreference: request<undefined, BusyMessageModePreference>()("app:get-busy-message-mode"),
+    setBusyMessageModePreference: request<BusyMessageModePreference, BusyMessageModePreference>()(
+      "app:set-busy-message-mode",
+    ),
+    getRemoteSessionReusePreference: request<undefined, RemoteSessionReusePreference>()("app:get-remote-session-reuse"),
+    setRemoteSessionReusePreference: request<RemoteSessionReusePreference, RemoteSessionReusePreference>()(
+      "app:set-remote-session-reuse",
+    ),
     getAppLanguagePreference: request<undefined, AppLanguagePreference>()("app:get-language-preference"),
     setAppLanguagePreference: request<SetAppLanguagePreferenceInput, AppLanguagePreference>()(
       "app:set-language-preference",
@@ -431,6 +480,7 @@ export const IPC_ENDPOINTS = {
     exportDiagnostics: request<undefined, ExportResult>()("maintenance:export-diagnostics"),
   },
   providers: {
+    setProviderOn: request<{ provider: AgentProviderId; on: boolean }, AgentStatus>()("app:set-provider-on"),
     connectProvider: request<AgentProviderId, AgentStatus>()("app:connect-provider"),
     refreshAgentProviders: request<undefined, AgentStatus>()("app:refresh-agent-providers"),
     /**
@@ -583,9 +633,10 @@ export const IPC_ENDPOINTS = {
       "provider-admin:delete-custom-provider",
     ),
   },
-  // The Slack workspaces where this computer's agents answer. Only the host's own desktop can use
-  // these: a connect opens a Slack page in this computer's browser, and the page returns to this
-  // computer's `openbot://` link. A token only travels towards the host; no result carries one.
+  // The Slack workspaces, Discord guilds and Telegram chats where this computer's agents answer. Only
+  // the host's own desktop can use these: a connect opens a Slack, Discord or Telegram page in this
+  // computer's browser, and a Slack or Discord page returns to this computer's `openbot://` link. A
+  // token only travels towards the host; no result carries one.
   messaging: {
     getSlackOverview: request<undefined, SlackOverview>()("messaging:get-slack-overview"),
     connectSlackWorkspace: request<undefined, void>()("messaging:connect-slack-workspace"),
@@ -595,12 +646,32 @@ export const IPC_ENDPOINTS = {
     addSlackOrchestrator: request<AddSlackOrchestratorInput, AddSlackOrchestratorResult>()(
       "messaging:add-slack-orchestrator",
     ),
+    getDiscordOverview: request<undefined, MessagingOverview>()("messaging:get-discord-overview"),
+    connectDiscordGuild: request<undefined, void>()("messaging:connect-discord-guild"),
+    disconnectDiscordGuild: request<MessagingWorkspaceInput, void>()("messaging:disconnect-discord-guild"),
+    reconnectDiscordGuild: request<MessagingWorkspaceInput, void>()("messaging:reconnect-discord-guild"),
+    setDiscordEnabled: request<SetMessagingEnabledInput, void>()("messaging:set-discord-enabled"),
+    addDiscordOrchestrator: request<AddMessagingOrchestratorInput, AddMessagingOrchestratorResult>()(
+      "messaging:add-discord-orchestrator",
+    ),
+    // The Telegram chats that added the OpenBot bot. A connect opens a `t.me` link with a one-use code
+    // in this computer's browser; the chat links itself when the bot is added.
+    getTelegramOverview: request<undefined, TelegramOverview>()("messaging:get-telegram-overview"),
+    connectTelegramChat: request<ConnectTelegramChatInput, void>()("messaging:connect-telegram-chat"),
+    disconnectTelegramChat: request<TelegramChatInput, void>()("messaging:disconnect-telegram-chat"),
+    reconnectTelegramChat: request<TelegramChatInput, void>()("messaging:reconnect-telegram-chat"),
+    setTelegramEnabled: request<SetTelegramEnabledInput, void>()("messaging:set-telegram-enabled"),
+    addTelegramOrchestrator: request<AddTelegramOrchestratorInput, AddMessagingOrchestratorResult>()(
+      "messaging:add-telegram-orchestrator",
+    ),
   },
   // The server name, logo and app update of one server's host. `host.updateIdentity` and `update`
   // reach this computer only; these take the server, so a remote admin reaches the host. The
   // identity result is the server as the list shows it after the change.
   hostAdmin: {
     updateIdentity: scopedRequest<UpdateHostIdentityInput, ServerSummary, "required">()("host-admin:update-identity"),
+    getReleaseStatus: scopedQuery<HostReleaseStatus | null, "required">()("host-admin:get-release-status"),
+    checkRelease: scopedQuery<HostReleaseStatus, "required">()("host-admin:check-release"),
     getUpdateStatus: scopedQuery<HostUpdateStatus, "required">()("host-admin:get-update-status"),
     checkForUpdate: scopedQuery<HostUpdateStatus, "required">()("host-admin:check-for-update"),
     startUpdate: scopedRequest<UpdateRestartMode, HostUpdateStatus, "required">()("host-admin:start-update"),
@@ -623,6 +694,12 @@ export const IPC_ENDPOINTS = {
   },
   // The 1Password connection of this computer. Local only, like `githubConnector`. The token goes
   // from the renderer to main once, in `connectWithToken`; every answer is the status only.
+  bitwardenConnector: {
+    status: request<undefined, BitwardenConnectorStatus>()("bitwarden-connector:status"),
+    connect: request<string, BitwardenConnectorStatus>()("bitwarden-connector:connect"),
+    disconnect: request<undefined, BitwardenConnectorStatus>()("bitwarden-connector:disconnect"),
+    changed: event<BitwardenConnectorStatus>()("bitwarden-connector:changed"),
+  },
   onePasswordConnector: {
     status: request<undefined, OnePasswordConnectorStatus>()("onepassword-connector:status"),
     // Looks again for the CLI and the 1Password app's CLI integration, for a page that opens or regains focus.
@@ -647,6 +724,12 @@ export const IPC_ENDPOINTS = {
   },
   // The account's Stripe subscription. The main process gets the Checkout or Portal URL from the
   // account server and opens it in the browser, so the renderer never sends a URL.
+  // The iCalendar feed of this computer's routines. `create` also replaces the URL of a feed that is on.
+  routineFeed: {
+    get: request<undefined, RoutineFeed>()("routine-feed:get"),
+    create: request<undefined, RoutineFeed>()("routine-feed:create"),
+    remove: request<undefined, RoutineFeed>()("routine-feed:remove"),
+  },
   billing: {
     getState: request<undefined, BillingState>()("billing:get-state"),
     openPortal: request<BillingPortalRequest, void>()("billing:open-portal"),
@@ -660,6 +743,7 @@ export const IPC_ENDPOINTS = {
     create: request<CreateHostedServerInput, HostedServerSummary>()("hosted-servers:create"),
     openCheckout: request<string, HostedServerSummary>()("hosted-servers:open-checkout"),
     delete: request<DeleteHostedServerInput, void>()("hosted-servers:delete"),
+    lifecycle: request<HostedServerLifecycleInput, void>()("hosted-servers:lifecycle"),
     wake: request<string, HostedServerSummary>()("hosted-servers:wake"),
   },
   marketplaceAgents: {
@@ -815,6 +899,20 @@ export const IPC_ENDPOINTS = {
       "agent:channel-routines:runs",
     ),
   },
+  /**
+   * Routine flows: an agent routine's answer handed on from agent to agent, and the canvas that shows
+   * it. Only this computer's host keeps them; a remote server answers that it cannot.
+   */
+  routineFlows: {
+    canvas: scopedRequest<string, RoutineFlowCanvas>()("routine-flows:canvas"),
+    savePosition: scopedRequest<SaveRoutineFlowPositionInput, void>()("routine-flows:save-position"),
+    removePosition: scopedRequest<RemoveRoutineFlowPositionInput, void>()("routine-flows:remove-position"),
+    connect: scopedRequest<ConnectRoutineFlowInput, RoutineFlowLink>()("routine-flows:connect"),
+    disconnect: scopedRequest<DisconnectRoutineFlowInput, void>()("routine-flows:disconnect"),
+    updateLink: scopedRequest<UpdateRoutineFlowLinkInput, RoutineFlowLink>()("routine-flows:update-link"),
+    /** The local agents whose canvases changed. */
+    changed: event<RoutineFlowsChanged>()("routine-flows:changed"),
+  },
   agentAttachments: {
     chooseAttachments: scopedRequest<ChooseAttachmentsInput, DraftAttachment[]>()("agent:choose-attachments"),
     discardDraftAttachment: scopedRequest<string, void>()("agent:discard-draft-attachment"),
@@ -824,6 +922,9 @@ export const IPC_ENDPOINTS = {
     openWorkspaceFile: scopedRequest<OpenWorkspaceFileInput, void>()("agent:open-workspace-file"),
     previewSharedFile: scopedRequest<OpenSharedFileInput, FilePreview>()("agent:preview-shared-file"),
     previewWorkspaceFile: scopedRequest<OpenWorkspaceFileInput, FilePreview>()("agent:preview-workspace-file"),
+    listWorkspaceDirectory: scopedRequest<OpenWorkspaceFileInput, WorkspaceDirectory>()(
+      "agent:list-workspace-directory",
+    ),
   },
   // Not part of `agentAttachments`: the preload sends the paths of dropped and pasted files, and the
   // renderer must never name a path to import. So this group is never bridged to the renderer.
@@ -930,6 +1031,13 @@ export const IPC_ENDPOINTS = {
     ),
     // A test connects once and reports what it found. Nothing is stored, and no agent uses it.
     testMcpServer: scopedRequest<TestMcpServerInput, McpTestResult, "required">()("servers:mcp:test"),
+    // A test never opens a browser; a sign-in does, and answers once the browser came back and the
+    // server took the token. These four act on the computer that runs OpenBot only: nobody sits in
+    // front of a remote host's browser.
+    signInMcpServer: scopedRequest<TestMcpServerInput, McpTestResult, "required">()("servers:mcp:sign-in"),
+    cancelMcpSignIn: scopedRequest<CancelMcpSignInInput, void, "required">()("servers:mcp:cancel-sign-in"),
+    signOutMcpServer: scopedRequest<SignOutMcpServerInput, McpSignInState[], "required">()("servers:mcp:sign-out"),
+    listMcpSignIns: scopedQuery<McpSignInState[], "required">()("servers:mcp:list-sign-ins"),
   },
   // Bound against the storage service, not `AgentService`, so it is its own group.
   storage: {
@@ -983,6 +1091,16 @@ export const IPC_ENDPOINTS = {
     revokeSession: request<string, void>()("host:revoke-session"),
     event: event<HostStatus>()("host:event"),
   },
+  events: {
+    getStatus: scopedQuery<EventStatus, "required">()("events:get-status"),
+    listRoutines: scopedRequest<ListEventRoutinesInput, EventRoutine[], "required">()("events:list-routines"),
+    saveRoutine: scopedRequest<SaveEventRoutineInput, SaveEventRoutineResult, "required">()("events:save-routine"),
+    deleteRoutine: scopedRequest<EventRoutineRef, void, "required">()("events:delete-routine"),
+    testRoutine: scopedRequest<EventRoutineRef, void, "required">()("events:test-routine"),
+    rotateSecret: scopedRequest<EventRoutineRef, WebhookSecret, "required">()("events:rotate-secret"),
+    listActivity: scopedRequest<ListEventActivityInput, EventActivity[], "required">()("events:list-activity"),
+  },
+
   remoteDesktop: {
     checkSetup: request<string, RemoteDesktopSetupStatus>()("remote-desktop:check-setup"),
     openSetup: request<RemoteDesktopSetupAction, void>()("remote-desktop:open-setup"),
@@ -996,6 +1114,66 @@ export const IPC_ENDPOINTS = {
 } as const;
 
 export type IpcEndpoints = typeof IPC_ENDPOINTS;
+
+/**
+ * Where each group sits on `window.openbot`. The empty path is the top level, and several groups can
+ * share one path: the agent groups are spread into `agent`. Null keeps a group off the page; only the
+ * preload calls it. A new group does not compile until it has a place here, so the author decides
+ * what the page can call. `OpenBotDesktopApi`, the built-preload verifier and the test harness all
+ * read this table; the preload and the preview mock are checked against it through the type.
+ */
+export const IPC_GROUP_PATHS = {
+  app: "",
+  maintenance: "maintenance",
+  providers: "",
+  providerRuntimes: "providerRuntimes",
+  voice: "voice",
+  dynamicIsland: "dynamicIsland",
+  computerUse: "computerUse",
+  skills: "skills",
+  customProviders: "customProviders",
+  providerDetection: "providerDetection",
+  customAgents: "customAgents",
+  providerAdmin: "providerAdmin",
+  messaging: "messaging",
+  hostAdmin: "hostAdmin",
+  githubConnector: "githubConnector",
+  onePasswordConnector: "onePasswordConnector",
+  bitwardenConnector: "bitwardenConnector",
+  hostedSites: "hostedSites",
+  routineFeed: "routineFeed",
+  routineFlows: "routineFlows",
+  billing: "billing",
+  hostedServers: "hostedServers",
+  marketplaceAgents: "marketplaceAgents",
+  agentTemplates: "agentTemplates",
+  auth: "auth",
+  update: "update",
+  notifications: "notifications",
+  agent: "agent",
+  agentMemories: "agent",
+  sharedTables: "agent",
+  agentRoutines: "agent",
+  channelMemories: "agent",
+  channelRoutines: "agent",
+  agentAttachments: "agent",
+  // The preload calls it from its own drop, paste, and file input handlers.
+  attachmentImports: null,
+  browser: "browser",
+  browserInput: "browser",
+  servers: "servers",
+  agentAdmin: "agent",
+  mcpServers: "agent",
+  storage: "storage",
+  agentImport: "agentImport",
+  plugins: "plugins",
+  host: "host",
+  events: "events",
+  remoteDesktop: "remoteDesktop",
+} as const satisfies { readonly [Group in keyof IpcEndpoints]: string | null };
+
+export type IpcGroupName = keyof IpcEndpoints;
+type IpcGroupPaths = typeof IPC_GROUP_PATHS;
 
 // What a typed endpoint looks like to the renderer. A payload that may be `undefined` is an optional
 // argument. A server-scoped payload loses its scope and takes the server last instead, because the
@@ -1044,6 +1222,30 @@ export type GroupApi<Group extends IpcEndpointGroup> = {
     ? Subscribe<Group[Key]>
     : Invoke<Group[Key]>;
 };
+
+type GroupsAt<Path extends string> = {
+  [Group in IpcGroupName]: IpcGroupPaths[Group] extends Path ? Group : never;
+}[IpcGroupName];
+
+type UnionToIntersection<Union> = (Union extends unknown ? (value: Union) => void : never) extends (
+  value: infer Intersection,
+) => void
+  ? Intersection
+  : never;
+
+// Distributes over a union of groups, one `GroupApi` each.
+type GroupApis<Group extends IpcGroupName> = Group extends IpcGroupName ? GroupApi<IpcEndpoints[Group]> : never;
+
+/** Every group at one path of `window.openbot`, as one surface: `PathApi<"agent">` is all nine agent groups. */
+export type PathApi<Path extends string> = UnionToIntersection<GroupApis<GroupsAt<Path>>>;
+
+type NestedPath = Exclude<IpcGroupPaths[IpcGroupName], "" | null>;
+
+/**
+ * `window.openbot` as `IPC_GROUP_PATHS` lays it out, with every method passed straight through.
+ * `OpenBotDesktopApi` is this, except for the few members the preload writes by hand.
+ */
+export type BridgedDesktopApi = PathApi<""> & { [Path in NestedPath]: PathApi<Path> };
 
 /** The runtime twin of `GroupApi`'s method names, for the preload bridge and the test harness. */
 export function groupApiMethodName(key: string, endpoint: IpcEndpoint): string {

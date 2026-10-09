@@ -13,10 +13,14 @@ import {
 } from "@openbot/contracts/ipc";
 import { isBoolean, isDynamicRecord, isFunction, isNumber, isOneOf, isString } from "@openbot/contracts/runtime-values";
 import { normalizeEmailAddress } from "@openbot/contracts/validation";
+import { classifyFailure, operationForCode, type ReportQueue, safeProperties } from "@openbot/telemetry";
 import { OpenPanelBase, type OpenPanelOptions } from "@openpanel/web";
+import { Effect, Exit, Scope } from "effect";
 import { parse as parseDomain } from "tldts";
+import type { FailureSignal } from "../backend/agent/failure-signal";
 import type { ToolUsageSignal } from "../backend/agent/thread-items";
 import type { BrowserSiteVisit } from "../backend/browser-host";
+import { type AnalyticsOperationFailure, analyticsIO, analyticsSync } from "./analytics-effects";
 
 const OPENPANEL_API_URL = "https://analytics.openbot.run/api";
 const OPENPANEL_CLIENT_ID = "6c989975-87ef-4f0c-857e-ab449a65b5c2";
@@ -36,7 +40,7 @@ const MAX_TOOL_ROWS_PER_TURN = 32;
 const MAX_SITE_TABS = 1_000;
 const MAX_ROUTINE_RUNS = 10_000;
 const MAX_INVENTORY_ITEMS = 32;
-const ANALYTICS_SCHEMA_VERSION = 6;
+const ANALYTICS_SCHEMA_VERSION = 7;
 const CURATED_AGENT_PREFIX = "openbot-curated-agent-";
 const LISTING_SLUG_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/u;
 const TOOL_NAME_PATTERN = /^[A-Za-z0-9_.-]{1,64}$/u;
@@ -97,6 +101,7 @@ function createOpenPanelClient(options: OpenPanelOptions): HostOpenPanelClient {
 }
 
 export interface HostAnalyticsOptions {
+  reports?: ReportQueue;
   enabled: boolean;
   trackingEnabled?: boolean;
   appVersion: string;
@@ -109,7 +114,7 @@ export interface HostAnalyticsOptions {
    */
   resolveMcpServer?: (name: string) => { slug: string | null } | null;
   resolveRoutineRun?: (agentId: string, routineId: string, runId: string) => AnalyticsRoutineRun | null;
-  resolveInventory?: () => Promise<AnalyticsInventory>;
+  resolveInventory?: () => Effect.Effect<AnalyticsInventory, AnalyticsOperationFailure>;
   inventoryDay?: AnalyticsInventoryDayStore;
 }
 
@@ -134,8 +139,8 @@ export interface AnalyticsInventory {
 
 /** The local day of the last inventory event. `malformed` counts as sent today. */
 export interface AnalyticsInventoryDayStore {
-  read(): Promise<string | "missing" | "malformed">;
-  write(day: string): Promise<void>;
+  read(): Effect.Effect<string | "missing" | "malformed", AnalyticsOperationFailure>;
+  write(day: string): Effect.Effect<void, AnalyticsOperationFailure>;
 }
 
 const AGENT_PROPERTY_NAMES = ["provider", "model", "reasoning_effort", "agent_source", "agent_listing"] as const;
@@ -151,7 +156,16 @@ const HOST_ALLOWLIST = {
     "has_secret_prompt",
     "approval_kind",
   ],
-  system_operation_failed: ["provider", "model", "reasoning_effort", "area", "failure_code"],
+  system_operation_failed: [
+    "provider",
+    "model",
+    "reasoning_effort",
+    "area",
+    "failure_code",
+    "cause_code",
+    "severity",
+    "operation",
+  ],
   system_tool_used: [...AGENT_PROPERTY_NAMES, "origin", "tool_kind", "plugin", "tool", "call_count", "failed_count"],
   system_site_visited: [...AGENT_PROPERTY_NAMES, "domain", "actor"],
   system_routine_run: [...AGENT_PROPERTY_NAMES, "status", "run_kind", "trigger_type"],
@@ -176,6 +190,9 @@ type HostProperties = Partial<Record<HostPropertyName, HostPropertyValue>>;
 type HostPendingEvent = { name: HostEventName; properties: HostProperties; timestamp: string };
 type ToolUseRow = { kind: string; plugin?: string; tool?: string; calls: number; failed: number };
 type ActiveTurn = {
+  failureScope?: ReturnType<ReportQueue["scope"]>;
+  agentId: string;
+  properties: HostProperties;
   startedAt: number;
   origin: string;
   owner: AnalyticsIdentity | null;
@@ -184,6 +201,7 @@ type ActiveTurn = {
 };
 
 export class HostAnalytics {
+  readonly #reports: ReportQueue | undefined;
   readonly #resolveOwner: HostAnalyticsOptions["resolveOwner"];
   readonly #resolveAgent: HostAnalyticsOptions["resolveAgent"];
   readonly #resolveMcpServer: NonNullable<HostAnalyticsOptions["resolveMcpServer"]>;
@@ -201,11 +219,14 @@ export class HostAnalytics {
   readonly #siteDomains = new Map<string, string>();
   readonly #routineRunOwners = new Map<string, AnalyticsIdentity | null>();
   readonly #routineRunReports = new Set<string>();
+  #closed = false;
+  readonly #scope = Scope.makeUnsafe();
   #inventoryDay: string | null = null;
-  #inventoryCheck: Promise<void> | null = null;
+  #inventoryCheck = false;
   readonly #operationQueue: AnalyticsOperationQueue = { active: false, operations: [] };
 
   constructor(options: HostAnalyticsOptions, createClient: ClientFactory = createOpenPanelClient) {
+    this.#reports = options.reports;
     this.#resolveOwner = options.resolveOwner;
     this.#resolveAgent = options.resolveAgent;
     this.#resolveMcpServer = options.resolveMcpServer ?? (() => null);
@@ -237,17 +258,21 @@ export class HostAnalytics {
       this.#handleHostedSiteConversation(event.snapshot.messages);
       this.#handleRoutineRunConversation(event.snapshot.agentId, event.snapshot.messages);
     }
-    if (!this.#client || !this.#trackingEnabled) return;
+    if ((!this.#client && !this.#reports) || !this.#trackingEnabled) return;
     switch (event.type) {
       case "conversation":
         return;
       case "turn-started": {
+        this.#configureReports();
         const now = performance.now();
         this.#pruneActiveTurns(now);
         if (this.#activeTurns.has(event.turnId)) return;
         this.#makeTurnCapacity();
         const owner = normalizeAnalyticsIdentity(this.#resolveOwner());
         this.#activeTurns.set(event.turnId, {
+          ...(this.#reports ? { failureScope: this.#reports.scope() } : {}),
+          agentId: event.agentId,
+          properties: this.#agentProperties(event.agentId),
           startedAt: now,
           origin: event.origin ?? "unknown",
           owner,
@@ -325,15 +350,52 @@ export class HostAnalytics {
         );
         return;
       case "error":
+        if (this.#reports) return;
         this.#track("system_operation_failed", {
           ...(event.agentId ? this.#agentProperties(event.agentId) : {}),
           area: "agent",
           failure_code: systemFailureCode(event.code),
+          cause_code: classifyFailure(event.message),
+          severity: "error",
+          operation: operationForCode(event.code),
         });
         return;
       default:
         return;
     }
+  }
+
+  #configureReports(): void {
+    if (this.#reports) Effect.runFork(this.#reports.configure(this.#trackingEnabled, this.#resolveOwner()?.id ?? null));
+  }
+
+  /** Only the local service emits this signal. Remote clients never send host reports. */
+  handleFailure(failure: FailureSignal): void {
+    if (!this.#reports || !this.#trackingEnabled) return;
+    this.#configureReports();
+    const candidates = [...this.#activeTurns.values()].filter((turn) => turn.agentId === failure.agentId);
+    const turn = failure.turnId
+      ? this.#activeTurns.get(failure.turnId)
+      : candidates.length === 1
+        ? candidates[0]
+        : undefined;
+    if (turn?.owner && turn.owner.id !== this.#resolveOwner()?.id) return;
+    const properties = turn?.properties ?? (failure.agentId ? this.#agentProperties(failure.agentId) : {});
+    const provider =
+      failure.provider ?? properties.provider ?? AGENT_PROVIDERS.find((id) => failure.code.startsWith(`${id}_`));
+    const safe = safeProperties({
+      ...properties,
+      provider,
+      ...(failure.model ? { model: failure.model } : {}),
+      area: "agent",
+      operation: operationForCode(failure.code),
+      source: "host",
+      severity: failure.severity ?? "error",
+      failure_code: systemFailureCode(failure.code),
+      cause_code: failure.causeCode,
+      ...(turn ? { origin: turn.origin } : {}),
+    });
+    if (safe) Effect.runFork((turn?.failureScope ?? this.#reports).record("system_operation_failed", safe));
   }
 
   /** Counts one finished tool step. The turn's rows are sent when the turn completes. */
@@ -368,6 +430,7 @@ export class HostAnalytics {
   }
 
   flushPending(): void {
+    this.#configureReports();
     if (!this.#client || !this.#trackingEnabled) return;
     const owner = normalizeAnalyticsIdentity(this.#resolveOwner());
     if (!owner) return;
@@ -382,6 +445,7 @@ export class HostAnalytics {
   }
 
   clear(): void {
+    if (this.#reports) Effect.runFork(this.#reports.configure(this.#trackingEnabled, null));
     this.#pending = [];
     this.#bufferOwnerlessEvents = false;
     for (const activeTurn of this.#activeTurns.values()) {
@@ -394,6 +458,7 @@ export class HostAnalytics {
   setTrackingEnabled(enabled: boolean): void {
     if (this.#trackingEnabled === enabled) return;
     this.#trackingEnabled = enabled;
+    this.#configureReports();
     if (!enabled) {
       this.#hostedSiteOwners.clear();
       this.#activeTurns.clear();
@@ -527,53 +592,59 @@ export class HostAnalytics {
   /** Sends the inventory at most once per local day. It needs an owner, so it waits for sign-in. */
   #checkInventory(): void {
     const today = localDay(new Date());
-    if (this.#inventoryDay === today || this.#inventoryCheck) return;
+    if (this.#closed || this.#inventoryDay === today || this.#inventoryCheck) return;
     const resolveInventory = this.#resolveInventory;
     const store = this.#inventoryDayStore;
     if (!this.#client || !this.#trackingEnabled || !resolveInventory || !store) return;
     if (!normalizeAnalyticsIdentity(this.#resolveOwner())) return;
-    this.#inventoryCheck = (async () => {
-      const stored = await store.read();
-      if (stored === "malformed") {
-        // A damaged file counts as sent today. It is written again, so the next day sends.
-        await store.write(today);
+    this.#inventoryCheck = true;
+    Effect.runFork(
+      Effect.gen({ self: this }, function* () {
+        const stored = yield* store.read();
+        if (stored === "malformed") {
+          // A damaged file counts as sent today. It is written again, so the next day sends.
+          yield* store.write(today);
+          this.#inventoryDay = today;
+          return;
+        }
+        if (stored === today) {
+          this.#inventoryDay = today;
+          return;
+        }
+        const inventory = yield* resolveInventory();
+        if (this.#closed || !this.#trackingEnabled || !normalizeAnalyticsIdentity(this.#resolveOwner())) return;
+        // The day is stored before the send, so a failed write sends nothing and a crash cannot send twice.
+        yield* store.write(today);
         this.#inventoryDay = today;
-        return;
-      }
-      if (stored === today) {
-        this.#inventoryDay = today;
-        return;
-      }
-      const inventory = await resolveInventory();
-      if (!this.#trackingEnabled || !normalizeAnalyticsIdentity(this.#resolveOwner())) return;
-      // The day is stored before the send, so a failed write sends nothing and a crash cannot send twice.
-      await store.write(today);
-      this.#inventoryDay = today;
-      const owner = normalizeAnalyticsIdentity(this.#resolveOwner());
-      if (!owner || !this.#trackingEnabled) return;
-      this.#trackForOwner(
-        "system_inventory",
-        {
-          agent_count: inventory.agentCount,
-          enabled_routine_count: inventory.enabledRoutineCount,
-          custom_mcp_server_count: inventory.customMcpServerCount,
-          plugins: inventory.plugins,
-          curated_skills: inventory.curatedSkills,
-          curated_agents: inventory.curatedAgents,
-          local_skill_count: inventory.localSkillCount,
-          community_skill_count: inventory.communitySkillCount,
-          providers: inventory.providers,
-          computer_use_enabled: inventory.computerUseEnabled,
-        },
-        owner,
-      );
-    })()
-      .catch(() => {
-        // Analytics must never change host behavior. The next check tries again.
-      })
-      .finally(() => {
-        this.#inventoryCheck = null;
-      });
+        const owner = normalizeAnalyticsIdentity(this.#resolveOwner());
+        if (!owner || !this.#trackingEnabled) return;
+        this.#trackForOwner(
+          "system_inventory",
+          {
+            agent_count: inventory.agentCount,
+            enabled_routine_count: inventory.enabledRoutineCount,
+            custom_mcp_server_count: inventory.customMcpServerCount,
+            plugins: inventory.plugins,
+            curated_skills: inventory.curatedSkills,
+            curated_agents: inventory.curatedAgents,
+            local_skill_count: inventory.localSkillCount,
+            community_skill_count: inventory.communitySkillCount,
+            providers: inventory.providers,
+            computer_use_enabled: inventory.computerUseEnabled,
+          },
+          owner,
+        );
+      }).pipe(
+        Effect.ignore,
+        Effect.ensuring(
+          Effect.sync(() => {
+            this.#inventoryCheck = false;
+          }),
+        ),
+        Effect.uninterruptible,
+        Effect.forkIn(this.#scope, { startImmediately: true }),
+      ),
+    );
   }
 
   #trackForOwner(name: HostEventName, properties: HostProperties, owner: AnalyticsIdentity, flushPending = true): void {
@@ -657,6 +728,7 @@ export class HostAnalytics {
   }
 
   #enqueue(kind: AnalyticsOperationKind, run: () => unknown): void {
+    if (this.#closed) return;
     const hasPendingTrack = this.#operationQueue.operations.some((operation) => operation.kind === "track");
     if (kind === "clear" && !hasPendingTrack) {
       this.#operationQueue.operations = [];
@@ -673,22 +745,29 @@ export class HostAnalytics {
     this.#operationQueue.operations.push({ kind, run });
     if (this.#operationQueue.active) return;
     this.#operationQueue.active = true;
-    void this.#drainQueue();
+    Effect.runFork(
+      this.#drainQueue().pipe(Effect.uninterruptible, Effect.forkIn(this.#scope, { startImmediately: true })),
+    );
   }
 
-  async #drainQueue(): Promise<void> {
+  #drainQueue = Effect.fn("Analytics.drainQueue")(function* (this: HostAnalytics) {
     while (this.#operationQueue.operations.length > 0) {
       const operation = this.#operationQueue.operations.shift();
       if (!operation) continue;
-      try {
-        const result = operation.run();
-        if (isPromiseLike(result)) await result;
-      } catch {
-        // Analytics must never change host behavior or stop later events.
-      }
+      yield* Effect.gen(function* () {
+        const result = yield* analyticsSync(operation.run);
+        if (isPromiseLike(result)) yield* analyticsIO(() => Promise.resolve(result));
+      }).pipe(Effect.catch(() => Effect.void));
     }
     this.#operationQueue.active = false;
-  }
+  });
+
+  /** Stop accepting events, then finish work already owned by this service. */
+  readonly close = Effect.fn("HostAnalytics.close")(function* (this: HostAnalytics) {
+    this.#closed = true;
+    if (this.#reports) yield* this.#reports.close();
+    yield* Scope.close(this.#scope, Exit.void);
+  }, Effect.uninterruptible);
 }
 
 /** Runs a resolver whose failure must not reach the host, which has already done its work. */
@@ -723,6 +802,16 @@ export function sanitizeHostEvent(name: HostEventName, properties: HostPropertie
 }
 
 function sanitizeHostProperty(name: HostEventName, key: string, value: unknown): HostPropertyValue | undefined {
+  if (key === "cause_code" || key === "severity" || key === "operation") {
+    const safe = safeProperties({
+      source: "host",
+      operation: "other",
+      cause_code: "unknown",
+      severity: "error",
+      [key]: value,
+    });
+    return safe?.[key];
+  }
   if (key === "failure_code") {
     return isString(value)
       ? name === "hosted_site_action"

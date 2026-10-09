@@ -8,7 +8,7 @@ export const messages = defineMessages("settings", {
   // The logo color setting, General tab.
   "settings.appearance.title": "Appearance",
   "settings.logoColor.title": "Logo color",
-  "settings.logoColor.description": "The color of the OpenBot logo in the Dock,\nthe taskbar and the Dynamic Island.",
+  "settings.logoColor.description": "Shown in the Dock, the taskbar and the Dynamic Island.",
   "settings.logoColor.buildNote": "This build keeps its own logo color. The choice applies to the release app.",
   "settings.logoColor.lavender": "Lavender",
   "settings.logoColor.green": "Green",
@@ -23,11 +23,11 @@ export const messages = defineMessages("settings", {
   // The Settings window, General tab.
   "settings.providers.title": "AI providers",
   "settings.appBehavior.title": "App behavior",
+  "settings.conversations.title": "Conversations",
   "settings.launchAtLogin.title": "Launch OpenBot at login",
   "settings.launchAtLogin.description": "Open the app when you sign in to this computer.",
   "settings.keepRunning.title": "Keep OpenBot running in the background",
   "settings.keepRunning.description": "Keep active tasks running after you close the window.",
-  "settings.workspace.title": "Workspace",
   "settings.restoreWorkspace.title": "Restore the last workspace on launch",
   "settings.restoreWorkspace.description": "Open the workspace and tasks from your previous session.",
   "settings.externalLinks.title": "Open external links in",
@@ -37,12 +37,17 @@ export const messages = defineMessages("settings", {
   "settings.externalLinks.openbot": "OpenBot",
   // The message send shortcut. The saved mode stays in English; only the labels are translated.
   "settings.sendShortcut.title": "Send shortcut",
-  "settings.sendShortcut.description":
-    "Choose which keys send a message on this device and browser. With Enter to send, Shift+Enter adds a new line. With the modifier mode, Enter adds a new line.",
+  "settings.sendShortcut.description": "Choose the keys that send a message on this device and browser.",
   "settings.sendShortcut.enter": "Enter to send",
   "settings.sendShortcut.modEnterMac": "⌘Enter to send",
   "settings.sendShortcut.modEnterWin": "Ctrl+Enter to send",
-  "settings.autonomy.title": "Agent autonomy",
+  "settings.busyMessage.title": "Steer agents while they work",
+  "settings.busyMessage.description":
+    "New messages join the agent’s current work, not the queue. Works with ChatGPT and Claude.",
+  "settings.keepRemoteSessions.title": "Fast connection to servers",
+  "settings.keepRemoteSessions.description":
+    "Keep the connection to your joined servers between launches. OpenBot starts about a second faster. When you quit OpenBot, the OpenBot service does not close the connection.",
+  "settings.permissions.title": "Permissions",
   "settings.turbo.title": "Turbo mode",
   "settings.turbo.description":
     "Let every agent run commands, change files, widen its own filesystem and network access, and publish, update or delete public sites without asking.",
@@ -53,6 +58,7 @@ export const messages = defineMessages("settings", {
   "settings.autoApprove.revokeFailed":
     "Could not revoke the standing approval for {name}. It is still active. Try again.",
   "settings.notifications.title": "Notifications",
+  "settings.alerts.title": "Alerts",
   "settings.desktopNotifications.title": "Desktop notifications",
   "settings.desktopNotifications.description": "Show a notification when an agent needs attention.",
   "settings.testNotification.title": "Test notification",
@@ -62,6 +68,7 @@ export const messages = defineMessages("settings", {
   "settings.testNotification.failed": "Could not show a notification.",
   "settings.testNotification.openSettings": "Open system settings",
   "settings.testNotification.openSettingsFailed": "Could not open the system settings.",
+  "settings.sounds.title": "Sounds",
   "settings.taskSound.title": "Play a sound when a task finishes",
   "settings.taskSound.description": "Use a short sound for completed tasks.",
   "settings.soundFeedback.title": "Action sounds",
@@ -93,13 +100,17 @@ export const messages = defineMessages("settings", {
   "settings.notch.size.height": "Height",
   "settings.notch.size.previewNotch": "Built-in display",
   "settings.notch.size.previewIsland": "External display",
-  "settings.privacy.title": "Privacy",
   "settings.analytics.title": "Share product analytics",
   "settings.analytics.description":
     "Send usage and reliability metadata with your account ID and email to OpenBot’s self-hosted analytics.",
+  "settings.analytics.webTitle": "Share error reports",
+  "settings.analytics.webDescription":
+    "Send error and warning codes with your account ID to OpenBot’s analytics. This setting applies to this browser.",
   // The Settings window shell: its tab list, headers and save bar.
   "settings.tab.general.title": "General",
   "settings.tab.general.description": "Control how OpenBot behaves on this computer.",
+  "settings.tab.notifications.title": "Notifications",
+  "settings.tab.notifications.description": "Choose how OpenBot alerts you.",
   "settings.tab.computerUse.title": "Computer Use",
   "settings.tab.computerUse.description": "Allow OpenBot to see and interact with apps on this computer.",
   "settings.tab.profile.title": "Profile",
@@ -131,23 +142,31 @@ export const messages = defineMessages("settings", {
   "settings.disconnect.pending": "Disconnecting…",
   // The Mobile Connect tab.
   "settings.mobileConnect.title": "Connect your phone",
-  "settings.mobileConnect.iosApp.title": "iPhone app",
-  "settings.mobileConnect.iosApp.description":
-    "OpenBot for iPhone is in public beta on TestFlight. Install it, then sign in below.",
-  "settings.mobileConnect.iosApp.copyLink": "Copy link",
-  "settings.mobileConnect.iosApp.linkCopied": "Link copied",
+  "settings.mobileConnect.install.title": "Install the app",
+  "settings.mobileConnect.install.description": "Choose your phone and scan the code with its camera.",
+  "settings.mobileConnect.install.platformLabel": "Phone",
+  "settings.mobileConnect.app.copyLink": "Copy link",
+  "settings.mobileConnect.app.linkCopied": "Link copied",
+  "settings.mobileConnect.iosApp.title": "OpenBot for iPhone",
+  "settings.mobileConnect.iosApp.badge": "Beta",
+  "settings.mobileConnect.iosApp.description": "Public beta on TestFlight. For iOS 16.4 or later.",
   "settings.mobileConnect.iosApp.qrLabel": "TestFlight invite QR code",
   "settings.mobileConnect.iosApp.step.testFlight": "On your iPhone, install TestFlight from the App Store.",
   "settings.mobileConnect.iosApp.step.invite":
     "Scan this QR code with the iPhone camera, or copy the invite link and open it on your iPhone.",
   "settings.mobileConnect.iosApp.step.install": "In TestFlight, tap Accept, then Install.",
-  "settings.mobileConnect.iosApp.step.signIn":
-    "Open OpenBot on your iPhone. Generate a QR code below and scan it to sign in.",
+  "settings.mobileConnect.androidApp.title": "OpenBot for Android",
+  "settings.mobileConnect.androidApp.badge": "Available",
+  "settings.mobileConnect.androidApp.description": "On Google Play. For Android 7.0 or later.",
+  "settings.mobileConnect.androidApp.qrLabel": "Google Play QR code",
+  "settings.mobileConnect.androidApp.step.scan":
+    "Scan this QR code with the phone camera, or copy the link and open it on your phone.",
+  "settings.mobileConnect.androidApp.step.install": "On Google Play, tap Install.",
   "settings.mobileConnect.description":
     "Scan a one-time code with the OpenBot mobile app to use this account on your phone.",
-  "settings.mobileConnect.signIn.title": "Mobile sign-in",
+  "settings.mobileConnect.signIn.title": "Sign in on your phone",
   "settings.mobileConnect.signIn.description":
-    "The code expires after two minutes and stops working after the first successful scan.",
+    "Open OpenBot on your phone and scan a one-time code. The code expires after two minutes and works only once.",
   "settings.mobileConnect.generating": "Generating…",
   "settings.mobileConnect.generate": "Generate QR code",
   "settings.mobileConnect.generateNew": "Generate new code",
@@ -256,9 +275,9 @@ export const messages = defineMessages("settings", {
     "OpenBot installs {target} when no agent works. New routine runs wait until then.",
   "settings.updates.idleRestart.relaunch": "Restart when idle",
   "settings.updates.idleRestart.update": "Install when idle",
-  "settings.updates.allowRemote.title": "Allow updates from server admins",
+  "settings.updates.allowRemote.title": "Allow updates from server members",
   "settings.updates.allowRemote.description":
-    "Owners and admins of this server can download an update and restart OpenBot on this computer.",
+    "All signed-in server members can request an update when this computer is idle. Owners and admins can also force a restart.",
   // The Hosted sites tab.
   "settings.hostedSites.title": "Published sites",
   "settings.hostedSites.unavailable": "Site hosting is unavailable.",
@@ -287,6 +306,7 @@ export const messages = defineMessages("settings", {
   "settings.hostedServers.usageNote":
     "A server stops about 15 minutes after the last message or change, also when an app is open. A key press or click in the app, a message, or a scheduled routine starts it again. Its agents and routines work when this computer is off.",
   "settings.hostedServers.empty": "You do not have a hosted server yet.",
+  "settings.hostedServers.loading": "Loading hosted servers…",
   "settings.hostedServers.state.awaitingPayment": "Waiting for payment",
   "settings.hostedServers.state.planEnded": "Plan ended",
   "settings.hostedServers.state.creating": "Creating",

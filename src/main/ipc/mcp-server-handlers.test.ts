@@ -1,3 +1,4 @@
+import { Effect } from "effect";
 // @vitest-environment node
 
 // The local connection test starts the managed runtime download only when the command needs it,
@@ -13,6 +14,7 @@ import {
 } from "@openbot/contracts/ipc";
 import { describe, expect, it, vi } from "vitest";
 import { NO_MCP_TOOL_RUNTIMES } from "../../backend/mcp-provider-shapes";
+import { ProviderRuntimeFailure } from "../provider-runtime-effects";
 import type { ResponseDecoder } from "../remote-host-decoding";
 import type { RemoteRequestInit } from "../remote-server-client";
 import { REMOTE_REQUEST_TIMEOUT_MS } from "../remote-server-http";
@@ -66,37 +68,43 @@ function httpConfig(): McpServerConfig {
   };
 }
 
-function setup(options: { ensureToolRuntimesReady?: () => Promise<void> }): {
+function setup(options: { ensureToolRuntimesReady?: () => Effect.Effect<void, ProviderRuntimeFailure> }): {
   ensureToolRuntimesReady: ReturnType<typeof vi.fn>;
   testMcpServer: ReturnType<typeof vi.fn>;
   remoteCalls: RemoteRequestInit[];
   test: (config: McpServerConfig) => Promise<McpTestResult>;
   testRemote: (config: McpServerConfig) => Promise<McpTestResult>;
+  signInRemote: (config: McpServerConfig) => Promise<unknown>;
 } {
   registrations.clear();
-  const testMcpServer = vi.fn(async (): Promise<McpTestResult> => ({ toolCount: 2, error: null }));
+  const testMcpServer = vi.fn((): Effect.Effect<McpTestResult> => Effect.sync(() => ({ toolCount: 2, error: null })));
   const service = {
     listMcpServers: () => [],
-    saveMcpServer: (input: { config: McpServerConfig }) => [input.config],
-    removeMcpServer: () => [],
-    setMcpServerEnabled: () => [],
+    saveMcpServer: (input: { config: McpServerConfig }) => Effect.succeed([input.config]),
+    removeMcpServer: () => Effect.succeed([]),
+    setMcpServerEnabled: () => Effect.succeed([]),
     testMcpServer,
+    signInMcpServer: () => Effect.succeed({ toolCount: 0, error: null }),
+    cancelMcpSignIn: () => undefined,
+    signOutMcpServer: () => Effect.succeed([]),
+    listMcpSignIns: () => [],
   };
   const remoteCalls: RemoteRequestInit[] = [];
   const remoteServers = {
     supportsCapability: () => true,
     // Generic like the manager: the host answers what the codec below decodes.
-    request: async <T>(
+    request: <T>(
       _serverId: string,
       _path: string,
       decoder: ResponseDecoder<T>,
       init?: RemoteRequestInit,
-    ): Promise<T> => {
-      if (init) remoteCalls.push(init);
-      return decoder({ toolCount: 1, error: null });
-    },
+    ): Effect.Effect<T> =>
+      Effect.sync(() => {
+        if (init) remoteCalls.push(init);
+        return decoder({ toolCount: 1, error: null });
+      }),
   };
-  const ensureToolRuntimesReady = vi.fn(options.ensureToolRuntimesReady ?? (async () => undefined));
+  const ensureToolRuntimesReady = vi.fn(options.ensureToolRuntimesReady ?? (() => Effect.sync(() => undefined)));
   registerIpcGroup(
     "mcpServers",
     mcpServerIpcHandlers({
@@ -108,8 +116,10 @@ function setup(options: { ensureToolRuntimesReady?: () => Promise<void> }): {
     }).mcpServers,
   );
   const listener = registrations.get(IPC_ENDPOINTS.mcpServers.testMcpServer.channel);
-  if (!listener) throw new Error("The MCP test handler was not registered.");
+  const signInListener = registrations.get(IPC_ENDPOINTS.mcpServers.signInMcpServer.channel);
+  if (!listener || !signInListener) throw new Error("The MCP test handlers were not registered.");
   return {
+    signInRemote: async (config) => signInListener(TRUSTED_EVENT, { serverId: "remote-1", payload: { config } }),
     ensureToolRuntimesReady,
     testMcpServer,
     remoteCalls,
@@ -142,6 +152,18 @@ describe("mcpServerIpcHandlers test", () => {
     await expect(test(httpConfig())).resolves.toEqual({ toolCount: 2, error: null });
     expect(ensureToolRuntimesReady).not.toHaveBeenCalled();
     expect(testMcpServer).toHaveBeenCalledOnce();
+    // Test spends the stored sign-in and never opens a browser; only Sign in does.
+    expect(testMcpServer).toHaveBeenCalledWith(expect.anything(), { storedCredentials: true, signInPlace: "here" });
+  });
+
+  it("refuses a sign-in for a remote server without asking the host", async () => {
+    // Nobody sits in front of the host's browser, and the Team API has no sign-in route.
+    const { remoteCalls, signInRemote } = setup({});
+
+    await expect(signInRemote(httpConfig())).rejects.toThrow(
+      "Sign-in to an MCP server works only in OpenBot on the host computer.",
+    );
+    expect(remoteCalls).toHaveLength(0);
   });
 
   it("waits for the download before probing a command nothing names", async () => {
@@ -159,9 +181,8 @@ describe("mcpServerIpcHandlers test", () => {
     // A runtime the download cannot provide - and a transfer that fails halfway - is not the
     // test's failure: the probe still runs and reports what this machine starts.
     const { testMcpServer, test } = setup({
-      ensureToolRuntimesReady: async () => {
-        throw new Error("The runtime download failed.");
-      },
+      ensureToolRuntimesReady: () =>
+        Effect.fail(new ProviderRuntimeFailure({ cause: new Error("The runtime download failed.") })),
     });
 
     await expect(test(stdioConfig())).resolves.toEqual({ toolCount: 2, error: null });

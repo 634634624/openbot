@@ -1,11 +1,12 @@
-import { type MenuComponentRef, MenuView } from "@expo/ui/community/menu";
+import type { MenuComponentRef } from "@expo/ui/community/menu";
+import { markdownPreviewText } from "@openbot/contracts/markdown-preview-text";
 import MaskedView from "@react-native-masked-view/masked-view";
 import { BlurView } from "expo-blur";
-import { Link, router } from "expo-router";
+import { Link } from "expo-router";
 import { Typography } from "heroui-native";
 import { useThemeColor } from "heroui-native/hooks";
 import { type PropsWithChildren, useEffect, useId, useMemo, useRef } from "react";
-import { Platform, StyleSheet, View } from "react-native";
+import { Platform, StyleSheet, useWindowDimensions, View } from "react-native";
 import Animated, {
   Easing,
   interpolate,
@@ -17,19 +18,18 @@ import Animated, {
   withTiming,
 } from "react-native-reanimated";
 import Svg, { Defs, LinearGradient, Rect, Stop } from "react-native-svg";
-import { useUniwind } from "uniwind";
 import { useAgentChatPreview } from "@/features/agents/components/agent-chat-preview";
-import { useAgentContextMenu } from "@/features/agents/components/agent-context-menu";
+import { AgentAndroidMenu, useAgentContextMenu } from "@/features/agents/components/agent-context-menu";
 import { AgentPinAvatar } from "@/features/agents/components/agent-pin-avatar";
 import { AgentPinSwipeRow } from "@/features/agents/components/agent-pin-swipe-row";
 import { useAgentPinTransition } from "@/features/agents/components/agent-pin-transition";
 import { BloubAvatar } from "@/features/agents/components/bloub-avatar";
 import { ChatLinkPressable } from "@/features/agents/components/chat-link-pressable";
-import { useChatSectionMenu } from "@/features/agents/components/use-chat-section-menu";
-import { markdownPreviewText } from "@/features/chat/model/chat-markdown-parser";
+import { ChatZoomSource } from "@/features/agents/components/chat-zoom-source";
 import { useAgentUnread } from "@/features/workspace/components/use-live-workspace";
 import { type MobileAgent, useMobileWorkspace } from "@/features/workspace/context/mobile-workspace-context";
 import { canToggleAgentPin } from "@/features/workspace/model/agent-pins";
+import { isAndroid } from "@/shared/lib/platform";
 import { useText } from "@/shared/lib/text";
 
 const AnimatedRect = Animated.createAnimatedComponent(Rect);
@@ -106,12 +106,11 @@ export function AgentListRow({
   rightInset = 20,
 }: AgentListRowProps) {
   const { t } = useText();
-  const { theme } = useUniwind();
   const [background] = useThemeColor(["background"]);
+  const { width: windowWidth } = useWindowDimensions();
   const { pinnedAgentIds, pinnedChannelIds } = useMobileWorkspace();
   const { toggleAgentPinAnimated, transition } = useAgentPinTransition();
   const editMenu = useRef<MenuComponentRef>(null);
-  const sectionMenu = useChatSectionMenu(agent.serverId, agent.id);
   const agentContextMenu = useAgentContextMenu(agent);
   const agentChatPreview = useAgentChatPreview(agent);
   const previewLine = useMemo(() => markdownPreviewText(agent.preview), [agent.preview]);
@@ -130,11 +129,11 @@ export function AgentListRow({
   const avatar = onOpen ? (
     bloub
   ) : (
-    <Link.AppleZoom>
+    <ChatZoomSource>
       <AgentPinAvatar agentId={agent.id} location="row" size={54}>
         {bloub}
       </AgentPinAvatar>
-    </Link.AppleZoom>
+    </ChatZoomSource>
   );
 
   const row = (
@@ -165,7 +164,8 @@ export function AgentListRow({
         <View
           className="min-h-20 w-full flex-row items-center gap-3 py-1"
           style={{
-            backgroundColor: background,
+            // In the Android search sheet the row shows the sheet color, not the home list color.
+            backgroundColor: onOpen && isAndroid ? "transparent" : background,
             opacity: pressed ? 0.58 : 1,
             paddingLeft: leftInset,
             paddingRight: rightInset,
@@ -224,22 +224,10 @@ export function AgentListRow({
       onPin={(withHaptic) => toggleAgentPinAnimated(agent.id, { haptic: withHaptic })}
     >
       {Platform.OS === "android" ? (
-        <MenuView
-          ref={editMenu}
-          colorScheme={theme === "dark" ? "dark" : "light"}
-          shouldOpenOnLongPress
-          actions={[...sectionMenu.androidActions, { id: "edit", title: t("mobile.agent.menu.info") }]}
-          onPressAction={({ nativeEvent }) => {
-            sectionMenu.onAction(nativeEvent.event);
-            if (nativeEvent.event === "edit")
-              router.push({
-                pathname: "/agent-info/[agentId]",
-                params: { agentId: agent.id, serverId: agent.serverId },
-              });
-          }}
-        >
-          {agentLink}
-        </MenuView>
+        // The menu measures its child without a width limit; the home list row fills the window.
+        <AgentAndroidMenu agent={agent} menuRef={editMenu} style={{ width: "100%" }}>
+          <View style={{ width: windowWidth }}>{agentLink}</View>
+        </AgentAndroidMenu>
       ) : (
         agentLink
       )}

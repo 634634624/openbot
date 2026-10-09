@@ -23,6 +23,8 @@ import {
   type AppLogoColorPreference,
   type ApprovalAutomationPreference,
   type AppSetupState,
+  type BitwardenConnectorStatus,
+  type BusyMessageModePreference,
   type CentralAuthIssue,
   type CentralAuthState,
   type CentralAuthUser,
@@ -47,6 +49,7 @@ import {
   isAppLanguage,
   isAppLogoColor,
   isApprovalAutomationPreference,
+  isBusyMessageMode,
   isCustomAgentCheckResult,
   isCustomAgentResult,
   isCustomAgentSummary,
@@ -69,6 +72,7 @@ import {
   parseOnePasswordConnectorStatus,
   type RemoteDesktopSetupStatus,
   type RemoteDesktopTestStatus,
+  type RemoteSessionReusePreference,
   UPDATE_PHASES,
   type UpdatePreference,
   type UpdateStatus,
@@ -113,6 +117,12 @@ export const decodeApprovalAutomationPreference: (value: unknown) => ApprovalAut
   isApprovalAutomationPreference,
   "approval automation preference",
 );
+
+export function decodeBusyMessageModePreference(value: unknown): BusyMessageModePreference {
+  const preference = decodeRecord(value, "busy message mode preference");
+  if (!isBusyMessageMode(preference.mode)) throw new Error("Invalid busy message mode.");
+  return { mode: preference.mode };
+}
 
 export function decodeAppLanguagePreference(value: unknown): AppLanguagePreference {
   const preference = decodeRecord(value, "language preference");
@@ -247,6 +257,12 @@ export function decodeUpdatePreference(value: unknown): UpdatePreference {
     autoDownload: requiredBoolean(preference, "autoDownload"),
     allowRemoteUpdates: requiredBoolean(preference, "allowRemoteUpdates"),
     autoInstall: requiredBoolean(preference, "autoInstall"),
+  };
+}
+
+export function decodeRemoteSessionReusePreference(value: unknown): RemoteSessionReusePreference {
+  return {
+    keepBetweenRuns: requiredBoolean(decodeRecord(value, "remote session preference"), "keepBetweenRuns"),
   };
 }
 
@@ -433,4 +449,10 @@ export function decodeRemoteDesktopSetupFromMain(value: unknown): RemoteDesktopS
 export function decodeRemoteDesktopTestFromMain(value: unknown): RemoteDesktopTestStatus {
   if (!isRemoteDesktopTestStatus(value)) throw new Error("Invalid remote desktop test response.");
   return { ...value };
+}
+
+export function decodeBitwardenConnectorStatus(value: unknown): BitwardenConnectorStatus {
+  if (!value || typeof value !== "object" || !("connected" in value) || typeof value.connected !== "boolean")
+    throw new Error("Invalid Bitwarden connector response.");
+  return { connected: value.connected };
 }

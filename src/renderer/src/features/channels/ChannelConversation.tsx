@@ -6,7 +6,6 @@ import {
   type BrowserTab,
   type BrowserTakeoverRequest,
   canPreviewAttachment,
-  type DraftAttachment,
   type FilePreview,
 } from "@openbot/contracts/ipc";
 import { ArrowUp, Button, Plus, X } from "@openbot/ui";
@@ -25,6 +24,11 @@ import { AwaitingReplies } from "@openbot/ui/features/conversation/AwaitingRepli
 import { ChatActionMarker } from "@openbot/ui/features/conversation/ChatActionMarker";
 import { ChatMessageRow } from "@openbot/ui/features/conversation/ChatMessageRow";
 import { ChatRowBoundary } from "@openbot/ui/features/conversation/ChatRowBoundary";
+import {
+  ChatScrollRail,
+  createChatScrollRail,
+  unloadedHistory,
+} from "@openbot/ui/features/conversation/ChatScrollRail";
 import { ComposerEditor, expandComposerMentions } from "@openbot/ui/features/conversation/ComposerEditor";
 import { StopIcon } from "@openbot/ui/features/conversation/ConversationIcons";
 import { ApprovalCard, BrowserTakeoverCard } from "@openbot/ui/features/conversation/ConversationPrompts";
@@ -69,8 +73,13 @@ import { deviceSendShortcut, sendShortcutAriaKey, sendShortcutHintKey } from "..
 import { AgentMemoriesModal } from "../conversation/AgentMemoriesModal";
 import { AgentRoutinesSettings } from "../conversation/AgentRoutinesSettings";
 import { attachmentFilePreview } from "../conversation/attachment-preview";
+import { htmlAttachmentPageUrl } from "../conversation/chat-visual-url";
+import { EMPTY_DRAFT } from "../conversation/composer-draft";
+import { useConversationController } from "../conversation/conversation-controller-context";
+import type { ComposerDraft } from "../conversation/conversation-types";
 import { channelMemoriesPort } from "../conversation/memories-port";
-import { channelRoutinesPort } from "../conversation/routines-port";
+import { desktopEventRoutinesApi } from "../conversation/routine-webhooks-api";
+import { channelRoutinesPort, eventRoutinesPort } from "../conversation/routines-port";
 import { ChannelEditor } from "./ChannelEditor";
 import { channelTimelineEntries, firstUnreadChannelMessageId } from "./channel-timeline";
 import { useChannels } from "./channels-context";
@@ -79,6 +88,7 @@ const ChannelFilePreviewPanel = lazy(() => import("../conversation/FilePreviewPa
 
 /** What the open channel reads from the client around it. The channel itself comes from `useChannels()`. */
 export interface ChannelConversationProps {
+  connectionReady?: boolean;
   isOwnMessage: (authorId: string) => boolean;
   /** The device with the keyboard on desktop. Web leaves it empty and the browser is detected. */
   platform?: "darwin" | "win32" | "linux" | undefined;
@@ -90,6 +100,8 @@ export interface ChannelConversationProps {
   onSelectAgent: (agentId: string) => void;
   /** The host is this computer, so it keeps the routine settings that the released Team API drops. */
   localHost?: boolean;
+  /** The desktop server whose event API this window may manage, as for an agent: owner, admin or this computer. */
+  eventsServerId?: string | undefined;
 }
 
 export function ChannelConversation(props: ChannelConversationProps) {
@@ -131,9 +143,17 @@ export function ChannelConversation(props: ChannelConversationProps) {
     const id = channelId();
     return id ? channelMemoriesPort(id, channelName(), runtime().agent) : null;
   });
-  const routinesPort = createMemo(() => {
+  const legacyRoutinesPort = createMemo(() => {
     const id = channelId();
     return id ? channelRoutinesPort(id, runtime().agent, props.localHost === true) : null;
+  });
+  const routinesPort = createMemo(() => {
+    const id = channelId();
+    const legacy = legacyRoutinesPort();
+    if (!id || !legacy) return null;
+    const serverId = props.eventsServerId;
+    const eventApi = runtime().eventRoutines ?? (serverId ? desktopEventRoutinesApi(serverId) : undefined);
+    return eventApi ? eventRoutinesPort({ kind: "channel", id }, eventApi, legacy) : legacy;
   });
   // The settings row reads both counts before either view opens, so it cannot take them from the
   // view that renders the list. It loads them here and follows the events those views follow.
@@ -167,19 +187,28 @@ export function ChannelConversation(props: ChannelConversationProps) {
       onCleanup(port.subscribe(load));
     },
   );
-  const [composer, setComposer] = createStore<{
-    text: string;
-    reply: string | null;
-    attachments: DraftAttachment[];
-  }>({ text: "", reply: null, attachments: [] });
+  // The drafts live in the conversation controller, so each channel keeps its own through a switch
+  // to another chat, and its text through a restart.
+  const conversation = useConversationController();
+  const composer = createMemo(() => {
+    const selectedId = channels.state.selectedId;
+    return (selectedId ? conversation.channelDrafts()[selectedId] : undefined) ?? EMPTY_DRAFT;
+  });
+  const updateDraft = (channelId: string, update: (draft: ComposerDraft) => ComposerDraft) =>
+    conversation.setChannelDrafts((current) => ({
+      ...current,
+      [channelId]: update(current[channelId] ?? EMPTY_DRAFT),
+    }));
+  const updateComposer = (patch: Partial<ComposerDraft>) => {
+    const selectedId = channels.state.selectedId;
+    if (selectedId) updateDraft(selectedId, (draft) => ({ ...draft, ...patch }));
+  };
   const addAttachments = (load: () => Promise<AttachmentSummary[]>) =>
     void channels.perform(async () => {
       const selectedId = channels.state.selectedId;
       const attachments = await load();
-      if (selectedId === channels.state.selectedId)
-        setComposer((state) => {
-          state.attachments = [...state.attachments, ...attachments];
-        });
+      if (selectedId)
+        updateDraft(selectedId, (draft) => ({ ...draft, attachments: [...draft.attachments, ...attachments] }));
     });
   /** Dropped or pasted files. Only a browser runtime imports them here; the desktop preload imports its own. */
   const canImportFiles = () => Boolean(runtime().importAttachments && channels.state.page?.channel.archived === false);
@@ -198,17 +227,10 @@ export function ChannelConversation(props: ChannelConversationProps) {
         state.memories.count = 0;
         state.routines.count = 0;
       });
-      setComposer((state) => {
-        Object.assign(state, { text: "", reply: null, attachments: [] });
-      });
     },
   );
-  const clearSent = (text: string) => {
-    if (composer.text !== text) return;
-    setComposer((state) => {
-      Object.assign(state, { text: "", reply: null, attachments: [] });
-    });
-  };
+  const clearSent = (channelId: string, text: string) =>
+    updateDraft(channelId, (draft) => (draft.text === text ? EMPTY_DRAFT : draft));
   let messageList: HTMLElement | undefined;
   let virtualRoot: HTMLElement | undefined;
   let unreadMessagesDivider: HTMLElement | undefined;
@@ -240,16 +262,7 @@ export function ChannelConversation(props: ChannelConversationProps) {
     }
     void channels.perform(() => runtime().agent.openAttachment({ attachmentId: attachment.id, action }));
   };
-  /** Absent where the runtime saves files one at a time, so the row offers no bulk download. */
-  const downloadAttachments = () => {
-    const agent = runtime().agent;
-    if (!agent.downloadAttachments) return undefined;
-    return async (attachments: AttachmentSummary[]) => {
-      await channels.perform(async () => {
-        await agent.downloadAttachments?.({ attachments: attachments.map(({ id, name }) => ({ id, name })) });
-      });
-    };
-  };
+
   // The preview belongs to the channel it was opened from, and the settings panel takes the slot back.
   createEffect(
     () => ({ id: channelId(), editing: channels.state.editing }),
@@ -327,6 +340,17 @@ export function ChannelConversation(props: ChannelConversationProps) {
     scrollMargin: virtualScrollMargin,
   });
   const virtualMessageRows = createMemo(() => messageVirtualizer.getVirtualItems());
+  const timelineMessages = createMemo(() => timeline().map((entry) => entry.message));
+  const rail = createChatScrollRail({
+    rows: timelineMessages,
+    storedCount: () => channels.state.page?.messages.length ?? 0,
+    unloaded: () => unloadedHistory(channels.state.page),
+    virtualizer: messageVirtualizer,
+    onLoadOlder: () => void channels.loadOlder(),
+    onJump: () => {
+      stickToLatest = false;
+    },
+  });
   /*
    * A message animates in once, and only after the channel has drawn its first page: everything
    * that was already there when the reader opened the channel arrives at the same moment, and ten
@@ -516,6 +540,7 @@ export function ChannelConversation(props: ChannelConversationProps) {
    * failed.
    */
   const stopWork = async () => {
+    if (props.connectionReady === false) return;
     const channelId = channels.state.page?.channel.id;
     if (!channelId) return;
     for (const taskId of activeRuns()) {
@@ -538,27 +563,33 @@ export function ChannelConversation(props: ChannelConversationProps) {
       recipientAgentId,
     });
   const submit = () => {
-    const text = composer.text;
-    if (channels.state.pending || (!text.trim() && !composer.attachments.length) || !channels.state.selectedId) return;
+    const { text, attachments, replyToMessageId } = composer();
+    const channelId = channels.state.selectedId;
+    if (
+      props.connectionReady === false ||
+      channels.state.pending ||
+      (!text.trim() && !attachments.length) ||
+      !channelId
+    )
+      return;
     const expanded = expandComposerMentions(text);
     // A request that opens with a member is addressed to that member, the way a reader writes it.
     // A mention later in the text is what it reads as: a reference the owner of the work can see.
     const mention = chatTagReferences(expanded).find(
       (reference) => reference.kind === "agent" && !expanded.slice(0, reference.start).trim(),
     );
-    void channels
-      .command({
+    void channels.command(
+      {
         type: "send",
         operationId: crypto.randomUUID(),
-        channelId: channels.state.selectedId,
+        channelId,
         text: expanded,
         recipientAgentId: mention?.id ?? null,
-        replyToMessageId: composer.reply,
-        attachmentDraftIds: composer.attachments.map((attachment) => attachment.id),
-      })
-      .then((sent) => {
-        if (sent) clearSent(text);
-      });
+        replyToMessageId,
+        attachmentDraftIds: attachments.map((attachment) => attachment.id),
+      },
+      () => clearSent(channelId, text),
+    );
   };
   return (
     <main
@@ -592,8 +623,8 @@ export function ChannelConversation(props: ChannelConversationProps) {
           <Button
             variant="ghost"
             onClick={() =>
-              void channels.retry().then((sent) => {
-                if (sent?.type === "send") clearSent(sent.text);
+              void channels.retry((sent) => {
+                if (sent.type === "send") clearSent(sent.channelId, sent.text);
               })
             }
           >
@@ -632,6 +663,7 @@ export function ChannelConversation(props: ChannelConversationProps) {
               aria-live="polite"
               ref={(element) => {
                 messageList = element;
+                rail.ref(element);
                 updateVirtualScrollMargin();
               }}
               onScroll={(event) => {
@@ -641,6 +673,7 @@ export function ChannelConversation(props: ChannelConversationProps) {
                 updateUnreadDividerVisibility();
               }}
             >
+              <ChatScrollRail {...rail.props} />
               <Show when={unreadCount() > 0 && !unreadDividerVisible()}>
                 <UnreadMessagesBanner
                   count={unreadCount()}
@@ -765,7 +798,6 @@ export function ChannelConversation(props: ChannelConversationProps) {
                                 void runtime().openUrl(url);
                               }}
                               onPreview={(attachment) => void previewChannelAttachment(attachment)}
-                              onDownloadAttachments={downloadAttachments()}
                               onAttachmentAction={channelAttachmentAction}
                               onDownload={(attachment) => channelAttachmentAction(attachment, "download")}
                               actions={
@@ -788,10 +820,7 @@ export function ChannelConversation(props: ChannelConversationProps) {
                                   onReply={
                                     page().channel.archived
                                       ? undefined
-                                      : () =>
-                                          setComposer((state) => {
-                                            state.reply = initialEntry.id;
-                                          })
+                                      : () => updateComposer({ replyToMessageId: initialEntry.id })
                                   }
                                   onCopy={() => void copyChannelMessage(entry()?.message ?? initialEntry.message)}
                                 />
@@ -928,10 +957,10 @@ export function ChannelConversation(props: ChannelConversationProps) {
                 <form
                   class="composer"
                   data-compact={
-                    !composer.reply &&
-                    !composer.attachments.length &&
-                    !composer.text.includes("\n") &&
-                    composer.text.length < 120
+                    !composer().replyToMessageId &&
+                    !composer().attachments.length &&
+                    !composer().text.includes("\n") &&
+                    composer().text.length < 120
                       ? "true"
                       : undefined
                   }
@@ -940,23 +969,19 @@ export function ChannelConversation(props: ChannelConversationProps) {
                     submit();
                   }}
                 >
-                  <Show when={composer.reply}>
+                  <Show when={composer().replyToMessageId}>
                     <Button
                       type="button"
                       variant="ghost"
                       size="xs"
-                      onClick={() =>
-                        setComposer((state) => {
-                          state.reply = null;
-                        })
-                      }
+                      onClick={() => updateComposer({ replyToMessageId: null })}
                     >
                       {t("channel.composer.cancelReply")}
                     </Button>
                   </Show>
-                  <Show when={composer.attachments.length}>
+                  <Show when={composer().attachments.length}>
                     <div class="composer-attachments">
-                      <For each={composer.attachments}>
+                      <For each={composer().attachments}>
                         {(attachment) => (
                           <div class="composer-attachment" data-kind="file">
                             <span class="composer-attachment-copy">
@@ -968,8 +993,8 @@ export function ChannelConversation(props: ChannelConversationProps) {
                               size="xs"
                               aria-label={t("channel.composer.removeAttachment", { name: attachment.name })}
                               onClick={() =>
-                                setComposer((state) => {
-                                  state.attachments = state.attachments.filter((item) => item.id !== attachment.id);
+                                updateComposer({
+                                  attachments: composer().attachments.filter((item) => item.id !== attachment.id),
                                 })
                               }
                             >
@@ -987,18 +1012,14 @@ export function ChannelConversation(props: ChannelConversationProps) {
                         page().channel.members.some((member) => member.agentId === agent.id),
                       )}
                       sendShortcut={deviceSendShortcut(props.platform)}
-                      attachments={composer.attachments}
+                      attachments={composer().attachments}
                       ariaLabel={t("channel.composer.label")}
                       placeholder={t("channel.composer.placeholder", { name: page().channel.name })}
-                      value={composer.text}
+                      value={composer().text}
                       disabled={channels.state.pending}
                       onSubmit={submit}
                       onPasteFiles={importFiles}
-                      onValueChange={(text) =>
-                        setComposer((state) => {
-                          state.text = text;
-                        })
-                      }
+                      onValueChange={(text) => updateComposer({ text })}
                     />
                   </div>
                   <div class="composer-toolbar">
@@ -1007,6 +1028,7 @@ export function ChannelConversation(props: ChannelConversationProps) {
                       variant="ghost"
                       class="composer-button"
                       aria-label={t("channel.composer.attach")}
+                      disabled={props.connectionReady === false}
                       onClick={() => addAttachments(() => runtime().agent.chooseAttachments({ filter: "all" }))}
                     >
                       <Plus aria-hidden="true" />
@@ -1014,7 +1036,7 @@ export function ChannelConversation(props: ChannelConversationProps) {
                     <div class="composer-primary-actions">
                       {/* As in the agent chat, an empty composer offers stop while work runs. */}
                       <Show
-                        when={activeRuns().length > 0 && !composer.text.trim() && !composer.attachments.length}
+                        when={activeRuns().length > 0 && !composer().text.trim() && !composer().attachments.length}
                         fallback={
                           <Button
                             type="submit"
@@ -1023,7 +1045,11 @@ export function ChannelConversation(props: ChannelConversationProps) {
                             aria-label={t("channel.composer.send")}
                             aria-keyshortcuts={sendShortcutAriaKey(deviceSendShortcut(props.platform))}
                             title={t(sendShortcutHintKey(deviceSendShortcut(props.platform), "send"))}
-                            disabled={channels.state.pending || (!composer.text.trim() && !composer.attachments.length)}
+                            disabled={
+                              props.connectionReady === false ||
+                              channels.state.pending ||
+                              (!composer().text.trim() && !composer().attachments.length)
+                            }
                           >
                             <ArrowUp aria-hidden="true" />
                           </Button>
@@ -1034,6 +1060,7 @@ export function ChannelConversation(props: ChannelConversationProps) {
                           variant="ghost"
                           class="voice-button voice-button-active"
                           aria-label={t("channel.composer.stop")}
+                          disabled={props.connectionReady === false}
                           onClick={() => void stopWork()}
                         >
                           <StopIcon />
@@ -1062,6 +1089,7 @@ export function ChannelConversation(props: ChannelConversationProps) {
                     onOpenSharedFile={() => undefined}
                     onOpenWorkspaceFile={() => undefined}
                     sourceUrl={file().attachment.previewUrl}
+                    pageUrl={htmlAttachmentPageUrl(file().attachment)}
                     onOpenExternally={() => channelAttachmentAction(file().attachment, "open")}
                     onDownload={() => channelAttachmentAction(file().attachment, "download")}
                     onReveal={

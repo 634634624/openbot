@@ -65,7 +65,8 @@
   }
 
   .web-app-frame[data-web-mobile-pane="workspace"] .conversation-panel,
-  .web-app-frame[data-web-mobile-pane="workspace"] .remote-compatibility-screen {
+  .web-app-frame[data-web-mobile-pane="workspace"] .remote-compatibility-screen,
+  .web-app-frame[data-web-mobile-pane="workspace"] > .server-connection-workspace {
     display: none;
   }
 
@@ -160,7 +161,7 @@
     max-width: 132px;
   }
 
-  .web-app-frame[data-web-mobile-pane="conversation"] .agent-settings-runtime .provider-model-trigger-field {
+  .web-app-frame[data-web-mobile-pane="conversation"] .agent-settings-runtime-rows .provider-model-trigger-field {
     width: 100%;
     max-width: none;
   }
@@ -195,11 +196,6 @@
   .web-mobile-navigation-button {
     transition: none;
   }
-}
-
-.web-connection-notice {
-  margin: var(--openbot-space-4);
-  flex: 0 0 auto;
 }
 
 /* Takes the conversation-panel grid cell, so it follows the same desktop and mobile placement. */
@@ -313,10 +309,6 @@
 .web-connect-download.ui-button,
 .web-connect-download.ui-button:hover {
   color: var(--openbot-text-on-light);
-}
-
-.web-host-offline-reconnect.ui-button {
-  min-width: 160px;
 }
 
 .web-connect-refresh.ui-button {

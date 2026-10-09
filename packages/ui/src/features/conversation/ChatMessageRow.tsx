@@ -11,7 +11,7 @@ import {
   MessageHeader,
 } from "@openbot/ui";
 import type { JSX } from "@solidjs/web";
-import { For, Show } from "solid-js";
+import { createMemo, For, Show } from "solid-js";
 import { avatarHeadColor } from "../../bloub-avatar";
 import type { AgentMessage, AgentProfile } from "../../data";
 import { useText } from "../../text";
@@ -67,7 +67,6 @@ export interface ChatMessageRowProps {
   onAttachmentAction: (attachment: AttachmentSummary, action: "open" | "reveal" | "download") => void;
   onOpenSharedFile?: (path: string) => void;
   onOpenWorkspaceFile?: (path: string) => void;
-  onDownloadAttachments?: (attachments: AttachmentSummary[]) => Promise<void>;
   onDownload?: (attachment: AttachmentSummary) => void;
 }
 
@@ -86,6 +85,8 @@ export function ChatMessageRow(props: ChatMessageRowProps): JSX.Element {
   const own = () => props.author.kind === "you";
   const member = () => props.author.kind === "member";
   const person = () => own() || member();
+  // A memo, because `Bubble` reads the variant more than once and it splits the whole body.
+  const variant = createMemo(() => conversationBubbleVariant(props.message));
   const seed = () => props.author.agent?.avatarSeed ?? props.author.avatarSeed;
   // A colour literal in an inline style is refused by `check:ui`, and rightly: this is the agent's
   // own head colour, read through the same helper the action markers use, so a name matches the
@@ -164,7 +165,7 @@ export function ChatMessageRow(props: ChatMessageRowProps): JSX.Element {
           <Bubble
             class={member() ? "message-bubble-member" : undefined}
             align={person() ? "end" : "start"}
-            variant={conversationBubbleVariant(props.message)}
+            variant={variant()}
             data-author={person() ? "user" : "assistant"}
             data-streaming={props.message.streaming === true ? "" : undefined}
           >
@@ -182,7 +183,6 @@ export function ChatMessageRow(props: ChatMessageRowProps): JSX.Element {
                 onAttachmentAction={props.onAttachmentAction}
                 onOpenSharedFile={props.onOpenSharedFile}
                 onOpenWorkspaceFile={props.onOpenWorkspaceFile}
-                onDownloadAttachments={props.onDownloadAttachments}
                 onDownload={props.onDownload}
               />
               {props.children}

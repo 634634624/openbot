@@ -28,9 +28,20 @@ export const messages = defineMessages("status.messaging", {
   // The name and title of the agent that OpenBot adds to answer in Slack. The user can rename it.
   "status.messaging.orchestratorName": "Slack Orchestrator",
   "status.messaging.orchestratorTitle": "Answers in Slack and asks the team",
+  // The same texts for Discord. Discord users read the first one.
+  "status.messaging.discordNoAgent": "No agent can answer here yet. Add the Discord Orchestrator in OpenBot.",
+  "status.messaging.discordOrchestratorName": "Discord Orchestrator",
+  "status.messaging.discordOrchestratorTitle": "Answers in Discord and asks the team",
   // The sidebar section that OpenBot puts the Slack Orchestrator in. The user can rename it.
   "status.messaging.integrationsSection": "Integrations",
   // The page a development Slack install ends on.
   "status.messaging.signInReceived": "OpenBot received the Slack install. You can close this tab.",
   "status.messaging.signInUnknown": "OpenBot did not start this Slack install. Start it again in OpenBot.",
+  // Text that OpenBot posts in a Telegram chat, and the Telegram Orchestrator agent. Telegram users
+  // read the posts. The user can rename the agent.
+  "status.messaging.telegramNoAgent": "No agent can answer here yet. Add the Telegram Orchestrator in OpenBot.",
+  "status.messaging.telegramLinked":
+    "OpenBot is connected to this chat. Mention {bot} or reply to a message of OpenBot to ask the agents.",
+  "status.messaging.telegramOrchestratorName": "Telegram Orchestrator",
+  "status.messaging.telegramOrchestratorTitle": "Answers in Telegram and asks the team",
 });

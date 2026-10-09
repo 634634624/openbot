@@ -63,6 +63,17 @@ export interface AgentMessageMarkerModel {
   expectsReply: boolean;
 }
 
+export interface RoutineRunMarkerModel {
+  kind: "routine-run";
+  sourceAgentId: string | null;
+  routineId: string;
+  runId: string;
+  routineName: string;
+  status: "queued" | RoutineRunConversationEvent["status"];
+  timestamp: string;
+  previousTransitions?: RoutineRunMarkerTransition[];
+}
+
 export type ChatActionMarkerModel =
   | (SkillConversationEvent & { kind: "skill-lifecycle"; timestamp: string })
   | AgentMessageMarkerModel
@@ -84,15 +95,18 @@ export type ChatActionMarkerModel =
       status: "completed";
       timestamp: string;
     }
+  | RoutineRunMarkerModel
+  /**
+   * Consecutive completed runs of one routine, oldest first, drawn as one row. Only the timeline
+   * joins them: each stored run keeps its own marker. `routineName` is the name of the newest run,
+   * and `timestamp` is the time of the newest run.
+   */
   | {
-      kind: "routine-run";
-      sourceAgentId: string | null;
+      kind: "routine-run-group";
       routineId: string;
-      runId: string;
       routineName: string;
-      status: "queued" | RoutineRunConversationEvent["status"];
+      runs: Array<{ id: string; marker: RoutineRunMarkerModel }>;
       timestamp: string;
-      previousTransitions?: RoutineRunMarkerTransition[];
     }
   | {
       kind: "hosted-site";
@@ -180,6 +194,8 @@ export interface AgentProfile {
   computerUse?: boolean;
   /** Absent means off. Absent for an agent on a remote host too, which does not share it. */
   allowAutomation?: boolean;
+  /** Absent means the app default. Absent for an agent on a remote host too, which does not share it. */
+  busyMessageMode?: AgentSummary["busyMessageMode"];
   threadId: string | null;
   /** The agent's working directory. Absent for profiles built before it was tracked. */
   workspacePath?: string;

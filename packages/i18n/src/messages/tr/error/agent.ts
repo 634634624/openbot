@@ -26,6 +26,8 @@ export const messages = {
     "Şu anda hiçbir {provider} modeli mevcut değil. Kullanılabilir modelleri görmek için list_models çağrısı yapın.",
   "error.agent.reasoningEffortUnsupported":
     '"{model}" modeli "{effort}" akıl yürütme eforunu desteklemiyor. Desteklenen eforlar: {efforts}.',
+  "error.agent.noStartingModelInSettings":
+    "{provider} için kullanılabilir model yok ve oturum açılmış diğer sağlayıcılarda da yok. Bir sağlayıcıda oturum açın veya Sunucu ayarları → Sağlayıcılar bölümünden varsayılan sağlayıcıyı değiştirin.",
   "error.agent.noStartingModel":
     "{provider} sağlayıcısının kullanılabilir modeli yok ve oturum açmış başka hiçbir sağlayıcının da modeli bulunmuyor. Bir sağlayıcıda oturum açın veya Sağlayıcılar ve izinler bölümünden varsayılan sağlayıcıyı değiştirin.",
   "error.agent.waitBeforeProviderChange": "Sağlayıcıyı değiştirmeden önce etkin turun ve kuyruğun bitmesini bekleyin.",
@@ -70,6 +72,8 @@ export const messages = {
   "error.agent.queueEditRejected": "Kuyruk düzenlemesi reddedildi: {reason}",
   "error.agent.computerUseLocalOnly": "Bilgisayar Kullanımı yalnızca ajanı çalıştıran bilgisayarda değiştirilebilir.",
   "error.agent.automationLocalOnly": "Yerel betiklere yalnızca ajanı çalıştıran bilgisayarda izin verilebilir.",
+  "error.agent.busyMessageModeLocalOnly":
+    "Ajan çalışırken mesajların ne yapacağı yalnızca ajanı çalıştıran bilgisayarda ayarlanabilir.",
   "error.agent.automationOff": "Bu ajan, yerel betiklerin rutinlerini çalıştırmasına izin vermiyor.",
   "error.agent.automationPayloadTooLong": "Veri yükü {limit} karakterden daha uzun.",
   "error.agent.automationRateLimited":

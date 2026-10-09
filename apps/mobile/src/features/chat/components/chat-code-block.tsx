@@ -4,8 +4,9 @@ import { Button, Typography } from "heroui-native";
 import { useThemeColor } from "heroui-native/hooks";
 import { Check, Copy } from "lucide-react-native";
 import { memo, useEffect, useRef, useState } from "react";
-import { Alert, type ColorValue, ScrollView, useWindowDimensions, View } from "react-native";
+import { type ColorValue, ScrollView, useWindowDimensions, View } from "react-native";
 import { useCSSVariable } from "uniwind";
+import { showFailureAlert } from "@/features/analytics/failure-reports";
 import { haptics } from "@/shared/lib/haptics";
 import { useText } from "@/shared/lib/text";
 import { type CodeToken, codeLanguageLabel, highlightCode } from "../model/code-highlight";
@@ -24,12 +25,7 @@ export const ChatCodeBlock = memo(function ChatCodeBlock({
 }) {
   const { fontScale } = useWindowDimensions();
   const { t } = useText();
-  const [foreground, muted, keyword] = useThemeColor(["foreground", "muted", "link"]);
-  const [string, number, error] = useCSSVariable([
-    "--openbot-success-text",
-    "--openbot-warning-text",
-    "--openbot-danger-text",
-  ]).map(String);
+  const { foreground, muted, colors } = useCodeTokenColors();
   const [highlight, setHighlight] = useState<{ text: string; language?: string; tokens: CodeToken[] } | null>(null);
   const [copiedText, setCopiedText] = useState<string | null>(null);
   const lastHighlight = useRef<number | null>(null);
@@ -54,20 +50,6 @@ export const ChatCodeBlock = memo(function ChatCodeBlock({
       if (timer !== null) clearTimeout(timer);
     };
   }, [text, language]);
-  const colors: Partial<Record<ShjToken, ColorValue>> = {
-    kwd: keyword,
-    type: keyword,
-    class: keyword,
-    func: keyword,
-    str: string,
-    insert: string,
-    num: number,
-    bool: number,
-    esc: number,
-    cmnt: muted,
-    deleted: error,
-    err: error,
-  };
   const tokens =
     !highlight || highlight.language !== language || !text.startsWith(highlight.text)
       ? [{ text, offset: 0 }]
@@ -82,7 +64,7 @@ export const ChatCodeBlock = memo(function ChatCodeBlock({
       void haptics.notification("success");
     } catch {
       void haptics.notification("error");
-      Alert.alert(t("mobile.chat.code.copyFailed"), t("mobile.chat.copyFailedMessage"));
+      showFailureAlert(undefined, "turn", t("mobile.chat.code.copyFailed"), t("mobile.chat.copyFailedMessage"));
     }
   }
   return (
@@ -130,3 +112,28 @@ export const ChatCodeBlock = memo(function ChatCodeBlock({
     </View>
   );
 });
+
+/** The colours of highlighted code, shared by the code block in a message and the code view of a preview. */
+export function useCodeTokenColors() {
+  const [foreground, muted, keyword] = useThemeColor(["foreground", "muted", "link"]);
+  const [string, number, error] = useCSSVariable([
+    "--openbot-success-text",
+    "--openbot-warning-text",
+    "--openbot-danger-text",
+  ]).map(String);
+  const colors: Partial<Record<ShjToken, ColorValue>> = {
+    kwd: keyword,
+    type: keyword,
+    class: keyword,
+    func: keyword,
+    str: string,
+    insert: string,
+    num: number,
+    bool: number,
+    esc: number,
+    cmnt: muted,
+    deleted: error,
+    err: error,
+  };
+  return { foreground, muted, colors };
+}

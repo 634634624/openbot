@@ -48,6 +48,8 @@ const databaseHostPath = resolve(resourcesPath, "app.asar.unpacked/out/main/agen
 
 await Promise.all([
   access(executablePath),
+  access(resolve(resourcesPath, "app.asar.unpacked/node_modules/effect/package.json")),
+  access(resolve(resourcesPath, "app.asar.unpacked/node_modules/effect/dist/index.js")),
   access(resolve(resourcesPath, "app.asar")),
   access(packagedIconPath),
   access(sourceIconPath),
@@ -116,9 +118,10 @@ if (!isDynamicRecord(packageJson)) throw new Error("package.json is not a JSON o
 expectEqual(plist.CFBundleShortVersionString, packageJson.version, "application version");
 
 // Electron is unavailable to this process, and its own imports are what keep it startable there.
+// The unpacked Effect package checked above is its only import outside node: builtins.
 const databaseHost = await readFile(databaseHostPath, "utf8");
-if (/from "(?!node:)/.test(databaseHost)) {
-  throw new Error("The database host must import nothing but node: builtins.");
+if (/from "(?!node:|effect["/])/.test(databaseHost)) {
+  throw new Error("The database host must import nothing but node: builtins and effect.");
 }
 
 const executableArchitecture = run("file", [executablePath]);

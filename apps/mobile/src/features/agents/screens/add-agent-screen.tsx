@@ -4,16 +4,17 @@ import * as Crypto from "expo-crypto";
 import { router, Stack, useNavigation } from "expo-router";
 import { usePreventRemove } from "expo-router/react-navigation";
 import { Typography } from "heroui-native";
+import { X } from "lucide-react-native";
 import { useEffect, useRef, useState } from "react";
 import { Alert } from "react-native";
-
 import { AgentAppearancePicker } from "@/features/agents/components/agent-appearance-picker";
 import { useMobileWorkspace } from "@/features/workspace/context/mobile-workspace-context";
+import { AndroidHeaderButton } from "@/shared/components/android-header-button";
 import { SheetFormField } from "@/shared/components/sheet-form-field";
 import { SheetSaveAction } from "@/shared/components/sheet-save-action";
 import { SheetScrollView } from "@/shared/components/sheet-scroll-view";
 import { haptics } from "@/shared/lib/haptics";
-import { isIOS } from "@/shared/lib/platform";
+import { isAndroid, isIOS } from "@/shared/lib/platform";
 import { useText } from "@/shared/lib/text";
 
 export function AddAgentScreen() {
@@ -74,25 +75,39 @@ export function AddAgentScreen() {
 
   return (
     <SheetScrollView
+      clearHeader
       className="bg-sheet"
       contentContainerClassName="gap-5 px-5 pb-safe-offset-5 pt-5"
       contentInsetAdjustmentBehavior="automatic"
       keyboardDismissMode="interactive"
       keyboardShouldPersistTaps="handled"
     >
-      <Stack.Toolbar placement="left">
-        <Stack.Toolbar.Button
-          icon={isIOS ? "xmark" : undefined}
+      {isAndroid ? (
+        <AndroidHeaderButton
+          placement="left"
+          icon={X}
           accessibilityLabel={t("common.close")}
           disabled={saving}
           onPress={() => {
             void haptics.impact("soft");
             router.back();
           }}
-        >
-          {isIOS ? t("common.close") : "×"}
-        </Stack.Toolbar.Button>
-      </Stack.Toolbar>
+        />
+      ) : (
+        <Stack.Toolbar placement="left">
+          <Stack.Toolbar.Button
+            icon={isIOS ? "xmark" : undefined}
+            accessibilityLabel={t("common.close")}
+            disabled={saving}
+            onPress={() => {
+              void haptics.impact("soft");
+              router.back();
+            }}
+          >
+            {isIOS ? t("common.close") : "×"}
+          </Stack.Toolbar.Button>
+        </Stack.Toolbar>
+      )}
       <SheetSaveAction
         dirty={dirty}
         canSave={valid && !finished}
@@ -105,6 +120,7 @@ export function AddAgentScreen() {
         seed={avatarSeed}
         hue={avatarHue}
         name={name}
+        colorGlow
         nameField={
           <SheetFormField
             editable={!saving}

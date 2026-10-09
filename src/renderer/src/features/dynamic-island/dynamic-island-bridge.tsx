@@ -1,4 +1,5 @@
 import type { DynamicIslandAction } from "@openbot/contracts/ipc";
+import { classifyFailure } from "@openbot/telemetry";
 import { useText } from "@openbot/ui/text";
 import { createEffect, onSettled, untrack } from "solid-js";
 import { actionToast } from "../../action-toast";
@@ -20,7 +21,7 @@ import { dynamicIslandPort } from "./dynamic-island-port";
  * Island bridge for the visible server: projects workspace state out to main and handles
  * actions coming back. Split from `dynamic-island.tsx` (which owns the coordinator above the
  * per-server domains) so the coordinator survives a server switch while the projection stays
- * scoped to the active server. See docs/ARCHITECTURE.md.
+ * scoped to the active server. See docs/architecture/change-rules.md.
  *
  * Projection waits for scope `loaded()` to avoid publishing a new server id next to a
  * half-filled workspace. Cross-server actions republish through `server-switch.tsx` because
@@ -112,7 +113,10 @@ export function DynamicIslandBridge() {
     return dynamicIslandPort().dynamicIsland.onAction((action) => {
       void handleDynamicIslandAction(action).catch((error) => {
         actionToast.error(t("island.error.openRemoteTitle"), {
-          description: errorMessage(error, t("island.error.openRemote")),
+          ...{
+            description: errorMessage(error, t("island.error.openRemote")),
+          },
+          report: { operation: "other", source: "action", cause_code: classifyFailure(error) },
         });
       });
     });

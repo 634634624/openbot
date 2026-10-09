@@ -12,10 +12,11 @@ import * as DocumentPicker from "expo-document-picker";
 import { File } from "expo-file-system";
 import * as ImagePicker from "expo-image-picker";
 import { useRef, useState } from "react";
-import { Alert } from "react-native";
 import { attachmentSizeBucket } from "@/features/analytics/events";
+import { showFailureAlert } from "@/features/analytics/failure-reports";
 import { mobileAnalytics } from "@/features/analytics/mobile-analytics";
 import { haptics } from "@/shared/lib/haptics";
+import { readFileBase64 } from "@/shared/lib/read-file-base64";
 import { useText } from "@/shared/lib/text";
 import { type ImageDimensions, imageDimensions } from "../model/image-dimensions";
 
@@ -140,7 +141,7 @@ export function useChatAttachments(
     // Check before reading: a rejected file should not be copied into memory first.
     if (file.size > MOBILE_ATTACHMENT_BYTES) throw new Error(t("mobile.chat.attachment.tooLarge", { name: safeName }));
     assertSupported(safeName);
-    return { name: safeName, mimeType: attachmentMimeTypeForName(safeName), base64: await file.base64(), uri };
+    return { name: safeName, mimeType: attachmentMimeTypeForName(safeName), base64: await readFileBase64(file), uri };
   }
   async function addFile(uri: string, name: string) {
     if (itemsRef.current.length >= INPUT_LIMITS.attachments) throw new Error(limitMessage());
@@ -199,7 +200,9 @@ export function useChatAttachments(
         failure_code: "operation_failed",
       });
       void haptics.notification("error");
-      Alert.alert(
+      showFailureAlert(
+        error,
+        "turn",
         t("mobile.chat.attachment.addFailed"),
         error instanceof Error ? error.message : t("mobile.chat.tryAgain"),
       );
@@ -248,7 +251,9 @@ export function useChatAttachments(
           failure_code: "operation_failed",
         });
         void haptics.notification("error");
-        Alert.alert(
+        showFailureAlert(
+          error,
+          "turn",
           t("mobile.chat.attachment.addFailed"),
           error instanceof Error ? error.message : t("mobile.chat.tryAgain"),
         );

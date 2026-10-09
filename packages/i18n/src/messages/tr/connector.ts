@@ -153,4 +153,155 @@ export const messages = {
   "connector.slack.removeEffectKept": "Konuşmalar ve Slack Düzenleyicisi OpenBot'ta kalır.",
   "connector.slack.keep": "Bağlı tut",
   "connector.slack.close": "Kapat",
+
+  // Sunucu ayarları > Bağlayıcılar > Discord: bir Discord sunucusu tek OpenBot botunu ekler ve Discord
+  // Düzenleyicisi ajanı her isteği alır, ekibe sorar ve yanıtlar. Her zaman "Discord sunucusu" yazın.
+  "connector.discord.title": "Discord",
+  "connector.discord.description":
+    "Kullanıcılar bir Discord sunucusunun kanalında @OpenBot'tan bahseder. Discord Düzenleyicisi doğru ajana sorar ve yanıtlar.",
+  "connector.discord.statusNotSetUp": "Ayarlanmadı",
+  "connector.discord.statusConnected": "Bağlandı",
+  "connector.discord.statusAttention": "İlgilenilmesi gerekiyor",
+  // {workspace} Discord sunucusunun adıdır.
+  "connector.discord.summaryConnected": "{workspace} · Discord Düzenleyicisi yanıtlıyor",
+  "connector.discord.summaryNoAgent": "{workspace} · Henüz yanıt veren bir ajan yok",
+  "connector.discord.attentionTitle": {
+    one: "{count} Discord sunucusunun ilgilenilmesi gerekiyor",
+    other: "{count} Discord sunucusunun ilgilenilmesi gerekiyor",
+  },
+  "connector.discord.attentionDescription": "Aşağıdaki durum ne yapılması gerektiğini belirtir.",
+  "connector.discord.connect": "Discord'a Bağlan",
+  "connector.discord.addAgent": "Ajan ekle",
+  "connector.discord.actionFailed": "Discord değişikliği kabul etmedi",
+  "connector.discord.workspaceTitle": "Discord sunucusu",
+  "connector.discord.workspaceDescription":
+    "Bir kanalda @OpenBot'tan bahsedin. Devam etmek için OpenBot'a yanıt verin.",
+  "connector.discord.disconnectWorkspace": "Bağlantıyı Kes",
+  "connector.discord.missingScopes":
+    "OpenBot Discord'da şu izinlere sahip değil: {scopes}. Discord sunucusu bağlantısını kesin, ardından tekrar bağlayın.",
+  "connector.discord.retryAt": "Discord OpenBot'tan beklemesini istedi. {time} saatinde tekrar deneyecek.",
+  "connector.discord.reconnect": "Yeniden Bağlan",
+  "connector.discord.resume": "Sürdür",
+  // {action} Pause gibi bir düğmedir; {name} Discord sunucusunun adıdır.
+  "connector.discord.rowAction": "{action}: {name}",
+  "connector.discord.orchestratorTitle": "Discord Düzenleyicisi",
+  "connector.discord.orchestratorDescription":
+    "Bu ajan Discord'dan gelen her isteği alır. Kısa olanları kendisi yanıtlar, diğer işleri doğru ajana iletir ve yanıtı kanalda verir.",
+  "connector.discord.orchestratorNone": "Henüz yanıt veren bir ajan yok",
+  "connector.discord.orchestratorNoneDescription":
+    "Discord Düzenleyicisini ekleyin, aksi takdirde Discord yanıt alamaz.",
+  "connector.discord.channelsNote": "OpenBot, rolünün görebildiği kanalları görür.",
+  // Bağlanma iletişim kutusu. Adımlar sayı olarak gösterilir; ekran okuyucular adları okur.
+  "connector.discord.stepWorkspace": "Discord sunucusu",
+  "connector.discord.stepAgent": "Ajan",
+  "connector.discord.connectTitle": "Bir Discord sunucusuna bağlanın",
+  "connector.discord.connectDescription": "OpenBot, Discord sunucusuna OpenBot adında bir bot ekler.",
+  "connector.discord.connectStepBrowser": "Discord tarayıcınızda açılır",
+  "connector.discord.connectStepAllow": "Sunucuyu seçin, ardından Yetkilendir'e tıklayın",
+  "connector.discord.connectStepReturn": "Discord işlemi tamamlandığında bu iletişim kutusu devam eder",
+  "connector.discord.connectInDiscord": "Discord'da Bağlan",
+  "connector.discord.connectWaiting": "Discord bekleniyor. Yetkilendirmeyi tarayıcınızda tamamlayın.",
+  "connector.discord.agentStepTitle": "Discord Düzenleyicisini ekleyin",
+  // {workspace} Discord sunucusunun adıdır.
+  "connector.discord.agentStepDescription": "Bu yeni ajan, {workspace} içinde @OpenBot'a gönderilen her şeyi yanıtlar.",
+  "connector.discord.orchestratorName": "Discord Düzenleyicisi",
+  "connector.discord.orchestratorRole": "Discord'da yanıt verir ve ekibe sorar",
+  "connector.discord.orchestratorDoesReceive": "Her Discord isteğini ilk olarak alır",
+  "connector.discord.orchestratorDoesDelegate": "Her görevi en uygun ajana iletir",
+  "connector.discord.orchestratorDoesAnswer": "Yanıtı Discord kanalında verir",
+  "connector.discord.orchestratorModel": "Model",
+  "connector.discord.doneTitle": "OpenBot {workspace} içinde",
+  "connector.discord.doneDescription": "Bir kanalda @OpenBot'tan bahsedin. Devam etmek için OpenBot'a yanıt verin.",
+  "connector.discord.done": "Bitti",
+  "connector.discord.disconnectTitle": "{workspace} bağlantısı kesilsin mi?",
+  "connector.discord.disconnectDescription":
+    "OpenBot {workspace} içinde yanıt vermeyi bırakır ve Discord bağlantısını bu bilgisayardan kaldırır.",
+  "connector.discord.disconnectEffect":
+    "{workspace} içindeki kişiler artık @OpenBot aracılığıyla ajanlarınıza ulaşamaz.",
+  "connector.discord.removeEffectKept": "Konuşmalar ve Discord Düzenleyicisi OpenBot'ta kalır.",
+  "connector.discord.keep": "Bağlı tut",
+  "connector.discord.close": "Kapat",
+  // Sunucu ayarları > Bağlayıcılar > Telegram: her sohbet tek OpenBot botunu ekler ve Telegram
+  // Düzenleyicisi ajanı tüm sohbetlerin mesajlarını alır, ekibe sorar ve yanıtlar.
+  "connector.telegram.title": "Telegram",
+  "connector.telegram.description":
+    "OpenBot botunu bir Telegram grubuna ekleyin veya botla doğrudan bir sohbet açın. Telegram Düzenleyicisi doğru ajana sorar ve yanıtlar.",
+  "connector.telegram.statusNotSetUp": "Ayarlanmadı",
+  "connector.telegram.statusConnected": "Bağlandı",
+  "connector.telegram.statusAttention": "İlgilenilmesi gerekiyor",
+  // {count} bağlı Telegram sohbetlerinin sayısıdır.
+  "connector.telegram.summaryConnected": {
+    one: "{count} sohbet · Telegram Düzenleyicisi yanıtlıyor",
+    other: "{count} sohbet · Telegram Düzenleyicisi yanıtlıyor",
+  },
+  "connector.telegram.summaryNoAgent": {
+    one: "{count} sohbet · Henüz yanıt veren bir ajan yok",
+    other: "{count} sohbet · Henüz yanıt veren bir ajan yok",
+  },
+  "connector.telegram.attentionTitle": {
+    one: "{count} sohbetin ilgilenilmesi gerekiyor",
+    other: "{count} sohbetin ilgilenilmesi gerekiyor",
+  },
+  "connector.telegram.attentionDescription": "Aşağıdaki durum ne yapılması gerektiğini belirtir.",
+  "connector.telegram.connect": "Telegram'a Bağlan",
+  "connector.telegram.addAgent": "Ajan ekle",
+  "connector.telegram.actionFailed": "Telegram değişikliği kabul etmedi",
+  "connector.telegram.chatsTitle": "Sohbetler",
+  "connector.telegram.groupDescription": "Kullanıcılar bottan bahseder veya mesajlarını yanıtlar.",
+  "connector.telegram.directDescription": "Bu sohbetteki her mesaj Telegram Düzenleyicisine gider.",
+  "connector.telegram.helpRemoved":
+    "OpenBot botu artık bu sohbette değil. Sohbetin bağlantısını kesin, sonra botu yeniden ekleyin.",
+  "connector.telegram.helpRelayUnavailable":
+    "OpenBot bu bilgisayarda Telegram mesajlarını alamıyor. Oturum açın, Sunucu ayarlarında bu bilgisayara bir ad verin ve OpenBot'u açık tutun.",
+  "connector.telegram.helpError": "OpenBot bu sohbete ulaşamıyor. Yeniden bağlanın veya sohbetin bağlantısını kesin.",
+  "connector.telegram.retryAt": "Telegram OpenBot'tan beklemesini istedi. {time} saatinde tekrar deneyecek.",
+  "connector.telegram.pause": "Duraklat",
+  "connector.telegram.resume": "Sürdür",
+  "connector.telegram.reconnect": "Yeniden Bağlan",
+  "connector.telegram.disconnectChat": "Bağlantıyı Kes",
+  // {action} Pause gibi bir düğmedir; {name} sohbet adıdır.
+  "connector.telegram.rowAction": "{action}: {name}",
+  "connector.telegram.linkTitle": "Başka bir sohbet bağlayın",
+  "connector.telegram.linkDescription": "Telegram tarayıcınızda açılır. Sohbet bağlandığında burada görünür.",
+  "connector.telegram.linkWaiting": "Telegram bekleniyor. Telegram'da sohbeti seçin.",
+  "connector.telegram.addToGroup": "Bir gruba ekle",
+  "connector.telegram.openDirectChat": "Doğrudan sohbet aç",
+  "connector.telegram.orchestratorTitle": "Telegram Düzenleyicisi",
+  "connector.telegram.orchestratorDescription":
+    "Bu ajan tüm Telegram sohbetlerinizden OpenBot'a gelen mesajları alır. Kısa olanları kendisi yanıtlar, diğer işleri doğru ajana iletir ve yanıtı sohbette yayınlar.",
+  "connector.telegram.orchestratorNone": "Henüz yanıt veren bir ajan yok",
+  "connector.telegram.orchestratorNoneDescription":
+    "Telegram Düzenleyicisini ekleyin, aksi takdirde Telegram yanıt alamaz.",
+  "connector.telegram.mentionNote":
+    "Bir grupta bottan bahsedin veya mesajlarını yanıtlayın. Doğrudan sohbette her mesaj bota gider.",
+  // Bağlanma iletişim kutusu. Adımlar sayı olarak gösterilir; ekran okuyucular adları okur.
+  "connector.telegram.stepChat": "Sohbet",
+  "connector.telegram.stepAgent": "Ajan",
+  "connector.telegram.connectTitle": "Bir Telegram sohbeti bağlayın",
+  "connector.telegram.connectDescription":
+    "OpenBot botunu bir gruba ekleyin veya botla doğrudan bir sohbet açın. Tek bir bot tüm sohbetlerinize hizmet eder.",
+  "connector.telegram.connectStepBrowser": "Telegram tarayıcınızda açılır",
+  "connector.telegram.connectStepPick": "Grubu seçin veya doğrudan sohbette Başlat'a dokunun",
+  "connector.telegram.connectStepReturn": "Sohbet bağlandığında bu iletişim kutusu devam eder",
+  "connector.telegram.connectWaiting": "Telegram bekleniyor. Telegram'da sohbeti seçin.",
+  "connector.telegram.agentStepTitle": "Telegram Düzenleyicisini ekleyin",
+  // {chat} Telegram sohbetinin adıdır.
+  "connector.telegram.agentStepDescription":
+    "Bu yeni ajan, {chat} içinde ve daha sonra bağladığınız her sohbette OpenBot'a gelen mesajları yanıtlar.",
+  "connector.telegram.orchestratorName": "Telegram Düzenleyicisi",
+  "connector.telegram.orchestratorRole": "Telegram'da yanıt verir ve ekibe sorar",
+  "connector.telegram.orchestratorDoesReceive": "OpenBot'a gelen her Telegram mesajını ilk olarak alır",
+  "connector.telegram.orchestratorDoesDelegate": "Her görevi en uygun ajana iletir",
+  "connector.telegram.orchestratorDoesAnswer": "Yanıtı Telegram sohbetinde yayınlar",
+  "connector.telegram.orchestratorModel": "Model",
+  "connector.telegram.doneTitle": "OpenBot {chat} içinde",
+  "connector.telegram.done": "Bitti",
+  "connector.telegram.disconnectTitle": "{chat} bağlantısı kesilsin mi?",
+  "connector.telegram.disconnectDescription":
+    "OpenBot botu {chat} sohbetinden ayrılır ve OpenBot orada yanıt vermeyi bırakır. Konuşmalar OpenBot'ta kalır.",
+  "connector.telegram.disconnectEffect":
+    "{chat} içindeki kişiler artık OpenBot botu aracılığıyla ajanlarınıza ulaşamaz.",
+  "connector.telegram.removeEffectKept": "Konuşmalar ve Telegram Düzenleyicisi OpenBot'ta kalır.",
+  "connector.telegram.keep": "Bağlı tut",
+  "connector.telegram.close": "Kapat",
 } as const satisfies PartialTranslation<typeof source>;

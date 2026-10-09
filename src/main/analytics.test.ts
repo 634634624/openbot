@@ -1,3 +1,4 @@
+import { Effect } from "effect";
 // @vitest-environment node
 
 import {
@@ -92,7 +93,7 @@ describe("host analytics", () => {
     );
 
     expect(client.setGlobalProperties).toHaveBeenCalledWith(
-      expect.objectContaining({ event_schema_version: 6, surface: "desktop_host" }),
+      expect.objectContaining({ event_schema_version: 7, surface: "desktop_host" }),
     );
 
     analytics.handleAgentEvent({
@@ -776,6 +777,9 @@ describe("host analytics", () => {
       reasoning_effort: "medium",
       area: "agent",
       failure_code: "interrupt_failed",
+      cause_code: "unknown",
+      severity: "error",
+      operation: "turn",
       profileId: "owner-account",
     });
   });
@@ -905,10 +909,11 @@ function dayStore(stored: string | "missing" | "malformed"): AnalyticsInventoryD
   const written: string[] = [];
   return {
     written,
-    read: async () => written.at(-1) ?? stored,
-    write: async (day) => {
-      written.push(day);
-    },
+    read: () => Effect.sync(() => written.at(-1) ?? stored),
+    write: (day) =>
+      Effect.sync(() => {
+        written.push(day);
+      }),
   };
 }
 
@@ -931,7 +936,7 @@ describe("usage analytics", () => {
   });
 
   it("names a server as a catalog plugin only when its address or command matches the listing", async () => {
-    const servers = await loadCatalogPluginServers("resources/plugin-catalog");
+    const servers = await Effect.runPromise(loadCatalogPluginServers("resources/plugin-catalog"));
     const config = (fields: Partial<McpServerConfig>): McpServerConfig => ({
       id: "server",
       name: "linear",
@@ -1052,7 +1057,7 @@ describe("usage analytics", () => {
 
   it("sends the inventory once per local day with only catalog names", async () => {
     const store = dayStore("missing");
-    const resolveInventory = vi.fn(async () => inventory());
+    const resolveInventory = vi.fn(() => Effect.sync(inventory));
     const { analytics, tracked } = usageAnalytics({ resolveInventory, inventoryDay: store });
     analytics.flushPending();
     await vi.waitFor(() => expect(tracked("system_inventory")).toHaveLength(1));
@@ -1068,7 +1073,7 @@ describe("usage analytics", () => {
 
   it("treats a malformed inventory day as sent today, and repairs it for the next day", async () => {
     const store = dayStore("malformed");
-    const resolveInventory = vi.fn(async () => inventory());
+    const resolveInventory = vi.fn(() => Effect.sync(inventory));
     const { analytics } = usageAnalytics({ resolveInventory, inventoryDay: store });
     analytics.flushPending();
     await vi.waitFor(() => expect(store.written).toHaveLength(1));
@@ -1081,13 +1086,14 @@ describe("usage analytics", () => {
   it("does not send the inventory when the user turns analytics off during the check", async () => {
     const store = dayStore("missing");
     const { analytics, tracked } = usageAnalytics({
-      resolveInventory: async () => inventory(),
+      resolveInventory: () => Effect.sync(inventory),
       inventoryDay: {
         ...store,
-        write: async (day) => {
-          analytics.setTrackingEnabled(false);
-          await store.write(day);
-        },
+        write: (day) =>
+          Effect.gen(function* () {
+            analytics.setTrackingEnabled(false);
+            yield* store.write(day);
+          }),
       },
     });
     analytics.flushPending();

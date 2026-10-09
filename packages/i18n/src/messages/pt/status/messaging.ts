@@ -28,8 +28,18 @@ export const messages = {
   "status.messaging.filesSkipped": "Alguns arquivos não foram enviados: {names}.",
   "status.messaging.orchestratorName": "Orquestrador do Slack",
   "status.messaging.orchestratorTitle": "Responde no Slack e consulta a equipe",
+  "status.messaging.discordNoAgent":
+    "Nenhum agente pode responder aqui ainda. Adicione o Orquestrador do Discord no OpenBot.",
+  "status.messaging.discordOrchestratorName": "Orquestrador do Discord",
+  "status.messaging.discordOrchestratorTitle": "Responde no Discord e consulta a equipe",
   "status.messaging.integrationsSection": "Integrações",
   "status.messaging.signInReceived": "O OpenBot recebeu a instalação do Slack. Você pode fechar esta aba.",
   "status.messaging.signInUnknown":
     "O OpenBot não iniciou esta instalação do Slack. Inicie a instalação novamente no OpenBot.",
+  "status.messaging.telegramNoAgent":
+    "Nenhum agente pode responder aqui ainda. Adicione o Orquestrador do Telegram no OpenBot.",
+  "status.messaging.telegramLinked":
+    "O OpenBot está conectado a este chat. Mencione {bot} ou responda a uma mensagem do OpenBot para falar com os agentes.",
+  "status.messaging.telegramOrchestratorName": "Orquestrador do Telegram",
+  "status.messaging.telegramOrchestratorTitle": "Responde no Telegram e consulta a equipe",
 } as const satisfies PartialTranslation<typeof source>;

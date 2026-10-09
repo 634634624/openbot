@@ -38,8 +38,9 @@ export const messages = {
   "server.join.account": "Conta",
   "server.join.emailBound": "Este convite só funciona para o destinatário do e-mail.",
   "server.join.unknownDate": "Desconhecida",
-  "server.add.title": "Execute o OpenBot na nuvem",
-  "server.add.description": "O OpenBot executa o servidor para você. Escolha um plano para começar.",
+  "server.add.title": "Execute o OpenBot 24/7 em um servidor externo",
+  "server.add.description":
+    "Os servidores do OpenBot mantêm seus agentes e rotinas em execução, mesmo com o computador desligado. Cuidamos da infraestrutura e da manutenção, para que seu servidor esteja pronto sem nenhuma configuração técnica.",
   "server.add.billing.label": "Período de cobrança",
   "server.add.currency.label": "Moeda",
   "server.add.billing.monthly": "Mensal",
@@ -124,11 +125,11 @@ export const messages = {
   "server.rail.notificationSettings": "Configurações de notificações",
   "server.rail.usage": "Uso",
   "server.rail.settings": "Configurações do servidor",
+  "server.rail.leave": "Sair do servidor",
+  "server.rail.delete": "Excluir servidor",
   "server.select.failedTitle": "Não foi possível selecionar o servidor",
   "server.select.failedDescription": "Não foi possível trocar de servidor. Tente novamente.",
   "server.select.openAgentFailed": "Não foi possível abrir {name}. Encontre-o na barra lateral.",
-  "server.scope.agentsLoadFailed":
-    "Não foi possível carregar os agentes. Verifique a conexão com o servidor e tente novamente.",
   "server.settings.unavailable": "Este servidor está indisponível.",
   "server.settings.identityRefreshFailed": "Não foi possível atualizar a identidade do servidor.",
   "server.settings.loadFailed": "Não foi possível carregar as configurações do servidor.",
@@ -242,6 +243,10 @@ export const messages = {
   "server.members.actionsFor": "Ações para {name}",
   "server.members.makeMember": "Tornar membro",
   "server.members.makeAdmin": "Tornar administrador",
+  "server.members.makeAdminTitle": "Tornar {name} administrador?",
+  "server.members.makeMemberTitle": "Tornar {name} membro?",
+  "server.members.roleChangeDescription":
+    "{name} pode ser desconectado deste servidor e precisará se conectar de novo.",
   "server.invite.invalidEmail": "Digite um endereço de e-mail válido.",
   "server.invite.title": "Convidar pessoas",
   "server.invite.description":
@@ -282,6 +287,8 @@ export const messages = {
   "server.invite.neverExpires": { one: "Nunca expira · {count} entrada", other: "Nunca expira · {count} entradas" },
   "server.invite.expires": "Expira em {date}",
   "server.invite.revoke": "Revogar",
+  "server.invite.revokeTitle": "Revogar este convite?",
+  "server.invite.revokeDescription": "O convite deixa de funcionar. Quem entrou com ele continua como membro.",
   "server.desktop.accessTitle": "Acesso à área de trabalho remota",
   "server.desktop.gatewayDescription":
     "Todo membro ativo do servidor pode controlar este computador anfitrião. Não há senha separada para a área de trabalho remota.",
@@ -338,7 +345,7 @@ export const messages = {
   "server.update.waitingFor": "Aguardando {reasons}.",
   "server.update.disabledTitle": "As atualizações remotas estão desativadas",
   "server.update.disabledDescription":
-    "O usuário de {name} desativou as atualizações por administradores do servidor. Peça que atualize o OpenBot ou ative a configuração.",
+    "O usuário de {name} desativou as atualizações por membros do servidor. Peça que atualize o OpenBot ou ative a opção.",
   "server.update.managedTitle": "Um Host Manager controla as atualizações",
   "server.update.managedDescription":
     "O OpenBot Host Manager atualiza {name}. Entre em contato com o administrador do computador anfitrião.",

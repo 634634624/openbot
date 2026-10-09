@@ -31,7 +31,10 @@ function SettingsModalStory(props: {
   initialOpen: boolean;
   /** Adds the Hosted servers tab with a stopped server and a server whose plan ended. */
   hostedServers?: boolean;
+  /** How long the hosted server list takes to answer. */
+  hostedServersDelayMs?: number;
   initialTab?: SettingsTab;
+  openTab?: SettingsTab;
   /** A restart that a server admin asked for. */
   scheduledRestart?: UpdateStatus["scheduledRestart"];
 }) {
@@ -44,6 +47,13 @@ function SettingsModalStory(props: {
     toast.dismiss();
     window.openbot = previousApi;
   });
+  const hostedServersApi = {
+    ...mock.api.hostedServers,
+    list: async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, props.hostedServersDelayMs ?? 0));
+      return mock.api.hostedServers.list();
+    },
+  };
   const [open, setOpen] = createSignal(props.initialOpen);
   const [value, setValue] = createSignal({ ...DEFAULT_GENERAL_SETTINGS });
   const [updateStatus, setUpdateStatus] = createSignal<UpdateStatus>(
@@ -59,6 +69,13 @@ function SettingsModalStory(props: {
       platform: "ios",
       connectedAt: Date.now() - 86_400_000,
       lastActiveAt: Date.now() - 45_000,
+    },
+    {
+      sessionId: "22222222-2222-4222-8222-222222222222",
+      name: "Pixel 9",
+      platform: "android",
+      connectedAt: Date.now() - 3_600_000,
+      lastActiveAt: Date.now() - 600_000,
     },
   ]);
 
@@ -97,6 +114,7 @@ function SettingsModalStory(props: {
         </Button>
         <SettingsModal
           initialTab={props.initialTab}
+          openTab={props.openTab}
           open={open()}
           onOpenChange={setOpen}
           value={value()}
@@ -122,7 +140,7 @@ function SettingsModalStory(props: {
           }}
           onUpdateAction={runUpdateAction}
           billingApi={billingApi}
-          hostedServersApi={props.hostedServers ? mock.api.hostedServers : undefined}
+          hostedServersApi={props.hostedServers ? hostedServersApi : undefined}
           onAddHostedServer={props.hostedServers ? fn() : undefined}
         />
       </main>
@@ -185,6 +203,15 @@ export const Narrow: Story = {
   parameters: { viewport: { defaultViewport: "settingsNarrow" } },
 };
 
+export const Notifications: Story = {
+  render: () => <SettingsModalStory initialOpen initialTab="notifications" />,
+};
+
+/** The install guide for each phone, the sign-in code and the connected phones. */
+export const MobileConnect: Story = {
+  render: () => <SettingsModalStory initialOpen initialTab="mobile-connect" />,
+};
+
 /** No plan yet. Choose a plan: the mock then shows it as active, as after a Stripe payment. */
 export const Billing: Story = {
   render: () => <SettingsModalStory initialOpen initialTab="billing" />,
@@ -193,6 +220,16 @@ export const Billing: Story = {
 /** An account that can create hosted servers. Start, renew and delete change the mock list. */
 export const HostedServers: Story = {
   render: () => <SettingsModalStory initialOpen hostedServers initialTab="hosted-servers" />,
+};
+
+/** "Manage servers" with a list that answers after 300 ms: the tab opens at once and shows no spinner. */
+export const HostedServersFastList: Story = {
+  render: () => <SettingsModalStory initialOpen hostedServers hostedServersDelayMs={300} openTab="hosted-servers" />,
+};
+
+/** "Manage servers" with a list that answers after 3 s: the spinner fades in after its delay. */
+export const HostedServersSlowList: Story = {
+  render: () => <SettingsModalStory initialOpen hostedServers hostedServersDelayMs={3_000} openTab="hosted-servers" />,
 };
 
 export const ScheduledRemoteUpdate: Story = {

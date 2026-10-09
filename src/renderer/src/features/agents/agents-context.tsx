@@ -70,6 +70,8 @@ const Agents = createSimpleContext({
     const { uiErrors, setUiErrors, appendUiError } = useUiErrors();
 
     const [agentList, setAgentList] = createSignal<AgentProfile[]>([]);
+    /** The first roster read of this scope succeeded. */
+    const [agentListSettled, setAgentListSettled] = createSignal(false);
     const [duplicatingAgentIds, setDuplicatingAgentIds] = createSignal<Set<string>>(new Set());
     const [modelOptions, setModelOptions] = createSignal<AgentModelOption[]>([]);
     const selectionServerId = untrack(activeServerId);
@@ -98,6 +100,24 @@ const Agents = createSimpleContext({
         serverSetupChoice() === null &&
         remoteAdminServer(activeServer(), "providers-v1") !== undefined,
     );
+    /**
+     * A server whose roster has not come back yet. A remote host answers over the remote connection,
+     * which takes seconds after a launch, so an empty list here does not mean the server has no
+     * agents. Main reports such a host as `offline` until the first connection is up, so that state
+     * counts as connecting too. A failed connection reports `error` or an issue, and an incompatible
+     * or sleeping server keeps its own state. Only a successful read can settle the roster.
+     */
+    const agentListConnecting = createMemo(() => {
+      if (agentListSettled()) return false;
+      const server = activeServer();
+      if (!server || server.kind === "local") return true;
+      return (
+        server?.kind === "remote" &&
+        (server.state === "offline" || server.state === "connecting" || server.state === "online") &&
+        server.issue == null &&
+        server.hostedSleep !== "sleeping"
+      );
+    });
     const [settingsRequest, setSettingsRequest] = createSignal<AgentSettingsRequest | null>(null);
     const [agentStatus, setAgentStatus] = createSignal<AgentStatus>(FALLBACK_STATUS);
     let openedAgentChatId: string | null = null;
@@ -146,6 +166,7 @@ const Agents = createSimpleContext({
         return existing;
       });
       setAgentList(profiles);
+      setAgentListSettled(true);
       setActiveAgentId((current) => {
         // Validate the saved choice before it can trigger conversation requests.
         const preferred = current || savedAgentId;
@@ -253,6 +274,9 @@ const Agents = createSimpleContext({
     return {
       agentList,
       setAgentList,
+      agentListConnecting,
+      agentListSettled,
+      setAgentListSettled,
       duplicatingAgentIds,
       setDuplicatingAgentIds,
       modelOptions,

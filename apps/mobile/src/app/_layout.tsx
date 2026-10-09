@@ -5,12 +5,13 @@ import { usePathname } from "expo-router";
 import { DarkTheme, DefaultTheme, ThemeProvider } from "expo-router/react-navigation";
 import { Stack } from "expo-router/stack";
 import { StatusBar } from "expo-status-bar";
+import * as SystemUI from "expo-system-ui";
 import { HeroUINativeProvider } from "heroui-native/provider";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { StyleSheet, View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { KeyboardProvider } from "react-native-keyboard-controller";
-import { useReducedMotion } from "react-native-reanimated";
+import { ReducedMotionConfig, ReduceMotion } from "react-native-reanimated";
 import { useCSSVariable, useUniwind, withUniwind } from "uniwind";
 
 import { MobileAnalyticsLifecycle } from "@/features/analytics/lifecycle";
@@ -22,12 +23,15 @@ import { loadDictationLanguage } from "@/features/settings/model/dictation-langu
 import { loadHapticsPreference } from "@/features/settings/model/haptics";
 import { loadLiveActivitiesPreference } from "@/features/settings/model/live-activities";
 import { loadAgentColorMessages } from "@/features/settings/model/message-color";
+import { useMotionPreferences } from "@/features/settings/model/motion";
+import { loadMotionPreferences } from "@/features/settings/model/motion-storage";
 import { installSupportLog } from "@/features/support/model/support-log-capture";
 import { AppLoadingOverlayProvider, useAppLoadingOverlay } from "@/shared/components/app-loading-overlay";
 import { BloubAnimationProvider } from "@/shared/components/bloub-loader";
 import { SplashBackdrop } from "@/shared/components/splash-backdrop";
+import { useReducedMotion } from "@/shared/lib/motion";
 import { nativeSplash } from "@/shared/lib/native-splash";
-import { isIOS } from "@/shared/lib/platform";
+import { isAndroid, isIOS } from "@/shared/lib/platform";
 import { queryClient } from "@/shared/lib/query-client";
 import { useText } from "@/shared/lib/text";
 import { useAppForeground } from "@/shared/lib/use-app-foreground";
@@ -53,8 +57,11 @@ function RootNavigator() {
   const pathname = usePathname();
   const { setLoadingLabel, isLoaderPresent } = useAppLoadingOverlay();
   const appearanceReady = useAppearance((state) => state.ready);
-  const busy = loading || !appearanceReady || (!session && isLoaderPresent);
-  const { covered, reportArtwork, reportContentReady } = useSplashGate(busy, nativeSplash, appearanceReady);
+  // Motion choices are read before the first screen, so no screen starts an animation that Settings turned off.
+  const motionReady = useMotionPreferences((state) => state.ready);
+  const preferencesReady = appearanceReady && motionReady;
+  const busy = loading || !preferencesReady || (!session && isLoaderPresent);
+  const { covered, reportArtwork, reportContentReady } = useSplashGate(busy, nativeSplash, preferencesReady);
 
   const container = useRef<View>(null);
   const reducedMotion = useReducedMotion();
@@ -95,7 +102,7 @@ function RootNavigator() {
             accessibilityElementsHidden={covered}
             importantForAccessibility={covered ? "no-hide-descendants" : "auto"}
           >
-            {!loading && appearanceReady ? (
+            {!loading && preferencesReady ? (
               <View className="flex-1" onLayout={session || pathname !== "/" ? () => reportReady() : undefined}>
                 <Stack
                   screenOptions={{
@@ -108,7 +115,10 @@ function RootNavigator() {
                     <Stack.Screen name="index" options={{ headerShown: false }} />
                     <Stack.Screen
                       name="scan-qr-code"
-                      options={{ animation: "slide_from_right", title: t("mobile.app.route.scanQrCode") }}
+                      options={{
+                        animation: reducedMotion ? "fade" : "slide_from_right",
+                        title: t("mobile.app.route.scanQrCode"),
+                      }}
                     />
                   </Stack.Protected>
                   <Stack.Protected guard={Boolean(session)}>
@@ -128,7 +138,7 @@ function RootNavigator() {
             accessibilityElementsHidden={!covered}
             importantForAccessibility={covered ? "auto" : "no-hide-descendants"}
           >
-            {appearanceReady && (covered || !motion.complete) ? (
+            {preferencesReady && (covered || !motion.complete) ? (
               <SplashBackdrop
                 onArtworkDisplay={reportArtwork}
                 progress={motion.progress}
@@ -145,23 +155,41 @@ function RootNavigator() {
 
 export default function RootLayout() {
   const { theme: colorScheme } = useUniwind();
+  const animations = useMotionPreferences((state) => state.allAnimations);
+  const heroConfig = useMemo(() => (animations ? {} : { animation: "disable-all" as const }), [animations]);
   const canvas = String(useCSSVariable("--openbot-bg-native-canvas"));
   // React Navigation paints its near-black dark background behind screens during transitions.
   const darkTheme = useMemo(() => ({ ...DarkTheme, colors: { ...DarkTheme.colors, background: canvas } }), [canvas]);
+  // Android shows the window background behind the system bars. Without this it keeps the light splash color.
+  // iOS shows the window background behind sheets, so it keeps its default.
+  useEffect(() => {
+    if (!isAndroid) return;
+    void SystemUI.setBackgroundColorAsync(canvas).catch(() => undefined);
+  }, [canvas]);
   useEffect(() => {
     void loadAppearance().catch(() => undefined);
     void loadHapticsPreference().catch(() => undefined);
     void loadAgentColorMessages().catch(() => undefined);
     void loadLiveActivitiesPreference().catch(() => undefined);
+    void loadMotionPreferences().catch(() => undefined);
     void loadDictationLanguage().catch(() => undefined);
     void loadAppLanguage().catch(() => undefined);
   }, []);
 
   return (
     <UniwindGestureHandlerRootView className="flex-1">
-      <KeyboardProvider preload={false}>
+      {/* The app draws under the system bars and pads with safe area insets. Expo Go on Android does not
+          report edge-to-edge, and without these props the keyboard provider pads the whole app. */}
+      <KeyboardProvider
+        preload={false}
+        statusBarTranslucent={isAndroid}
+        navigationBarTranslucent={isAndroid}
+        preserveEdgeToEdge={isAndroid}
+      >
         <QueryClientProvider client={queryClient}>
-          <HeroUINativeProvider>
+          <HeroUINativeProvider config={heroConfig}>
+            {/* Off in Settings reduces every animation that follows the system Reduce Motion setting. */}
+            {animations ? null : <ReducedMotionConfig mode={ReduceMotion.Always} />}
             <ThemeProvider value={colorScheme === "dark" ? darkTheme : DefaultTheme}>
               <StatusBar style={colorScheme === "dark" ? "light" : "dark"} />
               <BloubAnimationProvider>

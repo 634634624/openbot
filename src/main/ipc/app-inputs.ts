@@ -1,6 +1,7 @@
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import type {
   AgentProviderId,
+  BusyMessageModePreference,
   DeleteHostedSiteInput,
   DynamicIslandAction,
   DynamicIslandPreference,
@@ -15,6 +16,7 @@ import type {
   MarketplaceSkillQuery,
   NotificationPreference,
   PublishHostedSiteInput,
+  RemoteSessionReusePreference,
   ReplaceHostedSiteInput,
   SaveSetupInput,
   SetAnalyticsPreferenceInput,
@@ -35,6 +37,7 @@ import {
   isAgentProvider,
   isAppLanguage,
   isAppLogoColor,
+  isBusyMessageMode,
   isDynamicIslandAction,
   isDynamicIslandInteractive,
   isDynamicIslandPreference,
@@ -84,6 +87,17 @@ export function parseApprovalAutomation(input: unknown): SetApprovalAutomationIn
     parsed.autoApprove = input.autoApprove;
   }
   return parsed;
+}
+
+export function parseBusyMessageModePreference(input: unknown): BusyMessageModePreference {
+  if (!isDynamicRecord(input) || !isBusyMessageMode(input.mode)) throw new Error("Busy message mode is required.");
+  return { mode: input.mode };
+}
+
+export function parseRemoteSessionReusePreference(input: unknown): RemoteSessionReusePreference {
+  if (!isDynamicRecord(input) || !isBoolean(input.keepBetweenRuns))
+    throw new Error("The remote session setting is required.");
+  return { keepBetweenRuns: input.keepBetweenRuns };
 }
 
 export function parseAppLanguagePreference(input: unknown): SetAppLanguagePreferenceInput {

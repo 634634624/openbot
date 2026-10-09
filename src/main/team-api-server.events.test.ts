@@ -7,6 +7,7 @@ import {
   decodeTeamProtocolV3CurrentHttpResponse,
   encodeTeamProtocolV3CurrentHttpResponse,
 } from "@openbot/contracts/team-protocol/v3-adapter";
+import { Effect } from "effect";
 import opencodeFixture from "../../packages/contracts/src/team-protocol/fixtures/v4/host-http-response.json";
 import { legacyProviderView } from "./team-api/provider-visibility";
 // @vitest-environment node
@@ -50,7 +51,7 @@ describe("TeamApiServer events", () => {
     const { port } = await start({
       agents: createAgents({ listAgents: () => [source, gemini], getRuntimeSnapshot: () => snapshot }, events),
     });
-    const login = await store.login("owner", "correct horse battery");
+    const login = await Effect.runPromise(store.login("owner", "correct horse battery"));
     for (const supportsOpencode of [false, true]) {
       const socket = new WebSocket(`ws://127.0.0.1:${port}/v1/events`, [
         "openbot-team-v1",
@@ -98,7 +99,7 @@ describe("TeamApiServer events", () => {
     const { port } = await start({
       agents: createAgents({ listAgents: () => [source, cursor], getRuntimeSnapshot: () => snapshot }, events),
     });
-    const login = await store.login("owner", "correct horse battery");
+    const login = await Effect.runPromise(store.login("owner", "correct horse battery"));
     for (const capabilities of [
       ["agent-runtime-snapshots", "opencode", "local-providers"],
       ["agent-runtime-snapshots", "opencode", "local-providers", "local-providers-v2"],
@@ -132,7 +133,7 @@ describe("TeamApiServer events", () => {
     const events = new EventEmitter();
     const { store, start } = await createTeamApiFixture("skills-events", { configure: true });
     const { port } = await start({ agents: createAgents({}, events) });
-    const login = await store.login("owner", "correct horse battery");
+    const login = await Effect.runPromise(store.login("owner", "correct horse battery"));
     const received = new Map<boolean, unknown[]>();
     const sockets: WebSocket[] = [];
     for (const supportsSkillsEvents of [true, false]) {
@@ -174,22 +175,26 @@ describe("TeamApiServer events", () => {
 
   it("shares sidebar layout mutations with owner, admin, and member clients", async () => {
     const { root, store, start } = await createTeamApiFixture("sidebar-layout", { configure: true });
-    const adminInvite = await store.createInvite("admin");
-    const memberInvite = await store.createInvite("member");
-    const admin = await store.acceptInviteWithAccount(adminInvite.token, {
-      id: "admin-account",
-      email: "admin@example.com",
-      name: "Admin",
-      avatarUrl: null,
-    });
-    const member = await store.acceptInviteWithAccount(memberInvite.token, {
-      id: "member-account",
-      email: "member@example.com",
-      name: "Member",
-      avatarUrl: null,
-    });
+    const adminInvite = await Effect.runPromise(store.createInvite("admin"));
+    const memberInvite = await Effect.runPromise(store.createInvite("member"));
+    const admin = await Effect.runPromise(
+      store.acceptInviteWithAccount(adminInvite.token, {
+        id: "admin-account",
+        email: "admin@example.com",
+        name: "Admin",
+        avatarUrl: null,
+      }),
+    );
+    const member = await Effect.runPromise(
+      store.acceptInviteWithAccount(memberInvite.token, {
+        id: "member-account",
+        email: "member@example.com",
+        name: "Member",
+        avatarUrl: null,
+      }),
+    );
     const sidebarLayout = new SidebarLayoutStore(join(root, "sidebar-layout.json"));
-    await sidebarLayout.initialize();
+    await Effect.runPromise(sidebarLayout.initialize());
     const getRuntimeSnapshot = vi.fn<TeamApiAgents["getRuntimeSnapshot"]>(() => ({
       agents: [],
       activeTurns: [],
@@ -234,7 +239,7 @@ describe("TeamApiServer events", () => {
       now: () => now,
     });
 
-    const owner = await store.login("owner", "correct horse battery");
+    const owner = await Effect.runPromise(store.login("owner", "correct horse battery"));
     const socket = new WebSocket(`ws://127.0.0.1:${port}/v1/events`, [
       "openbot-events-v2",
       `openbot-token.${member.sessionToken}`,
@@ -451,7 +456,7 @@ describe("TeamApiServer events", () => {
         agentEvents,
       ),
     });
-    const login = await store.login("owner", "correct horse battery");
+    const login = await Effect.runPromise(store.login("owner", "correct horse battery"));
     const received = new Map<string, Array<{ type: string }>>();
     const open = async (name: string, capabilities: string[]): Promise<WebSocket> => {
       const messages: Array<{ type: string }> = [];
@@ -499,10 +504,69 @@ describe("TeamApiServer events", () => {
 
   it("keeps legacy event clients connected without sending runtime snapshots", async () => {
     const { store, start } = await createTeamApiFixture("legacy-events", { configure: true });
-    const login = await store.login("owner", "correct horse battery");
+    const login = await Effect.runPromise(store.login("owner", "correct horse battery"));
     const agentEvents = new EventEmitter();
+    const source = opencodeFixture[0];
+    if (!isAgentSummary(source)) throw new Error("Invalid agent fixture.");
+    const primaryAgent: AgentSummary = {
+      ...source,
+      id: "chief",
+      provider: "codex",
+      model: "gpt-5.6-luna",
+      threadId: "thread-chief",
+    };
+    const legacySnapshot = {
+      agentId: "chief",
+      threadId: "thread-chief",
+      activeTurnId: null,
+      revision: 2,
+      messages: [
+        {
+          id: "reply-1",
+          author: "assistant" as const,
+          text: "Done",
+          createdAt: "2026-08-29T10:00:00.000Z",
+          status: "completed" as const,
+        },
+        {
+          id: "routine-event-1",
+          author: "system" as const,
+          source: "system" as const,
+          text: "Morning brief",
+          createdAt: "2026-08-29T10:01:00.000Z",
+          status: "completed" as const,
+          itemType: routineConversationEventItemType("created", "routine-1"),
+        },
+        {
+          id: "routine-run-event-1",
+          author: "system" as const,
+          source: "system" as const,
+          text: "Morning brief",
+          createdAt: "2026-08-29T10:02:00.000Z",
+          status: "completed" as const,
+          itemType: routineRunConversationEventItemType("running", "routine-1", "run-1"),
+        },
+        {
+          id: "hosted-site-event-1",
+          author: "system" as const,
+          source: "system" as const,
+          text: hostedSiteConversationEventText({
+            siteId: null,
+            title: "Launch page",
+            hostname: null,
+            url: null,
+          }),
+          createdAt: "2026-08-29T10:03:00.000Z",
+          status: "completed" as const,
+          itemType: hostedSiteConversationEventItemType("publish", "running", "operation-1"),
+        },
+      ],
+    };
     const { port } = await start({
-      agents: createAgents({}, agentEvents),
+      agents: createAgents(
+        { listAgents: () => [primaryAgent], readConversation: () => Effect.succeed(legacySnapshot) },
+        agentEvents,
+      ),
     });
     const socket = new WebSocket(`ws://127.0.0.1:${port}/v1/events`, [
       "openbot-events",
@@ -523,60 +587,79 @@ describe("TeamApiServer events", () => {
       await expect(supportedEvent).resolves.toMatchObject({ type: "bots-changed" });
 
       const conversationEvent = nextJsonEvent(socket);
-      agentEvents.emit("event", {
-        type: "conversation",
-        snapshot: {
-          agentId: "chief",
-          threadId: "thread-chief",
-          activeTurnId: null,
-          revision: 2,
-          messages: [
-            {
-              id: "reply-1",
-              author: "assistant",
-              text: "Done",
-              createdAt: "2026-08-29T10:00:00.000Z",
-              status: "completed",
-            },
-            {
-              id: "routine-event-1",
-              author: "system",
-              source: "system",
-              text: "Morning brief",
-              createdAt: "2026-08-29T10:01:00.000Z",
-              status: "completed",
-              itemType: routineConversationEventItemType("created", "routine-1"),
-            },
-            {
-              id: "routine-run-event-1",
-              author: "system",
-              source: "system",
-              text: "Morning brief",
-              createdAt: "2026-08-29T10:02:00.000Z",
-              status: "completed",
-              itemType: routineRunConversationEventItemType("running", "routine-1", "run-1"),
-            },
-            {
-              id: "hosted-site-event-1",
-              author: "system",
-              source: "system",
-              text: hostedSiteConversationEventText({
-                siteId: null,
-                title: "Launch page",
-                hostname: null,
-                url: null,
-              }),
-              createdAt: "2026-08-29T10:03:00.000Z",
-              status: "completed",
-              itemType: hostedSiteConversationEventItemType("publish", "running", "operation-1"),
-            },
-          ],
-        },
-      });
+      agentEvents.emit("event", { type: "conversation", snapshot: legacySnapshot });
       await expect(conversationEvent).resolves.toMatchObject({
         type: "conversation",
         snapshot: { messages: [expect.objectContaining({ id: "reply-1" })] },
       });
+    } finally {
+      socket.close();
+    }
+  });
+
+  it("materializes the full snapshot for a released legacy conversation event", async () => {
+    const { store, start } = await createTeamApiFixture("legacy-full-conversation", { configure: true });
+    const login = await Effect.runPromise(store.login("owner", "correct horse battery"));
+    const agentEvents = new EventEmitter();
+    const source = opencodeFixture[0];
+    if (!isAgentSummary(source)) throw new Error("Invalid agent fixture.");
+    const primaryAgent: AgentSummary = {
+      ...source,
+      id: "chief",
+      provider: "codex",
+      model: "gpt-5.6-luna",
+      threadId: "thread-chief",
+    };
+    const fullSnapshot = {
+      agentId: "chief",
+      threadId: "thread-chief",
+      activeTurnId: null,
+      revision: 4,
+      messages: [
+        {
+          id: "old-message",
+          author: "user" as const,
+          text: "Earlier",
+          createdAt: "2026-08-29T09:00:00.000Z",
+          status: "completed" as const,
+        },
+        {
+          id: "new-message",
+          author: "assistant" as const,
+          text: "Done",
+          createdAt: "2026-08-29T10:00:00.000Z",
+          status: "completed" as const,
+        },
+      ],
+    };
+    const readConversation = vi.fn(() => Effect.succeed(fullSnapshot));
+    const { port } = await start({
+      agents: createAgents({ listAgents: () => [primaryAgent], readConversation }, agentEvents),
+    });
+    const socket = new WebSocket(`ws://127.0.0.1:${port}/v1/events`, [
+      "openbot-events",
+      `openbot-token.${login.sessionToken}`,
+    ]);
+    const presence = nextJsonEvent(socket);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        socket.addEventListener("open", () => resolve(), { once: true });
+        socket.addEventListener("error", () => reject(new Error("WebSocket did not open.")), { once: true });
+      });
+      await presence;
+      const conversationEvent = nextJsonEvent(socket);
+      agentEvents.emit("event", {
+        type: "conversation",
+        snapshot: { ...fullSnapshot, revision: 4, messages: [fullSnapshot.messages[1]] },
+      });
+      await expect(conversationEvent).resolves.toMatchObject({
+        type: "conversation",
+        snapshot: {
+          revision: 4,
+          messages: [expect.objectContaining({ id: "old-message" }), expect.objectContaining({ id: "new-message" })],
+        },
+      });
+      expect(readConversation).toHaveBeenCalledWith("chief");
     } finally {
       socket.close();
     }

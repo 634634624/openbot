@@ -18,6 +18,7 @@ import {
   emitAgentEvent,
   emitDynamicIslandAction,
   emitPresence,
+  emitServers,
   installOpenbotStub,
   presenceMember,
   testConversationPage,
@@ -26,6 +27,7 @@ import {
 import { AGENT_SELECTION_STORAGE_KEY } from "./features/agents/agent-selection";
 import { useAgents } from "./features/agents/agents-context";
 import { useConversation } from "./features/conversation/conversation-context";
+import { useServerScope } from "./features/servers/server-scope";
 import { useServers } from "./features/servers/servers-context";
 import { SIDEBAR_PINS_STORAGE_KEY } from "./features/sidebar/sidebar-pins-storage";
 import { SIDEBAR_COLLAPSED_STORAGE_KEY } from "./features/sidebar/sidebar-sections-storage";
@@ -138,19 +140,59 @@ describe("OpenBot connected desktop shell", () => {
     expect(JSON.parse(window.localStorage.getItem(AGENT_SELECTION_STORAGE_KEY) ?? "{}")).toEqual({ team: "other" });
   });
 
+  // Failure mode: after a launch a joined server answered seconds later, and until then the empty
+  // roster offered the first agent and asked for a local CLI setup that the server does not need.
+  it("shows that a joined server connects until its agents come back", async () => {
+    // Main reports a joined host as offline until its first connection after a launch is up.
+    const local = testServer("local", false);
+    const remote = testServer("remote-1", true);
+    vi.mocked(window.openbot.servers.list).mockResolvedValue([local, { ...remote, state: "offline" }]);
+    const status = await window.openbot.agent.getStatus();
+    let resolveAgents: (agents: AgentSummary[]) => void = () => undefined;
+    const agentsRead = new Promise<AgentSummary[]>((resolve) => {
+      resolveAgents = resolve;
+    });
+    vi.mocked(window.openbot.agent.listAgents).mockReturnValue(agentsRead);
+    // The host answers the status read over the same connection, so it waits too.
+    let resolveStatus: ((status: AgentStatus) => void) | undefined;
+    vi.mocked(window.openbot.agent.getStatus).mockReturnValue(
+      new Promise((resolve) => {
+        resolveStatus = resolve;
+      }),
+    );
+    render(() => <App />);
+
+    expect(await screen.findByText("Connecting…", { selector: ".empty-search" })).toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: "Message Chief" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Complete agent CLI setup to start")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Create your first agent" })).not.toBeInTheDocument();
+
+    emitServers?.([local, remote]);
+    await waitFor(() => expect(window.openbot.agent.listAgents).toHaveBeenCalledOnce());
+    resolveAgents(AGENTS);
+    await agentsRead;
+    expect(screen.queryByRole("heading", { name: "Chief" })).not.toBeInTheDocument();
+    resolveStatus?.(status);
+    expect(await screen.findByRole("heading", { name: "Chief" })).toBeVisible();
+    expect(screen.queryByText("Connecting…", { selector: ".empty-search" })).not.toBeInTheDocument();
+  });
+
   it("keeps a saved selection after a failed agent load and restores it on retry", async () => {
     window.localStorage.setItem(AGENT_SELECTION_STORAGE_KEY, JSON.stringify({ local: "sales-outbound" }));
     vi.mocked(window.openbot.agent.listAgents).mockRejectedValueOnce(new Error("Offline"));
     function LoadStatus() {
-      const { agentStatus } = useAgents();
-      return <output aria-label="Agent load status">{agentStatus().message}</output>;
+      const { connection } = useServerScope();
+      return <output aria-label="Agent load status">{connection.failed ? "Failed" : "Loading"}</output>;
     }
     const view = render(() => (
       <AppProviders>
         <LoadStatus />
       </AppProviders>
     ));
-    await waitFor(() => expect(screen.getByLabelText("Agent load status")).toHaveTextContent("Offline"));
+    await waitFor(() => expect(screen.getByLabelText("Agent load status")).toHaveTextContent("Failed"));
+    expect(JSON.parse(window.localStorage.getItem(AGENT_SELECTION_STORAGE_KEY) ?? "{}")).toEqual({
+      local: "sales-outbound",
+    });
     view.unmount();
     render(() => <App />);
     expect(await screen.findByRole("heading", { name: "Sales Outbound" })).toBeVisible();
@@ -198,8 +240,10 @@ describe("OpenBot connected desktop shell", () => {
     await fireEvent.input(composer);
     await fireEvent.click(screen.getByRole("button", { name: "View agent settings" }));
     const settings = await screen.findByRole("complementary", { name: "Agent settings" });
-    const name = within(settings).getByRole("textbox", { name: "Agent name" });
+    await fireEvent.click(within(settings).getByRole("button", { name: /^Edit profile of/u }));
+    const name = await within(settings).findByRole("textbox", { name: "Agent name" });
     await fireEvent.input(name, { target: { value: "Draft agent name" } });
+    await fireEvent.click(within(settings).getByRole("button", { name: "Back to settings" }));
     const usageTrigger = within(settings).getByRole("button", { name: "Usage" });
     await fireEvent.click(usageTrigger);
     const usage = await screen.findByRole("region", { name: "Agent usage" });
@@ -207,8 +251,10 @@ describe("OpenBot connected desktop shell", () => {
     expect(within(usage).getByRole("heading", { name: "Usage Local" })).toBeInTheDocument();
     await fireEvent.click(within(usage).getByRole("button", { name: "Back" }));
     expect(screen.getByRole("main", { name: "Conversation" })).toBeInTheDocument();
-    expect(screen.getByRole("textbox", { name: "Agent name" })).toHaveValue("Draft agent name");
-    expect(screen.getByRole("textbox", { name: "Message Chief" })).toHaveTextContent("Keep this conversation draft");
+    expect(screen.getByRole("button", { name: "Edit profile of Draft agent name" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Message Draft agent name" })).toHaveTextContent(
+      "Keep this conversation draft",
+    );
     await waitFor(() => expect(usageTrigger).toHaveFocus());
     const server = screen.getByRole("button", { name: "Local server" });
     await fireEvent.keyDown(server, { key: "F10", shiftKey: true });
@@ -217,7 +263,9 @@ describe("OpenBot connected desktop shell", () => {
     expect(screen.getByRole("button", { name: /^Usage agents/ })).toHaveTextContent("All agents");
     await fireEvent.click(screen.getByRole("button", { name: "Back" }));
     await waitFor(() => expect(server).toHaveFocus());
-    expect(screen.getByRole("textbox", { name: "Message Chief" })).toHaveTextContent("Keep this conversation draft");
+    expect(screen.getByRole("textbox", { name: "Message Draft agent name" })).toHaveTextContent(
+      "Keep this conversation draft",
+    );
   });
 
   it("keeps shell state and subscriptions when a view boundary remounts", async () => {
@@ -338,10 +386,7 @@ describe("OpenBot connected desktop shell", () => {
     expect(screen.getByText("Norbert")).toBeInTheDocument();
     expect(screen.getByText("norbertbodziony@gmail.com")).toBeInTheDocument();
     expect(within(accountDialog).queryByRole("button", { name: "Sign out" })).not.toBeInTheDocument();
-    await fireEvent.click(within(accountDialog).getByRole("button", { name: "Providers & permissions" }));
-    const permissionsDialog = await screen.findByRole("dialog", { name: "Providers & permissions" });
-    expect(within(permissionsDialog).queryByRole("button", { name: "Sign out" })).not.toBeInTheDocument();
-    await fireEvent.click(within(permissionsDialog).getByRole("button", { name: "Cancel" }));
+    await fireEvent.click(accountButton);
     expect(window.openbot.auth.logout).not.toHaveBeenCalled();
     expect(screen.queryByRole("button", { name: "Open computer" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /remote control/iu })).not.toBeInTheDocument();

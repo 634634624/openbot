@@ -22,7 +22,6 @@ import {
   type TeamPresenceSnapshot,
   type TeamRealtimeEvent,
 } from "@openbot/contracts/ipc";
-import { isString } from "@openbot/contracts/runtime-values";
 import { TEAM_API_ROUTES } from "@openbot/contracts/team-api-routes";
 import {
   AGENT_ADMIN_CAPABILITY,
@@ -31,7 +30,10 @@ import {
   AGENT_PUBLISH_CAPABILITY,
   AGENT_UPDATE_CAPABILITY,
   CHANNEL_DELETE_CAPABILITY,
+  EVENTS_CAPABILITY,
   HOST_ADMIN_CAPABILITY,
+  HOST_MEMBER_UPDATE_CAPABILITY,
+  HOST_RELEASE_CAPABILITY,
   HOST_UPDATE_CAPABILITY,
   HOSTED_SITES_CAPABILITY,
   isTeamCurrentCapability,
@@ -77,12 +79,17 @@ import { TEAM_CURSOR_CLINE_CAPABILITY, TEAM_PROTOCOL_V6 } from "@openbot/contrac
 import { encodeTeamProtocolV6BaseCurrentEvent } from "@openbot/contracts/team-protocol/v6-base-adapter";
 import { sourceText } from "@openbot/i18n/source";
 import { createOpenBotLogger, toLogValue } from "@openbot/logging";
+import { Deferred, Effect, Exit, Scope } from "effect";
 import type * as Ws from "ws";
-import { duplicateAgentIntoLayout } from "../backend/agent/duplication-gate";
+import { AgentDuplicationFailed, duplicateAgentIntoLayout } from "../backend/agent/duplication-gate";
+import { runCauseEffect } from "../backend/effect-boundary";
 import { McpServerError } from "../backend/mcp-server-store";
+import { StoredStateFailure } from "../backend/stored-state-effects";
 import type { TeamChatStore } from "../backend/team-chat-store";
 import { LifecycleGate } from "./lifecycle-gate";
+import { listenLoopback } from "./listen-loopback";
 import { RemoteScreenError } from "./remote-screen-gateway";
+import { RemoteWorkflowError, remoteCall, toRemoteWorkflowError } from "./remote-service-effects";
 import { isClientUse } from "./team-api/client-use";
 import type { TeamApiOptions, TeamApiSidebarLayout } from "./team-api/dependencies";
 import { HttpError } from "./team-api/http-error";
@@ -113,6 +120,7 @@ import { routeBrowser } from "./team-api/route-browser";
 import { routeChannels } from "./team-api/route-channels";
 import { routeContextReset } from "./team-api/route-context-reset";
 import { routeDirect } from "./team-api/route-direct";
+import { routeEvents } from "./team-api/route-events";
 import { routeFiles } from "./team-api/route-files";
 import { routeHostAdmin } from "./team-api/route-host-admin";
 import { routeHostUpdate } from "./team-api/route-host-update";
@@ -125,6 +133,7 @@ import { routeSharedTables } from "./team-api/route-shared-tables";
 import { routeSkillsAdmin } from "./team-api/route-skills-admin";
 import { routeStorage } from "./team-api/route-storage";
 import { routeTeam } from "./team-api/route-team";
+import { routeWorkspaceDirectory } from "./team-api/route-workspace-directory";
 import { TeamStoreError } from "./team-store";
 
 const EVENT_PAYLOAD_LIMIT = 256 * 1_024;
@@ -155,6 +164,13 @@ interface EventClientState {
   nextSnapshotRequestAt: number;
 }
 
+type ConversationEventAudience = "all" | "modern" | "legacy";
+
+interface PendingLegacyConversationRead {
+  event: Extract<AgentEvent, { type: "conversation" }>;
+  retries: number;
+}
+
 interface RateEntry {
   attempts: number;
   resetAt: number;
@@ -174,12 +190,17 @@ export class TeamApiServer {
   readonly #options: Omit<TeamApiOptions, "sidebarLayout"> & { sidebarLayout: TeamApiSidebarLayout };
   readonly #rateLimits = new Map<string, RateEntry>();
   readonly #eventClients = new Map<Ws.WebSocket, EventClientState>();
+  readonly #pendingLegacyConversationReads = new Map<string, PendingLegacyConversationRead>();
+  #legacyConversationScope = Scope.makeUnsafe();
   #hostRestart: HostRestartEvent = { type: HOST_RESTART_EVENT, state: "none", version: null };
   readonly #responseRoutes = new WeakMap<
     ServerResponse,
     { method: string; path: string; protocol: number; capabilities: Set<string>; hiddenAgentIds?: ReadonlySet<string> }
   >();
-  readonly #duplicateRequests = new Map<string, { sourceAgentId: string; result: Promise<DuplicateAgentResult> }>();
+  readonly #duplicateRequests = new Map<
+    string,
+    { sourceAgentId: string; result: Deferred.Deferred<DuplicateAgentResult, AgentDuplicationFailed> }
+  >();
   readonly #webSockets = new webSockets.WebSocketServer({
     noServer: true,
     maxPayload: EVENT_PAYLOAD_LIMIT,
@@ -195,7 +216,7 @@ export class TeamApiServer {
   readonly #rateLimitCapacity: number;
   readonly #now: () => number;
   #server: Server | null = null;
-  readonly #lifecycle = new LifecycleGate<number>();
+  readonly #lifecycle = new LifecycleGate<number, RemoteWorkflowError>();
   #port: number | null = null;
   #heartbeat: ReturnType<typeof setInterval> | null = null;
   #lastClientUseAt: number | null = null;
@@ -217,18 +238,23 @@ export class TeamApiServer {
 
   // Without the gate, two starts at once open two listeners and lose one, and a stop during a start
   // runs before the listener exists. A listener lost that way stays open for the previous account.
-  start(): Promise<number> {
-    return this.#lifecycle.start(() => this.#start());
+  start(): Effect.Effect<number, RemoteWorkflowError> {
+    // A dependency that throws while the listener starts is a failed start, so the host stops it.
+    return this.#lifecycle.start(() =>
+      this.#start().pipe(Effect.catchDefect((cause) => Effect.fail(new RemoteWorkflowError({ cause })))),
+    );
   }
 
-  stop(): Promise<void> {
+  stop(): Effect.Effect<void, RemoteWorkflowError> {
     return this.#lifecycle.stop(() => this.#stop());
   }
 
-  async #start(): Promise<number> {
+  readonly #start = Effect.fn("TeamApiServer.start")(function* (this: TeamApiServer) {
     if (this.#server && this.#port) return this.#port;
-    this.#server = createServer((request, response) => void this.#handle(request, response));
-    this.#server.on("upgrade", (request, socket, head) => {
+    if (this.#legacyConversationScope.state._tag === "Closed") this.#legacyConversationScope = Scope.makeUnsafe();
+    const server = createServer((request, response) => void this.#handle(request, response));
+    this.#server = server;
+    server.on("upgrade", (request, socket, head) => {
       const url = new URL(request.url ?? "/", "http://127.0.0.1");
       if (this.#options.remoteScreen?.handlesUpgrade(url)) {
         this.#options.remoteScreen.handleUpgrade(request, socket, head, url);
@@ -283,13 +309,8 @@ export class TeamApiServer {
       socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
       socket.destroy();
     });
-    await new Promise<void>((resolve, reject) => {
-      this.#server?.once("error", reject);
-      this.#server?.listen(0, "127.0.0.1", () => resolve());
-    });
-    const address = this.#server.address();
-    if (!address || isString(address)) throw new Error(sourceText("error.team.bindFailed"));
-    this.#port = address.port;
+    const port = yield* remoteCall(() => listenLoopback(server, () => new Error(sourceText("error.team.bindFailed"))));
+    this.#port = port;
     this.#agentListener = (event) => this.#broadcastAgentEvent(event);
     this.#options.agents.on("event", this.#agentListener);
     this.#sidebarLayoutListener = (layout) => this.#broadcastAgentEvent({ type: "sidebar-layout-changed", layout });
@@ -303,37 +324,50 @@ export class TeamApiServer {
     }, 15_000);
     this.#heartbeat.unref?.();
     this.#publishPresence();
-    return this.#port;
-  }
+    return port;
+  }).bind(this);
 
-  async #stop(): Promise<void> {
+  readonly #stop = Effect.fn("TeamApiServer.stop")(function* (this: TeamApiServer) {
     if (this.#heartbeat) clearInterval(this.#heartbeat);
     this.#heartbeat = null;
     if (this.#agentListener) this.#options.agents.off("event", this.#agentListener);
     this.#agentListener = null;
     if (this.#sidebarLayoutListener) this.#options.sidebarLayout.off("changed", this.#sidebarLayoutListener);
     this.#sidebarLayoutListener = null;
+    yield* Scope.close(this.#legacyConversationScope, Exit.void);
+    this.#legacyConversationScope = Scope.makeUnsafe();
     for (const [client, connection] of this.#eventClients) {
       if (connection.typingTimer) clearTimeout(connection.typingTimer);
       if (connection.directTypingTimer) clearTimeout(connection.directTypingTimer);
       client.close(1001, "Server stopped");
     }
     this.#eventClients.clear();
+    this.#pendingLegacyConversationReads.clear();
     this.#localTypingAgentId = null;
-    try {
-      await this.#options.remoteScreen?.stop();
-      await this.#options.browserView?.stop();
-    } finally {
-      // The heartbeat and the event listeners are already gone. Leaving the socket open
-      // would let the next `start()` hand back its port unchanged, so the previous account
-      // keeps a listener that no longer checks a revoked session or delivers an event.
-      const server = this.#server;
-      this.#server = null;
-      this.#port = null;
-      if (server) await new Promise<void>((resolve) => server.close(() => resolve()));
-      this.#publishPresence();
-    }
-  }
+    const { remoteScreen, browserView } = this.#options;
+    yield* Effect.gen(function* () {
+      if (remoteScreen) yield* remoteScreen.stop();
+      if (browserView) yield* browserView.stop();
+    }).pipe(
+      toRemoteWorkflowError,
+      Effect.ensuring(
+        Effect.gen({ self: this }, function* () {
+          // The heartbeat and the event listeners are already gone. Leaving the socket open
+          // would let the next `start()` hand back its port unchanged, so the previous account
+          // keeps a listener that no longer checks a revoked session or delivers an event.
+          const server = this.#server;
+          this.#server = null;
+          this.#port = null;
+          if (server) {
+            yield* Effect.callback<void>((resume) => {
+              server.close(() => resume(Effect.void));
+            });
+          }
+          this.#publishPresence();
+        }),
+      ),
+    );
+  }).bind(this);
 
   getPresence(): TeamPresenceSnapshot {
     const identity = this.#options.store.getIdentity();
@@ -413,7 +447,11 @@ export class TeamApiServer {
   }
 
   #sendHostRestart(client: Ws.WebSocket, connection: EventClientState): void {
-    if (!connection.capabilities.has(HOST_UPDATE_CAPABILITY)) return;
+    if (
+      !connection.capabilities.has(HOST_UPDATE_CAPABILITY) &&
+      !connection.capabilities.has(HOST_MEMBER_UPDATE_CAPABILITY)
+    )
+      return;
     if (client.readyState === webSockets.WebSocket.OPEN) client.send(JSON.stringify(this.#hostRestart));
   }
 
@@ -507,7 +545,7 @@ export class TeamApiServer {
       }
 
       if (this.#options.remoteScreen?.handlesHttp(url)) {
-        await this.#options.remoteScreen.handleHttp(request, response, url);
+        await runCauseEffect(this.#options.remoteScreen.handleHttp(request, response, url));
         return;
       }
 
@@ -537,10 +575,12 @@ export class TeamApiServer {
       if (method === "POST" && url.pathname === TEAM_API_ROUTES.join.server) {
         const body = await readJson(request);
         this.#checkRate(request, stringField(body, "username", false, 64));
-        const result = await this.#options.store.acceptInvite(
-          stringField(body, "inviteToken", false, INPUT_LIMITS.identifier),
-          stringField(body, "username", false, 64),
-          stringField(body, "password", false, 256),
+        const result = await runCauseEffect(
+          this.#options.store.acceptInvite(
+            stringField(body, "inviteToken", false, INPUT_LIMITS.identifier),
+            stringField(body, "username", false, 64),
+            stringField(body, "password", false, 256),
+          ),
         );
         return this.#json(response, 201, result);
       }
@@ -548,25 +588,33 @@ export class TeamApiServer {
         const body = await readJson(request);
         const identity = this.#options.store.getIdentity();
         const user = identity
-          ? await this.#options.redeemCentralTicket?.(
-              stringField(body, "accountTicket", false, INPUT_LIMITS.identifier),
-              identity.serverId,
-            )
+          ? await (this.#options.redeemCentralTicket
+              ? runCauseEffect(
+                  this.#options.redeemCentralTicket(
+                    stringField(body, "accountTicket", false, INPUT_LIMITS.identifier),
+                    identity.serverId,
+                  ),
+                )
+              : undefined)
           : null;
         if (!user) return this.#json(response, 401, { error: sourceText("error.team.signInRequired") });
         this.#checkRate(request, user.email);
-        const result = await this.#options.store.acceptInviteWithAccount(
-          stringField(body, "inviteToken", false, INPUT_LIMITS.identifier),
-          user,
+        const result = await runCauseEffect(
+          this.#options.store.acceptInviteWithAccount(
+            stringField(body, "inviteToken", false, INPUT_LIMITS.identifier),
+            user,
+          ),
         );
         return this.#json(response, 201, result);
       }
       if (method === "POST" && url.pathname === TEAM_API_ROUTES.auth.login) {
         const body = await readJson(request);
         this.#checkRate(request, stringField(body, "username", false, 64));
-        const result = await this.#options.store.login(
-          stringField(body, "username", false, 64),
-          stringField(body, "password", false, 256),
+        const result = await runCauseEffect(
+          this.#options.store.login(
+            stringField(body, "username", false, 64),
+            stringField(body, "password", false, 256),
+          ),
         );
         return this.#json(response, 200, result);
       }
@@ -574,14 +622,18 @@ export class TeamApiServer {
         const body = await readJson(request);
         const identity = this.#options.store.getIdentity();
         const user = identity
-          ? await this.#options.redeemCentralTicket?.(
-              stringField(body, "accountTicket", false, INPUT_LIMITS.identifier),
-              identity.serverId,
-            )
+          ? await (this.#options.redeemCentralTicket
+              ? runCauseEffect(
+                  this.#options.redeemCentralTicket(
+                    stringField(body, "accountTicket", false, INPUT_LIMITS.identifier),
+                    identity.serverId,
+                  ),
+                )
+              : undefined)
           : null;
         if (!user) return this.#json(response, 401, { error: sourceText("error.team.signInRequired") });
         this.#checkRate(request, user.email);
-        return this.#json(response, 200, await this.#options.store.loginWithAccount(user));
+        return this.#json(response, 200, await runCauseEffect(this.#options.store.loginWithAccount(user)));
       }
 
       // The auth gate does not look at the path. An unknown route without a token is 401, not 404,
@@ -593,6 +645,10 @@ export class TeamApiServer {
       }
       if (isClientUse(method, url.pathname)) this.#lastClientUseAt = Date.now();
       const context = this.#requestContext(request, response, url, token, authenticated);
+      // Before `hidden`: the response projection must see the agents that the roster sends.
+      if (method === "GET" && url.pathname === TEAM_API_ROUTES.agents.all && this.#options.agentsReady) {
+        await runCauseEffect(this.#options.agentsReady());
+      }
       const hidden = this.#hiddenAgentIds(context.protocol, context.capabilities);
       // Every protocol gets the projection, also with no hidden agent: a provider status row, a
       // model or an auth state of a local-only provider can be in the response.
@@ -642,6 +698,8 @@ export class TeamApiServer {
       if ((await routeHostAdmin(context, this.#options.admin)) === "handled") return;
       if ((await routeHostUpdate(context, this.#options.admin)) === "handled") return;
       if ((await routeContextReset(context, this.#options.agents, hidden)) === "handled") return;
+      if ((await routeWorkspaceDirectory(context, this.#options.agents, hidden)) === "handled") return;
+      if ((await this.#routeEvents(context)) === "handled") return;
       if ((await routeAgentImport(context, this.#options.agentImport, newAgentHidden)) === "handled") return;
       if (
         (await routeLiveActivityPush(context, this.#options.liveActivityPush, () =>
@@ -726,6 +784,10 @@ export class TeamApiServer {
     });
   }
 
+  #routeEvents(context: TeamApiRequestContext): Promise<RouteOutcome> {
+    return routeEvents(context, { events: this.#options.events });
+  }
+
   #checkRate(request: IncomingMessage, username: string): void {
     const key = `${request.socket.remoteAddress ?? "local"}:${username.toLowerCase()}`;
     const now = this.#now();
@@ -776,9 +838,101 @@ export class TeamApiServer {
   }
 
   #broadcastAgentEvent(event: AgentEvent): void {
+    if (event.type !== "conversation") {
+      this.#broadcastAgentEventToClients(event);
+      return;
+    }
+
+    // A bounded runtime snapshot is enough for modern clients: they fetch the page they need after
+    // this invalidation. The released event clients have no invalidation path, so they keep the old
+    // full snapshot contract. Read that snapshot only when such a client is connected, and keep the
+    // read out of the synchronous event path used by modern clients.
+    const primaryAgent = this.#options.agents.listAgents().find((agent) => agent.id === event.snapshot.agentId);
+    if (!primaryAgent || primaryAgent.threadId !== event.snapshot.threadId) {
+      // Execution and channel threads are consumed by their owners before this listener. A stale
+      // event for a deleted agent must also never enter readConversation, which fails for an
+      // agent that is gone.
+      this.#broadcastAgentEventToClients(event, "modern");
+      return;
+    }
+    const hasLegacyClient = [...this.#eventClients.values()].some(isLegacyConversationClient);
+    this.#broadcastAgentEventToClients(event, hasLegacyClient ? "modern" : "all");
+    if (hasLegacyClient) this.#queueLegacyConversationEvent(event);
+  }
+
+  #queueLegacyConversationEvent(event: Extract<AgentEvent, { type: "conversation" }>, retries = 0): void {
+    const agentId = event.snapshot.agentId;
+    const pending = this.#pendingLegacyConversationReads.get(agentId);
+    if (pending) {
+      // One full SQLite materialization is enough for a burst. The newest event is the state that
+      // the legacy client needs, so an older read never gets replayed after a newer event arrives.
+      pending.event = event;
+      return;
+    }
+
+    const next: PendingLegacyConversationRead = { event, retries };
+    this.#pendingLegacyConversationReads.set(agentId, next);
+    const materialize = Effect.gen({ self: this }, function* () {
+      // `readConversation` fails for an agent that is gone. Skip a delayed event read for an agent
+      // that was deleted after the event was emitted.
+      if (!this.#options.agents.listAgents().some((agent) => agent.id === agentId)) {
+        this.#pendingLegacyConversationReads.delete(agentId);
+        return;
+      }
+      if (![...this.#eventClients.values()].some(isLegacyConversationClient)) {
+        this.#pendingLegacyConversationReads.delete(agentId);
+        return;
+      }
+      const snapshot = yield* this.#options.agents.readConversation(agentId);
+      if (this.#pendingLegacyConversationReads.get(agentId) !== next) return;
+      if (!this.#options.agents.listAgents().some((agent) => agent.id === agentId)) {
+        this.#pendingLegacyConversationReads.delete(agentId);
+        return;
+      }
+      if (![...this.#eventClients.values()].some(isLegacyConversationClient)) {
+        this.#pendingLegacyConversationReads.delete(agentId);
+        return;
+      }
+      const latest = next.event;
+      if (snapshot.revision < latest.snapshot.revision && next.retries === 0) {
+        // The event can be emitted while the read is still catching up with its transaction.
+        // Retry once the newest revision is the durable one instead of sending a stale snapshot.
+        this.#pendingLegacyConversationReads.delete(agentId);
+        this.#queueLegacyConversationEvent(latest, 1);
+        return;
+      }
+      if (snapshot.revision < latest.snapshot.revision) {
+        this.#pendingLegacyConversationReads.delete(agentId);
+        (this.#options.logger ?? logger).warn("Legacy conversation event read is behind its revision.");
+        return;
+      }
+      this.#pendingLegacyConversationReads.delete(agentId);
+      this.#broadcastAgentEventToClients({ type: "conversation", snapshot }, "legacy");
+    }).pipe(
+      Effect.catch((error) =>
+        Effect.sync(() => {
+          if (this.#pendingLegacyConversationReads.get(agentId) === next) {
+            this.#pendingLegacyConversationReads.delete(agentId);
+          }
+          (this.#options.logger ?? logger).warn(
+            "Legacy conversation event could not be materialized:",
+            toLogValue(error.cause),
+          );
+        }),
+      ),
+      Effect.forkIn(this.#legacyConversationScope, { startImmediately: true }),
+    );
+    Effect.runFork(materialize);
+  }
+
+  #broadcastAgentEventToClients(event: AgentEvent, audience: ConversationEventAudience = "all"): void {
     const filteredConversationPayloads = new Map<string, string>();
 
     for (const [client, connection] of this.#eventClients) {
+      if (event.type === "conversation") {
+        const legacy = isLegacyConversationClient(connection);
+        if ((audience === "legacy" && !legacy) || (audience === "modern" && legacy)) continue;
+      }
       // An event this client's protocol cannot describe is skipped for this client only. Thrown
       // out of the loop, it would stop the event for every client after this one.
       const encodeEvent = (event: AgentEvent, options = {}) => {
@@ -933,7 +1087,9 @@ export class TeamApiServer {
           if (acceptsCapabilityDeclaration) {
             if (!event.capabilities) throw new Error("Invalid client capabilities.");
             const snapshotsWereEnabled = connection.capabilities.has("agent-runtime-snapshots");
-            const restartWasSent = connection.capabilities.has(HOST_UPDATE_CAPABILITY);
+            const restartWasSent =
+              connection.capabilities.has(HOST_UPDATE_CAPABILITY) ||
+              connection.capabilities.has(HOST_MEMBER_UPDATE_CAPABILITY);
             connection.capabilities = new Set(event.capabilities.filter(isTeamCurrentCapability));
             if (connection.capabilities.has("agent-runtime-snapshots") && !snapshotsWereEnabled) {
               this.#sendRuntimeSnapshot(client, connection, false);
@@ -1137,28 +1293,43 @@ export class TeamApiServer {
     return this.#options.chat;
   }
 
-  #duplicateAgent(sourceAgentId: string, operationId: string): Promise<DuplicateAgentResult> {
-    const committed = this.#options.agents.committedAgentDuplication(operationId, sourceAgentId);
-    if (committed) {
-      return Promise.resolve({ agent: committed.agent, layout: this.#options.sidebarLayout.getSnapshot() });
-    }
-    const pending = this.#duplicateRequests.get(operationId);
-    if (pending) {
-      if (pending.sourceAgentId !== sourceAgentId) {
-        return Promise.reject(new Error("This agent duplication operation belongs to another source agent."));
+  /** Concurrent requests with one operation id share one duplication. */
+  #duplicateAgent(
+    sourceAgentId: string,
+    operationId: string,
+  ): Effect.Effect<DuplicateAgentResult, AgentDuplicationFailed> {
+    return Effect.suspend(() => {
+      const committed = this.#options.agents.committedAgentDuplication(operationId, sourceAgentId);
+      if (committed) {
+        return Effect.succeed({ agent: committed.agent, layout: this.#options.sidebarLayout.getSnapshot() });
       }
-      return pending.result;
-    }
-    const result = duplicateAgentIntoLayout(
-      this.#options.agents,
-      this.#options.sidebarLayout,
-      sourceAgentId,
-      operationId,
-    ).finally(() => {
-      this.#duplicateRequests.delete(operationId);
+      const pending = this.#duplicateRequests.get(operationId);
+      if (pending) {
+        if (pending.sourceAgentId !== sourceAgentId) {
+          return Effect.fail(
+            new AgentDuplicationFailed({
+              cause: new Error("This agent duplication operation belongs to another source agent."),
+            }),
+          );
+        }
+        return Deferred.await(pending.result);
+      }
+      const result = Deferred.makeUnsafe<DuplicateAgentResult, AgentDuplicationFailed>();
+      this.#duplicateRequests.set(operationId, { sourceAgentId, result });
+      return duplicateAgentIntoLayout(
+        this.#options.agents,
+        this.#options.sidebarLayout,
+        sourceAgentId,
+        operationId,
+      ).pipe(
+        Effect.onExit((exit) => {
+          this.#duplicateRequests.delete(operationId);
+          return Deferred.done(result, exit);
+        }),
+        // The first request owns the operation; the requests that share it wait for its end.
+        Effect.uninterruptible,
+      );
     });
-    this.#duplicateRequests.set(operationId, { sourceAgentId, result });
-    return result;
   }
 
   #requireDirectRecipient(senderMemberId: string, recipientMemberId: string): TeamMemberSummary {
@@ -1270,7 +1441,10 @@ export class TeamApiServer {
           return this.#options.admin?.providers !== undefined;
         if (capability === PROVIDERS_SIGN_IN_V3_CAPABILITY) return this.#options.admin?.providers?.pasteSignIn === true;
         if (capability === HOST_ADMIN_CAPABILITY) return this.#options.admin?.identity !== undefined;
-        if (capability === HOST_UPDATE_CAPABILITY) return this.#options.admin?.update !== undefined;
+        if (capability === HOST_RELEASE_CAPABILITY) return this.#options.admin?.release !== undefined;
+        if (capability === HOST_UPDATE_CAPABILITY || capability === HOST_MEMBER_UPDATE_CAPABILITY)
+          return this.#options.admin?.update !== undefined;
+        if (capability === EVENTS_CAPABILITY) return this.#options.events !== undefined;
         if (capability === AGENT_IMPORT_CAPABILITY) return this.#options.agentImport !== undefined;
         if (capability === LIVE_ACTIVITY_PUSH_CAPABILITY) return this.#options.liveActivityPush !== undefined;
         return true;
@@ -1362,22 +1536,24 @@ function unavailableSidebarLayout(): TeamApiSidebarLayout {
       agentAssignments: {},
       agentOrder: [],
     }),
-    mutate: async () => {
-      throw new HttpError(503, sourceText("error.team.sidebarLayoutUnavailable"));
-    },
-    withProfileAssignment: async () => {
-      throw new Error(sourceText("error.team.sidebarLayoutUnavailable"));
-    },
-    placeDuplicateAfter: async () => {
-      throw new HttpError(503, sourceText("error.team.sidebarLayoutUnavailable"));
-    },
-    removeAgent: async () => ({
-      revision: 0,
-      sections: [],
-      order: ["people", "unassigned"],
-      agentAssignments: {},
-      agentOrder: [],
-    }),
+    mutate: () =>
+      Effect.fail(
+        new StoredStateFailure({ cause: new HttpError(503, sourceText("error.team.sidebarLayoutUnavailable")) }),
+      ),
+    withProfileAssignment: () =>
+      Effect.fail(new StoredStateFailure({ cause: new Error(sourceText("error.team.sidebarLayoutUnavailable")) })),
+    placeDuplicateAfter: () =>
+      Effect.fail(
+        new StoredStateFailure({ cause: new HttpError(503, sourceText("error.team.sidebarLayoutUnavailable")) }),
+      ),
+    removeAgent: () =>
+      Effect.succeed({
+        revision: 0,
+        sections: [],
+        order: ["people", "unassigned"],
+        agentAssignments: {},
+        agentOrder: [],
+      }),
     on: () => undefined,
     off: () => undefined,
   };
@@ -1387,6 +1563,10 @@ function unavailableSidebarLayout(): TeamApiSidebarLayout {
 function eventProtocol(capabilities: ReadonlySet<string>): 1 | 4 | 5 | 6 {
   if (capabilities.has(TEAM_CURSOR_CLINE_CAPABILITY)) return 6;
   return capabilities.has(TEAM_LOCAL_PROVIDERS_CAPABILITY) ? 5 : capabilities.has("opencode") ? 4 : 1;
+}
+
+function isLegacyConversationClient(connection: EventClientState): boolean {
+  return connection.includeConversationEvents && !connection.capabilities.has("agent-runtime-snapshots");
 }
 
 function eventCapability(event: AgentEvent): TeamCurrentCapability | null {

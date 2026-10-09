@@ -4,10 +4,57 @@ import { type DynamicRecord, isDynamicRecord, isNumber, isString } from "@openbo
 import { isGeneratedAgentId } from "@openbot/contracts/validation";
 import { createOpenBotLogger, toLogValue } from "@openbot/logging";
 import { CHANNEL_SCHEMA_SQL, CHANNEL_SETTINGS_SCHEMA_SQL } from "./channel-schema";
+import { PROVIDER_HISTORY_SCHEMA_SQL } from "./database/provider-history-schema";
 import { MCP_SERVERS_SCHEMA_SQL } from "./mcp-schema";
 import { MESSAGING_SCHEMA_SQL } from "./messaging/messaging-schema";
+import { ROUTINE_FLOW_SCHEMA_SQL } from "./routine-flows/routine-flow-schema";
 
 const BASELINE_SCHEMA_VERSION = 8;
+
+/** Webhook triggers and received deliveries for routines. */
+const WEBHOOK_SCHEMA_SQL = `
+  CREATE TABLE IF NOT EXISTS projection_routine_webhooks (
+    routine_id TEXT PRIMARY KEY REFERENCES projection_agent_routines(routine_id) ON DELETE CASCADE,
+    route_id TEXT NOT NULL UNIQUE,
+    event_type TEXT,
+    filters_json TEXT NOT NULL CHECK(json_valid(filters_json)),
+    secret_ciphertext TEXT NOT NULL,
+    url TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_event_sequence INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS projection_channel_routine_webhooks (
+    routine_id TEXT PRIMARY KEY REFERENCES projection_channel_routines(routine_id) ON DELETE CASCADE,
+    route_id TEXT NOT NULL UNIQUE,
+    event_type TEXT,
+    filters_json TEXT NOT NULL CHECK(json_valid(filters_json)),
+    secret_ciphertext TEXT NOT NULL,
+    url TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_event_sequence INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS projection_webhook_route_revocations (
+    route_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS projection_webhook_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    owner_kind TEXT NOT NULL CHECK(owner_kind IN ('agent', 'channel')),
+    routine_id TEXT NOT NULL,
+    delivery_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('started', 'ignored')),
+    reason TEXT CHECK(reason IS NULL OR reason IN ('event-type', 'filter', 'inactive')),
+    run_id TEXT,
+    received_at TEXT NOT NULL,
+    UNIQUE(owner_kind, routine_id, delivery_id)
+  );
+  CREATE INDEX IF NOT EXISTS webhook_receipts_recent
+    ON projection_webhook_receipts(owner_kind, routine_id, received_at DESC, receipt_id);
+  CREATE INDEX IF NOT EXISTS webhook_receipts_received ON projection_webhook_receipts(received_at);
+`;
 
 // This is the frozen compatibility schema for every database that predates v8.
 // Future schema changes must update LATEST_SCHEMA_SQL and append a migration without editing this SQL.
@@ -305,7 +352,8 @@ const V12_REACTIONS_TABLE_SQL = `  CREATE TABLE IF NOT EXISTS projection_reactio
     PRIMARY KEY(agent_id, message_id, actor_kind, actor_agent_id)
   );`;
 
-// Migrations 17, 22, 23, 24 and 26 widen the provider CHECK, so the fresh schema is no longer the v8 baseline here either.
+// Migrations 17, 22, 23, 24 and 26 widen the provider CHECK and migration 28 removes it, so the fresh schema is no
+// longer the v8 baseline here either.
 // One line rather than the whole table: the substitution then survives any later baseline edit that does
 // not touch this constraint, and `substituteOnce` still shouts if the line ever stops being unique.
 const BASELINE_PROVIDER_SESSIONS_CHECK_SQL = `provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude', 'grok')),`;
@@ -313,7 +361,7 @@ const BASELINE_PROVIDER_SESSIONS_CHECK_SQL = `provider TEXT NOT NULL CHECK(provi
 const V17_PROVIDER_SESSIONS_CHECK_SQL = `provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude', 'grok', 'opencode')),`;
 
 // Migration 22 adds the Antigravity provider. This list is frozen with the migration: do not derive it
-// from `AGENT_PROVIDERS`, because a later provider must get its own migration.
+// from `AGENT_PROVIDERS`, because a shipped migration must always write the same table.
 const V22_PROVIDER_SESSIONS_CHECK_SQL = `provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude', 'grok', 'opencode', 'antigravity')),`;
 
 // Migration 23 adds `acp`, the one provider of every custom ACP agent. Frozen with the migration, like V22.
@@ -324,6 +372,11 @@ const V24_PROVIDER_SESSIONS_CHECK_SQL = `provider TEXT NOT NULL CHECK(provider I
 
 // Migration 26 adds the Cline provider. Frozen with the migration, like V22.
 const V26_PROVIDER_SESSIONS_CHECK_SQL = `provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude', 'grok', 'opencode', 'antigravity', 'acp', 'cursor', 'cline')),`;
+
+// Migration 28 removes the provider CHECK, so a new provider no longer needs a table rebuild. The write path
+// validates the provider instead: `ProviderSessions.bindProviderSession` and the thread replay accept only
+// `AGENT_PROVIDERS`. Frozen with the migration.
+const V28_PROVIDER_SESSIONS_COLUMN_SQL = `provider TEXT NOT NULL,`;
 
 // Migration 27 adds what a routine does while the provider plan of its agent is spent. Frozen with the
 // migration. ADD COLUMN appends the declaration at the end of the stored CREATE statement, so the latest
@@ -395,7 +448,7 @@ const LATEST_SCHEMA_SQL =
     substituteOnce(
       substituteOnce(BASELINE_V8_SCHEMA_SQL, BASELINE_REACTIONS_TABLE_SQL, V12_REACTIONS_TABLE_SQL),
       BASELINE_PROVIDER_SESSIONS_CHECK_SQL,
-      V26_PROVIDER_SESSIONS_CHECK_SQL,
+      V28_PROVIDER_SESSIONS_COLUMN_SQL,
     ),
     BASELINE_AGENT_ROUTINES_END_SQL,
     withRoutineLimitPolicy(BASELINE_AGENT_ROUTINES_END_SQL),
@@ -409,7 +462,10 @@ const LATEST_SCHEMA_SQL =
     withRoutineLimitPolicy(V19_CHANNEL_ROUTINES_END_SQL),
   ) +
   MCP_SERVERS_SCHEMA_SQL +
-  MESSAGING_SCHEMA_SQL;
+  MESSAGING_SCHEMA_SQL +
+  PROVIDER_HISTORY_SCHEMA_SQL +
+  WEBHOOK_SCHEMA_SQL +
+  ROUTINE_FLOW_SCHEMA_SQL;
 
 /** The end of a routine table with the migration 27 column after its last one. */
 function withRoutineLimitPolicy(tableEnd: string): string {
@@ -545,6 +601,29 @@ const MIGRATIONS: readonly OpenBotMigration[] = [
     // Adds a column with a constant default to two tables: no rebuild, so no foreign-key pause and no
     // vacuum. Every existing routine keeps waiting, which is what it did before.
     up: addRoutineLimitPolicy,
+  },
+  {
+    version: 28,
+    // The same rebuild as migrations 17, 22, 23, 24 and 26, with foreign keys off for the same reason.
+    disableForeignKeys: true,
+    up: removeProviderSessionsCheck,
+  },
+  {
+    version: 29,
+    // Provider history is additive durable import state. Existing conversation projections and
+    // provider sessions remain untouched, so foreign keys stay enabled and no vacuum is needed.
+    up: (db) => db.exec(PROVIDER_HISTORY_SCHEMA_SQL),
+  },
+  {
+    version: 30,
+    // Only creates tables, so no foreign-key pause and no vacuum. Existing routines and runs stay as they are.
+    up: (db) => db.exec(WEBHOOK_SCHEMA_SQL),
+  },
+  {
+    version: 31,
+    // Only creates tables, so no foreign-key pause and no vacuum. Existing routines have no links,
+    // so every routine keeps running only its own agent, which is what it did before.
+    up: (db) => db.exec(ROUTINE_FLOW_SCHEMA_SQL),
   },
 ];
 
@@ -833,6 +912,12 @@ function addRoutineLimitPolicy(db: DatabaseSync): void {
   }
 }
 
+// Migration 28 removes the provider CHECK. It rebuilds the table with no guard: every shipped table has the
+// CHECK, and a rebuild of a table that has none, which a replay over a new database meets, keeps every row.
+function removeProviderSessionsCheck(db: DatabaseSync): void {
+  rebuildProviderSessions(db, V28_PROVIDER_SESSIONS_COLUMN_SQL, "projection_provider_sessions_v28");
+}
+
 // Migrations 17, 22, 23, 24 and 26 share this SQL. Each migration gives its own CHECK line and staging table name, so the
 // SQL that migration 17 runs is the same text as before this function was shared.
 function widenProviderSessionsCheck(
@@ -845,12 +930,16 @@ function widenProviderSessionsCheck(
     .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'projection_provider_sessions'")
     .get();
   if (!isDynamicRecord(row) || !isString(row.sql) || row.sql.includes(providerLiteral)) return;
+  rebuildProviderSessions(db, providerCheckSql, stagingTable);
+}
 
+// The rebuild that migrations 17, 22, 23, 24, 26 and 28 run. `providerColumnSql` is the whole provider column line.
+function rebuildProviderSessions(db: DatabaseSync, providerColumnSql: string, stagingTable: string): void {
   db.exec(`
     CREATE TABLE ${stagingTable} (
       id TEXT PRIMARY KEY,
       thread_id TEXT NOT NULL REFERENCES projection_threads(thread_id) ON DELETE CASCADE,
-      ${providerCheckSql}
+      ${providerColumnSql}
       external_session_id TEXT NOT NULL,
       model TEXT NOT NULL,
       effort TEXT NOT NULL,

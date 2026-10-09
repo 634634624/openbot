@@ -10,6 +10,7 @@ import {
   type DirectConversationSnapshot,
   type DirectMessage,
   type DirectThreadSummary,
+  type HostedServerIssue,
   type HostStatus,
   type InvitePreview,
   type InviteSummary,
@@ -36,6 +37,7 @@ import {
   decodeRecord,
   nullableNumber,
   nullableString,
+  optionalHistoryExtent,
   requiredBoolean,
   requiredNumber,
   requiredString,
@@ -179,7 +181,11 @@ export function decodeDirectConversationPage(value: unknown): DirectConversation
     otherMemberId: requiredString(page, "otherMemberId"),
     messages: decodeList(page.messages, "direct message list", directMessage),
     revision: requiredNumber(page, "revision"),
-    pageInfo: { hasOlder: requiredBoolean(pageInfo, "hasOlder"), olderCursor: nullableString(pageInfo, "olderCursor") },
+    pageInfo: {
+      hasOlder: requiredBoolean(pageInfo, "hasOlder"),
+      olderCursor: nullableString(pageInfo, "olderCursor"),
+      ...optionalHistoryExtent(pageInfo),
+    },
     ...optionalReadState(page),
   };
 }
@@ -262,6 +268,7 @@ function server(summary: DynamicRecord): ServerSummary {
     connectionSequence,
     hostRestart,
     hostedSleep,
+    hostedIssue,
     memberLimit,
   } = summary;
   if (!isOneOf(SERVER_NOTIFICATION_LEVELS, notificationLevel)) throw new Error("Invalid notificationLevel.");
@@ -294,6 +301,7 @@ function server(summary: DynamicRecord): ServerSummary {
     ...(hostedSleep === undefined
       ? {}
       : { hostedSleep: hostedSleep === "sleeping" || hostedSleep === "waking" ? hostedSleep : null }),
+    ...(hostedIssue === undefined ? {} : { hostedIssue: decodeHostedIssue(hostedIssue) }),
     ...(memberLimit === undefined ? {} : { memberLimit }),
   };
 }
@@ -422,4 +430,9 @@ function remoteDesktopDisplay(display: DynamicRecord): RemoteDesktopDisplay {
 function teamRole(value: unknown): TeamRole {
   if (!isOneOf(TEAM_ROLES, value)) throw new Error("Invalid role.");
   return value;
+}
+
+function decodeHostedIssue(value: unknown): HostedServerIssue | null {
+  if (value === null || value === "plan_ended" || value === "wake_failed" || value === "start_timeout") return value;
+  throw new Error("Invalid hostedIssue.");
 }

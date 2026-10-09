@@ -1,6 +1,26 @@
 import { defineMessages } from "../../message";
 
 export const messages = defineMessages("server", {
+  "server.connection.planEnded": "The plan for {name} has ended",
+  "server.connection.wakeFailed": "Could not start {name}",
+  "server.connection.startTimeout": "{name} did not start in time",
+  "server.connection.sleeping": "{name} is asleep",
+  "server.connection.waking": "Starting {name}",
+  "server.connection.loading": "Loading {name}",
+  "server.connection.connecting": "Connecting to {name}",
+  "server.connection.reconnecting": "Reconnecting to {name}",
+  "server.connection.blocked": "{name} needs your attention",
+  "server.connection.nextRetry": "Next attempt in {seconds} seconds.",
+  "server.connection.wakeHint": "Use this workspace or select Retry to start the server.",
+  "server.connection.planHint": "Open account settings to check the server plan.",
+  "server.connection.loadingHint": "You can select another server while this one loads.",
+  "server.connection.cachedHint": "Loaded content and drafts are kept. Server actions will resume after reconnection.",
+  "server.connection.conversationFailed": "The conversation could not load. Try again.",
+  "server.connection.panelsFailed": "Some workspace panels could not load. Try again.",
+  "server.connection.retry": "Retry",
+  "server.connection.manage": "Open settings",
+  "server.connection.restored": "Connection to {name} restored",
+
   "server.compatibility.updateClientTitle": "Update this OpenBot app",
   "server.compatibility.updateHostTitle": "Update OpenBot on {name}",
   "server.compatibility.unsafeDataTitle": "The host returned unsafe data",
@@ -38,8 +58,9 @@ export const messages = defineMessages("server", {
   "server.join.emailBound": "This invitation only works for its email recipient.",
   "server.join.unknownDate": "Unknown",
   // The dialog that the plus button on the server rail opens. {price} is a formatted amount, such as "€20".
-  "server.add.title": "Run OpenBot in the cloud",
-  "server.add.description": "OpenBot runs the server for you. Choose a plan to start.",
+  "server.add.title": "Run OpenBot 24/7 on an external server",
+  "server.add.description":
+    "OpenBot Servers keep your agents and routines running, even when your computer is off. We handle the infrastructure and maintenance, so your server is ready to use without any technical setup.",
   "server.add.billing.label": "Billing period",
   "server.add.currency.label": "Currency",
   "server.add.billing.monthly": "Monthly",
@@ -134,10 +155,13 @@ export const messages = defineMessages("server", {
   "server.rail.usage": "Usage",
   "server.rail.schedule": "Routines",
   "server.rail.settings": "Server settings",
+  // The last items of the server menu. Leave is for a joined server; delete is for a hosted server that the user owns.
+  "server.rail.remove": "Remove server",
+  "server.rail.leave": "Leave server",
+  "server.rail.delete": "Delete server",
   "server.select.failedTitle": "Could not select the server",
   "server.select.failedDescription": "Could not switch servers. Try again.",
   "server.select.openAgentFailed": "Could not open {name}. Find it in the sidebar.",
-  "server.scope.agentsLoadFailed": "Could not load agents. Check the server connection and try again.",
   "server.settings.unavailable": "This server is not available.",
   "server.settings.identityRefreshFailed": "The server identity could not refresh.",
   "server.settings.loadFailed": "The server settings could not load.",
@@ -176,6 +200,22 @@ export const messages = defineMessages("server", {
   "server.settings.importDescription": "Move your agents from Grok Bot to this server.",
   "server.settings.connectorsTitle": "Connectors",
   "server.settings.connectorsDescription": "Connect accounts that every agent on this server can use.",
+  "server.settings.routinesTitle": "Routines",
+  "server.settings.routinesDescription": "Show the routine schedule of this computer in a calendar app.",
+  "server.routineFeed.title": "Calendar feed",
+  "server.routineFeed.offTitle": "The calendar feed is off",
+  "server.routineFeed.offDescription":
+    "Make a private URL, then subscribe to it in Apple Calendar (On My Mac) or in another calendar app that reads it on this computer. Each run of the next 30 days shows as an event. Paused routines are not shown.",
+  "server.routineFeed.create": "Make feed URL",
+  "server.routineFeed.urlLabel": "Feed URL",
+  "server.routineFeed.agentLabel": "Agent filter",
+  "server.routineFeed.allAgents": "All agents and channels",
+  "server.routineFeed.copy": "Copy URL",
+  "server.routineFeed.privacy":
+    "Anyone with this URL can read routine names and run times. The URL works only on this computer, so Google Calendar and iCloud cannot read it.",
+  "server.routineFeed.regenerate": "New URL",
+  "server.routineFeed.regenerateLabel": "Make a new URL. The old URL stops working.",
+  "server.routineFeed.turnOff": "Turn off",
   "server.settings.nameTooShort": "Enter at least {limit} characters.",
   "server.settings.nameTooLong": "Use no more than {limit} characters.",
   "server.settings.actionFailedTitle": "Server action failed",
@@ -223,6 +263,12 @@ export const messages = defineMessages("server", {
   "server.settings.saveIdentityFirst": "Save the server identity before publishing.",
   "server.settings.reachable": "Reachable online. Only invited people can sign in.",
   "server.settings.notReachable": "Not reachable online. Existing members and invitations remain.",
+  "server.settings.removeTitle": "Remove server",
+  "server.settings.removeConfirmTitle": "Remove {name}?",
+  "server.settings.removeConfirmDescription":
+    "This removes the server from the account service for all members and ends remote access. Files and chats on its computer stay intact. To use it again, register it from that computer.",
+  "server.settings.removing": "Removing…",
+  "server.settings.removedTitle": "Removed {name}",
   "server.settings.leaveTitle": "Leave server",
   "server.settings.leaveDescription":
     "Remove this server from your server list. The server and its other members stay.",
@@ -248,6 +294,9 @@ export const messages = defineMessages("server", {
   "server.members.actionsFor": "Actions for {name}",
   "server.members.makeMember": "Make member",
   "server.members.makeAdmin": "Make admin",
+  "server.members.makeAdminTitle": "Make {name} an admin?",
+  "server.members.makeMemberTitle": "Make {name} a member?",
+  "server.members.roleChangeDescription": "{name} can be disconnected from this server and must then connect again.",
   "server.invite.invalidEmail": "Enter a valid email address.",
   "server.invite.title": "Invite people",
   "server.invite.description":
@@ -287,6 +336,8 @@ export const messages = defineMessages("server", {
   "server.invite.neverExpires": { one: "Never expires · {count} join", other: "Never expires · {count} joins" },
   "server.invite.expires": "Expires {date}",
   "server.invite.revoke": "Revoke",
+  "server.invite.revokeTitle": "Revoke this invitation?",
+  "server.invite.revokeDescription": "The invitation stops working. People who joined with it stay members.",
   "server.desktop.accessTitle": "Remote desktop access",
   "server.desktop.gatewayDescription":
     "Every active server member can control this host. There is no separate remote desktop password.",
@@ -329,6 +380,23 @@ export const messages = defineMessages("server", {
   "server.update.status.downloadFailed": "{name} could not download the update. Try again.",
   "server.update.status.installFailed":
     "{name} could not install the update. Make sure that no other user of that computer runs OpenBot, then try again.",
+  "server.update.releaseCheckFailed":
+    "{name} could not read the release feed. Check the host network connection, then try again.",
+  "server.update.releaseUnavailable":
+    "Release checks are not available for this build. Ask the host administrator to check for a compatible release.",
+  "server.update.externalTitle": "The host controls installation",
+  "server.update.path.hostManager":
+    "OpenBot Host Manager installs updates when all users are idle. Ask the host administrator to check the Host Manager status if an update does not start.",
+  "server.update.path.hosted":
+    "The hosted service downloads updates in the background. A downloaded update starts when the server next starts. Wait for active work to finish before you stop and resume the server. If it stays on an old version, contact the host administrator.",
+  "server.update.path.system":
+    "On the host, run sudo openbot update to install the latest release. This command stops OpenBot. Wait for active work to finish first. Automatic downloads install at the next boot.",
+  "server.update.path.container":
+    "On the Docker host, pull the new OpenBot image and create the container again with the same data volumes. Wait for active work to finish first. Keep the existing volumes to preserve your data.",
+  "server.update.path.manual":
+    "This installation cannot replace itself. Ask the host administrator to install the compatible release from github.com/nightly-labs/openbot/releases. Keep the existing OpenBot data.",
+  "server.update.path.unavailable":
+    "This is a development build. Use an installed OpenBot release to check for updates.",
   "server.update.check": "Check for updates",
   "server.update.start": "Update when idle",
   "server.update.restartNow": "Restart now",
@@ -345,7 +413,7 @@ export const messages = defineMessages("server", {
   "server.update.waitingFor": "Waiting for {reasons}.",
   "server.update.disabledTitle": "Remote updates are off",
   "server.update.disabledDescription":
-    "The user of {name} turned off updates from server admins. Ask them to update OpenBot or to turn the setting on.",
+    "The user of {name} turned off updates from server members. Ask them to update OpenBot or to turn the setting on.",
   "server.update.managedTitle": "A Host Manager controls updates",
   "server.update.managedDescription": "OpenBot Host Manager updates {name}. Contact the host administrator.",
   "server.update.unsupportedTitle": "{name} cannot update itself",

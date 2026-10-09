@@ -113,7 +113,10 @@ function composerFrame(storyArgs: Parameters<typeof ComposerEditor>[0], options:
   const [value, setValue] = createSignal(storyArgs.value);
   // The picker hangs off the composer inside `.composer-wrap`, the way the conversation renders it.
   return (
-    <div class="composer-wrap" style={{ width: options.width, "margin-top": "260px" }}>
+    <div
+      class="composer-wrap"
+      style={{ width: options.width, "max-width": "calc(100vw - 32px)", "margin-top": "260px" }}
+    >
       <div class="composer" data-compact={options.compact ? "" : undefined}>
         <div class="composer-input-label">
           <ComposerEditor {...storyArgs} value={value()} onValueChange={setValue} onSubmit={storyArgs.onSubmit} />
@@ -144,6 +147,11 @@ export const LongMultilineDraft: Story = {
     value: Array.from({ length: 30 }, (_, index) => `Line ${index + 1}: Edit this part of the draft.`).join("\n"),
   },
   render: (storyArgs) => composerFrame(storyArgs, { width: "480px" }),
+};
+
+export const WrappedDraft: Story = {
+  args: { value: "Edit this long draft without adding a line break. ".repeat(30) },
+  render: (storyArgs) => composerFrame(storyArgs, { width: "480px", compact: true }),
 };
 
 export const WithAgentAndSkillTags: Story = {
@@ -186,6 +194,33 @@ export const SkillPickerLongDescription: Story = {
   args: {
     skills: [longDescriptionSkill, ...installedSkills],
   },
+  render: (storyArgs) => composerFrame(storyArgs, { width: "480px" }),
+};
+
+/** A workspace copy and a marketplace copy share a name, so each row shows its slug. */
+export const SkillPickerDuplicateNames: Story = {
+  args: {
+    skills: [
+      ...installedSkills,
+      {
+        ...installedSkills[0],
+        skillId: "workspace:release-notes-team",
+        slug: "release-notes-team",
+        origin: "workspace",
+      },
+    ],
+    skillPickerRequest: 1,
+  },
+  render: (storyArgs) => composerFrame(storyArgs, { width: "480px" }),
+};
+
+export const SkillPickerEmpty: Story = {
+  args: { skills: [], skillPickerRequest: 1 },
+  render: (storyArgs) => composerFrame(storyArgs, { width: "480px" }),
+};
+
+export const SkillPickerLoadFailed: Story = {
+  args: { skills: [], skillsLoadFailed: true, skillPickerRequest: 1 },
   render: (storyArgs) => composerFrame(storyArgs, { width: "480px" }),
 };
 

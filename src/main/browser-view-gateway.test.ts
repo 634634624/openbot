@@ -1,4 +1,6 @@
+import { Effect } from "effect";
 import { restartActivityGeneration } from "../backend/restart-activity";
+
 // @vitest-environment node
 
 import { createServer, type IncomingMessage } from "node:http";
@@ -6,19 +8,31 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import type { Duplex } from "node:stream";
 import {
+  BROWSER_VIEW_CONTEXT_MENU_QUERY,
+  BROWSER_VIEW_CURSOR_QUERY,
   BROWSER_VIEW_FRAME_ACK_QUERY,
+  BROWSER_VIEW_MAX_CLIPBOARD_TEXT,
+  BROWSER_VIEW_VIEWPORT_QUERY,
+  type BrowserViewContextMenu,
+  type BrowserViewCursor,
+  decodeBrowserViewCopied,
   decodeBrowserViewFrame,
+  decodeBrowserViewHostMessage,
   encodeBrowserViewInput,
 } from "@openbot/contracts/team-protocol/browser-view-v1";
 import { afterEach, assert, describe, expect, it, vi } from "vitest";
 import type * as Ws from "ws";
 import { z } from "zod";
 import type { BrowserViewportInput } from "../backend/browser-cdp";
+import { browserFailure } from "../backend/browser-effects";
+import { runCauseEffect } from "../backend/effect-boundary";
 import { BrowserViewGateway } from "./browser-view-gateway";
 
 const requireModule = createRequire(import.meta.url);
 const webSockets: typeof Ws = requireModule(join(dirname(requireModule.resolve("ws/package.json")), "index.js"));
 const TEAM_SESSION = "team-session-1";
+/** A page with nothing selected. */
+const noCopy = () => Effect.succeed("");
 
 /** A client that will name the frame it has drawn. The host keeps sizes only for this socket. */
 function acknowledgingViewUrl(origin: string, streamPath: string): string {
@@ -33,18 +47,156 @@ afterEach(async () => {
 });
 
 describe("the live browser view on a host", () => {
+  // Failure modes: a stopped upgrade server rejects new views; old sessions survive a restart;
+  // a restarted view loses frames or input. Exercise the real socket for each case.
+  it("streams frames and input after the Team API stops and starts", async () => {
+    const stopView = vi.fn(() => Effect.void);
+    const dispatch = vi.fn(() => Effect.void);
+    const gateway = new BrowserViewGateway({
+      browser: {
+        startView: (_tabId, onFrame) =>
+          Effect.sync(() => {
+            onFrame({ sequence: 1, width: 1200, height: 800, image: new Uint8Array([0xff, 0xd8, 0xff]) });
+            return stopView;
+          }),
+        copyViewSelection: noCopy,
+        dispatchViewInput: dispatch,
+      },
+      authenticate: () => null,
+    });
+    const origin = await serve(gateway);
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const session = gateway.createSession({ memberId: "member-1", teamSessionId: TEAM_SESSION, tabId: "tab-1" });
+      const socket = new webSockets.WebSocket(`${origin}${session.streamPath}`, {
+        headers: { "X-OpenBot-WebRTC-Session": TEAM_SESSION },
+      });
+      const frames = collect(socket);
+      await new Promise<void>((resolve, reject) => {
+        socket.once("open", resolve);
+        socket.once("error", reject);
+      });
+      await vi.waitFor(() => expect(frames).toHaveLength(1));
+      assert(frames[0]);
+      expect(decodeBrowserViewFrame(frames[0])).toMatchObject({ sequence: 1, width: 1200, height: 800 });
+      socket.send(
+        encodeBrowserViewInput({ type: "key", action: "down", key: "a", code: "KeyA", text: "", modifiers: 0 }),
+      );
+      await vi.waitFor(() => expect(dispatch).toHaveBeenCalledTimes(attempt));
+      expect(dispatch).toHaveBeenLastCalledWith("tab-1", expect.objectContaining({ type: "key", key: "a" }), undefined);
+      const closed = new Promise<void>((resolve) => socket.once("close", () => resolve()));
+      await runCauseEffect(gateway.stop());
+      await closed;
+      expect(stopView).toHaveBeenCalledTimes(attempt);
+      expect(gateway.activeViewCount()).toBe(0);
+      expect(await runCauseEffect(gateway.closeMemberSession(session.id, "member-1"))).toBe(false);
+    }
+  });
+
+  // Failure modes: a paste longer than the old 4 KiB input bound is dropped; a key typed after a paste
+  // lands before it; a copy gets no answer and the client's clipboard write waits for ever; a
+  // protected tab's selection reaches the member; a selection too long to send is sent, or is not
+  // reported.
+  it("pastes the member's text in order and answers every copy", async () => {
+    const dispatched: BrowserViewportInput[] = [];
+    // A tab whose fields hold a secret, a selection too long to send, then one that is sent.
+    const copySelection = vi.fn((_tabId: string, _max: number) => {
+      const call = copySelection.mock.calls.length;
+      if (call === 1) return Effect.fail(browserFailure(new Error("protected")));
+      return Effect.succeed(call === 2 ? null : "copied text");
+    });
+    // A paste takes several CDP calls on a real page. This one gives the event loop a turn, which is
+    // when the key sent right behind it is read from the socket.
+    const pasting = () => new Promise<void>((resolve) => setImmediate(() => setImmediate(resolve)));
+    const gateway = new BrowserViewGateway({
+      browser: {
+        startView: (_tabId, onFrame) =>
+          Effect.sync(() => {
+            onFrame({ sequence: 1, width: 1200, height: 800, image: new Uint8Array([0xff, 0xd8, 0xff]) });
+            return () => Effect.void;
+          }),
+        copyViewSelection: copySelection,
+        dispatchViewInput: (_tabId, input) =>
+          Effect.promise(() => (input.type === "paste" ? pasting() : Promise.resolve())).pipe(
+            Effect.andThen(
+              Effect.sync(() => {
+                dispatched.push(input);
+              }),
+            ),
+          ),
+      },
+      authenticate: () => null,
+    });
+    const origin = await serve(gateway);
+    const session = gateway.createSession({ memberId: "member-1", teamSessionId: TEAM_SESSION, tabId: "tab-1" });
+    const socket = new webSockets.WebSocket(`${origin}${session.streamPath}`, {
+      headers: { "X-OpenBot-WebRTC-Session": TEAM_SESSION },
+    });
+    const answers: string[] = [];
+    socket.on("message", (data, binary) => {
+      if (!binary) answers.push(data.toString());
+    });
+    await new Promise((resolve) => socket.once("open", resolve));
+
+    const text = "a pasted paragraph ".repeat(1_000);
+    const key = { type: "key", action: "char", key: "!", code: "Digit1", text: "!", modifiers: 8 } as const;
+    socket.send(encodeBrowserViewInput({ type: "paste", text }));
+    socket.send(encodeBrowserViewInput(key));
+    // The key and the copy reach the host while the paste still runs. They wait for it.
+    socket.send(encodeBrowserViewInput({ type: "copy" }));
+    await vi.waitFor(() => expect(answers).toHaveLength(1));
+    expect(dispatched).toEqual([{ type: "paste", text }, key]);
+
+    for (const index of [1, 2]) {
+      socket.send(encodeBrowserViewInput({ type: "copy" }));
+      await vi.waitFor(() => expect(answers).toHaveLength(index + 1));
+    }
+    expect(answers.map(decodeBrowserViewCopied)).toEqual([
+      { type: "copied", text: "" },
+      { type: "copyTooLarge" },
+      { type: "copied", text: "copied text" },
+    ]);
+    expect(copySelection).toHaveBeenLastCalledWith("tab-1", BROWSER_VIEW_MAX_CLIPBOARD_TEXT);
+    socket.close();
+    await runCauseEffect(gateway.stop());
+  });
+
+  it("redacts a browser start failure before sending its close reason", async () => {
+    const gateway = new BrowserViewGateway({
+      browser: {
+        startView: () => Effect.fail(browserFailure(new Error("CDP failed: token=secret-value-123456"))),
+        copyViewSelection: noCopy,
+        dispatchViewInput: () => Effect.void,
+      },
+      authenticate: () => null,
+    });
+    const origin = await serve(gateway);
+    const session = gateway.createSession({ memberId: "member-1", teamSessionId: TEAM_SESSION, tabId: "tab-1" });
+    const socket = new webSockets.WebSocket(`${origin}${session.streamPath}`, {
+      headers: { "X-OpenBot-WebRTC-Session": TEAM_SESSION },
+    });
+    const ended = await new Promise<{ code: number; reason: string }>((resolve, reject) => {
+      socket.once("close", (code, reason) => resolve({ code, reason: reason.toString() }));
+      socket.once("error", reject);
+    });
+    expect(ended).toEqual({ code: 1011, reason: "CDP failed: token=[redacted]" });
+    await runCauseEffect(gateway.stop());
+  });
+
   it("sends the tab's frames and dispatches a click at the point on the frame", async () => {
     const dispatched: BrowserViewportInput[] = [];
     let send: ((frame: { sequence: number; width: number; height: number; image: Uint8Array }) => void) | undefined;
     const gateway = new BrowserViewGateway({
       browser: {
-        startView: async (_tabId, onFrame) => {
-          send = onFrame;
-          return async () => undefined;
-        },
-        dispatchViewInput: async (_tabId, input) => {
-          dispatched.push(input);
-        },
+        startView: (_tabId, onFrame) =>
+          Effect.sync(() => {
+            send = onFrame;
+            return () => Effect.void;
+          }),
+        copyViewSelection: noCopy,
+        dispatchViewInput: (_tabId, input) =>
+          Effect.sync(() => {
+            dispatched.push(input);
+          }),
       },
       authenticate: () => null,
     });
@@ -79,7 +231,7 @@ describe("the live browser view on a host", () => {
     // The member's pointer is a fraction of the frame they watched; the host's page is in pixels.
     await vi.waitFor(() => expect(dispatched).toEqual([expect.objectContaining({ x: 600, y: 200 })]));
     socket.close();
-    await gateway.stop();
+    await runCauseEffect(gateway.stop());
   });
 
   it("keeps a click on the last frame the member saw when a newer frame is dropped", async () => {
@@ -87,13 +239,16 @@ describe("the live browser view on a host", () => {
     let send: ((frame: { sequence: number; width: number; height: number; image: Uint8Array }) => void) | undefined;
     const gateway = new BrowserViewGateway({
       browser: {
-        startView: async (_tabId, onFrame) => {
-          send = onFrame;
-          return async () => undefined;
-        },
-        dispatchViewInput: async (_tabId, input) => {
-          dispatched.push(input);
-        },
+        startView: (_tabId, onFrame) =>
+          Effect.sync(() => {
+            send = onFrame;
+            return () => Effect.void;
+          }),
+        copyViewSelection: noCopy,
+        dispatchViewInput: (_tabId, input) =>
+          Effect.sync(() => {
+            dispatched.push(input);
+          }),
       },
       authenticate: () => null,
     });
@@ -139,7 +294,7 @@ describe("the live browser view on a host", () => {
     await vi.waitFor(() => expect(dispatched).toEqual([expect.objectContaining({ x: 600, y: 200 })]));
     socket.resume();
     socket.close();
-    await gateway.stop();
+    await runCauseEffect(gateway.stop());
   });
 
   it("expands a point with the frame the member named, not the newest one", async () => {
@@ -147,13 +302,16 @@ describe("the live browser view on a host", () => {
     let send: ((frame: { sequence: number; width: number; height: number; image: Uint8Array }) => void) | undefined;
     const gateway = new BrowserViewGateway({
       browser: {
-        startView: async (_tabId, onFrame) => {
-          send = onFrame;
-          return async () => undefined;
-        },
-        dispatchViewInput: async (_tabId, input) => {
-          dispatched.push(input);
-        },
+        startView: (_tabId, onFrame) =>
+          Effect.sync(() => {
+            send = onFrame;
+            return () => Effect.void;
+          }),
+        copyViewSelection: noCopy,
+        dispatchViewInput: (_tabId, input) =>
+          Effect.sync(() => {
+            dispatched.push(input);
+          }),
       },
       authenticate: () => null,
     });
@@ -188,7 +346,7 @@ describe("the live browser view on a host", () => {
     // The frame the member named, not the newest one: expanding with frame 2 puts this at (200, 75).
     await vi.waitFor(() => expect(dispatched).toEqual([expect.objectContaining({ x: 600, y: 200 })]));
     socket.close();
-    await gateway.stop();
+    await runCauseEffect(gateway.stop());
   });
 
   it("keeps a point on the frame still showing, and drops it once a newer frame is named", async () => {
@@ -196,13 +354,16 @@ describe("the live browser view on a host", () => {
     let send: ((frame: { sequence: number; width: number; height: number; image: Uint8Array }) => void) | undefined;
     const gateway = new BrowserViewGateway({
       browser: {
-        startView: async (_tabId, onFrame) => {
-          send = onFrame;
-          return async () => undefined;
-        },
-        dispatchViewInput: async (_tabId, input) => {
-          dispatched.push(input);
-        },
+        startView: (_tabId, onFrame) =>
+          Effect.sync(() => {
+            send = onFrame;
+            return () => Effect.void;
+          }),
+        copyViewSelection: noCopy,
+        dispatchViewInput: (_tabId, input) =>
+          Effect.sync(() => {
+            dispatched.push(input);
+          }),
       },
       authenticate: () => null,
     });
@@ -248,7 +409,7 @@ describe("the live browser view on a host", () => {
       ]),
     );
     socket.close();
-    await gateway.stop();
+    await runCauseEffect(gateway.stop());
   });
 
   it("forgets frames older than the one the member has drawn, without a click", async () => {
@@ -256,13 +417,16 @@ describe("the live browser view on a host", () => {
     let send: ((frame: { sequence: number; width: number; height: number; image: Uint8Array }) => void) | undefined;
     const gateway = new BrowserViewGateway({
       browser: {
-        startView: async (_tabId, onFrame) => {
-          send = onFrame;
-          return async () => undefined;
-        },
-        dispatchViewInput: async (_tabId, input) => {
-          dispatched.push(input);
-        },
+        startView: (_tabId, onFrame) =>
+          Effect.sync(() => {
+            send = onFrame;
+            return () => Effect.void;
+          }),
+        copyViewSelection: noCopy,
+        dispatchViewInput: (_tabId, input) =>
+          Effect.sync(() => {
+            dispatched.push(input);
+          }),
       },
       authenticate: () => null,
     });
@@ -304,7 +468,7 @@ describe("the live browser view on a host", () => {
       ]),
     );
     socket.close();
-    await gateway.stop();
+    await runCauseEffect(gateway.stop());
   });
 
   it("does not keep a frame size for a client that never acknowledges frames", async () => {
@@ -312,13 +476,16 @@ describe("the live browser view on a host", () => {
     let send: ((frame: { sequence: number; width: number; height: number; image: Uint8Array }) => void) | undefined;
     const gateway = new BrowserViewGateway({
       browser: {
-        startView: async (_tabId, onFrame) => {
-          send = onFrame;
-          return async () => undefined;
-        },
-        dispatchViewInput: async (_tabId, input) => {
-          dispatched.push(input);
-        },
+        startView: (_tabId, onFrame) =>
+          Effect.sync(() => {
+            send = onFrame;
+            return () => Effect.void;
+          }),
+        copyViewSelection: noCopy,
+        dispatchViewInput: (_tabId, input) =>
+          Effect.sync(() => {
+            dispatched.push(input);
+          }),
       },
       authenticate: () => null,
     });
@@ -353,18 +520,20 @@ describe("the live browser view on a host", () => {
     socket.send(encodeBrowserViewInput({ ...point }));
     await vi.waitFor(() => expect(dispatched).toEqual([expect.objectContaining({ x: 200, y: 75 })]));
     socket.close();
-    await gateway.stop();
+    await runCauseEffect(gateway.stop());
   });
 
   it("closes a view whose client stops acknowledging frames", async () => {
     let send: ((frame: { sequence: number; width: number; height: number; image: Uint8Array }) => void) | undefined;
     const gateway = new BrowserViewGateway({
       browser: {
-        startView: async (_tabId, onFrame) => {
-          send = onFrame;
-          return async () => undefined;
-        },
-        dispatchViewInput: async () => undefined,
+        startView: (_tabId, onFrame) =>
+          Effect.sync(() => {
+            send = onFrame;
+            return () => Effect.void;
+          }),
+        copyViewSelection: noCopy,
+        dispatchViewInput: () => Effect.void,
       },
       authenticate: () => null,
     });
@@ -384,7 +553,7 @@ describe("the live browser view on a host", () => {
     await closed;
     expect(frames.length).toBeLessThanOrEqual(121);
     expect(gateway.activeViewCount()).toBe(0);
-    await gateway.stop();
+    await runCauseEffect(gateway.stop());
   });
 
   it("keeps the view open while drawn frames are acknowledged inside the backlog", async () => {
@@ -392,13 +561,16 @@ describe("the live browser view on a host", () => {
     let send: ((frame: { sequence: number; width: number; height: number; image: Uint8Array }) => void) | undefined;
     const gateway = new BrowserViewGateway({
       browser: {
-        startView: async (_tabId, onFrame) => {
-          send = onFrame;
-          return async () => undefined;
-        },
-        dispatchViewInput: async (_tabId, input) => {
-          dispatched.push(input);
-        },
+        startView: (_tabId, onFrame) =>
+          Effect.sync(() => {
+            send = onFrame;
+            return () => Effect.void;
+          }),
+        copyViewSelection: noCopy,
+        dispatchViewInput: (_tabId, input) =>
+          Effect.sync(() => {
+            dispatched.push(input);
+          }),
       },
       authenticate: () => null,
     });
@@ -436,19 +608,21 @@ describe("the live browser view on a host", () => {
     }
     expect(socket.readyState).toBe(webSockets.WebSocket.OPEN);
     socket.close();
-    await gateway.stop();
+    await runCauseEffect(gateway.stop());
   });
 
   it("closes invalidated views and rejects reuse of their session", async () => {
     let invalidate: ((reason: string) => void) | undefined;
-    const stop = vi.fn(async () => undefined);
-    const dispatch = vi.fn(async () => undefined);
+    const stop = vi.fn(() => Effect.void);
+    const dispatch = vi.fn(() => Effect.void);
     const gateway = new BrowserViewGateway({
       browser: {
-        startView: async (_tabId, _onFrame, onEnded) => {
-          invalidate = onEnded;
-          return stop;
-        },
+        startView: (_tabId, _onFrame, onEnded) =>
+          Effect.sync(() => {
+            invalidate = onEnded;
+            return stop;
+          }),
+        copyViewSelection: noCopy,
         dispatchViewInput: dispatch,
       },
       authenticate: () => null,
@@ -471,14 +645,15 @@ describe("the live browser view on a host", () => {
     });
     const failure = await new Promise<string>((resolve) => retry.once("error", (error) => resolve(error.message)));
     expect(failure).toContain("401");
-    await gateway.stop();
+    await runCauseEffect(gateway.stop());
   });
 
   it("refuses a socket that names neither the session nor its member", async () => {
     const gateway = new BrowserViewGateway({
       browser: {
-        startView: async () => async () => undefined,
-        dispatchViewInput: async () => undefined,
+        startView: () => Effect.succeed(() => Effect.void),
+        copyViewSelection: noCopy,
+        dispatchViewInput: () => Effect.void,
       },
       authenticate: (token) => (token === "other-member-token" ? { id: "member-2" } : null),
     });
@@ -494,14 +669,15 @@ describe("the live browser view on a host", () => {
       const failure = await new Promise<string>((resolve) => socket.once("error", (error) => resolve(error.message)));
       expect(failure).toContain("401");
     }
-    await gateway.stop();
+    await runCauseEffect(gateway.stop());
   });
 
   it("counts only views with a live socket", async () => {
     const gateway = new BrowserViewGateway({
       browser: {
-        startView: async () => async () => undefined,
-        dispatchViewInput: async () => undefined,
+        startView: () => Effect.succeed(() => Effect.void),
+        copyViewSelection: noCopy,
+        dispatchViewInput: () => Effect.void,
       },
       authenticate: () => null,
     });
@@ -519,15 +695,16 @@ describe("the live browser view on a host", () => {
     socket.close();
     await vi.waitFor(() => expect(gateway.activeViewCount()).toBe(0));
     expect(restartActivityGeneration()).toBeGreaterThan(before);
-    await gateway.stop();
+    await runCauseEffect(gateway.stop());
   });
 
   it("releases a session after an abrupt stream disconnect", async () => {
-    const startView = vi.fn(async () => async () => undefined);
+    const startView = vi.fn(() => Effect.succeed(() => Effect.void));
     const gateway = new BrowserViewGateway({
       browser: {
         startView,
-        dispatchViewInput: async () => undefined,
+        copyViewSelection: noCopy,
+        dispatchViewInput: () => Effect.void,
       },
       authenticate: () => null,
       maxSessions: 1,
@@ -548,7 +725,106 @@ describe("the live browser view on a host", () => {
     expect(() =>
       gateway.createSession({ memberId: "member-1", teamSessionId: TEAM_SESSION, tabId: "tab-2" }),
     ).not.toThrow();
-    await gateway.stop();
+    await runCauseEffect(gateway.stop());
+  });
+});
+
+describe("the cursor, menus and page size of a live view", () => {
+  // Failure modes: a cursor or menu message reaches a desktop or web client that never asked for
+  // one, which reads every text message as a copy answer; a right-click of a phone opens the menu
+  // on the host's screen; the page size a phone asked for is not held.
+  async function openView(asks: { cursor?: boolean; menu?: boolean; viewport?: string } = {}) {
+    let reportCursor: ((cursor: BrowserViewCursor) => void) | undefined;
+    let heldViewport: unknown = null;
+    const dispatched: BrowserViewportInput[] = [];
+    const menus: Array<((menu: BrowserViewContextMenu) => void) | undefined> = [];
+    const gateway = new BrowserViewGateway({
+      browser: {
+        startView: (_tabId, onFrame, _onEnded, options) =>
+          Effect.sync(() => {
+            reportCursor = options?.onCursor;
+            heldViewport = options?.viewport ?? null;
+            onFrame({ sequence: 1, width: 1200, height: 800, image: new Uint8Array([0xff, 0xd8, 0xff]) });
+            return () => Effect.void;
+          }),
+        dispatchViewInput: (_tabId, input, onContextMenu) =>
+          Effect.sync(() => {
+            dispatched.push(input);
+            menus.push(onContextMenu);
+          }),
+        copyViewSelection: (tabId) => Effect.succeed(`selected in ${tabId}`),
+      },
+      authenticate: () => null,
+    });
+    const origin = await serve(gateway);
+    const session = gateway.createSession({ memberId: "member-1", teamSessionId: TEAM_SESSION, tabId: "tab-1" });
+    const url = new URL(`${origin}${session.streamPath}`);
+    if (asks.cursor) url.searchParams.set(BROWSER_VIEW_CURSOR_QUERY, "1");
+    if (asks.menu) url.searchParams.set(BROWSER_VIEW_CONTEXT_MENU_QUERY, "1");
+    if (asks.viewport) url.searchParams.set(BROWSER_VIEW_VIEWPORT_QUERY, asks.viewport);
+    const socket = new webSockets.WebSocket(url, { headers: { "X-OpenBot-WebRTC-Session": TEAM_SESSION } });
+    const messages: unknown[] = [];
+    socket.on("message", (data, binary) => {
+      if (!binary) messages.push(decodeBrowserViewHostMessage(String(data)));
+    });
+    const frames = collect(socket);
+    await new Promise((resolve) => socket.once("open", resolve));
+    await vi.waitFor(() => expect(frames).toHaveLength(1));
+    // The server waits for its sockets, so the gateway closes them first.
+    closers.unshift(() => runCauseEffect(gateway.stop()));
+    return {
+      socket,
+      messages,
+      dispatched,
+      menus,
+      heldViewport: () => heldViewport,
+      cursor: (cursor: BrowserViewCursor) => reportCursor?.(cursor),
+    };
+  }
+
+  const rightClick = encodeBrowserViewInput({
+    type: "pointer",
+    action: "down",
+    x: 0.5,
+    y: 0.5,
+    button: "right",
+    clickCount: 1,
+    deltaX: 0,
+    deltaY: 0,
+    modifiers: 0,
+  });
+
+  it("reports the page's cursor only to a client that asked for it", async () => {
+    const asked = await openView({ cursor: true });
+    asked.cursor("pointer");
+    await vi.waitFor(() => expect(asked.messages).toEqual([{ type: "cursor", cursor: "pointer" }]));
+
+    const silent = await openView();
+    silent.cursor("pointer");
+    silent.socket.send(encodeBrowserViewInput({ type: "copy" }));
+    // The copy answer is the barrier: a cursor message sent before it would arrive first.
+    await vi.waitFor(() => expect(silent.messages).toHaveLength(1));
+    expect(silent.messages).toEqual([{ type: "copied", text: "selected in tab-1" }]);
+  });
+
+  it("sends a right-click's menu to the client that asked, and holds the page size it asked for", async () => {
+    const asked = await openView({ menu: true, viewport: "1280x800" });
+    expect(asked.heldViewport()).toEqual({ width: 1280, height: 800 });
+    asked.socket.send(rightClick);
+    await vi.waitFor(() => expect(asked.dispatched).toMatchObject([{ type: "pointer", x: 600, y: 400 }]));
+    asked.menus[0]?.({ items: ["copy-link", "copy"], link: "https://a.example/" });
+    await vi.waitFor(() =>
+      expect(asked.messages).toEqual([
+        { type: "context-menu", items: ["copy-link", "copy"], link: "https://a.example/" },
+      ]),
+    );
+
+    // A client that did not ask leaves the menu to the host, and the page to the host's panel.
+    const silent = await openView({ viewport: "90x90" });
+    expect(silent.heldViewport()).toBeNull();
+    silent.socket.send(rightClick);
+    await vi.waitFor(() => expect(silent.dispatched).toHaveLength(1));
+    expect(silent.menus).toEqual([undefined]);
   });
 });
 

@@ -25,6 +25,10 @@ export default defineConfig({
     // Only `shard()` is overridden, so a local run orders files exactly as before. See the
     // sequencer for why `--shard` alone splits this suite badly.
     sequence: { sequencer: BalancedSequencer },
+    // The default triggers make `--changed` and `related` select every test when `package.json`
+    // or a vitest config changes, but only in a checkout path with no dot directory. Never select
+    // the full suite for a focused run: `test:changed` must stay on the dependents of a change.
+    forceRerunTriggers: [],
     onConsoleLog(log) {
       // Solid 2 RC dependencies still emit this dev-only diagnostic while
       // their components initialize. Keep other console output visible.
@@ -72,6 +76,7 @@ export default defineConfig({
             "packages/contracts/**/*.test.ts",
             "packages/i18n/**/*.test.ts",
             "packages/logging/**/*.test.ts",
+            "packages/telemetry/**/*.test.ts",
             "packages/user-errors/**/*.test.ts",
             "packages/team-client/**/*.test.ts",
             "packages/ui/**/*.test.ts",
@@ -111,6 +116,11 @@ export default defineConfig({
       "tests/visual/**",
       ".openbot-build/**",
       "build/whisper/**",
+      // Agent tools put git worktrees inside the checkout. The renderer project's
+      // `**/*.dom.test.ts` include otherwise runs each nested copy's DOM tests too.
+      "**/.worktrees/**",
+      "**/.claude/worktrees/**",
+      "**/.codex/**",
     ],
   },
 });

@@ -15,6 +15,7 @@ import {
   type DeleteRoutineInput,
   type DownloadAttachmentsInput,
   type EditQueuedMessageInput,
+  type FileAction,
   type ImportAttachmentsInput,
   type InterruptTurnInput,
   isAgentAccess,
@@ -22,6 +23,7 @@ import {
   isAgentProvider,
   isAvatarHue,
   isAvatarSeed,
+  isBusyMessageMode,
   isMessageReaction,
   isReasoningEffort,
   isRoutineSchedule,
@@ -456,11 +458,19 @@ export function parseSendMessage(value: unknown): SendMessageInput {
   if (replyToMessageId !== null && (!isString(replyToMessageId) || replyToMessageId.length > INPUT_LIMITS.identifier)) {
     throw new Error("Invalid reply target.");
   }
+  const clientMessageId = value.clientMessageId;
+  if (
+    clientMessageId !== undefined &&
+    (!isString(clientMessageId) || !clientMessageId || clientMessageId.length > INPUT_LIMITS.identifier)
+  ) {
+    throw new Error("Invalid client message id.");
+  }
   return {
     agentId: requireString(value.agentId, "agentId"),
     text: value.text,
     attachmentDraftIds,
     replyToMessageId: replyToMessageId?.trim() || null,
+    ...(clientMessageId === undefined ? {} : { clientMessageId }),
   };
 }
 
@@ -537,6 +547,12 @@ export function parseUpdateAgent(value: unknown): UpdateAgentInput {
   if (value.allowAutomation !== undefined) {
     if (!isBoolean(value.allowAutomation)) throw new Error("Invalid automation value.");
     result.allowAutomation = value.allowAutomation;
+  }
+  if (value.busyMessageMode !== undefined) {
+    if (value.busyMessageMode !== null && !isBusyMessageMode(value.busyMessageMode)) {
+      throw new Error("Invalid busy message mode.");
+    }
+    result.busyMessageMode = value.busyMessageMode;
   }
   if (value.avatarSeed !== undefined) {
     if (!isAvatarSeed(value.avatarSeed)) throw new Error("Invalid avatar seed.");
@@ -623,9 +639,17 @@ export function parseOpenAttachment(value: unknown): OpenAttachmentInput {
   };
 }
 
+const FILE_ACTIONS: readonly FileAction[] = ["open", "reveal", "download"];
+
+function parseFileAction(value: unknown): FileAction {
+  if (value === undefined) return "open";
+  if (!isOneOf(FILE_ACTIONS, value)) throw new Error("Invalid file action.");
+  return value;
+}
+
 export function parseOpenSharedFile(value: unknown): OpenSharedFileInput {
   if (!isObject(value)) throw new Error("Invalid shared file request.");
-  return { path: requireString(value.path, "path", INPUT_LIMITS.path) };
+  return { path: requireString(value.path, "path", INPUT_LIMITS.path), action: parseFileAction(value.action) };
 }
 
 export function parseOpenWorkspaceFile(value: unknown): OpenWorkspaceFileInput {
@@ -633,6 +657,7 @@ export function parseOpenWorkspaceFile(value: unknown): OpenWorkspaceFileInput {
   return {
     agentId: requireString(value.agentId, "agentId", INPUT_LIMITS.identifier),
     path: requireString(value.path, "path", INPUT_LIMITS.path),
+    action: parseFileAction(value.action),
   };
 }
 

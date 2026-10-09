@@ -7,16 +7,22 @@ import {
   type ConversationPlan,
   type ConversationSnapshot,
   conversationPlanText,
+  latestTurnAnswer,
 } from "@openbot/contracts/ipc";
 import { isString } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
+import { classifyFailure } from "@openbot/telemetry";
+import { Deferred, Effect, Exit, Schema, Scope } from "effect";
 import type { AgentClient } from "../agent-client";
 import type { AgentStore } from "../agent-store";
+import type { BrowserOperationError } from "../browser-effects";
 import { newAssistantMessage, normalizeCompletionStatus } from "../conversation-snapshots";
+import { causeHelpers } from "../effect-boundary";
 import type { DeliveryContext, MailboxStore } from "../mailbox-store";
 import {
   type AppServerNotification,
   decodeAccountLoginCompletedResult,
+  getArray,
   getRecord,
   getString,
   isRecord,
@@ -28,12 +34,15 @@ import type { BrowserUploadTarget } from "./browser-uploads";
 import type { ContextCompaction } from "./context-compaction";
 import type { ConversationRuntime } from "./conversation-runtime";
 import type { DeltaBuffer } from "./delta-buffer";
+import type { FailureContext, FailureSignal } from "./failure-signal";
 import type { ImageGenRuntime } from "./image-gen-runtime";
 import { markIncompleteImageGeneration } from "./image-generation";
 import type { MailboxSync } from "./mailbox-sync";
 import { PLAN_UPDATED_METHOD, planFromNotification } from "./plan-updates";
 import { isBalanceDiagnostic, isPlanLimitDiagnostic, isUsageLimitDiagnostic } from "./provider-diagnostics";
 import type { ProviderRuntime } from "./provider-runtime";
+import { isNoUpdateAnswer, settleQuietRoutineTurn } from "./routine-quiet-runs";
+import { ThreadFileHistory } from "./thread-file-history";
 import {
   isForeignReasoningError,
   isNonActionableCodexWarning,
@@ -57,16 +66,17 @@ export interface AgentBrowserHost extends AttentionBrowserHost, BrowserUploadTar
   clearControls(): void;
   endControl(threadId: string, turnId: string): void;
   /** Deleting an agent closes the tabs it owned, which nothing else can reach once it is gone. */
-  close(tabId: string): Promise<void>;
+  close(tabId: string): Effect.Effect<void, BrowserOperationError>;
 }
 
 export interface TurnHooks {
+  emitFailure?(failure: FailureSignal): void;
   emit(event: AgentEvent): void;
-  emitError(code: string, error: unknown, agentId?: string): void;
+  emitError(code: string, error: unknown, agentId?: string, context?: FailureContext): void;
   emitRuntimeSnapshot(): void;
   scheduleDrain(agentId: string): void;
   /** Closes a provider session the provider refuses; the next turn opens a new one with the transcript. */
-  dropRefusedSession(agentId: string, externalThreadId: string): void;
+  dropRefusedSession(agentId: string, externalThreadId: string): Effect.Effect<void, TurnOperationFailed>;
   listAgents(): AgentSummary[];
   redactMcp(text: string): string;
   /** A finished tool step, for product analytics only. It never reaches a renderer or a remote client. */
@@ -77,7 +87,17 @@ export interface TurnHooks {
    * Gives a channel task back to its channel's queue after a spent plan refused its turn. False
    * when the delivery is not an active channel assignment that can go back.
    */
-  requeueChannelDelivery(deliveryId: string): boolean;
+  requeueChannelDelivery(deliveryId: string): Effect.Effect<boolean>;
+  /**
+   * Whether this delivery is a routine run that may end without a message: a scheduled run whose
+   * agent answers only the no-update marker.
+   */
+  quietRoutineDelivery(deliveryId: string): boolean;
+  /**
+   * The agent preview before the routine run of this delivery showed its task, and that task, once.
+   * Null after a restart or for any other delivery.
+   */
+  takeRoutinePreview(deliveryId: string): { previous: string; shown: string } | null;
 }
 
 export interface TurnLifecycleOptions {
@@ -119,9 +139,11 @@ export class TurnLifecycle {
   readonly #deltas: DeltaBuffer;
   readonly #usageLimits: UsageLimitGate;
   readonly #hooks: TurnHooks;
+  readonly fileHistory = new ThreadFileHistory();
   readonly #failedTurns = new Map<string, string>();
   readonly #itemTurns = new Map<string, string>();
-  readonly #turnAssociations = new Map<string, Promise<void>>();
+  #scope = Scope.makeUnsafe();
+  readonly #turnAssociations = new Map<string, Deferred.Deferred<void, TurnOperationFailed>>();
   /**
    * The last error a provider reported for each running turn. The provider sends it just before
    * `turn/completed`, which carries only the status, so without this a failed delivery keeps no
@@ -169,6 +191,7 @@ export class TurnLifecycle {
   }
 
   forgetAgent(agentId: string): void {
+    this.fileHistory.forgetAgent(agentId);
     this.#failedTurns.delete(agentId);
     this.#lastEventAt.delete(agentId);
   }
@@ -203,7 +226,10 @@ export class TurnLifecycle {
     this.#hooks.emitRuntimeSnapshot();
   }
 
-  dispose(): void {
+  readonly dispose = Effect.fn("TurnLifecycle.dispose")(function* (this: TurnLifecycle) {
+    yield* Scope.close(this.#scope, Exit.void);
+    this.#scope = Scope.makeUnsafe();
+    this.fileHistory.clear();
     this.#failedTurns.clear();
     this.#turnAssociations.clear();
     this.#turnErrors.clear();
@@ -212,7 +238,7 @@ export class TurnLifecycle {
     this.#refusedRetries.clear();
     this.#lastEventAt.clear();
     this.#itemTurns.clear();
-  }
+  }).bind(this);
 
   /**
    * Ends each turn a client ran when the runtime stops it for a reason other than an exit: a
@@ -220,18 +246,27 @@ export class TurnLifecycle {
    * process sends no `turn/completed` and `#handleExit` skips it, so without this its turns stay
    * active, and its deliveries running, until OpenBot restarts.
    */
-  interruptTurnsOf(client: AgentClient): void {
+  readonly interruptTurnsOf = Effect.fn("TurnLifecycle.interruptTurnsOf")(function* (
+    this: TurnLifecycle,
+    client: AgentClient,
+  ) {
     for (const [turnId, turn] of this.#runningTurns) {
       if (turn.client !== client) continue;
       this.#runningTurns.delete(turnId);
       this.#attention.clearForTurn(turn.threadId, turnId);
-      void this.#completeTurn(turn.agentId, turn.threadId, turnId, "interrupted").catch((error) => {
-        this.#hooks.emitError("turn_completion_failed", error, turn.agentId);
-      });
+      yield* this.#completeTurn(turn.agentId, turn.threadId, turnId, "interrupted").pipe(
+        Effect.catch((failure) =>
+          Effect.sync(() => this.#hooks.emitError("turn_completion_failed", failure.cause, turn.agentId)),
+        ),
+      );
     }
-  }
+  }).bind(this);
 
-  handleNotification(notification: AppServerNotification, source: AgentClient): void {
+  readonly handleNotification = Effect.fn("TurnLifecycle.handleNotification")(function* (
+    this: TurnLifecycle,
+    notification: AppServerNotification,
+    source: AgentClient,
+  ) {
     const params = notification.params;
     const threadId = getString(params, "threadId");
     const agentId = threadId ? this.#conversation.agentForThread(threadId) : undefined;
@@ -259,7 +294,7 @@ export class TurnLifecycle {
 
     switch (notification.method) {
       case "account/login/completed": {
-        this.#providers.completeCodexLogin(params, source, decodeAccountLoginCompletedResult);
+        yield* this.#providers.completeCodexLogin(params, source, decodeAccountLoginCompletedResult);
         return;
       }
       case "turn/started": {
@@ -281,13 +316,13 @@ export class TurnLifecycle {
         snapshot.activeTurnId = turnId;
         this.#failedTurns.delete(agentId);
         const origin = this.#mailbox.startingDeliveryForAgent(agentId)?.delivery.sender.kind ?? "unknown";
-        const association = this.#associateStartedTurn(agentId, turnId, snapshot);
+        const association = Deferred.makeUnsafe<void, TurnOperationFailed>();
         this.#turnAssociations.set(turnId, association);
-        void association.finally(() => {
-          if (this.#turnAssociations.get(turnId) === association) {
-            this.#turnAssociations.delete(turnId);
-          }
-        });
+        yield* Effect.gen({ self: this }, function* () {
+          const exit = yield* Effect.exit(this.#associateStartedTurn(agentId, turnId, snapshot));
+          yield* Deferred.done(association, exit);
+          if (this.#turnAssociations.get(turnId) === association) this.#turnAssociations.delete(turnId);
+        }).pipe(Effect.forkIn(this.#scope, { startImmediately: true }));
         this.#hooks.emit({ type: "turn-started", agentId, threadId: publicThreadId, turnId, origin });
         this.#conversation.emitConversation(snapshot, "turn.started", { turnId });
         return;
@@ -298,6 +333,11 @@ export class TurnLifecycle {
         const turnId = getString(params, "turnId");
         const item = getRecord(params, "item");
         if (!turnId || !item) return;
+        this.fileHistory.record(
+          agentId,
+          this.#conversation.publicThreadId(agentId, threadId),
+          getArray(params, "filePaths"),
+        );
         const itemId = getString(item, "id");
         if (itemId) this.#itemTurns.set(itemId, turnId);
         this.#markProduced(turnId, isRepeatedWork(item));
@@ -312,7 +352,7 @@ export class TurnLifecycle {
         }
         const threadItem = toThreadItem(item);
         if (!threadItem) return;
-        this.#applyItem(agentId, threadId, turnId, threadItem, notification.method === "item/completed");
+        yield* this.#applyItem(agentId, threadId, turnId, threadItem, notification.method === "item/completed");
         return;
       }
       case "item/reasoning/summaryTextDelta":
@@ -374,14 +414,26 @@ export class TurnLifecycle {
         const turnId = getString(turn, "id");
         if (!turnId) return;
         const status = getString(turn, "status") ?? "completed";
+        if (status === "failed" && !this.#turnErrors.has(turnId)) {
+          this.#hooks.emitFailure?.({
+            code: "agent_error",
+            agentId,
+            turnId,
+            provider: source.provider,
+            model: this.#hooks.turnModel(agentId, turnId),
+            causeCode: classifyFailure(getRecord(turn, "error")),
+          });
+        }
         this.#attention.clearForTurn(threadId, turnId);
         if (this.#compaction.isCompactionTurn(threadId, turnId)) {
           this.#compaction.finish(agentId, threadId, status);
           return;
         }
-        void this.#completeTurn(agentId, threadId, turnId, status).catch((error) => {
-          this.#hooks.emitError("turn_completion_failed", error, agentId);
-        });
+        yield* this.#completeTurn(agentId, threadId, turnId, status).pipe(
+          Effect.catch((failure) =>
+            Effect.sync(() => this.#hooks.emitError("turn_completion_failed", failure.cause, agentId)),
+          ),
+        );
         return;
       }
       case "thread/tokenUsage/updated": {
@@ -395,7 +447,7 @@ export class TurnLifecycle {
         return;
       }
       case "account/rateLimits/updated": {
-        this.#providers.refreshCodexUsage();
+        yield* this.#providers.refreshCodexUsage();
         return;
       }
       case USAGE_LIMIT_METHOD: {
@@ -420,7 +472,7 @@ export class TurnLifecycle {
         if (isRecord(params) && params.willRetry === true) return;
         // A usage limit shows no banner, but the failed delivery still keeps it as the reason.
         const errorTurnId = getString(params, "turnId");
-        if (notification.method === "error" && message && errorTurnId && this.#runningTurns.has(errorTurnId)) {
+        if (notification.method === "error" && errorTurnId && this.#runningTurns.has(errorTurnId)) {
           this.#turnErrors.set(errorTurnId, message);
           // The turn's completion runs it again or reports it in words the user can act on.
           if (isForeignReasoningError(message)) return;
@@ -437,15 +489,36 @@ export class TurnLifecycle {
           if (planLimit && notification.method === "error" && errorTurnId && this.#runningTurns.has(errorTurnId)) {
             this.#limitedTurns.set(errorTurnId, this.#limitedTurns.get(errorTurnId) ?? null);
           }
-          this.#providers.refreshUsageAfterLimit(source);
+          this.#hooks.emitFailure?.({
+            code: "agent_error",
+            ...(agentId !== undefined ? { agentId } : {}),
+            turnId: errorTurnId,
+            provider: source.provider,
+            model: agentId && errorTurnId ? this.#hooks.turnModel(agentId, errorTurnId) : null,
+            causeCode: classifyFailure(error ?? message),
+            severity: notification.method === "warning" ? "warning" : "error",
+          });
+          yield* this.#providers.refreshUsageAfterLimit(source);
           return;
         }
-        this.#hooks.emitError(`agent_${notification.method}`, message, agentId);
+        this.#hooks.emitError(`agent_${notification.method}`, message, agentId, {
+          causeCode: classifyFailure(error ?? message),
+          provider: source.provider,
+          model: agentId && errorTurnId ? this.#hooks.turnModel(agentId, errorTurnId) : null,
+          turnId: errorTurnId,
+          severity: notification.method === "warning" ? "warning" : "error",
+        });
       }
     }
-  }
+  }).bind(this);
 
-  async #completeTurn(agentId: string, threadId: string, turnId: string, status: string): Promise<void> {
+  readonly #completeTurn = Effect.fn("TurnLifecycle.completeTurn")(function* (
+    this: TurnLifecycle,
+    agentId: string,
+    threadId: string,
+    turnId: string,
+    status: string,
+  ) {
     const running = this.#runningTurns.get(turnId);
     this.#runningTurns.delete(turnId);
     const reportedError = this.#turnErrors.get(turnId);
@@ -460,8 +533,9 @@ export class TurnLifecycle {
     const resetsAt = this.#limitedTurns.get(turnId) ?? null;
     this.#limitedTurns.delete(turnId);
     this.#deltas.flushTurn(turnId);
-    await this.#images.waitForOperations(threadId, turnId);
-    await this.#turnAssociations.get(turnId)?.catch(() => undefined);
+    yield* this.#images.waitForOperations(threadId, turnId);
+    const association = this.#turnAssociations.get(turnId);
+    if (association) yield* Deferred.await(association).pipe(Effect.catch(() => Effect.void));
     this.#memories.finishTurn(turnId, status);
     // A refused session is closed below, and a spent plan would refuse the summary turn too, so
     // neither is compacted.
@@ -478,7 +552,7 @@ export class TurnLifecycle {
       !this.#conversation.isExecutionThread(snapshot.threadId) &&
       deliveries.every(({ delivery }) => !this.#refusedRetries.has(delivery.id));
     if (retry) {
-      await this.#retryRefusedTurn(agentId, threadId, turnId, snapshot, deliveries);
+      yield* this.#retryRefusedTurn(agentId, threadId, turnId, snapshot, deliveries);
       return;
     }
     // The plan refused the turn before it did anything that a second run would repeat, so its
@@ -497,53 +571,59 @@ export class TurnLifecycle {
     // The limit belongs to the model the turn ran on, which the agent may have left since.
     const model = this.#hooks.turnModel(agentId, turnId);
     if (requeue) {
-      await this.#requeueTurn(agentId, threadId, turnId, snapshot, deliveries);
+      yield* this.#requeueTurn(agentId, threadId, turnId, snapshot, deliveries);
       // After the requeue, so a routine set to skip finds its run back in the queue.
-      this.#usageLimits.reached(agentId, resetsAt, model);
+      yield* this.#usageLimits.reached(agentId, resetsAt, model);
       this.#hooks.scheduleDrain(agentId);
       return;
     }
-    if (limited) this.#usageLimits.reached(agentId, resetsAt, model);
-    else if (status === "completed") this.#usageLimits.completed(agentId, model);
+    if (limited) yield* this.#usageLimits.reached(agentId, resetsAt, model);
+    else if (status === "completed") yield* this.#usageLimits.completed(agentId, model);
     // After the limit is recorded, so the channel does not assign the task to this agent again
     // before the reset. A channel that took the task back ends this turn as interrupted.
-    const outcome =
-      repeatable && channelTurn && deliveries.every(({ delivery }) => this.#hooks.requeueChannelDelivery(delivery.id))
-        ? "interrupted"
-        : status;
+    let requeued = repeatable && channelTurn;
+    for (const { delivery } of requeued ? deliveries : []) {
+      if (yield* this.#hooks.requeueChannelDelivery(delivery.id)) continue;
+      requeued = false;
+      break;
+    }
+    const outcome = requeued ? "interrupted" : status;
     if (outcome === "failed") this.#failedTurns.set(agentId, turnId);
     else this.#failedTurns.delete(agentId);
     const failure = refused
       ? sourceText("error.provider.foreignReasoning", { provider: providerLabel(running.client.provider) })
       : reportedError;
-    if (refused) this.#hooks.emitError("agent_error", failure, agentId);
+    if (refused) {
+      yield* this.#hooks.dropRefusedSession(agentId, threadId);
+      this.#hooks.emitError("agent_error", failure, agentId);
+    }
     if (deliveries.some((delivery) => delivery.delivery.sender.kind === "agent")) {
       dropPlaceholderAnswers(snapshot, turnId);
     }
-    const latestAssistant = [...snapshot.messages]
-      .reverse()
-      .find(
-        (message) =>
-          message.author === "assistant" &&
-          message.turnId === turnId &&
-          message.itemType !== "commentary" &&
-          message.itemType !== "question_prompt" &&
-          message.itemType !== CONVERSATION_PLAN_ITEM_TYPE &&
-          message.text.trim(),
-      );
+    // Only a turn that ran nothing but scheduled routine runs: a person who wrote in the same turn,
+    // or who started a Test, script or webhook run, waits for the answer.
+    const quiet =
+      outcome === "completed" &&
+      deliveries.length > 0 &&
+      !this.#conversation.isExecutionThread(snapshot.threadId) &&
+      deliveries.every(
+        ({ delivery }) => delivery.sender.kind === "routine" && this.#hooks.quietRoutineDelivery(delivery.id),
+      ) &&
+      settleQuietRoutineTurn(snapshot, turnId);
+    const latestAssistant = latestTurnAnswer(snapshot.messages, turnId);
     if (deliveries.length > 0) {
       const terminal = outcome === "failed" ? "failed" : outcome === "interrupted" ? "interrupted" : "completed";
       for (const delivery of deliveries) {
         this.#refusedRetries.delete(delivery.delivery.id);
         const reason = terminal === "failed" && failure ? this.#hooks.redactMcp(failure) : null;
-        await this.#mailbox.markTerminal(delivery.delivery.id, terminal, reason);
+        yield* this.#mailbox.markTerminal(delivery.delivery.id, terminal, reason).pipe(toTurnOperationFailed);
         this.#mailboxSync.syncDeliveryMessage(snapshot, delivery.delivery.id);
       }
       // A turn can start with the answers of several teammates. `#relayAgentResult` skips each one
       // that wants no answer, so only a teammate that asked for a result gets one.
       if (!this.#conversation.isExecutionThread(snapshot.threadId) && terminal === "completed" && latestAssistant) {
         for (const delivery of deliveries)
-          await this.#relayAgentResult(agentId, turnId, delivery, latestAssistant.text);
+          yield* this.#relayAgentResult(agentId, turnId, delivery, latestAssistant.text);
       }
       // The requester holds the answers of the other teammates until each request has ended, so
       // this end can release them, also when this turn failed and sends no result.
@@ -551,9 +631,27 @@ export class TurnLifecycle {
         if (delivery.sender.kind === "agent") this.#hooks.scheduleDrain(delivery.sender.agentId);
       }
     }
-    if (latestAssistant && !this.#conversation.isExecutionThread(snapshot.threadId)) {
-      await this.#store.updatePreview(agentId, latestAssistant.text);
+    // Each run start saved the earlier preview; a quiet turn puts back the oldest one, unless
+    // something else changed the preview since. Every turn takes its entries, so none stays behind.
+    const savedPreviews = deliveries.flatMap(({ delivery }) =>
+      delivery.sender.kind === "routine" ? (this.#hooks.takeRoutinePreview(delivery.id) ?? []) : [],
+    );
+    // A routine run that answered only the no-update marker, also a Test run that shows it in the
+    // chat, does not put the marker in the preview.
+    const markerAnswer =
+      latestAssistant !== undefined &&
+      deliveries.some(({ delivery }) => delivery.sender.kind === "routine") &&
+      isNoUpdateAnswer(latestAssistant.text);
+    if (latestAssistant && !markerAnswer && !this.#conversation.isExecutionThread(snapshot.threadId)) {
+      yield* this.#store.updatePreview(agentId, latestAssistant.text).pipe(toTurnOperationFailed);
       this.#hooks.emit({ type: "agents-changed", agents: this.#hooks.listAgents() });
+    } else if (quiet || (markerAnswer && !this.#conversation.isExecutionThread(snapshot.threadId))) {
+      const saved = savedPreviews[0];
+      const current = this.#store.list().find((entry) => entry.id === agentId)?.preview;
+      if (saved && current === savedPreviews.at(-1)?.shown) {
+        yield* this.#store.updatePreview(agentId, saved.previous).pipe(toTurnOperationFailed);
+        this.#hooks.emit({ type: "agents-changed", agents: this.#hooks.listAgents() });
+      }
     }
     this.#conversation.emitConversation(snapshot, "turn.completed", { turnId, status: outcome });
     if (deliveries.length > 0) {
@@ -571,11 +669,11 @@ export class TurnLifecycle {
       turnId,
       status: outcome,
       origin: deliveries[0]?.delivery.sender.kind ?? "unknown",
+      ...(quiet ? { quiet: true as const } : {}),
     });
-    if (refused) this.#hooks.dropRefusedSession(agentId, threadId);
-    if (shouldCompact) await this.#compaction.request(agentId, threadId);
+    if (shouldCompact) yield* this.#compaction.request(agentId, threadId);
     else this.#hooks.scheduleDrain(agentId);
-  }
+  }, Effect.uninterruptible);
 
   /**
    * Queues the deliveries of a turn once more, after the provider refused the session's history.
@@ -583,29 +681,31 @@ export class TurnLifecycle {
    * session repeats nothing. The turn ends as interrupted, which no one is told of as a failure,
    * and the queued delivery starts again at once.
    */
-  async #retryRefusedTurn(
+  readonly #retryRefusedTurn = Effect.fn("TurnLifecycle.retryRefusedTurn")(function* (
+    this: TurnLifecycle,
     agentId: string,
     threadId: string,
     turnId: string,
     snapshot: ConversationSnapshot,
     deliveries: readonly DeliveryContext[],
-  ): Promise<void> {
+  ) {
     for (const { delivery } of deliveries) this.#refusedRetries.add(delivery.id);
-    await this.#requeueTurn(agentId, threadId, turnId, snapshot, deliveries);
-    this.#hooks.dropRefusedSession(agentId, threadId);
+    yield* this.#requeueTurn(agentId, threadId, turnId, snapshot, deliveries);
+    yield* this.#hooks.dropRefusedSession(agentId, threadId);
     this.#hooks.scheduleDrain(agentId);
-  }
+  }, Effect.uninterruptible);
 
   /** Puts the deliveries of a turn the provider refused back at their place in the queue, and ends the turn as interrupted. */
-  async #requeueTurn(
+  readonly #requeueTurn = Effect.fn("TurnLifecycle.requeueTurn")(function* (
+    this: TurnLifecycle,
     agentId: string,
     threadId: string,
     turnId: string,
     snapshot: ConversationSnapshot,
     deliveries: readonly DeliveryContext[],
-  ): Promise<void> {
+  ) {
     for (const { delivery } of deliveries) {
-      await this.#mailbox.requeueRefused(delivery.id);
+      yield* this.#mailbox.requeueRefused(delivery.id).pipe(toTurnOperationFailed);
       this.#mailboxSync.syncDeliveryMessage(snapshot, delivery.id);
     }
     this.#conversation.emitConversation(snapshot, "turn.completed", { turnId, status: "interrupted" });
@@ -623,7 +723,7 @@ export class TurnLifecycle {
       status: "interrupted",
       origin: deliveries[0]?.delivery.sender.kind ?? "unknown",
     });
-  }
+  }, Effect.uninterruptible);
 
   #markProduced(turnId: string, acted: boolean): void {
     const running = this.#runningTurns.get(turnId);
@@ -632,21 +732,34 @@ export class TurnLifecycle {
     if (acted) running.acted = true;
   }
 
-  async #associateStartedTurn(agentId: string, turnId: string, snapshot: ConversationSnapshot): Promise<void> {
-    const deliveries = this.#mailbox.startingDeliveriesForAgent(agentId);
+  readonly #associateStartedTurn = Effect.fn("TurnLifecycle.associateStartedTurn")(function* (
+    this: TurnLifecycle,
+    agentId: string,
+    turnId: string,
+    snapshot: ConversationSnapshot,
+  ) {
+    const deliveries = yield* turnStep(() => this.#mailbox.startingDeliveriesForAgent(agentId));
     if (deliveries.length === 0) return;
-    try {
+    yield* Effect.gen({ self: this }, function* () {
       for (const { delivery } of deliveries) {
-        await this.#mailbox.markRunning(delivery.id, turnId);
-        this.#mailboxSync.syncDeliveryMessage(snapshot, delivery.id);
+        yield* this.#mailbox.markRunning(delivery.id, turnId).pipe(toTurnOperationFailed);
+        yield* turnStep(() => this.#mailboxSync.syncDeliveryMessage(snapshot, delivery.id));
       }
-      this.#mailboxSync.emitQueue(agentId);
-    } catch (error) {
-      this.#hooks.emitError("delivery_turn_association_failed", error, agentId);
-    }
-  }
+      yield* turnStep(() => this.#mailboxSync.emitQueue(agentId));
+    }).pipe(
+      Effect.catch((failure) =>
+        Effect.sync(() => this.#hooks.emitError("delivery_turn_association_failed", failure.cause, agentId)),
+      ),
+    );
+  }, Effect.uninterruptible);
 
-  async #relayAgentResult(agentId: string, turnId: string, delivery: DeliveryContext, text: string): Promise<void> {
+  readonly #relayAgentResult = Effect.fn("TurnLifecycle.relayAgentResult")(function* (
+    this: TurnLifecycle,
+    agentId: string,
+    turnId: string,
+    delivery: DeliveryContext,
+    text: string,
+  ) {
     if (delivery.delivery.sender.kind !== "agent") return;
     const messageId = delivery.delivery.messageId;
     const originAgentId = this.#mailbox.chainOriginAgentId(messageId);
@@ -662,16 +775,18 @@ export class TurnLifecycle {
     )
       return;
 
-    await this.#mailbox.enqueue({
-      sender: { kind: "agent", agentId },
-      recipientAgentIds: [recipientAgentId],
-      text,
-      replyToMessageId: messageId,
-      // The requested result, not a new request. The chain-origin guard above already stops a
-      // second relay; this is what tells the recipient it owes no acknowledgement for one.
-      expectsReply: false,
-      idempotencyKey: `auto-result:${turnId}:${messageId}`,
-    });
+    yield* this.#mailbox
+      .enqueue({
+        sender: { kind: "agent", agentId },
+        recipientAgentIds: [recipientAgentId],
+        text,
+        replyToMessageId: messageId,
+        // The requested result, not a new request. The chain-origin guard above already stops a
+        // second relay; this is what tells the recipient it owes no acknowledgement for one.
+        expectsReply: false,
+        idempotencyKey: `auto-result:${turnId}:${messageId}`,
+      })
+      .pipe(toTurnOperationFailed);
     const senderSnapshot = this.#conversation.snapshotToUpdate(agentId);
     if (senderSnapshot) {
       this.#mailboxSync.syncMailboxMessages(senderSnapshot);
@@ -679,12 +794,19 @@ export class TurnLifecycle {
     }
     this.#mailboxSync.emitQueue(recipientAgentId);
     this.#hooks.scheduleDrain(recipientAgentId);
-  }
+  }, Effect.uninterruptible);
 
-  #applyItem(agentId: string, threadId: string, turnId: string, item: ThreadItem, completed: boolean): void {
+  readonly #applyItem = Effect.fn("TurnLifecycle.applyItem")(function* (
+    this: TurnLifecycle,
+    agentId: string,
+    threadId: string,
+    turnId: string,
+    item: ThreadItem,
+    completed: boolean,
+  ) {
     const usage = completed ? toolUsage(item) : null;
     if (usage) this.#hooks.emitToolUsage({ ...usage, agentId, turnId });
-    if (this.#images.handleItem(agentId, threadId, turnId, item, completed)) return;
+    if (yield* this.#images.handleItem(agentId, threadId, turnId, item, completed)) return;
     const toolProgress = toolProgressText(item, completed);
     if (toolProgress) {
       this.#emitTurnProgress(agentId, this.#conversation.publicThreadId(agentId, threadId), turnId, toolProgress);
@@ -702,7 +824,7 @@ export class TurnLifecycle {
     message.status = completed ? "completed" : "streaming";
     this.#itemTurns.set(item.id, turnId);
     this.#conversation.emitConversation(snapshot);
-  }
+  });
 
   /**
    * Shows a turn's plan as one message, which each update replaces. The first update places it in
@@ -774,6 +896,12 @@ function dropPlaceholderAnswers(snapshot: ConversationSnapshot, turnId: string):
     snapshot.messages.splice(index, 1);
   }
 }
+
+export class TurnOperationFailed extends Schema.TaggedError<TurnOperationFailed>()("TurnOperationFailed", {
+  cause: Schema.Defect(),
+}) {}
+
+const { sync: turnStep, rewrap: toTurnOperationFailed } = causeHelpers(TurnOperationFailed);
 
 /**
  * Whether running the turn again would repeat this item: a tool step, or answer text. Thinking and

@@ -2,6 +2,7 @@ import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import type {
   AgentApproval,
   AgentEvent,
+  AgentModelOption,
   AgentRuntimeApproval,
   AgentStatus,
   AgentSummary,
@@ -10,6 +11,7 @@ import type {
   BrowserTab,
   BrowserTakeoverRequest,
   ConversationPage,
+  HostedServerIssue,
   HostedServerSleep,
   QueueSnapshot,
   RespondToApprovalInput,
@@ -20,8 +22,8 @@ import type {
   TeamRealtimeEvent,
 } from "@openbot/contracts/ipc";
 import { cleanAgentMessageText } from "@openbot/team-client/agent-message-text";
-import { WAKE_RECONNECT_DELAY_MS } from "@openbot/team-client/hosted-server-wake";
 import type { RemoteTeamHost } from "@openbot/team-client/remote-directory";
+import { createRemoteConnectionRecovery, type RemoteRecoveryStatus } from "@openbot/team-client/remote-recovery";
 import { reconcilePendingRequests } from "@openbot/team-client/runtime-attention";
 import { currentText } from "@openbot/ui/text";
 import { createEffect, createMemo, createSignal, createStore, onSettled } from "solid-js";
@@ -31,25 +33,24 @@ import { createSidebarPreferences } from "../sidebar/sidebar-preferences";
 import { defaultSidebarLayout } from "../sidebar/sidebar-sections";
 import { createHostRestartToasts } from "../updates/host-restart-toast";
 import type { WebHostNotice } from "./web-host-connections";
+import { createWebHostLifecycle } from "./web-host-lifecycle";
 import type { WebHostState } from "./web-host-lock";
-import { createWebHostedServerWake } from "./web-hosted-server-wake";
 import {
   createWebWorkspaceRuntime,
+  WebHostConnectionError,
   WebHostIncompatibleError,
   type WebRuntimeEvents,
   type WebWorkspaceRuntime,
 } from "./web-runtime";
 import { orderWebHosts, readWebServerOrder, writeWebServerOrder } from "./web-server-order";
+import { readWebServerSelection, writeWebServerSelection } from "./web-server-selection";
 
 interface WebConversation {
   page: ConversationPage | null;
   draft: string;
   attachments: AttachmentSummary[];
   loading: boolean;
-  sending: boolean;
-  uncertain: boolean;
-  /** Why the last send failed. The composer shows it; it is not a workspace error. */
-  sendError: string | null;
+  error?: string | null;
 }
 interface WebWorkspaceState {
   hosts: RemoteTeamHost[];
@@ -78,6 +79,14 @@ interface WebWorkspaceState {
    * starts after the user's input (`waking`). Cleared when it is online again.
    */
   hostedSleep: HostedServerSleep | null;
+  hostedIssue: HostedServerIssue | null;
+  connectionError: string | null;
+  recovery: RemoteRecoveryStatus | null;
+  workspaceLoaded: boolean;
+  panelsFailed: boolean;
+  panelsLoading: boolean;
+  agentStatus: AgentStatus | null;
+  models: AgentModelOption[];
   /** The opened host said it restarts into an update (`host-update-v1`). Cleared when it is online again. */
   hostRestart: { state: "waiting" | "restarting"; version: string | null } | null;
   /** The state of each host that this tab has not opened, from its status connection. */
@@ -103,17 +112,14 @@ interface WebWorkspaceState {
   duplicatingAgentIds: string[];
   sidebarLayout: SidebarLayoutSnapshot;
 }
-/** A host restarts in under a minute; the retries stop after three. */
-const HOST_RESTART_RETRY_MS = 5_000;
-const HOST_RESTART_RETRY_LIMIT = 36;
-/** A sleeping server can start for a routine. The tab asks the account service again after this long. */
-const SLEEP_RECHECK_MS = 5 * 60_000;
 
 export type WebRuntimeFactory = (
   accountId: string,
   events: WebRuntimeEvents,
   accountFetch: typeof fetch,
 ) => WebWorkspaceRuntime;
+
+export type WebWorkspace = ReturnType<typeof createWebWorkspace>;
 
 export function createWebWorkspace(
   props: {
@@ -148,6 +154,14 @@ export function createWebWorkspace(
     capabilities: [],
     status: "offline",
     hostedSleep: null,
+    hostedIssue: null,
+    connectionError: null,
+    recovery: null,
+    workspaceLoaded: false,
+    panelsFailed: false,
+    panelsLoading: false,
+    agentStatus: null,
+    models: [],
     hostRestart: null,
     hostStates: {},
     incompatibility: null,
@@ -171,11 +185,14 @@ export function createWebWorkspace(
   let pendingReload = false;
   let reloadPromise: Promise<void> | null = null;
   let hostsRefreshPromise: Promise<void> | null = null;
+  /**
+   * The hosts this account left. The leave revokes this session and takes the host out of the list;
+   * neither is an error. An id stays until a list without its host arrives.
+   */
+  const leftHostIds = new Set<string>();
   let acceptedInvite: { inviteUrl: string; host: RemoteTeamHost } | null = null;
   /** Set when a revoked session connects again by itself; cleared when the host is online. */
   let revokedReconnect = false;
-  /** The next reconnect to a host that restarts into an update. The opened host has no other retry. */
-  let restartRetry: ReturnType<typeof setTimeout> | null = null;
   /** The queue read in flight by agent. An event during a read asks for one more read. */
   const queueLoads = new Map<string, { generation: number; again: boolean }>();
   /** Counts queue snapshots from events by agent. A read that started before a newer snapshot is dropped. */
@@ -185,16 +202,60 @@ export function createWebWorkspace(
   const conversationReads = new Map<string, number>();
   const heldDeltas = new Map<string, Array<Extract<AgentEvent, { type: "conversation-delta" }>>>();
   const hostEventListeners = new Set<(event: AgentEvent | TeamRealtimeEvent) => void>();
-  const hostedServer = createWebHostedServerWake(props.accountFetch);
-  let wakeReconnectTimer: number | undefined;
-  let sleepRecheckTimer: number | undefined;
-  /** Removes the listeners that wait for the user's input while the opened server sleeps. */
-  let stopWaitingForInput: (() => void) | null = null;
+  let connectionPromise: { hostId: string; opened: boolean; promise: Promise<void> } | null = null;
+  let recoveryBlocked = false;
+  let recovery = makeRecovery();
+  function makeRecovery() {
+    return createRemoteConnectionRecovery(
+      async () => {
+        const host = state.host;
+        if (!host || document.hidden) return;
+        await attemptConnection(host);
+        if (state.status !== "online") throw new Error(currentText().t("webClient.notice.connecting"));
+      },
+      () => {},
+      (status) => {
+        if (!disposed)
+          setState((draft) => {
+            draft.recovery = status;
+          });
+      },
+    );
+  }
+  function recover() {
+    if (disposed || !hostId || recoveryBlocked) return;
+    recovery.offline();
+    recovery.setActive(!document.hidden);
+  }
+  const hostLifecycle = createWebHostLifecycle({
+    accountFetch: props.accountFetch,
+    hostId: () => hostId,
+    disposed: () => disposed,
+    status: () => state.status,
+    hostedSleep: () => state.hostedSleep,
+    setHostedSleep,
+    setIssue: (issue) =>
+      setState((draft) => {
+        draft.hostedIssue = issue;
+      }),
+    suspend: () => {
+      recoveryBlocked = true;
+      recovery.suspend();
+    },
+    recover: () => {
+      recoveryBlocked = false;
+      recovery.refresh();
+      recover();
+    },
+  });
   const hostNoticeListeners = new Set<(hostId: string, event: WebHostNotice, agents: AgentSummary[]) => void>();
   const runtime = (props.createRuntime ?? createWebWorkspaceRuntime)(
     props.accountId,
     {
       accountChanged: props.onSessionCheck,
+      accessDenied(id, error) {
+        if (!disposed && id === hostId) blockAccess(error);
+      },
       hostNotice(id, event, agents) {
         if (disposed) return;
         for (const listener of hostNoticeListeners) listener(id, event, agents);
@@ -208,52 +269,45 @@ export function createWebWorkspace(
       hostSessionRevoked: () => void retryHosts(),
       connection(update) {
         if (disposed || update.hostId !== hostId) return;
+        if (recoveryBlocked && update.state === "offline" && !update.code) return;
+        // A host that announced a restart comes back by itself; a wake is only for a stopped server.
+        const unavailable = update.state === "offline" && !update.code && !state.hostRestart;
         setState((draft) => {
-          draft.status = update.state;
-          draft.error = update.message;
+          if (update.state !== "online") draft.status = update.state;
+          if (update.state !== "online")
+            draft.connectionError = currentText().t("server.connection.reconnecting", { name: draft.host?.name ?? "" });
+          // The lifecycle shows the message of an unavailable host only when the host does not sleep or wake.
+          if (update.code)
+            draft.connectionError = currentText().t(
+              update.code === "session_revoked"
+                ? "webClient.error.accessEnded"
+                : "server.compatibility.unsafeDataDescription",
+            );
           if (update.state !== "online") {
             draft.approvals = [];
             draft.prompts = [];
             draft.progress = {};
             draft.takeovers = [];
-            draft.browserTabs = [];
-            draft.activeBrowserTabId = null;
             draft.browserControlState = { sessions: [] };
-            draft.sidebarLayout = defaultSidebarLayout();
             draft.duplicatingAgentIds = [];
           }
         });
+        if (update.state === "offline") generation += 1;
+        if (update.code) {
+          hostLifecycle.endSleep();
+          recoveryBlocked = true;
+          recovery.suspend();
+        }
         if (update.code === "session_revoked") {
-          // A revoked session must not leave private conversations visible while the directory
-          // decides whether this membership still exists. Keep the host shell for a possible
-          // authorized reconnect, but invalidate every private read and pending action now.
-          generation += 1;
-          selectedId = null;
-          setState((draft) => {
-            draft.revocationRevision += 1;
-            draft.agents = [];
-            draft.agentsLoaded = false;
-            draft.conversations = {};
-            draft.queues = {};
-            draft.selectedId = null;
-            draft.approvals = [];
-            draft.prompts = [];
-            draft.progress = {};
-            draft.takeovers = [];
-            draft.browserTabs = [];
-            draft.activeBrowserTabId = null;
-            draft.browserControlState = { sessions: [] };
-            draft.sidebarLayout = defaultSidebarLayout();
-            draft.capabilities = [];
-            draft.presence = null;
-            draft.duplicatingAgentIds = [];
-          });
+          clearRevokedWorkspace();
           const revokedHostId = hostId;
           const revokedGeneration = generation;
+          const revokedConnection = connectionPromise?.promise;
           void props
             .onSessionCheck()
             .then(() => refreshHosts())
-            .then(() => {
+            .then(async () => {
+              await revokedConnection?.catch(() => undefined);
               // A member or role change anywhere on the host revokes every session, this one
               // too. The directory still lists the host, so this account can connect again.
               // Try once: a second revocation before the host is online waits for Reconnect.
@@ -267,19 +321,13 @@ export function createWebWorkspace(
             .catch(report);
           return;
         }
-        // A host that announced a restart comes back by itself; a wake is only for a stopped server.
-        if (update.state === "offline" && !update.code && !state.hostRestart) hostUnavailable(update.hostId);
-        if (update.state === "online") {
-          revokedReconnect = false;
-          endSleep();
-        } else if (state.hostRestart) retryAfterRestart();
-        if (update.state === "online" && update.resync) {
-          // A host that still waits to restart says so again when the connection declares capabilities.
-          setState((draft) => {
-            draft.hostRestart = null;
+        if (unavailable) {
+          const current = generation;
+          void hostLifecycle.hostUnavailable(update.hostId, connectionPromise?.opened ?? false).then((retry) => {
+            if (retry && !disposed && current === generation) recover();
           });
-          void resync();
-        }
+        } else if (state.hostRestart && update.state === "offline") recover();
+        if (update.state === "online" && update.resync && !connectionPromise) recover();
       },
       event(id, event) {
         if (disposed || id !== hostId) return;
@@ -500,9 +548,13 @@ export function createWebWorkspace(
         if (refreshHostId && !hosts.some((host) => host.hostId === refreshHostId)) {
           generation += 1;
           hostId = null;
+          recovery.dispose();
+          recovery = makeRecovery();
+          hostLifecycle.endSleep();
           selectedId = null;
           setState((draft) => {
             draft.host = null;
+            draft.workspaceLoaded = false;
             draft.memberId = null;
             draft.selectedId = null;
             draft.agents = [];
@@ -520,7 +572,7 @@ export function createWebWorkspace(
             draft.duplicatingAgentIds = [];
             draft.capabilities = [];
             draft.status = "offline";
-            draft.error = currentText().t("webClient.error.accessEnded");
+            draft.error = leftHostIds.has(refreshHostId) ? null : currentText().t("webClient.error.accessEnded");
           });
           // First, so the host that left does not get a status connection when it stops being open.
           runtime.hosts?.setHosts(hosts);
@@ -537,8 +589,13 @@ export function createWebWorkspace(
           draft.hostsLoaded = true;
           draft.hostsError = null;
         });
-        const first = orderWebHosts(hosts, serverOrder())[0];
-        if (!hostId && first) await connect(first);
+        for (const left of leftHostIds) if (!hosts.some((host) => host.hostId === left)) leftHostIds.delete(left);
+        if (!hostId) {
+          const savedHostId = readWebServerSelection(props.accountId);
+          const initialHost =
+            hosts.find((host) => host.hostId === savedHostId) ?? orderWebHosts(hosts, serverOrder())[0];
+          if (initialHost) await connect(initialHost);
+        }
         // After the opened host, so it takes its Signal connection before the status connections.
         if (!disposed) runtime.hosts?.setHosts(hosts);
       } catch (error) {
@@ -567,57 +624,33 @@ export function createWebWorkspace(
     );
     return promise;
   }
+  /**
+   * Leaves a joined host. The host leaves the list as it does when access ends, but without an error.
+   * Resolves when the membership is gone. The list read follows it, so a failed read or the connect
+   * to the next host is not a failed leave.
+   */
+  async function leaveHost(host: RemoteTeamHost): Promise<void> {
+    await departHost(host, () => runtime.leaveHost(host.hostId, host.membershipId));
+  }
+  async function removeOwnedHost(host: RemoteTeamHost): Promise<void> {
+    const remove = runtime.removeOwnedHost;
+    if (!remove) throw new Error(currentText().t("server.settings.actionFailed"));
+    await departHost(host, () => remove(host.hostId));
+  }
+  async function departHost(host: RemoteTeamHost, operation: () => Promise<void>): Promise<void> {
+    // Before the request: the host revokes this session before the request answers.
+    leftHostIds.add(host.hostId);
+    try {
+      await operation();
+    } catch (error) {
+      leftHostIds.delete(host.hostId);
+      throw error;
+    }
+    // A read that started before the leave can still list the host, so this read starts after it.
+    void (hostsRefreshPromise ?? Promise.resolve()).catch(() => undefined).then(retryHosts);
+  }
   function retryHosts(): Promise<void> {
     return refreshHosts().catch(() => undefined);
-  }
-  /**
-   * The opened host is offline. A hosted server that the account service stopped for no use waits for the
-   * user's input. Another stopped hosted server starts, and the tab connects again. A server that starts
-   * already is asked to start again, with no status read in between.
-   */
-  function hostUnavailable(id: string): void {
-    const starting = state.hostedSleep === "waking";
-    void (starting ? hostedServer.wake(id) : Promise.resolve(false)).then(async (waking) => {
-      const availability = waking ? "waking" : await hostedServer.unavailable(id);
-      if (disposed || hostId !== id || state.status === "online") return;
-      // The 5-minute recheck can find that the server does not sleep now, so input does not wake it.
-      if (availability !== "sleeping") stopWaitingForInput?.();
-      setHostedSleep(availability === "sleeping" ? "sleeping" : availability === "waking" ? "waking" : null);
-      if (availability === "waking") reconnectAfterWake(id);
-      else if (availability === "sleeping") waitForInput(id);
-    });
-  }
-  function reconnectAfterWake(id: string): void {
-    window.clearTimeout(wakeReconnectTimer);
-    wakeReconnectTimer = window.setTimeout(() => {
-      if (!disposed && hostId === id && state.status === "offline") void reconnect().catch(report);
-    }, WAKE_RECONNECT_DELAY_MS);
-  }
-  /** The next key or pointer press in the tab starts the sleeping server. */
-  function waitForInput(id: string): void {
-    stopWaitingForInput?.();
-    const onInput = () => {
-      stopWaitingForInput?.();
-      if (disposed || hostId !== id || state.status === "online") return;
-      setHostedSleep("waking");
-      void hostedServer.wakeForInput(id).then((waking) => {
-        if (disposed || hostId !== id || state.status === "online") return;
-        if (waking) reconnectAfterWake(id);
-        else {
-          setHostedSleep(null);
-          hostUnavailable(id);
-        }
-      });
-    };
-    window.addEventListener("pointerdown", onInput, true);
-    window.addEventListener("keydown", onInput, true);
-    sleepRecheckTimer = window.setTimeout(() => hostUnavailable(id), SLEEP_RECHECK_MS);
-    stopWaitingForInput = () => {
-      window.removeEventListener("pointerdown", onInput, true);
-      window.removeEventListener("keydown", onInput, true);
-      window.clearTimeout(sleepRecheckTimer);
-      stopWaitingForInput = null;
-    };
   }
   function setHostedSleep(hostedSleep: HostedServerSleep | null): void {
     if (state.hostedSleep !== hostedSleep)
@@ -625,29 +658,58 @@ export function createWebWorkspace(
         draft.hostedSleep = hostedSleep;
       });
   }
-  function endSleep(): void {
-    stopWaitingForInput?.();
-    setHostedSleep(null);
+  function clearRevokedWorkspace(): void {
+    // A revoked session must not leave private conversations visible while the directory
+    // decides whether this membership still exists. Keep the host shell for a possible
+    // authorized reconnect, but invalidate every private read and pending action now.
+    generation += 1;
+    selectedId = null;
+    setState((draft) => {
+      draft.revocationRevision += 1;
+      draft.workspaceLoaded = false;
+      draft.agents = [];
+      draft.agentsLoaded = false;
+      draft.conversations = {};
+      draft.queues = {};
+      draft.selectedId = null;
+      draft.approvals = [];
+      draft.prompts = [];
+      draft.progress = {};
+      draft.takeovers = [];
+      draft.browserTabs = [];
+      draft.activeBrowserTabId = null;
+      draft.browserControlState = { sessions: [] };
+      draft.sidebarLayout = defaultSidebarLayout();
+      draft.capabilities = [];
+      draft.presence = null;
+      draft.duplicatingAgentIds = [];
+    });
   }
-
-  /** `connect` clears `hostRestart`, so the retries count down instead of reading it again. */
-  function retryAfterRestart(retries = HOST_RESTART_RETRY_LIMIT): void {
-    if (restartRetry || disposed || retries <= 0) return;
-    const retryHostId = hostId;
-    restartRetry = setTimeout(() => {
-      restartRetry = null;
-      if (disposed || hostId !== retryHostId || state.status === "online") return;
-      void reconnect()
-        .catch(() => undefined)
-        .then(() => {
-          if (!disposed && hostId === retryHostId && state.status !== "online") retryAfterRestart(retries - 1);
-        });
-    }, HOST_RESTART_RETRY_MS);
+  function blockAccess(error: unknown): boolean {
+    if (
+      !(error instanceof WebHostConnectionError) ||
+      (error.code !== "authentication_required" && error.code !== "access_ended")
+    )
+      return false;
+    clearRevokedWorkspace();
+    hostLifecycle.endSleep();
+    recoveryBlocked = true;
+    recovery.suspend();
+    setState((draft) => {
+      draft.status = "offline";
+      draft.connectionError = error.message;
+    });
+    return true;
   }
   async function reconnect(): Promise<void> {
-    const host = state.hosts.find((listed) => listed.hostId === state.host?.hostId) ?? state.host;
-    if (!host || state.status === "connecting") return;
-    await connect({ ...host });
+    const host = state.hosts.find((listed) => listed.hostId === hostId) ?? state.host;
+    if (!host || connectionPromise) return;
+    if (state.hostedSleep === "sleeping" || state.hostedIssue) await hostLifecycle.retry();
+    else {
+      await props.onSessionCheck();
+      recoveryBlocked = false;
+      await connect(host);
+    }
   }
   async function joinInvite(inviteUrl: string): Promise<void> {
     const normalizedInviteUrl = inviteUrl.trim();
@@ -663,17 +725,43 @@ export function createWebWorkspace(
     acceptedInvite = null;
   }
   async function connect(host: RemoteTeamHost) {
-    if (state.status === "connecting") return;
+    recoveryBlocked = false;
+    recovery.dispose();
+    recovery = makeRecovery();
+    if (!connectionPromise || connectionPromise.hostId !== host.hostId) hostLifecycle.endSleep();
+    try {
+      await attemptConnection(host, true);
+    } catch {
+      if (!disposed && hostId === host.hostId && state.recovery?.phase !== "suspended") recover();
+    }
+  }
+  function attemptConnection(host: RemoteTeamHost, opened = false): Promise<void> {
+    if (connectionPromise?.hostId === host.hostId) return connectionPromise.promise;
+    const promise = connectWorkspace(host, opened).finally(() => {
+      if (connectionPromise?.promise === promise) connectionPromise = null;
+    });
+    connectionPromise = { hostId: host.hostId, opened, promise };
+    return promise;
+  }
+  async function connectWorkspace(host: RemoteTeamHost, opened: boolean) {
     const current = ++generation;
     const sameHost = hostId === host.hostId;
     // A hosted server that sleeps or wakes keeps the workspace visible, so each retry keeps its agents and the selection.
-    const keepWorkspace = sameHost && state.hostedSleep !== null;
+    const keepWorkspace = sameHost && state.workspaceLoaded;
     const previousSelected = sameHost ? selectedId : null;
     hostId = host.hostId;
+    writeWebServerSelection(props.accountId, host.hostId);
     if (!keepWorkspace) selectedId = null;
-    if (!sameHost) endSleep();
+    if (!sameHost) hostLifecycle.endSleep();
     setState((draft) => {
       draft.host = host;
+      draft.recovery = null;
+      draft.connectionError = null;
+      if (!sameHost) {
+        draft.workspaceLoaded = false;
+        draft.agentStatus = null;
+        draft.models = [];
+      }
       draft.status = "connecting";
       draft.hostRestart = null;
       draft.memberId = sameHost ? draft.memberId : null;
@@ -686,50 +774,47 @@ export function createWebWorkspace(
         draft.conversations = {};
         draft.queues = {};
         draft.hiddenIds = [];
-      } else {
-        for (const item of Object.values(draft.conversations)) {
-          if (item.sending) {
-            item.sending = false;
-            item.uncertain = true;
-          }
-        }
       }
       draft.approvals = [];
       draft.prompts = [];
-      draft.progress = {};
       draft.takeovers = [];
-      draft.browserTabs = [];
-      draft.activeBrowserTabId = null;
       draft.browserControlState = { sessions: [] };
-      draft.sidebarLayout = defaultSidebarLayout();
-      draft.duplicatingAgentIds = [];
-      draft.capabilities = [];
-      draft.presence = null;
+      if (!keepWorkspace) {
+        draft.progress = {};
+        draft.browserTabs = [];
+        draft.activeBrowserTabId = null;
+        draft.sidebarLayout = defaultSidebarLayout();
+        draft.duplicatingAgentIds = [];
+        draft.capabilities = [];
+        draft.presence = null;
+      }
       draft.error = null;
       draft.incompatibility = null;
     });
     try {
       const capabilities = await runtime.connect(host);
-      const agents = await runtime.listAgents();
-      const [browserTabs, sidebarLayout] = await Promise.all([
-        capabilities.includes("browser-control") ? runtime.browserTabs() : Promise.resolve([]),
-        readSidebarLayout(
-          capabilities,
-          agents.map((agent) => agent.id),
-        ),
+      const [agents, agentStatus, models] = await Promise.all([
+        runtime.listAgents(),
+        runtime.status(),
+        runtime.models(),
       ]);
       if (disposed || current !== generation) return;
       revokedReconnect = false;
-      endSleep();
+      hostLifecycle.endSleep();
       setState((draft) => {
         draft.capabilities = capabilities;
         draft.agents = agents;
         draft.agentsLoaded = true;
+        draft.workspaceLoaded = true;
+        draft.agentStatus = agentStatus;
+        draft.models = models;
+        draft.connectionError = null;
         draft.status = "online";
-        draft.browserTabs = browserTabs;
-        draft.activeBrowserTabId = browserTabs[0]?.id ?? null;
-        if (sidebarLayout.revision >= draft.sidebarLayout.revision) draft.sidebarLayout = sidebarLayout;
       });
+      void loadPanels(
+        capabilities,
+        agents.map((agent) => agent.id),
+      );
       preferences.reconcileActiveServerPins(agents.map((agent) => agent.id));
       for (const agent of agents) loadQueue(agent.id);
       void runtime
@@ -767,12 +852,63 @@ export function createWebWorkspace(
             hostProtocol: { ...error.hostProtocol },
           };
       });
-      if (!(error instanceof WebHostIncompatibleError)) {
-        report(error);
-        hostUnavailable(host.hostId);
+      if (blockAccess(error)) throw error;
+      if (error instanceof WebHostIncompatibleError || error instanceof WebHostConnectionError) {
+        hostLifecycle.endSleep();
+        recoveryBlocked = true;
+        recovery.suspend();
+        setState((draft) => {
+          draft.connectionError = error.message;
+        });
+      } else {
+        setState((draft) => {
+          draft.connectionError = currentText().t("server.connection.reconnecting", { name: host.name });
+        });
+        await hostLifecycle.hostUnavailable(host.hostId, opened);
       }
+      throw error;
     }
   }
+  async function loadPanels(capabilities = state.capabilities, agentIds = state.agents.map((agent) => agent.id)) {
+    const current = generation;
+    const isCurrent = () => !disposed && current === generation;
+    setState((draft) => {
+      draft.panelsFailed = false;
+      draft.panelsLoading = true;
+    });
+    const failed = () => {
+      if (isCurrent())
+        setState((draft) => {
+          draft.panelsFailed = true;
+        });
+    };
+    await Promise.all([
+      (capabilities.includes("browser-control") ? runtime.browserTabs() : Promise.resolve([]))
+        .then((browserTabs) => {
+          if (!isCurrent()) return;
+          setState((draft) => {
+            draft.browserTabs = browserTabs;
+            draft.activeBrowserTabId = browserTabs.some((tab) => tab.id === draft.activeBrowserTabId)
+              ? draft.activeBrowserTabId
+              : (browserTabs[0]?.id ?? null);
+          });
+        })
+        .catch(failed),
+      readSidebarLayout(capabilities, agentIds)
+        .then((layout) => {
+          if (isCurrent())
+            setState((draft) => {
+              if (layout.revision >= draft.sidebarLayout.revision) draft.sidebarLayout = layout;
+            });
+        })
+        .catch(failed),
+    ]);
+    if (isCurrent())
+      setState((draft) => {
+        draft.panelsLoading = false;
+      });
+  }
+
   async function load(id: string, older = false) {
     const current = generation;
     const previous = state.conversations[id];
@@ -813,7 +949,18 @@ export function createWebWorkspace(
           revision: older && old ? old.revision : page.revision,
         };
         item.loading = false;
+        item.error = null;
       });
+    } catch (error) {
+      if (!disposed && current === generation && !blockAccess(error))
+        setState((draft) => {
+          const item = draft.conversations[id];
+          if (item) {
+            item.loading = false;
+            item.error = currentText().t("webClient.error.requestFailed");
+          }
+        });
+      throw error;
     } finally {
       const reads = (conversationReads.get(id) ?? 1) - 1;
       if (reads > 0) conversationReads.set(id, reads);
@@ -911,19 +1058,15 @@ export function createWebWorkspace(
         draft: "",
         attachments: [],
         loading: true,
-        sending: false,
-        uncertain: false,
-        sendError: null,
       };
+      draft.conversations[id].loading = true;
+      draft.conversations[id].error = null;
     });
     try {
       await load(id);
     } catch (error) {
       if (disposed || current !== generation) return;
       report(error);
-      setState((draft) => {
-        if (draft.conversations[id]) draft.conversations[id].loading = false;
-      });
     }
   }
   async function resync() {
@@ -971,68 +1114,33 @@ export function createWebWorkspace(
       reloadPromise = null;
     }
   }
-  async function send(textOverride?: string, attachmentsOverride?: string[], replyToMessageId: string | null = null) {
-    const id = selectedId;
-    if (!id || state.status !== "online") return false;
-    const item = state.conversations[id];
-    if (
-      !item ||
-      item.sending ||
-      item.uncertain ||
-      (!(textOverride ?? item.draft).trim() && !(attachmentsOverride ?? item.attachments).length)
-    )
-      return false;
+  /**
+   * Sends one message to an agent of the open host. The chat shows it as pending and the answer says
+   * whether it arrived; a failure is never resent here. `clientMessageId` lets the host drop a retry.
+   */
+  async function send(
+    id: string,
+    text: string,
+    attachmentDraftIds: string[],
+    replyToMessageId: string | null = null,
+    clientMessageId?: string,
+  ): Promise<{ messageId: string } | { error: string }> {
+    const { t, errorMessage } = currentText();
+    if (state.status !== "online") return { error: t("chat.errorStatus.send") };
+    if (text.length > INPUT_LIMITS.messageText) return { error: t("webClient.error.messageTooLong") };
     const current = generation;
-    const text = textOverride ?? item.draft;
-    if (text.length > INPUT_LIMITS.messageText) {
-      setState((draft) => {
-        const conversation = draft.conversations[id];
-        if (conversation) conversation.sendError = currentText().t("webClient.error.messageTooLong");
-      });
-      return false;
-    }
-    setState((draft) => {
-      const conversation = draft.conversations[id];
-      if (!conversation) return;
-      conversation.sending = true;
-      conversation.sendError = null;
-    });
+    let messageId: string;
     try {
-      await runtime.send(
-        id,
-        text,
-        attachmentsOverride ?? item.attachments.map((attachment) => attachment.id),
-        replyToMessageId,
-      );
-      if (current !== generation || disposed) return false;
-      setState((draft) => {
-        const value = draft.conversations[id];
-        if (!value) return;
-        value.draft = "";
-        value.attachments = [];
-      });
-      try {
-        await refresh();
-      } catch (error) {
-        if (current === generation) report(error);
-      }
-      return true;
-    } catch {
-      if (current !== generation || disposed) return false;
-      setState((draft) => {
-        const conversation = draft.conversations[id];
-        if (!conversation) return;
-        conversation.uncertain = true;
-        conversation.sendError = currentText().t("webClient.error.deliveryUnconfirmed");
-      });
-      return false;
-    } finally {
-      if (current === generation && !disposed)
-        setState((draft) => {
-          const conversation = draft.conversations[id];
-          if (conversation) conversation.sending = false;
-        });
+      messageId = await runtime.send(id, text, attachmentDraftIds, replyToMessageId, clientMessageId);
+    } catch (error) {
+      return { error: errorMessage(error, t("webClient.error.deliveryUnconfirmed")) };
     }
+    // The next pending send of the chat waits for this answer, so the history reload runs beside it.
+    if (current === generation && !disposed)
+      refresh().catch((error: unknown) => {
+        if (current === generation) report(error);
+      });
+    return { messageId };
   }
   /** Marks the selected agent's messages read through the newest loaded one. Writes for one agent run in order. */
   function markRead() {
@@ -1103,17 +1211,36 @@ export function createWebWorkspace(
       void props
         .onSessionCheck()
         .then(() => refreshHosts())
-        .then(() => refresh())
+        .then(() => {
+          if (state.status === "online") return resync();
+          if (state.recovery?.phase !== "suspended") recover();
+        })
         .catch(report);
     };
+    const visibility = () => {
+      if (document.hidden) {
+        hostLifecycle.cancelPending();
+        if (hostId && state.status !== "online") generation += 1;
+        recovery.setActive(false);
+      } else {
+        hostLifecycle.resume();
+        if (state.status !== "online" && state.recovery?.phase !== "suspended") recover();
+      }
+    };
+    const network = () => {
+      if (!document.hidden) recovery.networkRestored();
+    };
+    document.addEventListener("visibilitychange", visibility);
+    window.addEventListener("online", network);
     window.addEventListener("focus", focus);
     return () => {
       disposed = true;
       generation += 1;
-      window.clearTimeout(wakeReconnectTimer);
-      stopWaitingForInput?.();
+      recovery.dispose();
+      hostLifecycle.dispose();
+      document.removeEventListener("visibilitychange", visibility);
+      window.removeEventListener("online", network);
       acceptedInvite = null;
-      if (restartRetry) clearTimeout(restartRetry);
       window.removeEventListener("focus", focus);
       void runtime.dispose({ sessionsEnded: props.accountSessionEnded?.() ?? false }).catch(() => undefined);
     };
@@ -1121,6 +1248,7 @@ export function createWebWorkspace(
   return {
     state,
     profiles,
+    retryPanels: loadPanels,
     selected,
     conversation,
     runtime,
@@ -1146,6 +1274,8 @@ export function createWebWorkspace(
     },
     run,
     refreshHosts,
+    leaveHost,
+    removeOwnedHost,
     retryHosts,
     reconnect,
     joinInvite,
@@ -1314,16 +1444,6 @@ export function createWebWorkspace(
         setState((draft) => {
           const conversation = draft.conversations[id];
           if (conversation) conversation.draft = text;
-        });
-    },
-    acknowledgeSend() {
-      const id = selectedId;
-      if (id)
-        setState((draft) => {
-          const conversation = draft.conversations[id];
-          if (!conversation) return;
-          conversation.uncertain = false;
-          conversation.sendError = null;
         });
     },
     async upload(file: File) {

@@ -34,6 +34,8 @@ export const messages = defineMessages("error.agent", {
     "No {provider} model is available now. Call list_models to see the available models.",
   "error.agent.reasoningEffortUnsupported":
     'Model "{model}" does not support reasoning effort "{effort}". Supported efforts: {efforts}.',
+  "error.agent.noStartingModelInSettings":
+    "{provider} has no model available, and no other signed-in provider has one. Sign in to a provider, or change the default provider in Server settings → Providers.",
   "error.agent.noStartingModel":
     "{provider} has no model available, and no other signed-in provider has one. Sign in to a provider, or change the default provider in Providers & permissions.",
   "error.agent.waitBeforeProviderChange": "Wait for the active turn and queue to finish before changing provider.",
@@ -77,6 +79,8 @@ export const messages = defineMessages("error.agent", {
   "error.agent.queueEditRejected": "Queue edit rejected: {reason}",
   "error.agent.computerUseLocalOnly": "Computer Use can only be changed on the computer that runs the agent.",
   "error.agent.automationLocalOnly": "Local scripts can only be allowed on the computer that runs the agent.",
+  "error.agent.busyMessageModeLocalOnly":
+    "What messages do while the agent works can only be set on the computer that runs the agent.",
   "error.agent.automationOff": "This agent does not allow local scripts to run its routines.",
   "error.agent.automationPayloadTooLong": "The payload is longer than {limit} characters.",
   "error.agent.automationRateLimited":

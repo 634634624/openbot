@@ -2,7 +2,8 @@ import type { ClientSideConnection, InitializeResponse } from "@agentclientproto
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import { type DynamicRecord, isNumber } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
-import { AcpAgentClient } from "./acp-client";
+import { Effect } from "effect";
+import { AcpAgentClient, type AcpHistoryPersistence } from "./acp-client";
 import type { GrokCliInfo } from "./cli";
 import type {
   McpAuthorizationSource,
@@ -12,6 +13,7 @@ import type {
 } from "./mcp-provider-shapes";
 import { confineSpawnTarget, grokStatePaths, type ProcessConfinement } from "./process-confinement";
 import { type AccountRateLimitsReadResult, getRecord, getString } from "./protocol";
+import { providerCall } from "./provider-client-effects";
 
 export class GrokAgentClient extends AcpAgentClient {
   constructor(
@@ -24,6 +26,7 @@ export class GrokAgentClient extends AcpAgentClient {
     mcpAuthorization?: McpAuthorizationSource,
     confinement?: ProcessConfinement,
     agentEnvironment?: () => Readonly<Record<string, string>>,
+    history?: AcpHistoryPersistence,
   ) {
     super(cli, requestTimeoutMs, {
       provider: "grok",
@@ -42,21 +45,27 @@ export class GrokAgentClient extends AcpAgentClient {
       ],
       env: { GROK_OAUTH2_REFERRER: "openbot" },
       ...(agentEnvironment ? { extraEnv: () => ({ ...agentEnvironment() }) } : {}),
+      history,
       signInMessage: sourceText("error.provider.grokSignIn"),
       authenticate,
-      readAccount: async (connection) => grokAccount(await connection.extMethod("_x.ai/auth/info", {})),
-      readRateLimits: async (connection) => grokRateLimits(await connection.extMethod("_x.ai/billing", {})),
+      readAccount: (connection) =>
+        providerCall(() => connection.extMethod("_x.ai/auth/info", {})).pipe(Effect.map(grokAccount)),
+      readRateLimits: (connection) =>
+        providerCall(() => connection.extMethod("_x.ai/billing", {})).pipe(Effect.map(grokRateLimits)),
     });
   }
 }
 
-async function authenticate(connection: ClientSideConnection, initialization: InitializeResponse): Promise<void> {
+const authenticate = Effect.fn("Grok.authenticate")(function* (
+  connection: ClientSideConnection,
+  initialization: InitializeResponse,
+) {
   const authMethod = process.env.XAI_API_KEY?.trim() ? "xai.api_key" : "cached_token";
   const advertised = initialization.authMethods ?? [];
   const selected =
     advertised.find((method) => method.id === authMethod) ?? advertised.find((method) => method.id === "cached_token");
-  if (selected) await connection.authenticate({ methodId: selected.id });
-}
+  if (selected) yield* providerCall(() => connection.authenticate({ methodId: selected.id }));
+});
 
 function grokAccount(value: unknown): { email: string | null } {
   const email = getString(value, "email");

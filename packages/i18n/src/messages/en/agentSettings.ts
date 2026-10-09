@@ -5,6 +5,16 @@ export const messages = defineMessages("agentSettings", {
   "agentSettings.title": "Settings",
   "agentSettings.backToDetails": "Back to details",
   "agentSettings.closeDetails": "Close details",
+  "agentSettings.backToSettings": "Back to settings",
+  "agentSettings.profile.title": "Profile",
+  "agentSettings.profile.open": "Edit profile of {name}",
+  "agentSettings.instructionsEdit": "Edit instructions",
+  "agentSettings.permissions.title": "Permissions",
+  "agentSettings.advanced.title": "Advanced",
+  "agentSettings.groups.brain": "Brain",
+  "agentSettings.groups.knows": "Knows",
+  "agentSettings.groups.does": "Does",
+  "agentSettings.groups.rules": "Rules",
   "agentSettings.saveFailed": "Could not save agent settings.",
 
   "agentSettings.name": "Name",
@@ -37,15 +47,17 @@ export const messages = defineMessages("agentSettings", {
   "agentSettings.avatar.saveFailed": "Could not save the agent avatar.",
   "agentSettings.avatar.processFailed": "Could not process the agent avatar.",
 
-  "agentSettings.runtime.title": "Runtime",
   "agentSettings.runtime.model": "Agent model",
   "agentSettings.runtime.modelBusy": "Wait for the current work to finish before changing models.",
   "agentSettings.runtime.modelUnavailable": "Models are available after an agent CLI connects.",
   "agentSettings.runtime.reasoning": "Reasoning",
   "agentSettings.runtime.reasoningLabel": "Agent reasoning level",
   "agentSettings.runtime.selectReasoning": "Select reasoning",
+  "agentSettings.runtime.reasoningSetByProvider": "Set by {provider}",
   "agentSettings.runtime.access": "Access",
   "agentSettings.runtime.accessLabel": "Agent access",
+  "agentSettings.runtime.busyMessage": "While working",
+  "agentSettings.runtime.busyMessageLabel": "Messages while the agent works",
   "agentSettings.runtime.workingDirectory": "Working directory",
   "agentSettings.runtime.notAvailable": "Not available yet",
   "agentSettings.runtime.fullAccessNote":
@@ -57,9 +69,14 @@ export const messages = defineMessages("agentSettings", {
 
   "agentSettings.access.workspace": "Workspace only",
   "agentSettings.access.full": "Full access",
+  "agentSettings.busyMessage.appDefaultQueue": "App default (Queue)",
+  "agentSettings.busyMessage.appDefaultSteer": "App default (Steer)",
+  "agentSettings.busyMessage.queue": "Queue",
+  "agentSettings.busyMessage.steer": "Steer",
+  "agentSettings.busyMessage.steerUnsupported":
+    "{provider} cannot steer a running turn. Messages sent while it works wait in the queue.",
 
   "agentSettings.notifications.title": "Notifications",
-  "agentSettings.notifications.description": "Get notified when this agent finishes or needs input",
 
   "agentSettings.newChat.title": "New chat",
   "agentSettings.newChat.description": "The agent forgets this chat. Its setup stays.",

@@ -17,13 +17,6 @@ export const messages = {
   "server.compatibility.negotiatedProtocol": "Protocole négocié",
   "server.compatibility.unknown": "Inconnu",
   "server.compatibility.none": "Aucun",
-  "server.compatibility.versionMismatchTitle": "Versions d’OpenBot différentes sur {name}",
-  "server.compatibility.versionMismatchDescription":
-    "La connexion utilise le protocole {protocol}. Certaines fonctions récentes peuvent être indisponibles. Client {clientVersion} ; hôte {hostVersion}.",
-  "server.compatibility.versionMismatchUpdateHostDescription":
-    "Mettez à jour OpenBot sur {name} pour utiliser toutes les fonctions. La connexion utilise le protocole {protocol}. Client {clientVersion} ; hôte {hostVersion}.",
-  "server.compatibility.versionMismatchUpdateClientDescription":
-    "Mettez à jour cette application OpenBot pour utiliser toutes les fonctions. La connexion utilise le protocole {protocol}. Client {clientVersion} ; hôte {hostVersion}.",
   "server.join.title": "Rejoindre un serveur",
   "server.join.verifiedFrom": "Invitation vérifiée de {hostname}.",
   "server.join.pasteToContinue": "Collez un lien d’invitation pour continuer.",
@@ -45,7 +38,6 @@ export const messages = {
   "server.join.account": "Compte",
   "server.join.emailBound": "Cette invitation fonctionne uniquement pour son destinataire e-mail.",
   "server.join.unknownDate": "Inconnue",
-  "server.role.owner": "Propriétaire",
   "server.role.admin": "Admin",
   "server.role.member": "Membre",
   "server.mute.for15Minutes": "Pendant 15 minutes",
@@ -81,16 +73,24 @@ export const messages = {
   "server.rail.notificationSettings": "Réglages des notifications",
   "server.rail.usage": "Utilisation",
   "server.rail.settings": "Réglages du serveur",
+  "server.rail.leave": "Quitter le serveur",
+  "server.rail.delete": "Supprimer le serveur",
   "server.select.failedTitle": "Impossible de sélectionner le serveur",
   "server.select.failedDescription": "Impossible de changer de serveur. Réessayez.",
   "server.select.openAgentFailed": "Impossible d’ouvrir {name}. Retrouvez-le dans la barre latérale.",
-  "server.scope.agentsLoadFailed": "Impossible de charger les agents. Vérifiez la connexion au serveur et réessayez.",
   "server.settings.unavailable": "Ce serveur n’est pas disponible.",
   "server.settings.identityRefreshFailed": "Impossible d’actualiser l’identité du serveur.",
   "server.settings.loadFailed": "Impossible de charger les réglages du serveur.",
   "server.settings.identityLocalOnly":
     "Le nom et le logo de ce serveur ne peuvent changer que sur l’ordinateur qui l’exécute.",
   "server.settings.publicationLocalOnly": "Seul le serveur local peut changer la publication.",
+  "server.compatibility.versionMismatchTitle": "Versions d’OpenBot différentes sur {name}",
+  "server.compatibility.versionMismatchDescription":
+    "La connexion utilise le protocole {protocol}. Certaines fonctions récentes peuvent être indisponibles. Client {clientVersion} ; hôte {hostVersion}.",
+  "server.compatibility.versionMismatchUpdateHostDescription":
+    "Mettez à jour OpenBot sur {name} pour utiliser toutes les fonctions. La connexion utilise le protocole {protocol}. Client {clientVersion} ; hôte {hostVersion}.",
+  "server.compatibility.versionMismatchUpdateClientDescription":
+    "Mettez à jour cette application OpenBot pour utiliser toutes les fonctions. La connexion utilise le protocole {protocol}. Client {clientVersion} ; hôte {hostVersion}.",
   "server.connection.failedTitle": "La connexion a échoué",
   "server.connection.failedDescription":
     "Impossible de se connecter à ce serveur. Vérifiez que l’hôte est en ligne et réessayez.",
@@ -100,6 +100,7 @@ export const messages = {
   "server.import.tryAgain": "Réessayez.",
   "server.import.readFailed": "Impossible de lire l’export.",
   "server.import.applyFailed": "L’import ne s’est pas terminé.",
+  "server.role.owner": "Propriétaire",
   "server.settings.generalTitle": "Général",
   "server.settings.generalDescription": "Gérez l’identité de ce serveur et son accès publié.",
   "server.settings.membersTitle": "Membres",
@@ -190,6 +191,9 @@ export const messages = {
   "server.members.actionsFor": "Actions pour {name}",
   "server.members.makeMember": "Définir comme membre",
   "server.members.makeAdmin": "Définir comme admin",
+  "server.members.makeAdminTitle": "Définir {name} comme admin ?",
+  "server.members.makeMemberTitle": "Définir {name} comme membre ?",
+  "server.members.roleChangeDescription": "{name} peut être déconnecté de ce serveur et devra alors se reconnecter.",
   "server.invite.invalidEmail": "Saisissez une adresse e-mail valide.",
   "server.invite.title": "Inviter des personnes",
   "server.invite.description":
@@ -234,6 +238,9 @@ export const messages = {
   },
   "server.invite.expires": "Expire le {date}",
   "server.invite.revoke": "Révoquer",
+  "server.invite.revokeTitle": "Révoquer cette invitation ?",
+  "server.invite.revokeDescription":
+    "L’invitation ne fonctionne plus. Les personnes qui l’ont utilisée restent membres.",
   "server.desktop.accessTitle": "Accès au bureau à distance",
   "server.desktop.gatewayDescription":
     "Chaque membre actif du serveur peut contrôler cet hôte. Il n’y a pas de mot de passe distinct pour le bureau à distance.",

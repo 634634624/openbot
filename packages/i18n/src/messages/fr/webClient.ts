@@ -17,12 +17,9 @@ export const messages = {
   "webClient.pane.chat": "Discussion",
   "webClient.pane.workspace": "Espace de travail",
   "webClient.notice.connecting": "Connexion à votre ordinateur",
-  "webClient.notice.disconnected": "Votre ordinateur est déconnecté",
   "webClient.notice.findingHosts": "Recherche de vos ordinateurs",
   "webClient.notice.hostsFailed": "Impossible de charger vos ordinateurs",
   "webClient.notice.connectComputer": "Connectez votre ordinateur",
-  "webClient.notice.keepOpen":
-    "Gardez OpenBot ouvert sur votre ordinateur. Votre brouillon reste ici pendant la reconnexion.",
   "webClient.connect.description":
     "Lancez OpenBot sur votre ordinateur pour discuter avec vos agents depuis ce navigateur. Vous pouvez aussi rejoindre un ordinateur avec une invitation.",
   "webClient.connect.stepInstall": "Installez et ouvrez OpenBot sur votre ordinateur.",
@@ -30,19 +27,12 @@ export const messages = {
   "webClient.connect.stepRemote": "Activez l’accès à distance.",
   "webClient.notice.download": "Télécharger OpenBot",
   "webClient.notice.join": "Rejoindre avec une invitation",
-  "webClient.notice.reconnect": "Se reconnecter",
   "webClient.notice.refreshHosts": "Actualiser les hôtes",
-  "webClient.uncertain.title": "Vérifiez si votre message est arrivé",
-  "webClient.uncertain.description":
-    "La connexion s’est terminée avant la confirmation de la livraison. Actualisez et vérifiez la conversation avant d’envoyer à nouveau. Votre message ne sera pas renvoyé automatiquement.",
-  "webClient.uncertain.refresh": "Actualiser la conversation",
-  "webClient.uncertain.checked": "J’ai vérifié la conversation",
   "webClient.agent.modelsFailed": "Impossible de charger les modèles de l’hôte.",
   "webClient.agent.refreshFailed":
     "L’agent a été créé, mais l’espace de travail n’a pas pu être actualisé. Rechargez avant de réessayer.",
   "webClient.agent.unconfirmed":
     "Le résultat n’est pas confirmé. Fermez ce formulaire et vérifiez l’hôte avant de réessayer.",
-  "webClient.error.hostStatus": "Impossible de lire l’état de l’hôte.",
   "webClient.error.usageOffline": "Connectez-vous à votre hôte pour voir l’utilisation.",
   "webClient.error.desktopOnly": "Cette action est disponible dans l’application de bureau.",
   "webClient.settings.preferences.title": "Préférences",

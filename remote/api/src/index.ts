@@ -1,55 +1,298 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { z } from "zod";
+import { Context, Effect, Layer, ManagedRuntime, Schema } from "effect";
 import { createRemoteApiApp, prometheusMetrics } from "./app";
 import { readRemoteApiConfig } from "./config";
+import { DiscordGateway } from "./discord-gateway";
 import { SignalService } from "./signal-service";
-import { RemoteTokenService, signServiceRequest } from "./tokens";
+import { TelegramBotApi } from "./telegram";
+import {
+  RemoteTokenError,
+  RemoteTokenService,
+  signServiceRequest,
+  type TelegramChatLink,
+  TelegramFileTokens,
+} from "./tokens";
 
 const config = readRemoteApiConfig();
-/** A request to the account service, signed with the auth webhook secret. */
-const askControlPlane = (path: string, payload: unknown) => {
-  const body = JSON.stringify(payload);
-  const timestamp = Math.floor(Date.now() / 1_000).toString();
-  return fetch(new URL(path, config.controlPlaneUrl), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "OpenBot-Timestamp": timestamp,
-      "OpenBot-Signature": signServiceRequest(body, timestamp, config.authWebhookSecret),
-    },
-    body,
-    signal: AbortSignal.timeout(5_000),
+class ControlPlaneError extends Schema.TaggedError<ControlPlaneError>()("ControlPlaneError", {
+  message: Schema.String,
+}) {}
+
+const ResumeValidation = Schema.Struct({ valid: Schema.Boolean });
+const SlackValidation = Schema.Struct({ teams: Schema.Array(Schema.String) });
+const TelegramValidation = Schema.Struct({
+  chats: Schema.Array(Schema.Struct({ id: Schema.String, botId: Schema.String, linkedAt: Schema.Int })),
+});
+const TelegramLink = Schema.Struct({ hostId: Schema.String, linkedAt: Schema.Int });
+const DiscordValidation = Schema.Struct({ guilds: Schema.Array(Schema.String) });
+const WebhookValidation = Schema.Struct({ routes: Schema.Array(Schema.String) });
+
+class ControlPlane extends Context.Service<
+  ControlPlane,
+  {
+    validateResume(claims: import("./protocol").RemoteTicketClaims): Effect.Effect<boolean, ControlPlaneError>;
+    validateSlackRoute(
+      hostId: string,
+      teams: import("@openbot/contracts/signal-protocol/slack-route").SlackRouteTeam[],
+    ): Effect.Effect<string[], ControlPlaneError>;
+    validateTelegramRoute(
+      hostId: string,
+      chats: import("@openbot/contracts/signal-protocol/telegram-route").TelegramRouteChat[],
+    ): Effect.Effect<
+      import("@openbot/contracts/signal-protocol/telegram-route").TelegramRouteChat[],
+      ControlPlaneError
+    >;
+    // `null` when the code is not valid (404) or the chat is linked to another host (409).
+    linkTelegramChat(
+      botId: string,
+      chatId: string,
+      code: string,
+    ): Effect.Effect<TelegramChatLink | null, ControlPlaneError>;
+    validateDiscordRoute(
+      hostId: string,
+      guilds: import("@openbot/contracts/signal-protocol/discord-route").DiscordRouteGuild[],
+    ): Effect.Effect<string[], ControlPlaneError>;
+    validateWebhookRoute(
+      hostId: string,
+      routes: import("@openbot/contracts/signal-protocol/webhook-route").WebhookRoute[],
+    ): Effect.Effect<string[], ControlPlaneError>;
+    discordGuildRemoved(guildId: string): Effect.Effect<void, ControlPlaneError>;
+    reconcileDiscordGuilds(guildIds: string[], before: number): Effect.Effect<void, ControlPlaneError>;
+  }
+>()("@openbot/remote-api/ControlPlane") {
+  static layer = Layer.sync(ControlPlane, () => {
+    const ask = Effect.fn("ControlPlane.request")((path: string, payload: unknown) =>
+      Effect.tryPromise({
+        try: (signal) => {
+          const body = JSON.stringify(payload);
+          const timestamp = Math.floor(Date.now() / 1_000).toString();
+          return fetch(new URL(path, config.controlPlaneUrl), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "OpenBot-Timestamp": timestamp,
+              "OpenBot-Signature": signServiceRequest(body, timestamp, config.authWebhookSecret),
+            },
+            body,
+            signal: AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
+          });
+        },
+        catch: () => new ControlPlaneError({ message: "The account service request failed." }),
+      }),
+    );
+    const readJson = (response: Response) =>
+      Effect.tryPromise({
+        try: () => response.json(),
+        catch: () => new ControlPlaneError({ message: "The account service response is invalid." }),
+      });
+    const releaseResponse = (response: Response) => {
+      const body = response.body;
+      return body
+        ? Effect.tryPromise({ try: () => body.cancel(), catch: () => undefined }).pipe(Effect.catch(() => Effect.void))
+        : Effect.void;
+    };
+    return ControlPlane.of({
+      validateResume: Effect.fn("ControlPlane.validateResume")((claims) =>
+        Effect.acquireUseRelease(
+          ask("/v2/remote/resume/validate", claims),
+          (response) =>
+            Effect.gen(function* () {
+              if (!response.ok) return false;
+              const result = yield* readJson(response).pipe(
+                Effect.flatMap(Schema.decodeUnknownEffect(ResumeValidation)),
+                Effect.mapError(() => new ControlPlaneError({ message: "The account service response is invalid." })),
+              );
+              return result.valid;
+            }),
+          releaseResponse,
+        ),
+      ),
+      validateSlackRoute: Effect.fn("ControlPlane.validateSlackRoute")((hostId, teams) =>
+        Effect.acquireUseRelease(
+          ask("/v2/remote/slack-route/validate", { hostId, teams }),
+          (response) =>
+            Effect.gen(function* () {
+              if (!response.ok)
+                return yield* new ControlPlaneError({
+                  message: "The account service did not confirm the Slack route.",
+                });
+              const result = yield* readJson(response).pipe(
+                Effect.flatMap(Schema.decodeUnknownEffect(SlackValidation)),
+                Effect.mapError(() => new ControlPlaneError({ message: "The account service response is invalid." })),
+              );
+              return [...result.teams];
+            }),
+          releaseResponse,
+        ),
+      ),
+      validateDiscordRoute: Effect.fn("ControlPlane.validateDiscordRoute")((hostId, guilds) =>
+        Effect.acquireUseRelease(
+          ask("/v2/remote/discord-route/validate", { hostId, guilds }),
+          (response) =>
+            Effect.gen(function* () {
+              if (!response.ok)
+                return yield* new ControlPlaneError({
+                  message: "The account service did not confirm the Discord route.",
+                });
+              const result = yield* readJson(response).pipe(
+                Effect.flatMap(Schema.decodeUnknownEffect(DiscordValidation)),
+                Effect.mapError(() => new ControlPlaneError({ message: "The account service response is invalid." })),
+              );
+              return [...result.guilds];
+            }),
+          releaseResponse,
+        ),
+      ),
+      validateWebhookRoute: Effect.fn("ControlPlane.validateWebhookRoute")((hostId, routes) =>
+        Effect.acquireUseRelease(
+          ask("/v2/remote/webhook-route/validate", { hostId, routes }),
+          (response) =>
+            Effect.gen(function* () {
+              if (!response.ok)
+                return yield* new ControlPlaneError({
+                  message: "The account service did not confirm the webhook route.",
+                });
+              const result = yield* readJson(response).pipe(
+                Effect.flatMap(Schema.decodeUnknownEffect(WebhookValidation)),
+                Effect.mapError(() => new ControlPlaneError({ message: "The account service response is invalid." })),
+              );
+              return [...result.routes];
+            }),
+          releaseResponse,
+        ),
+      ),
+      reconcileDiscordGuilds: Effect.fn("ControlPlane.reconcileDiscordGuilds")((guildIds, before) =>
+        Effect.acquireUseRelease(
+          ask("/v2/remote/discord-route/reconcile", { guilds: guildIds, before }),
+          (response) =>
+            response.ok
+              ? Effect.void
+              : Effect.fail(
+                  new ControlPlaneError({ message: "The account service did not reconcile the Discord guilds." }),
+                ),
+          releaseResponse,
+        ),
+      ),
+      discordGuildRemoved: Effect.fn("ControlPlane.discordGuildRemoved")((guildId) =>
+        Effect.acquireUseRelease(
+          ask("/v2/remote/discord-route/removed", { guildId }),
+          (response) =>
+            response.ok
+              ? Effect.void
+              : Effect.fail(
+                  new ControlPlaneError({ message: "The account service did not unlink the Discord guild." }),
+                ),
+          releaseResponse,
+        ),
+      ),
+      validateTelegramRoute: Effect.fn("ControlPlane.validateTelegramRoute")((hostId, chats) =>
+        Effect.acquireUseRelease(
+          ask("/v2/remote/telegram-route/validate", {
+            hostId,
+            chats: chats.map(({ id, botId, linkedAt }) => ({ id, botId, linkedAt })),
+          }),
+          (response) =>
+            Effect.gen(function* () {
+              if (!response.ok)
+                return yield* new ControlPlaneError({
+                  message: "The account service did not confirm the Telegram route.",
+                });
+              const result = yield* readJson(response).pipe(
+                Effect.flatMap(Schema.decodeUnknownEffect(TelegramValidation)),
+                Effect.mapError(() => new ControlPlaneError({ message: "The account service response is invalid." })),
+              );
+              return [...result.chats];
+            }),
+          releaseResponse,
+        ),
+      ),
+      linkTelegramChat: Effect.fn("ControlPlane.linkTelegramChat")((botId, chatId, code) =>
+        Effect.acquireUseRelease(
+          ask("/v2/remote/telegram-route/link", { botId, chatId, code }),
+          (response) =>
+            Effect.gen(function* () {
+              if (response.status === 404 || response.status === 409) return null;
+              if (!response.ok)
+                return yield* new ControlPlaneError({ message: "The account service did not link the Telegram chat." });
+              const result = yield* readJson(response).pipe(
+                Effect.flatMap(Schema.decodeUnknownEffect(TelegramLink)),
+                Effect.mapError(() => new ControlPlaneError({ message: "The account service response is invalid." })),
+              );
+              return { hostId: result.hostId, linkedAt: result.linkedAt };
+            }),
+          releaseResponse,
+        ),
+      ),
+    });
   });
-};
+}
+
+const controlPlane = ManagedRuntime.make(ControlPlane.layer);
+const controlPlaneService = await controlPlane.runPromise(ControlPlane);
 const tokens = new RemoteTokenService(
   config,
-  async (claims) => {
-    const response = await askControlPlane("/v2/remote/resume/validate", claims);
-    if (!response.ok) return false;
-    return z.object({ valid: z.boolean() }).parse(await response.json()).valid;
-  },
+  (claims) =>
+    controlPlaneService
+      .validateResume(claims)
+      .pipe(Effect.mapError((error) => new RemoteTokenError({ message: error.message }))),
   {
-    validateSlackRoute: async (hostId, teams) => {
-      const response = await askControlPlane("/v2/remote/slack-route/validate", { hostId, teams });
-      if (!response.ok) throw new Error("The account service did not confirm the Slack route.");
-      return z.object({ teams: z.array(z.string()) }).parse(await response.json()).teams;
-    },
+    validateSlackRoute: (hostId, teams) =>
+      controlPlaneService
+        .validateSlackRoute(hostId, teams)
+        .pipe(Effect.mapError((error) => new RemoteTokenError({ message: error.message }))),
+    validateTelegramRoute: (hostId, chats) =>
+      controlPlaneService
+        .validateTelegramRoute(hostId, chats)
+        .pipe(Effect.mapError((error) => new RemoteTokenError({ message: error.message }))),
+    linkTelegramChat: (botId, chatId, code) =>
+      controlPlaneService
+        .linkTelegramChat(botId, chatId, code)
+        .pipe(Effect.mapError((error) => new RemoteTokenError({ message: error.message }))),
+    validateDiscordRoute: (hostId, guilds) =>
+      controlPlaneService
+        .validateDiscordRoute(hostId, guilds)
+        .pipe(Effect.mapError((error) => new RemoteTokenError({ message: error.message }))),
+    validateWebhookRoute: (hostId, routes) =>
+      controlPlaneService
+        .validateWebhookRoute(hostId, routes)
+        .pipe(Effect.mapError((error) => new RemoteTokenError({ message: error.message }))),
   },
 );
-await tokens.initialize();
+await controlPlane.runPromise(tokens.initialize());
 const signal = new SignalService(
   tokens,
   config.maximumConnectionsPerUser,
   config.maximumConnectionsPerIp,
   config.maximumMessagesPerMinute,
+  undefined,
+  {
+    discord: config.discord !== null,
+    telegram: config.telegram
+      ? { bot: new TelegramBotApi(config.telegram), files: new TelegramFileTokens(config.sessionSecret) }
+      : null,
+  },
 );
 const tlsPaths =
   config.tlsCertificatePath && config.tlsPrivateKeyPath
     ? { certificate: config.tlsCertificatePath, privateKey: config.tlsPrivateKeyPath }
     : undefined;
 
-const app = createRemoteApiApp(config, signal);
+const signalRuntime = ManagedRuntime.make(signal.dependencies);
+// The Discord bot's Gateway connection lives in this runtime. Disposal closes it.
+const discordRuntime = config.discord
+  ? ManagedRuntime.make(
+      DiscordGateway.layer(config.discord, signal, {
+        removed: (guildId) => controlPlaneService.discordGuildRemoved(guildId),
+        reconcile: (guildIds, before) => controlPlaneService.reconcileDiscordGuilds(guildIds, before),
+      }),
+    )
+  : null;
+const discord = discordRuntime ? await discordRuntime.runPromise(DiscordGateway) : null;
+if (!discord) {
+  console.log("OpenBot Discord is off: DISCORD_BOT_TOKEN and DISCORD_APPLICATION_ID are not both set and valid.");
+}
+const app = createRemoteApiApp(config, signal, signalRuntime, discord?.api ?? null);
 const listen = () =>
   app.listen({
     hostname: config.host,
@@ -64,6 +307,8 @@ const listen = () =>
       : {}),
   });
 listen();
+// Telegram posts to this Signal only after the listener is up. A failure is logged and Signal runs on.
+if (signal.telegram) void signalRuntime.runPromise(signal.telegram.bot.setWebhooks());
 const healthServer = Bun.serve({
   hostname: "127.0.0.1",
   port: config.healthPort,
@@ -83,43 +328,78 @@ const healthServer = Bun.serve({
 const protocol = tlsPaths ? "https" : "http";
 console.log(`OpenBot Remote API is ready at ${protocol}://${config.host}:${config.port}`);
 
-let certificateHash = await tlsCertificateHash();
-let reloading = false;
+const readCertificateFile = (path: string) =>
+  Effect.tryPromise({
+    try: (signal) => readFile(path, { signal }),
+    catch: () => new ControlPlaneError({ message: "The TLS certificate could not be read." }),
+  });
+
+let certificateHash = await controlPlane.runPromise(tlsCertificateHash());
+let pendingReload: Promise<void> | null = null;
+let shuttingDown = false;
 const certificateTimer = setInterval(() => void reloadTlsWhenChanged(), 5 * 60_000);
 
-async function reloadTlsWhenChanged(): Promise<void> {
-  if (!tlsPaths || reloading) return;
-  const nextHash = await tlsCertificateHash();
-  if (!nextHash || nextHash === certificateHash) return;
-  reloading = true;
-  try {
-    await app.stop(true);
-    listen();
-    certificateHash = nextHash;
-    console.log("OpenBot Remote API reloaded its TLS certificate.");
-  } finally {
-    reloading = false;
-  }
+function reloadTlsWhenChanged(): Promise<void> {
+  if (!tlsPaths || shuttingDown) return Promise.resolve();
+  pendingReload ??= controlPlane
+    .runPromise(reloadTlsEffect())
+    .catch(() => {
+      // TLS paths and provider causes must not enter diagnostics.
+      console.error("OpenBot Remote API could not reload its TLS certificate.");
+    })
+    .finally(() => {
+      pendingReload = null;
+    });
+  return pendingReload;
 }
 
-async function tlsCertificateHash(): Promise<string | null> {
-  if (!config.tlsCertificatePath || !config.tlsPrivateKeyPath) return null;
-  try {
-    const [certificate, key] = await Promise.all([
-      readFile(config.tlsCertificatePath),
-      readFile(config.tlsPrivateKeyPath),
-    ]);
-    return createHash("sha256").update(certificate).update(key).digest("hex");
-  } catch {
-    return null;
-  }
+const reloadTlsEffect = Effect.fn("Signal.reloadTls")(function* () {
+  const nextHash = yield* tlsCertificateHash();
+  if (shuttingDown || !nextHash || nextHash === certificateHash) return;
+  yield* Effect.tryPromise({
+    try: () => app.stop(true),
+    catch: () => new ControlPlaneError({ message: "The Signal listener could not be stopped." }),
+  });
+  if (shuttingDown) return;
+  yield* Effect.try({
+    try: listen,
+    catch: () => new ControlPlaneError({ message: "The Signal listener could not be restarted." }),
+  });
+  certificateHash = nextHash;
+  console.log("OpenBot Remote API reloaded its TLS certificate.");
+});
+
+function tlsCertificateHash(): Effect.Effect<string | null> {
+  const certificatePath = config.tlsCertificatePath;
+  const keyPath = config.tlsPrivateKeyPath;
+  if (!certificatePath || !keyPath) return Effect.succeed(null);
+  return Effect.all([readCertificateFile(certificatePath), readCertificateFile(keyPath)], { concurrency: 2 }).pipe(
+    Effect.map(([certificate, key]) => createHash("sha256").update(certificate).update(key).digest("hex")),
+    Effect.catch(() => Effect.succeed(null)),
+  );
 }
 
-const shutdown = async () => {
-  clearInterval(certificateTimer);
-  healthServer.stop(true);
-  await app.stop(true);
-  process.exit(0);
+let pendingShutdown: Promise<void> | null = null;
+const shutdown = () => {
+  shuttingDown = true;
+  pendingShutdown ??= (async () => {
+    clearInterval(certificateTimer);
+    healthServer.stop(true);
+    await pendingReload;
+    try {
+      await app.stop(true);
+    } finally {
+      try {
+        await discordRuntime?.dispose();
+        await signalRuntime.dispose();
+        signal.close();
+      } finally {
+        await controlPlane.dispose();
+      }
+    }
+    process.exit(0);
+  })();
+  return pendingShutdown;
 };
 process.once("SIGINT", () => void shutdown());
 process.once("SIGTERM", () => void shutdown());
