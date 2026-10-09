@@ -52,6 +52,7 @@ import {
 } from "@openbot/team-client/team-api-requests";
 import { replaceEqualDeep, useQueryClient } from "@tanstack/react-query";
 import { Effect } from "effect";
+import * as Crypto from "expo-crypto";
 import * as SecureStore from "expo-secure-store";
 import {
   createContext,
@@ -891,6 +892,65 @@ export function MobileWorkspaceProvider({ children }: PropsWithChildren) {
     ],
   );
 
+  /**
+   * Writes one agent's read cursor on `serverId` after its earlier writes. It rejects when the host refuses it.
+   */
+  const writeAgentRead = useCallback(
+    (agentId: string, visibleMessageId?: string | null, serverId = activeServerId): Promise<void> => {
+      if (!serverId) return Promise.resolve();
+      const isCurrentRead = readRefresh.invalidate(serverId);
+      const generation = loadGeneration.current;
+      liveState.update("unreadAgentIds", (current) =>
+        visibleMessageId === null ? [...new Set([...current, agentId])] : current.filter((id) => id !== agentId),
+      );
+      const write = (readWrites.current.get(agentId) ?? Promise.resolve())
+        .then(async () => {
+          if (generation !== loadGeneration.current) return;
+          const snapshot =
+            visibleMessageId !== undefined
+              ? null
+              : (conversationStore.get(agentId) ?? (await loadConversation(agentId, serverId)));
+          if (generation !== loadGeneration.current) return;
+          const throughMessageId = visibleMessageId !== undefined ? visibleMessageId : snapshot?.messages.at(-1)?.id;
+          if (throughMessageId === undefined) return;
+          const reads = await request(
+            "POST",
+            visibleMessageId === null
+              ? TEAM_API_ROUTES.agent.conversationUnread(agentId)
+              : TEAM_API_ROUTES.agent.conversationRead(agentId),
+            (value) => decodeConversationReads({ [agentId]: value }),
+            visibleMessageId === null ? {} : { throughMessageId },
+            serverId,
+          );
+          if (generation === loadGeneration.current && isCurrentRead()) {
+            readRefresh.invalidate(serverId);
+            applyConversationReads(reads);
+          }
+        })
+        .catch((error: unknown) => {
+          if (generation === loadGeneration.current) void refreshConversationReads(serverId).catch(() => undefined);
+          throw error;
+        });
+      // A failed write must not stop the next write for this agent.
+      const settled = write.catch(() => undefined);
+      readWrites.current.set(agentId, settled);
+      void settled.finally(() => {
+        if (readWrites.current.get(agentId) === settled) readWrites.current.delete(agentId);
+      });
+      return write;
+    },
+    [
+      liveState,
+      request,
+      refreshConversationReads,
+      loadConversation,
+      activeServerId,
+      readRefresh,
+      conversationStore,
+      applyConversationReads,
+    ],
+  );
+
   const markAgentRead = useCallback(
     (agentId: string, visibleMessageId?: string | null) => {
       if (
@@ -905,61 +965,47 @@ export function MobileWorkspaceProvider({ children }: PropsWithChildren) {
         );
         return;
       }
-      if (!activeServerId) return;
-      const isCurrentRead = readRefresh.invalidate(activeServerId);
-      const generation = loadGeneration.current;
-      liveState.update("unreadAgentIds", (current) =>
-        visibleMessageId === null ? [...new Set([...current, agentId])] : current.filter((id) => id !== agentId),
-      );
-      const write = (readWrites.current.get(agentId) ?? Promise.resolve())
-        .then(async () => {
-          if (generation !== loadGeneration.current) return;
-          const snapshot =
-            visibleMessageId !== undefined
-              ? null
-              : (conversationStore.get(agentId) ?? (await loadConversation(agentId)));
-          if (generation !== loadGeneration.current) return;
-          const throughMessageId = visibleMessageId !== undefined ? visibleMessageId : snapshot?.messages.at(-1)?.id;
-          if (throughMessageId === undefined) return;
-          const reads = await request(
-            "POST",
-            visibleMessageId === null
-              ? TEAM_API_ROUTES.agent.conversationUnread(agentId)
-              : TEAM_API_ROUTES.agent.conversationRead(agentId),
-            (value) => decodeConversationReads({ [agentId]: value }),
-            visibleMessageId === null ? {} : { throughMessageId },
+      void writeAgentRead(agentId, visibleMessageId).catch(() => {
+        if (visibleMessageId === null)
+          showFailureAlert(
+            undefined,
+            "settings",
+            currentText().t("mobile.workspace.alert.markUnreadTitle"),
+            currentText().t("mobile.workspace.alert.markUnreadBody"),
           );
-          if (generation === loadGeneration.current && isCurrentRead()) {
-            readRefresh.invalidate(activeServerId);
-            applyConversationReads(reads);
-          }
-        })
-        .catch(() => {
-          if (generation === loadGeneration.current) void refreshConversationReads().catch(() => undefined);
-          if (visibleMessageId === null)
-            showFailureAlert(
-              undefined,
-              "settings",
-              currentText().t("mobile.workspace.alert.markUnreadTitle"),
-              currentText().t("mobile.workspace.alert.markUnreadBody"),
-            );
-        });
-      readWrites.current.set(agentId, write);
-      void write.finally(() => {
-        if (readWrites.current.get(agentId) === write) readWrites.current.delete(agentId);
       });
     },
-    [
-      liveState,
-      request,
-      refreshConversationReads,
-      loadConversation,
-      activeServerId,
-      readRefresh,
-      conversationStore,
-      applyConversationReads,
-    ],
+    [activeServerId, writeAgentRead],
   );
+
+  /** Marks every unread agent and channel of the active server read through its newest message. */
+  const markAllRead = useCallback(async () => {
+    const serverId = activeServerIdRef.current;
+    if (!serverId) return;
+    // Only listed agents: a read of an id the host no longer knows creates that agent again.
+    const listed = new Set(agents.filter((agent) => agent.serverId === serverId).map((agent) => agent.id));
+    const unread = liveState.get().unreadAgentIds.filter((agentId) => listed.has(agentId));
+    const results = await Promise.allSettled([
+      // A cached chat can be older than the read state, so each receipt uses the host's newest message.
+      ...unread.map(async (agentId) => {
+        const page = await request(
+          "GET",
+          `${TEAM_API_ROUTES.agent.conversationPage(agentId)}?limit=1`,
+          decodeConversationPage,
+          undefined,
+          serverId,
+        );
+        const latestId = page.messages.at(-1)?.id;
+        if (latestId) await writeAgentRead(agentId, latestId, serverId);
+      }),
+      channelStore.markAllRead(serverId, Crypto.randomUUID),
+    ]);
+    const failure = results.find((result) => result.status === "rejected");
+    if (!failure) return;
+    // A later successful write discards the refresh of a refused one, so read the host state once more.
+    await refreshConversationReads(serverId).catch(() => undefined);
+    throw failure.reason;
+  }, [agents, liveState, request, writeAgentRead, channelStore, refreshConversationReads]);
 
   const updatePreferences = useCallback(
     (serverId: string, change: (current: RemoteWorkspacePreferences) => RemoteWorkspacePreferences) => {
@@ -1396,6 +1442,7 @@ export function MobileWorkspaceProvider({ children }: PropsWithChildren) {
         mobileAnalytics.track("conversation_action", { action: "unhide", result: saved ? "succeeded" : "failed" });
       },
       markAgentRead,
+      markAllRead,
       markAgentUnread: (agentId) => {
         markAgentRead(agentId, null);
       },
@@ -1445,6 +1492,7 @@ export function MobileWorkspaceProvider({ children }: PropsWithChildren) {
     loadConversation,
     loadOlderMessages,
     markAgentRead,
+    markAllRead,
     pinnedAgentIds,
     pinnedChannelIds,
     hiddenChannelIds,
