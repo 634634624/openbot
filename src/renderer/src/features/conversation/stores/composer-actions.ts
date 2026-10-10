@@ -528,7 +528,10 @@ export function createComposerActions(deps: ComposerActionsDeps) {
    * chat's messages in the order the user sent them. `draft` is what Edit puts back in the composer.
    */
   function queueSend(target: ConversationTarget, draft: ComposerDraft, text: string): void {
-    deps.setStickToLatest(true);
+    const activeTarget = deps.currentTarget();
+    if (activeTarget && activeTarget.agentId === target.agentId && activeTarget.serverId === target.serverId) {
+      deps.setStickToLatest(true);
+    }
     // Read the send function now: the send outlives this view when the user switches server.
     const send = deps.props.onSendMessage;
     const server = deps.props.server;
