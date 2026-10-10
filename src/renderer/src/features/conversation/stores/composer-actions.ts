@@ -176,6 +176,7 @@ export function createComposerActions(deps: ComposerActionsDeps) {
     // A pending Save owns the outcome: keep it for retry instead of replacing it.
     if (deps.editingPendingSave()) return;
     if (deps.editingDeliveryId() && !(await cancelQueuedMessageEdit())) return;
+    if (deps.props.agent?.id !== agentId || (deps.props.server?.id ?? "local") !== serverId) return;
     const backup = copyComposerDraft(deps.currentDraft());
     const supportsHold =
       deps.props.server?.kind !== "remote" ||
