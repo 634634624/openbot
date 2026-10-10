@@ -2281,6 +2281,9 @@ function toCurrentMailboxMessage(value: unknown): DynamicRecord | null {
     ...message,
     sender: toCurrentMailboxActor(value.sender),
     ...(isConversationMessageSender(senderMember) ? { senderMember } : {}),
+    // Released builds kept an agent's `replyToMessageId: ""`, which refers to no message, and every
+    // conversation that showed the message then failed to read.
+    ...(message.replyToMessageId === "" ? { replyToMessageId: null } : {}),
   };
 }
 

@@ -974,6 +974,39 @@ describe("MailboxStore", () => {
     ).toEqual({ "Kraków turned rainy.": false, "Which city next?": undefined });
   });
 
+  // Released builds kept an agent's `replyToMessageId: ""`. Every conversation that showed the message
+  // then failed to read, for the sender and for the recipient.
+  it("reads a released mailbox message with an empty reply id as no reply", async () => {
+    const userData = join(root, "blank-reply-user-data");
+    await mkdir(userData, { recursive: true });
+    await writeFile(
+      join(userData, "mailbox.json"),
+      JSON.stringify({
+        version: 3,
+        messages: [
+          {
+            id: "message-1",
+            sender: { kind: "agent", agentId: "weather" },
+            text: "Done.",
+            attachments: [],
+            replyToMessageId: "",
+            createdAt: "2026-01-01T00:00:00.000Z",
+          },
+        ],
+        deliveries: [],
+        drafts: [],
+        pausedAgentIds: [],
+        idempotency: {},
+        reactions: [],
+      }),
+    );
+    const imported = new MailboxStore(userData, join(root, "Blank Reply Shared"));
+    await runCauseEffect(imported.initialize());
+    expect(imported.conversationMessages("weather")).toEqual([
+      expect.objectContaining({ exchange: expect.objectContaining({ replyToMessageId: null }) }),
+    ]);
+  });
+
   it("rejects directories and oversized recipient lists", async () => {
     const directory = join(root, "folder");
     await mkdir(directory);
