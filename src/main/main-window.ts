@@ -348,6 +348,9 @@ export function createDynamicIslandWindow(bounds: Rectangle, _display: Display):
       webSecurity: true,
     },
   });
+  // Chromium shares zoom per origin. The main window zoom would shrink this fixed-size window's
+  // viewport and move the shared avatar out of the expanded panel.
+  window.webContents.setZoomMode("isolated");
   window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   window.webContents.on("will-navigate", (event, targetUrl) => {
     if (!isTrustedRendererUrl(targetUrl)) event.preventDefault();
@@ -408,6 +411,8 @@ export function createComputerUseHighlightWindow(bounds: Rectangle): BrowserWind
   // Nothing on this surface may be pressed, and it covers another application's whole window, so
   // every event is handed straight on to the window below it.
   window.setIgnoreMouseEvents(true, { forward: true });
+  // The rim uses window bounds in DIP as CSS pixels, so it must not follow the main window zoom.
+  window.webContents.setZoomMode("isolated");
   window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   window.webContents.on("will-navigate", (event, targetUrl) => {
     if (!isTrustedRendererUrl(targetUrl)) event.preventDefault();
@@ -462,6 +467,8 @@ export function createComputerUsePermissionHelpWindow(translate: AppTranslate): 
   // Over System Settings, which opens in front of everything: a window the pane covers would carry
   // the steps to nobody.
   window.setAlwaysOnTop(true, "floating");
+  // The fixed height fits the contents only at 100%; the main window zoom would clip the steps.
+  window.webContents.setZoomMode("isolated");
   window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   window.webContents.on("will-navigate", (event, targetUrl) => {
     if (!isTrustedRendererUrl(targetUrl)) event.preventDefault();
