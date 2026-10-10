@@ -28,6 +28,7 @@ import {
   ComposerUpdateNotice,
   ComposerUsageLimitNotice,
 } from "@openbot/ui/features/conversation/ComposerNotice";
+import { ComposerCompactionNotice, ContextUsageMeter } from "@openbot/ui/features/conversation/ContextUsage";
 import { CloseIcon, StopIcon } from "@openbot/ui/features/conversation/ConversationIcons";
 import { RichMessageText } from "@openbot/ui/features/conversation/RichMessageText";
 import { VoiceRecordingMorph } from "@openbot/ui/features/conversation/VoiceRecordingMorph";
@@ -37,6 +38,9 @@ import { reportErrorBanner, reportNotification } from "../../error-reports";
 import { deviceSendShortcut, sendShortcutAriaKey, sendShortcutHintKey } from "../../send-shortcut-preference";
 import { useConversationViewScope } from "./conversation-scope";
 import { voiceButtonLabel, voiceSupported } from "./voice-status";
+
+// Module scope: the composer remounts on navigation, and a dismissed notice must stay dismissed.
+const [dismissedCompactions, setDismissedCompactions] = createSignal<Record<string, string>>({});
 
 /** @internal Stable HMR boundary for conversation composer. */
 export function ConversationComposer() {
@@ -103,6 +107,15 @@ export function ConversationComposer() {
   const awaitingVisible = () => awaitingReplies().length > 0 && !pickerOpen();
   const slotOpen = () => queueVisible() || awaitingVisible();
   const voiceAvailable = () => !props.runtime && voiceSupported(props.platform);
+  const context = () =>
+    props.contextState?.agentId === props.agent?.id && props.contextState?.threadId === props.agent?.threadId
+      ? props.contextState
+      : undefined;
+  const compaction = () => {
+    const value = context()?.compaction;
+    return value && value.id !== dismissedCompactions()[currentChatConversationKey() ?? ""] ? value : null;
+  };
+
   /**
    * The provider status is the only source of truth for a signed-out provider, so the notice and the
    * model picker's "Sign in required" label can never disagree, and the notice is shown before the
@@ -343,6 +356,18 @@ export function ConversationComposer() {
           />
         )}
       </Show>
+      <Show when={compaction()?.id} keyed>
+        {(id) => (
+          <ComposerCompactionNotice
+            startedAt={compaction()?.startedAt ?? 0}
+            expectedMs={compaction()?.expectedMs}
+            status={compaction()?.status}
+            onDone={() =>
+              setDismissedCompactions((current) => ({ ...current, [currentChatConversationKey() ?? ""]: id }))
+            }
+          />
+        )}
+      </Show>
       <Show
         when={
           currentChatError() && currentChatError() !== providerUpdateRequired()?.message ? currentChatError() : null
@@ -543,6 +568,26 @@ export function ConversationComposer() {
             </DropdownMenu.Portal>
           </DropdownMenu.Root>
           <div class="composer-primary-actions">
+            <Show when={context()?.usage}>
+              {(usage) => (
+                <ContextUsageMeter
+                  usage={{
+                    ...usage(),
+                    compacting: context()?.compaction?.status === "running",
+                    ...(context()?.compaction?.status === "completed" &&
+                    context()?.compaction?.beforeTokens !== undefined &&
+                    context()?.compaction?.afterTokens !== undefined
+                      ? {
+                          lastCompaction: {
+                            beforeTokens: context()?.compaction?.beforeTokens ?? 0,
+                            afterTokens: context()?.compaction?.afterTokens ?? 0,
+                          },
+                        }
+                      : {}),
+                  }}
+                />
+              )}
+            </Show>
             <Show when={attachmentBusy() && props.runtime?.cancelImportFiles} keyed>
               {(cancelImportFiles) => (
                 <Button variant="ghost" type="button" onClick={() => void cancelImportFiles()}>
