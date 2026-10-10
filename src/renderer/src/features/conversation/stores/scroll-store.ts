@@ -217,9 +217,12 @@ export function createScrollStore(deps: ScrollStoreDeps) {
 
   async function jumpToUnreadMessages(): Promise<void> {
     const scrollElement = deps.elements.scrollElement();
-    const unreadMessagesDivider = deps.elements.unreadMessagesDivider();
+    const agentId = deps.props.agent?.id;
+    const serverId = deps.props.server?.id ?? "local";
+    let unreadMessagesDivider = deps.elements.unreadMessagesDivider();
     if (!scrollElement) return;
     const unreadBoundary = unreadBoundaryMessageId();
+    const firstUnreadMessageId = deps.props.firstUnreadMessageId;
     if (!unreadBoundary) {
       // Every unread row is a silent answer: there is no row to scroll to, only read state to move.
       if (deps.props.firstUnreadMessageId) await markUnreadMessages();
@@ -228,6 +231,9 @@ export function createScrollStore(deps: ScrollStoreDeps) {
     if (!unreadMessagesDivider && deps.props.onOpenSearchMessage) {
       await deps.props.onOpenSearchMessage(unreadBoundary);
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      if (deps.props.agent?.id !== agentId || (deps.props.server?.id ?? "local") !== serverId) return;
+      if (deps.props.firstUnreadMessageId !== firstUnreadMessageId) return;
+      unreadMessagesDivider = deps.elements.unreadMessagesDivider();
     }
     if (!unreadMessagesDivider) return;
     const divider = unreadMessagesDivider;
