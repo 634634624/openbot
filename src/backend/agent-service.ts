@@ -2797,8 +2797,10 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
         ) || delivery.delivery.attachments.map((item) => item.name).join(", "),
       )
       .pipe(
-        Effect.mapError(
-          (failure) => new AgentLifecycleFailed({ operation: "update message preview", cause: failure.cause }),
+        // The message is already queued: a failed preview write must not leave it without a drain,
+        // and a retry with the same id returns the stored receipt without one.
+        Effect.catch((failure) =>
+          Effect.sync(() => this.#emitError("message_preview_failed", failure.cause, agent.id)),
         ),
       );
     // A turn the user stopped is ending, and a message steered into it would end with it.
