@@ -63,6 +63,35 @@ Use them to compare click counts, not as a shared visit-to-click funnel breakdow
 The invitation-page funnel is separate: `join_page_action` with `action=view` followed by
 `action=download` or `action=open_app`.
 
+## Resource sampling
+
+`ResourceMonitor` (`src/main/resource-monitor.ts`) samples once a minute while the computer is awake.
+It reads `app.getAppMetrics()` for the Electron processes and groups them by type: the utility process
+`name` separates the database and voice hosts, and `BrowserHost.tabProcessIds()` separates browser
+tabs from windows. On macOS and Linux one `ps` call lists all processes. The descendants of the main
+process that are not Electron processes form the provider trees: a PID that a spawn site registered
+in `src/backend/provider-processes.ts` names its provider, its children inherit it, an unregistered
+`claude`, `codex`, `opencode` or `grok` executable names itself, and every other process is `other`.
+Windows reports `provider_tree_supported: false`. A sample with a failed `ps` records no total. CPU
+comes from the change in each process's CPU time between two listings, so a command that starts
+and ends between two samples, such as a short tool run, is not counted. The main event loop uses
+`monitorEventLoopDelay`, less its 20 ms timer interval.
+Database time comes from `AgentDatabaseSupervisor`, from the send of a statement to its answer or to
+the end of the host; the host process is not changed. Renderer and child process exits other than a
+clean exit are counted and written to the trace as `crash` spans at the next sample. A utility
+process with the reason `killed` is not counted: OpenBot stops these processes itself. An exit in the
+last minute before a quit is not counted: a stop signal can end the child processes before the
+main process starts its teardown.
+
+The pure part (`resource-summary.ts`) keeps each day as sparse histograms with two significant digits,
+peaks and counters, so p95 stays exact enough without a sample list. The summary file holds the
+current day and the last closed day; it is written at most every 15 minutes, at a day change and at
+shutdown, and a damaged file starts a new day. `HostAnalytics.checkResources()` sends the closed day
+as `system_resources` and marks it handled in the file before the send, so a crash cannot send it
+twice. The file keeps the handled day for the diagnostics export until a newer day replaces it.
+Nothing leaves the process with a PID, a command or a path: the summary keys are group names,
+provider ids and reason words, and the analytics allowlist checks each value again.
+
 ## Agent usage analytics
 
 `AgentUsage` owns local numeric usage records, cumulative counter checkpoints, and activity counts.
