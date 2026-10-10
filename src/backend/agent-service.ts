@@ -2932,6 +2932,9 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       ([id, snapshot]) => id === agentId && snapshot.activeTurnId === turnId,
     )?.[1];
     if (mayStop && (!snapshot || !mayStop())) return false;
+    // A Stop for a turn that already ended must not reach the next turn: ACP and Claude stop the
+    // running turn, whatever `turnId` says. A channel thread is not in these snapshots.
+    if (!executionThreadId && !snapshot) return false;
     const targetThreadId = executionThreadId ?? snapshot?.threadId;
     const session = targetThreadId
       ? this.#store.database.activeProviderSession(targetThreadId, agent.provider)
