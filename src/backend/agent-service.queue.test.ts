@@ -1298,7 +1298,8 @@ describe.sequential("AgentService: queue", () => {
       replyToMessageId: "",
       expectsReply: false,
     });
-    await waitForQueue(service, "worker", (queue) => queue.deliveries.length > 0);
+    // The worker conversation gets the message before the delivery is marked running.
+    await waitForQueue(service, "worker", (queue) => queue.deliveries[0]?.status === "running");
     expect(service.listQueue("worker").deliveries).toEqual([
       expect.objectContaining({ text: "Report sent.", replyToMessageId: null }),
     ]);
