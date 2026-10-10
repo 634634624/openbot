@@ -171,6 +171,7 @@ export const messages = {
   "error.remote.webRtcCommandFailed": "O comando WebRTC falhou.",
   "error.remote.dataChannelFailed": "O canal {kind} falhou.",
   "error.remote.formUnavailable": "Este formulário não está mais disponível.",
+  "error.remote.hostedServerRemoval": "Use a seção Cobrança para excluir um servidor hospedado.",
   "error.remote.channelsUnsupported": "Atualize este servidor no computador para usar canais.",
   "error.remote.channelDeleteUnsupported": "Atualize este servidor no computador para excluir canais.",
   "error.remote.attachmentUploadCancelled": "Envio do anexo cancelado.",

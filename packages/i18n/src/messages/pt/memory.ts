@@ -31,4 +31,13 @@ export const messages = {
   "memory.updateFailed": "Não foi possível atualizar a memória.",
   "memory.deleteFailed": "Não foi possível excluir a memória.",
   "memory.clearFailed": "Não foi possível limpar as memórias.",
+  "memory.inclusion.label": "Uso de memória",
+  "memory.inclusion.essential": "Sempre incluída",
+  "memory.inclusion.searchable": "Pesquisar quando necessário",
+  "memory.inclusion.automatic": "Deixar o agente decidir",
+  "memory.inclusion.userControlled": "Selecionada por você",
+  "memory.inclusion.agentControlled": "O agente pode mudar isto",
+  "memory.inclusion.explanation":
+    "Todas as memórias ficam salvas. Só as memórias essenciais entram em cada prompt. O agente pode pesquisar as demais.",
+  "memory.inclusion.capacity": "Capacidade de memória essencial: {used} de {total}",
 } as const satisfies PartialTranslation<typeof source>;

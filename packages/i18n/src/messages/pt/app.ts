@@ -28,6 +28,7 @@ export const messages = {
   "app.provider.codeExpiredDescription": "Ninguém o inseriu a tempo. Esse código não funciona mais.",
   "app.provider.connectFailed": "Não foi possível conectar {name}",
   "app.provider.connectFailedRetry": "O OpenBot não conseguiu conectar {name}. Tente novamente.",
+  "app.provider.restartFailed": "Não foi possível reiniciar {name}.",
   "app.provider.included": "{name} está incluído no OpenBot.",
   "app.clipboard.copyFailed": "Não foi possível copiar o texto.",
   "app.voice.tooLong": "As gravações de voz são limitadas a dois minutos.",

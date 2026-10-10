@@ -2,6 +2,16 @@ import type { PartialTranslation } from "../../message";
 import type { messages as source } from "../en/customProvider";
 
 export const messages = {
+  "customProvider.registry.title": "Registro ACP",
+  "customProvider.registry.description":
+    "Instale agentes neste host. Remover o runtime mantém as configurações, credenciais e conversas do agente.",
+  "customProvider.registry.search": "Pesquisar registro",
+  "customProvider.registry.empty": "Nenhum agente corresponde a esta busca.",
+  "customProvider.registry.agentId": "ID do agente personalizado",
+  "customProvider.registry.install": "Instalar",
+  "customProvider.registry.update": "Atualizar",
+  "customProvider.registry.remove": "Remover runtime",
+  "customProvider.registry.failed": "A operação do registro falhou.",
   "customProvider.error.providerIdRequired": "Digite um ID de provedor.",
   "customProvider.error.providerIdPattern":
     "Use letras minúsculas, números, hífens ou sublinhados, começando com uma letra ou um número.",
@@ -169,6 +179,9 @@ export const messages = {
   "customProvider.agents.description": "Agentes ACP que o OpenBot inicia neste computador.",
   "customProvider.agents.empty": "Nenhum agente personalizado ainda.",
   "customProvider.agents.add": "Adicionar agente",
+  "customProvider.agents.restart": "Reiniciar agentes",
+  "customProvider.agents.cancelRestart": "Cancelar reinicialização",
+  "customProvider.agents.restartPending": "Os agentes personalizados reiniciam quando as tarefas atuais pararem.",
   "customProvider.agents.commandMissing": "{command} · Comando não encontrado",
   "customProvider.agents.envCount": { one: "{count} variável", other: "{count} variáveis" },
   "customProvider.agents.editLabel": "Editar {name}",

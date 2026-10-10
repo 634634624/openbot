@@ -2,6 +2,10 @@ import type { PartialTranslation } from "../../../message";
 import type { messages as source } from "../../en/error/provider";
 
 export const messages = {
+  "error.provider.mcpConfig":
+    "O OpenBot não conseguiu registrar os servidores MCP na configuração do Codex. Verifique se seu config.toml do Codex é válido e gravável, depois reinicie o OpenBot.",
+  "error.provider.computerUseConfig":
+    "O OpenBot não conseguiu registrar o Uso do Computador na configuração do Codex. Verifique se seu config.toml do Codex é válido e gravável, depois reinicie o OpenBot. Você pode desligar o Uso do Computador nas configurações do agente para continuar sem ele.",
   "error.provider.endpointsReadOnly":
     "Os endpoints salvos foram gravados por uma versão mais recente do OpenBot, ou o arquivo não pode ser lido. Atualize o OpenBot para alterá-los.",
   "error.provider.endpointNoSecureStorage":
@@ -63,6 +67,8 @@ export const messages = {
   "error.provider.downloadIntegrity": "O download do ambiente de execução falhou na verificação de integridade.",
   "error.provider.runtimeReplacing":
     "Não foi possível instalar o ambiente de execução porque outra instância está substituindo-o.",
+  "error.provider.runtimeFilesInUse":
+    "O runtime não pôde ser instalado porque outro programa tem seus arquivos abertos. Feche-o e tente de novo.",
   "error.provider.metadataHttp": "O download dos metadados do ambiente de execução falhou com HTTP {status}.",
   "error.provider.metadataIntegrity": "Os metadados do ambiente de execução falharam na verificação de integridade.",
   "error.provider.diskSpace": "Não há espaço livre em disco suficiente para este provedor.",
@@ -139,6 +145,10 @@ export const messages = {
   "error.provider.bunVersionUnreadable": "Não foi possível ler a versão do ambiente de execução do Bun.",
   "error.provider.connectBeforeProfile": "Conecte o provedor selecionado antes de gerar um perfil.",
   "error.provider.cliNotReady": "A CLI de {provider} não está pronta ou não está autenticada.",
+  "error.provider.cliTimedOut":
+    "{provider} não respondeu a tempo. O computador pode estar ocupado. O OpenBot tentará de novo.",
+  "error.provider.cliTimedOutRefresh":
+    "{provider} não respondeu a tempo. O computador pode estar ocupado. Atualize os provedores para tentar de novo.",
   "error.provider.noCodeSignIn": "Não é possível entrar em {provider} com um código.",
   "error.provider.codeLoginNoLink": "O provedor não mostrou um link para entrar. Tente novamente.",
   "error.provider.codeLoginNotWaiting":
@@ -162,6 +172,8 @@ export const messages = {
     "O provedor do modelo recusou a solicitação por causa do limite de requisições. Aguarde alguns minutos ou escolha outro modelo e tente novamente.\n{detail}",
   "error.provider.opencodeBilling":
     "O provedor do modelo recusou a solicitação por causa da cobrança da conta. Aguardar não resolve isso. Adicione uma forma de pagamento ou saldo à conta do provedor, ou escolha outro modelo.\n{detail}",
+  "error.provider.opencodeInvalidUpload":
+    "O provedor de modelos do OpenCode reportou uma requisição de upload inválida. Escolha outro modelo e continue. Verifique as rotinas salvas antes de recriá-las.\n{detail}",
   "error.provider.opencodeProviderFailed":
     "Ocorreu uma falha no provedor do modelo. Sua conexão não é a causa. Tente novamente mais tarde ou escolha outro modelo.\n{detail}",
   "error.provider.opencodeNetwork":
@@ -205,11 +217,14 @@ export const messages = {
   "error.provider.clineNotStarted": "Não foi possível iniciar o Cline. Execute `cline --version` em um terminal.",
   "error.provider.clineVersionUnreadable": "Não foi possível ler a versão da CLI do Cline.",
   "error.provider.clineSignIn": "Entre com o Cline ou defina CLINE_API_KEY para usar o Cline.",
+  "error.provider.usageLimitReached": "A conta atingiu seu limite de uso.",
   "error.provider.foreignReasoning":
     "{provider} não aceitou o raciocínio anterior neste chat porque ele foi recebido por outra conta ou chave de API. O OpenBot iniciou uma nova sessão de {provider} com o histórico do chat. Tente novamente.",
   "error.provider.grokSignIn": "Execute `grok login` ou defina XAI_API_KEY para usar o Grok.",
   "error.provider.acpSignInTimedOut": "O tempo para entrar esgotou.",
   "error.provider.acpSignInStopped": "O processo de entrada parou antes de terminar.",
+  "error.provider.geminiBrowserUnavailable":
+    "O Gemini não conseguiu abrir a página de login. Instale um navegador e o xdg-utils, depois conecte a partir de uma sessão de desktop neste host. Um servidor sem desktop não consegue concluir este login.",
   "error.provider.acpSignInFailed": "O processo de entrada não foi concluído.",
   "error.provider.messageTooLarge": "O OpenBot interrompeu {provider} porque enviou uma mensagem maior que {limit} MB.",
   "error.provider.customAgentIdInvalid":
@@ -240,4 +255,74 @@ export const messages = {
   "error.provider.customAgentNotSaved": "Este agente personalizado não está salvo. Atualize a lista e tente novamente.",
   "error.provider.customAgentTooMany": "Você pode salvar no máximo {count} agentes personalizados.",
   "error.provider.customAgentEnvValueMissing": "Digite um valor para {name}.",
+  "error.provider.off": "{provider} está desligado no OpenBot. Ligue-o nas configurações de provedor primeiro.",
+  "error.provider.inUse": "Um agente usa {provider}. Mude o modelo dele antes de desligar este provedor.",
+  "error.provider.useBusy": "Aguarde a verificação ou o login do provedor terminar e tente de novo.",
+  "error.provider.useSettingsReadOnly":
+    "As configurações salvas do provedor não podem ser lidas. Atualize o OpenBot antes de alterá-las.",
+  "error.provider.useChangeFailed": "O OpenBot não conseguiu mudar a configuração do provedor.",
+  "error.provider.sessionSettingUnavailable": "Esta configuração não está disponível na sessão atual do provedor.",
+  "error.provider.sessionSettingInvalid": "Este valor não está disponível para a configuração.",
+  "error.provider.sessionSettingsBusy": "Aguarde o turno atual terminar antes de mudar uma configuração de sessão.",
+  "error.provider.piOutdated":
+    "O Pi {version} é antigo demais. Instale o Pi 1.1.0 ou mais recente para suporte a RPC e MCP nativos.",
+  "error.provider.nativeMissing": "A CLI do {provider} não está instalada. Baixe-a em Configurações.",
+  "error.provider.nativeNotStarted": "A CLI do {provider} não conseguiu iniciar.",
+  "error.provider.nativeVersionUnreadable": "A versão da CLI do {provider} não pôde ser lida.",
+  "error.provider.piSessionBusy": "Aguarde o turno atual do Pi terminar.",
+  "error.provider.piStopped": "O Pi não está rodando. Conecte o Pi e tente de novo.",
+  "error.provider.piSessionMissing": "O arquivo de sessão do Pi não está disponível neste computador.",
+  "error.provider.piResumeCancelled": "O Pi cancelou a retomada da sessão. Tente de novo.",
+  "error.provider.piSessionIdentity": "O Pi retornou uma sessão diferente. A sessão salva não foi substituída.",
+  "error.provider.piModelInvalid": "Selecione um modelo do Pi que inclua seu provedor.",
+  "error.provider.piToolInvalid": "A ferramenta retornou um resultado inválido.",
+  "error.provider.piSignIn": "Use /login no Pi no computador host. Feche o Pi quando o login terminar.",
+  "error.provider.museBusy": "A sessão do Muse está ocupada.",
+  "error.provider.museStopped": "O cliente Muse não está rodando.",
+  "error.provider.museUnexpectedProvider": "O Muse retornou um provedor de modelo inesperado.",
+  "error.provider.museNoActiveTurn": "O Muse não tem um turno ativo para direcionar.",
+  "error.provider.museInvalidProtocol": "O Muse retornou uma resposta de protocolo inválida.",
+  "error.provider.museNotStarted": "O Muse não iniciou.",
+  "error.provider.museNativeWindows": "O Muse exige um executável nativo no Windows.",
+  "error.provider.museStartTimeout": "A inicialização do Muse expirou.",
+  "error.provider.museStartStopped": "O Muse parou durante a inicialização.",
+  "error.provider.museProtocolVersion": "Versão do protocolo Muse não suportada.",
+  "error.provider.museHistoryRequired": "O Muse precisa manter o histórico da sessão.",
+  "error.provider.museRequestUnsupported": "Requisição de servidor Muse não suportada.",
+  "error.provider.museConnectionFailed":
+    "A conexão com o Muse falhou. Retome a conversa para recuperar o histórico salvo.",
+  "error.provider.museUnknownSession": "Sessão Muse desconhecida.",
+  "error.provider.museInvalidToolResult": "Resultado de ferramenta do OpenBot inválido.",
+  "error.provider.museMcpRequired": "O Muse precisa suportar servidores MCP de sessão.",
+  "error.provider.museSessionMismatch": "O Muse retornou uma sessão diferente.",
+  "error.provider.museCompactRejected": "O Muse não aceitou a compactação.",
+  "error.provider.museTurnMismatch": "O Muse retornou um turno diferente.",
+  "error.provider.museHistoryMismatch": "O histórico do Muse cruzou sessões.",
+  "error.provider.museRecoveryFailed": "O Muse não conseguiu recuperar os eventos faltantes.",
+  "error.provider.museHistoryStalled": "O cursor de histórico do Muse não avançou.",
+  "error.provider.museApprovalUnavailable": "O Muse não ofereceu esta resposta de aprovação.",
+  "error.provider.museHistoryOwner": "O histórico do Muse pertence a outra sessão.",
+  "error.provider.museHistoryMissing": "O Muse não retornou o histórico da sessão.",
+  "error.provider.museEmptyInput": "O Muse precisa de texto ou uma imagem.",
+  "error.provider.museMethodUnsupported": "O Muse não suporta {method}.",
+  "error.provider.museTurnFailed": "O turno do Muse falhou.",
+  "error.provider.museProfileUnsupported":
+    "O Muse não consegue gerar um perfil sem acesso a ferramentas externas. Use outro provedor para gerar o perfil e depois selecione o Muse para o agente.",
+  "error.provider.museAuthUnverified":
+    "A autenticação do Muse não está verificada. Conecte no computador host ou defina uma chave de API da Meta.",
+  "error.provider.museSignIn": "Entre no Muse no computador host para continuar.",
+  "error.provider.terminalLoginFailed":
+    "O terminal de login não pôde abrir. Abra a CLI do provedor neste host e entre por lá, depois atualize os provedores.",
+  "error.provider.nativeArchiveInvalid": "O download do provedor não contém uma instalação válida.",
+  "error.provider.nativeChecksum": "A instalação do provedor não passou na verificação de integridade.",
+  "error.provider.registryUnavailable": "O registro ACP não está disponível. Tente de novo.",
+  "error.provider.registryInvalid": "O registro ACP retornou dados inválidos.",
+  "error.provider.registryMissing": "Este agente não está no registro ACP.",
+  "error.provider.registryBusy": "Já há uma instalação em andamento para este agente.",
+  "error.provider.registryCancelled": "A instalação do agente foi cancelada.",
+  "error.provider.registryPrerequisite": "Instale {tool} no host antes de instalar este agente.",
+  "error.provider.registryBindingChanged": "O agente personalizado mudou durante a instalação. Tente de novo.",
+  "error.provider.registryInstallFailed": "A instalação do agente falhou. A instalação anterior permanece inalterada.",
+  "error.provider.registryRemoveBusy":
+    "Aguarde a instalação do agente e o trabalho ACP ativo terminarem antes de removê-lo.",
 } as const satisfies PartialTranslation<typeof source>;

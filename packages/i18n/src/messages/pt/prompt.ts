@@ -19,6 +19,7 @@ export const messages = {
   "prompt.customPlaceholder": "Digite sua própria resposta",
   "prompt.question.customAnswerFor": "Resposta personalizada para: {question}",
   "prompt.question.skip": "Pular",
+  "prompt.question.submitAnswer": "Enviar resposta",
   "prompt.question.emptyTitle": "Nenhuma pergunta aguardando.",
   "prompt.question.emptyBody": "O agente continuará quando precisar de outra decisão.",
   "prompt.choice.hint": "Escolha o que se aplica ou digite sua própria resposta.",

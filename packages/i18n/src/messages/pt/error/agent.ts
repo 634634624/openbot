@@ -5,6 +5,7 @@ export const messages = {
   "error.agent.approvalWhileDeleting": "Não é possível conceder aprovação enquanto o agente está sendo excluído.",
   "error.agent.accessLocalOnly": "O acesso do agente só pode ser alterado no computador que executa o agente.",
   "error.agent.duplicateCleanupFailed": "A duplicação do agente falhou e não foi possível remover a cópia incompleta.",
+  "error.agent.commitEffectsFailed": "A transação foi confirmada, mas os efeitos salvos falharam.",
   "error.agent.settingsLocalOnly":
     "As configurações do agente só podem ser alteradas no computador que executa o agente.",
   "error.agent.skillsLocalOnly": "As habilidades só podem ser alteradas no computador que executa o agente.",
@@ -80,6 +81,16 @@ export const messages = {
     'O perfil de agente salvo {id} tem um valor "{field}" ilegível; atualize os dados antes de iniciar o OpenBot.',
   "error.agent.queueEditRejected": "Edição da fila rejeitada: {reason}",
   "error.agent.computerUseLocalOnly": "Uso do computador só pode ser alterado no computador que executa o agente.",
+  "error.agent.automationLocalOnly": "Scripts locais só podem ser permitidos no computador que roda o agente.",
+  "error.agent.busyMessageModeLocalOnly":
+    "O que as mensagens fazem enquanto o agente trabalha só pode ser definido no computador que roda o agente.",
+  "error.agent.localScriptsOff": "Este agente não permite scripts locais.",
+  "error.agent.localScriptsRateLimited":
+    "Scripts locais enviaram {limit} mensagens ou pedidos de rotina a este agente na última hora. Tente de novo mais tarde.",
+  "error.agent.automationOff": "Este agente não permite que scripts locais executem suas rotinas.",
+  "error.agent.automationPayloadTooLong": "O payload tem mais de {limit} caracteres.",
+  "error.agent.automationRateLimited":
+    "Scripts locais executaram as rotinas deste agente {limit} vezes na última hora. Tente de novo mais tarde.",
   "error.agent.workspaceOnlyMacOnly":
     "Somente o espaço de trabalho está disponível para este provedor apenas no macOS. Escolha Acesso completo nas configurações do agente.",
   "error.agent.lowMemory":

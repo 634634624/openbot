@@ -2,6 +2,26 @@ import type { PartialTranslation } from "../../message";
 import type { messages as source } from "../en/server";
 
 export const messages = {
+  "server.connection.planEnded": "O plano de {name} terminou",
+  "server.connection.wakeFailed": "Não foi possível iniciar {name}",
+  "server.connection.startTimeout": "{name} não iniciou a tempo",
+  "server.connection.sleeping": "{name} está em repouso",
+  "server.connection.waking": "Iniciando {name}",
+  "server.connection.loading": "Carregando {name}",
+  "server.connection.connecting": "Conectando a {name}",
+  "server.connection.reconnecting": "Reconectando a {name}",
+  "server.connection.blocked": "{name} precisa da sua atenção",
+  "server.connection.nextRetry": "Próxima tentativa em {seconds} segundos.",
+  "server.connection.wakeHint": "Use este workspace ou selecione Tentar de novo para iniciar o servidor.",
+  "server.connection.planHint": "Abra as configurações da conta para verificar o plano do servidor.",
+  "server.connection.loadingHint": "Você pode selecionar outro servidor enquanto este carrega.",
+  "server.connection.cachedHint":
+    "Conteúdo carregado e rascunhos são mantidos. As ações do servidor retomam após a reconexão.",
+  "server.connection.conversationFailed": "A conversa não pôde ser carregada. Tente de novo.",
+  "server.connection.panelsFailed": "Alguns painéis do workspace não puderam ser carregados. Tente de novo.",
+  "server.connection.retry": "Tentar de novo",
+  "server.connection.manage": "Abrir configurações",
+  "server.connection.restored": "Conexão com {name} restaurada",
   "server.compatibility.updateClientTitle": "Atualize este app OpenBot",
   "server.compatibility.updateHostTitle": "Atualize o OpenBot em {name}",
   "server.compatibility.unsafeDataTitle": "O computador anfitrião retornou dados inseguros",
@@ -108,6 +128,11 @@ export const messages = {
   "server.state.offline": "offline",
   "server.state.error": "erro",
   "server.state.incompatible": "incompatível",
+  "server.state.sleeping": "em repouso",
+  "server.state.waking": "acordando",
+  "server.sleep.tooltipSleeping":
+    "{name} está em repouso porque ninguém o usou. Pressione uma tecla ou clique para acordá-lo.",
+  "server.sleep.tooltipWaking": "{name} está acordando. Isso leva cerca de um minuto.",
   "server.menu.open": "Abrir menu do servidor {name}",
   "server.menu.label": "Menu do servidor",
   "server.menu.layout": "Layout dos servidores",
@@ -124,6 +149,7 @@ export const messages = {
   "server.rail.mute": "Silenciar servidor",
   "server.rail.notificationSettings": "Configurações de notificações",
   "server.rail.usage": "Uso",
+  "server.rail.schedule": "Rotinas",
   "server.rail.settings": "Configurações do servidor",
   "server.rail.remove": "Remover servidor",
   "server.rail.leave": "Sair do servidor",
@@ -171,6 +197,22 @@ export const messages = {
   "server.settings.importDescription": "Mova seus agentes do Grok Bot para este servidor.",
   "server.settings.connectorsTitle": "Conectores",
   "server.settings.connectorsDescription": "Conecte contas que todos os agentes deste servidor podem usar.",
+  "server.settings.routinesTitle": "Rotinas",
+  "server.settings.routinesDescription": "Mostre o agendamento de rotinas deste computador em um app de calendário.",
+  "server.routineFeed.title": "Feed de calendário",
+  "server.routineFeed.offTitle": "O feed de calendário está desligado",
+  "server.routineFeed.offDescription":
+    "Crie uma URL privada e assine-a no Apple Calendar (No Meu Mac) ou em outro app de calendário que a leia neste computador. Cada execução dos próximos 30 dias aparece como um evento. Rotinas pausadas não são mostradas.",
+  "server.routineFeed.create": "Criar URL do feed",
+  "server.routineFeed.urlLabel": "URL do feed",
+  "server.routineFeed.agentLabel": "Filtro de agente",
+  "server.routineFeed.allAgents": "Todos os agentes e canais",
+  "server.routineFeed.copy": "Copiar URL",
+  "server.routineFeed.privacy":
+    "Qualquer pessoa com esta URL pode ler nomes de rotinas e horários de execução. A URL funciona apenas neste computador, então Google Calendar e iCloud não conseguem lê-la.",
+  "server.routineFeed.regenerate": "Nova URL",
+  "server.routineFeed.regenerateLabel": "Criar uma nova URL. A URL antiga para de funcionar.",
+  "server.routineFeed.turnOff": "Desligar",
   "server.settings.nameTooShort": "Digite pelo menos {limit} caracteres.",
   "server.settings.nameTooLong": "Use no máximo {limit} caracteres.",
   "server.settings.actionFailedTitle": "Falha na ação do servidor",
@@ -338,6 +380,23 @@ export const messages = {
   "server.update.status.downloadFailed": "{name} não conseguiu baixar a atualização. Tente novamente.",
   "server.update.status.installFailed":
     "{name} não conseguiu instalar a atualização. Verifique se nenhum outro usuário desse computador está executando o OpenBot e tente novamente.",
+  "server.update.releaseCheckFailed":
+    "{name} não conseguiu ler o feed de releases. Verifique a conexão de rede do host e tente de novo.",
+  "server.update.releaseUnavailable":
+    "Verificação de releases não está disponível nesta compilação. Peça ao administrador do host para verificar um release compatível.",
+  "server.update.externalTitle": "O host controla a instalação",
+  "server.update.path.hostManager":
+    "O OpenBot Host Manager instala atualizações quando todos os usuários estão ociosos. Peça ao administrador do host para verificar o status do Host Manager se uma atualização não iniciar.",
+  "server.update.path.hosted":
+    "O serviço hospedado baixa atualizações em segundo plano. Uma atualização baixada inicia na próxima inicialização do servidor. Aguarde o trabalho ativo terminar antes de parar e retomar o servidor. Se ele continuar em uma versão antiga, contate o administrador do host.",
+  "server.update.path.system":
+    "No host, execute sudo openbot update para instalar o release mais recente. Este comando interrompe o OpenBot. Aguarde o trabalho ativo terminar primeiro. Downloads automáticos são instalados na próxima inicialização.",
+  "server.update.path.container":
+    "No host Docker, baixe a nova imagem do OpenBot e crie o container de novo com os mesmos volumes de dados. Aguarde o trabalho ativo terminar primeiro. Mantenha os volumes existentes para preservar seus dados.",
+  "server.update.path.manual":
+    "Esta instalação não pode se substituir. Peça ao administrador do host para instalar o release compatível de github.com/nightly-labs/openbot/releases. Mantenha os dados existentes do OpenBot.",
+  "server.update.path.unavailable":
+    "Esta é uma compilação de desenvolvimento. Use um release instalado do OpenBot para verificar atualizações.",
   "server.update.check": "Buscar atualizações",
   "server.update.start": "Atualizar quando ocioso",
   "server.update.restartNow": "Reiniciar agora",

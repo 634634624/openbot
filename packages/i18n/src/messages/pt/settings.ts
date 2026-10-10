@@ -32,11 +32,19 @@ export const messages = {
   "settings.externalLinks.description": "Escolha onde os links das conversas abrem.",
   "settings.externalLinks.defaultBrowser": "Navegador padrão",
   "settings.externalLinks.openbot": "OpenBot",
+  "settings.sendShortcut.title": "Atalho de envio",
+  "settings.sendShortcut.description": "Escolha as teclas que enviam uma mensagem neste dispositivo e navegador.",
+  "settings.sendShortcut.enter": "Enter para enviar",
+  "settings.sendShortcut.modEnterMac": "⌘Enter para enviar",
+  "settings.sendShortcut.modEnterWin": "Ctrl+Enter para enviar",
   "settings.busyMessage.title": "Redirecionar agentes enquanto trabalham",
   "settings.busyMessage.description":
     "Novas mensagens entram no trabalho atual do agente, não na fila. Funciona com ChatGPT e Claude.",
   "settings.agentMemoryLimit.title": "Memórias por agente",
   "settings.agentMemoryLimit.description": "Quantas memórias cada agente neste computador pode guardar.",
+  "settings.keepRemoteSessions.title": "Conexão rápida a servidores",
+  "settings.keepRemoteSessions.description":
+    "Mantenha a conexão com seus servidores conectados entre inicializações. O OpenBot inicia cerca de um segundo mais rápido. Ao sair do OpenBot, o serviço do OpenBot não fecha a conexão.",
   "settings.permissions.title": "Permissões",
   "settings.turbo.title": "Modo Turbo",
   "settings.turbo.description":
@@ -94,6 +102,9 @@ export const messages = {
   "settings.analytics.title": "Compartilhar análises do produto",
   "settings.analytics.description":
     "Envie metadados de uso e confiabilidade com o ID e o e-mail da sua conta para o serviço de análise hospedado pelo próprio OpenBot.",
+  "settings.analytics.webTitle": "Compartilhar relatórios de erro",
+  "settings.analytics.webDescription":
+    "Enviar códigos de erro e aviso com o ID da sua conta para as análises do OpenBot. Esta configuração se aplica a este navegador.",
   "settings.tab.general.title": "Geral",
   "settings.tab.general.description": "Controle como o OpenBot se comporta neste computador.",
   "settings.tab.notifications.title": "Notificações",
@@ -250,6 +261,13 @@ export const messages = {
   "settings.updates.autoInstall.title": "Instalar atualizações automaticamente",
   "settings.updates.autoInstall.description":
     "O OpenBot reinicia para aplicar uma atualização baixada quando os agentes estão ociosos. Os membros dos seus servidores são desconectados por um breve período.",
+  "settings.updates.idleRestart.title": "Reiniciar o OpenBot",
+  "settings.updates.idleRestart.relaunchDescription":
+    "O OpenBot reinicia quando nenhum agente está trabalhando. Novas execuções de rotina aguardam até lá.",
+  "settings.updates.idleRestart.updateDescription":
+    "O OpenBot instala {target} quando nenhum agente está trabalhando. Novas execuções de rotina aguardam até lá.",
+  "settings.updates.idleRestart.relaunch": "Reiniciar quando ocioso",
+  "settings.updates.idleRestart.update": "Instalar quando ocioso",
   "settings.updates.allowRemote.title": "Permitir atualizações por membros do servidor",
   "settings.updates.allowRemote.description":
     "Todos os membros conectados ao servidor podem solicitar uma atualização quando este computador estiver ocioso. Proprietários e administradores também podem forçar uma reinicialização.",
