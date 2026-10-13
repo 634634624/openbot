@@ -19,8 +19,8 @@ import {
 } from "@openbot/ui";
 import { useText } from "@openbot/ui/text";
 import { createStore, For, Show } from "solid-js";
-import { HOOK_TRIGGER_LABELS } from "./hook-labels";
 import { HookRunItem } from "./HookRunItem";
+import { HOOK_TRIGGER_LABELS } from "./hook-labels";
 
 export interface HooksPanelProps {
   supported: boolean;
@@ -280,9 +280,7 @@ export function HooksPanel(props: HooksPanelProps) {
         <Show when={props.snapshot}>
           <Show when={props.snapshot?.blockedReason}>
             {(reason) => (
-              <p role="alert">
-                {reason() === "corrupt" ? t("hook.blocked.corrupt") : t("hook.blocked.ledger-full")}
-              </p>
+              <p role="alert">{reason() === "corrupt" ? t("hook.blocked.corrupt") : t("hook.blocked.ledger-full")}</p>
             )}
           </Show>
           <div class="hook-master-switches">
