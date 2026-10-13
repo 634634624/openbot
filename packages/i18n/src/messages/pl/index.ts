@@ -18,6 +18,7 @@ import { messages as customProvider } from "./customProvider";
 import { messages as diagram } from "./diagram";
 import { messages as dialog } from "./dialog";
 import { messages as files } from "./files";
+import { messages as hook } from "./hook";
 import { messages as importAgent } from "./import";
 import { messages as island } from "./island";
 import { messages as marketplace } from "./marketplace";
@@ -80,6 +81,7 @@ export const pl = {
   ...conversation,
   ...agentSettings,
   ...routine,
+  ...hook,
   ...memory,
   ...skill,
   ...sharedTable,
