@@ -29,6 +29,8 @@ export interface SidebarProps {
   /** The switch over the list is shown only when the caller handles `onViewChange`. */
   view?: SidebarView;
   onViewChange?: ((view: SidebarView) => void) | undefined;
+  /** Desktop exposes its local-only Hooks pane; other consumers keep the original tabs. */
+  showHooks?: boolean;
   deleteSupported?: boolean;
   marketplaceSupported?: boolean;
   channels?: ChannelSummary[];

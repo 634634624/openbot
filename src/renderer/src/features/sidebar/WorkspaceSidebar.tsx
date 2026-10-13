@@ -147,6 +147,7 @@ export function WorkspaceSidebar(props: { peopleEnabled: boolean }) {
       }}
       hasUnread={agentList().some((agent) => (unreadReplies()[agent.id] ?? 0) > 0) || channels.hasUnread()}
       view={layout.sidebarView()}
+      showHooks
       onViewChange={(view) => {
         // An open channel would stay in the middle with no row in the list.
         if (view !== "agents") channels.close();
@@ -191,7 +192,10 @@ export function WorkspaceSidebar(props: { peopleEnabled: boolean }) {
       onReorderPinned={reorderPinnedSidebarItems}
       onReorderPeople={reorderSidebarPeople}
       onSelectAgent={selectAgent}
-      onSelectPerson={(memberId) => { if (layout.sidebarView() === "hooks") layout.setSidebarView("agents"); void selectDirectMember(memberId); }}
+      onSelectPerson={(memberId) => {
+        if (layout.sidebarView() === "hooks") layout.setSidebarView("agents");
+        void selectDirectMember(memberId);
+      }}
       onPreloadDirectConversation={props.peopleEnabled ? () => void DirectConversation.preload() : undefined}
       onCreateAgent={() => {
         channels.close();

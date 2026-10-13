@@ -77,7 +77,9 @@ const Layout = createSimpleContext({
     const [sidebarView, setSidebarViewSignal] = createSignal<SidebarView>(
       window.localStorage.getItem(SIDEBAR_VIEW_STORAGE_KEY) === "hooks"
         ? "hooks"
-        : window.localStorage.getItem(SIDEBAR_VIEW_STORAGE_KEY) === "routines" ? "routines" : "agents",
+        : window.localStorage.getItem(SIDEBAR_VIEW_STORAGE_KEY) === "routines"
+          ? "routines"
+          : "agents",
     );
     const [leftPanelAutoCompact, setLeftPanelAutoCompact] = createSignal(false);
     const leftPanelCompact = createMemo(() => leftPanelCollapsed() || leftPanelAutoCompact());

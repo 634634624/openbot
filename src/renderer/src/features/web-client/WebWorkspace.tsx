@@ -1223,7 +1223,7 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
                 }
                 // The browser client does not know the unread counts of agent chats it has not opened.
                 hasUnread
-                view={layout.sidebarView()}
+                view={layout.sidebarView() === "hooks" ? "agents" : layout.sidebarView()}
                 onViewChange={
                   routinesSupported()
                     ? (view) => {
