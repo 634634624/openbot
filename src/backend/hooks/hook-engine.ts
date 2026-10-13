@@ -2,7 +2,7 @@ import { type HookDefinition, type HookEvent, type HookRun, isHookEvent } from "
 import { sourceText } from "@openbot/i18n/source";
 import { Effect, Exit, Scope, Semaphore } from "effect";
 import { executeHookCommand, type HookCommandExecutor, safeHookOutput } from "./hook-command";
-import { hookApplies, HookFailure, type HookStore } from "./hook-store";
+import { HookFailure, type HookStore, hookApplies } from "./hook-store";
 
 export interface HookEngineOptions {
   store: HookStore;
@@ -51,33 +51,37 @@ export class HookEngine {
   });
 
   readonly onEvent = Effect.fn("HookEngine.onEvent")(function* (this: HookEngine, event: HookEvent) {
-    return yield* this.#events.withPermits(1)(Effect.gen({ self: this }, function* () {
-      if (!isHookEvent(event)) return yield* new HookFailure({ reason: "invalid" });
-      if (!this.#ready || this.#stopped || event.source === "hook") return;
-      // Do not accept a run for an unknown/deleted agent.
-      if (!this.options.workspaceForAgent(event.agentId)) return;
-      const accepted = yield* this.options.store.accept(event);
-      for (const { run, definition } of accepted) {
-        this.notify(run);
-        this.#queue.push({ run, event: structuredClone(event), definition });
-      }
-      if (this.#stopped) {
-        for (const pending of this.#queue.splice(0)) {
-          yield* this.interrupt(pending.run);
+    return yield* this.#events.withPermits(1)(
+      Effect.gen({ self: this }, function* () {
+        if (!isHookEvent(event)) return yield* new HookFailure({ reason: "invalid" });
+        if (!this.#ready || this.#stopped || event.source === "hook") return;
+        // Do not accept a run for an unknown/deleted agent.
+        if (!this.options.workspaceForAgent(event.agentId)) return;
+        const accepted = yield* this.options.store.accept(event);
+        for (const { run, definition } of accepted) {
+          this.notify(run);
+          this.#queue.push({ run, event: structuredClone(event), definition });
         }
-        return;
-      }
-      if (!this.#draining && this.#queue.length > 0) {
-        this.#draining = true;
-        yield* this.drain().pipe(
-          Effect.catch((failure) => Effect.sync(() => this.reportFailure(failure.reason))),
-          Effect.ensuring(Effect.sync(() => {
-            this.#draining = false;
-          })),
-          Effect.forkIn(this.#scope, { startImmediately: true }),
-        );
-      }
-    }));
+        if (this.#stopped) {
+          for (const pending of this.#queue.splice(0)) {
+            yield* this.interrupt(pending.run);
+          }
+          return;
+        }
+        if (!this.#draining && this.#queue.length > 0) {
+          this.#draining = true;
+          yield* this.drain().pipe(
+            Effect.catch((failure) => Effect.sync(() => this.reportFailure(failure.reason))),
+            Effect.ensuring(
+              Effect.sync(() => {
+                this.#draining = false;
+              }),
+            ),
+            Effect.forkIn(this.#scope, { startImmediately: true }),
+          );
+        }
+      }),
+    );
   });
 
   private notify(run: HookRun): void {
@@ -114,7 +118,10 @@ export class HookEngine {
       const cwd = this.options.workspaceForAgent(pending.run.agentId);
       // A queued command is bound to its accepted definition. Disable/edit/delete interrupts it.
       if (
-        this.#stopped || !cwd || !current || !hookApplies(settings, current, pending.event) ||
+        this.#stopped ||
+        !cwd ||
+        !current ||
+        !hookApplies(settings, current, pending.event) ||
         JSON.stringify(current) !== JSON.stringify(pending.definition)
       ) {
         yield* this.interrupt(pending.run);
@@ -128,7 +135,9 @@ export class HookEngine {
       const freshDefinition = fresh.definitions.find((hook) => hook.id === current.id);
       const freshRun = this.options.store.snapshot().runs.find((run) => run.id === running.id);
       if (
-        this.#stopped || freshRun?.status !== "running" || !freshDefinition ||
+        this.#stopped ||
+        freshRun?.status !== "running" ||
+        !freshDefinition ||
         !hookApplies(fresh, freshDefinition, pending.event) ||
         JSON.stringify(freshDefinition) !== JSON.stringify(pending.definition)
       ) {
@@ -138,21 +147,26 @@ export class HookEngine {
       const controller = new AbortController();
       this.#active = { id: running.id, controller };
       const result = yield* Effect.tryPromise({
-        try: () => this.#executor({
-          command: current.command,
-          timeoutMs: current.timeoutMs,
-          cwd,
-          event: pending.event,
-          signal: controller.signal,
-        }),
+        try: () =>
+          this.#executor({
+            command: current.command,
+            timeoutMs: current.timeoutMs,
+            cwd,
+            event: pending.event,
+            signal: controller.signal,
+          }),
         catch: () => new HookFailure({ reason: "unavailable" }),
-      }).pipe(Effect.catch(() => Effect.succeed({
-        status: "failed" as const,
-        exitCode: null,
-        stdout: "",
-        stderr: sourceText("error.backend.hooksCommandRun"),
-        truncated: false,
-      })));
+      }).pipe(
+        Effect.catch(() =>
+          Effect.succeed({
+            status: "failed" as const,
+            exitCode: null,
+            stdout: "",
+            stderr: sourceText("error.backend.hooksCommandRun"),
+            truncated: false,
+          }),
+        ),
+      );
       this.#active = null;
       const output = safeHookOutput(result.stdout, result.stderr, this.options.redact);
       const settled = yield* this.options.store.updateRun({

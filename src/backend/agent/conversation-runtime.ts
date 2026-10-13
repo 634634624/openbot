@@ -551,9 +551,12 @@ export class ConversationRuntime {
   /** Upserts an app-owned item on its immutable origin, never on the agent's current chat. */
   upsertSystemItem(agentId: string, threadId: string, message: ConversationMessage): void {
     if (this.#forgottenExecutionThreads.has(threadId)) return;
-    if (!this.#store.database.connection.prepare(
-      "SELECT 1 FROM projection_threads WHERE thread_id = ? AND agent_id = ?",
-    ).get(threadId, agentId)) return;
+    if (
+      !this.#store.database.connection
+        .prepare("SELECT 1 FROM projection_threads WHERE thread_id = ? AND agent_id = ?")
+        .get(threadId, agentId)
+    )
+      return;
     const cached = this.#snapshots.get(agentId);
     const snapshot = cached?.threadId === threadId ? cached : this.#executionSnapshots.get(threadId);
     if (snapshot) {
@@ -568,9 +571,13 @@ export class ConversationRuntime {
     const page = this.#store.database.readConversationPage(agentId, threadId, { type: "latest" }, 100);
     if (page.threadId !== threadId) return;
     const revision = this.#store.database.persistConversationChanges({
-      agentId, threadId, activeTurnId: page.activeTurnId,
-      changedMessages: [message], removedMessageIds: [],
-      eventType: "conversation.hook-run-updated", detail: { runId: message.id },
+      agentId,
+      threadId,
+      activeTurnId: page.activeTurnId,
+      changedMessages: [message],
+      removedMessageIds: [],
+      eventType: "conversation.hook-run-updated",
+      detail: { runId: message.id },
     });
     const messages = page.messages.filter((item) => item.id !== message.id);
     messages.push(message);

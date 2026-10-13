@@ -5,15 +5,28 @@ import { join } from "node:path";
 import { HOOK_LIMITS, type HookDefinition, type HookEvent, type HookRun } from "@openbot/contracts/ipc-hooks";
 import { Effect } from "effect";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { safeHookOutput, type HookCommandExecutor, type HookCommandResult } from "./hook-command";
+import { type HookCommandExecutor, type HookCommandResult, safeHookOutput } from "./hook-command";
 import { HookEngine } from "./hook-engine";
 import { emptyHookSettings, HookStore } from "./hook-store";
 
 let root: string;
 let engines: HookEngine[];
-const event: HookEvent = { id: "event-1", trigger: "turn.completed", agentId: "agent-one", threadId: "thread-one", turnId: "turn-one" };
-const definition: HookDefinition = { id: "hook-one", name: "One action", enabled: true, scope: { kind: "global" },
-  trigger: "turn.completed", command: "user configured action", timeoutMs: 1000 };
+const event: HookEvent = {
+  id: "event-1",
+  trigger: "turn.completed",
+  agentId: "agent-one",
+  threadId: "thread-one",
+  turnId: "turn-one",
+};
+const definition: HookDefinition = {
+  id: "hook-one",
+  name: "One action",
+  enabled: true,
+  scope: { kind: "global" },
+  trigger: "turn.completed",
+  command: "user configured action",
+  timeoutMs: 1000,
+};
 const completed: HookCommandResult = { status: "completed", exitCode: 0, stdout: "done", stderr: "", truncated: false };
 function deferred<T>() {
   let resolve: (value: T) => void = () => {};
@@ -33,10 +46,20 @@ afterEach(async () => {
 async function setup(executor: HookCommandExecutor, runChanged?: (run: HookRun) => void) {
   const path = join(root, "hooks.json");
   const store = new HookStore({ path });
-  const engine = new HookEngine({ store, executor, workspaceForAgent: (id) => id === event.agentId ? root : null, runChanged });
+  const engine = new HookEngine({
+    store,
+    executor,
+    workspaceForAgent: (id) => (id === event.agentId ? root : null),
+    runChanged,
+  });
   engines.push(engine);
   await Effect.runPromise(engine.initialize());
-  await Effect.runPromise(store.saveSettings({ expectedRevision: 0, settings: { ...emptyHookSettings(), enabled: true, definitions: [definition] } }));
+  await Effect.runPromise(
+    store.saveSettings({
+      expectedRevision: 0,
+      settings: { ...emptyHookSettings(), enabled: true, definitions: [definition] },
+    }),
+  );
   return { store, engine, path };
 }
 describe.sequential("local lifecycle hooks", () => {
@@ -50,7 +73,9 @@ describe.sequential("local lifecycle hooks", () => {
     const store = new HookStore({ path });
     await Effect.runPromise(store.initialize());
     expect(store.snapshot().blockedReason).toBe("corrupt");
-    await expect(Effect.runPromise(store.saveSettings({ expectedRevision: 0, settings: emptyHookSettings() }))).rejects.toBeDefined();
+    await expect(
+      Effect.runPromise(store.saveSettings({ expectedRevision: 0, settings: emptyHookSettings() })),
+    ).rejects.toBeDefined();
     await expect(Effect.runPromise(store.resetHistory({ expectedRevision: 0 }))).rejects.toBeDefined();
     expect(await readFile(path, "utf8")).toBe(corrupt);
   });
@@ -58,8 +83,14 @@ describe.sequential("local lifecycle hooks", () => {
   it("rejects stale settings and never changes the accepted command", async () => {
     const { store } = await setup(async () => completed);
     await Effect.runPromise(store.saveSettings({ expectedRevision: 1, settings: emptyHookSettings() }));
-    await expect(Effect.runPromise(store.saveSettings({ expectedRevision: 1,
-      settings: { ...emptyHookSettings(), enabled: true, definitions: [definition] } }))).rejects.toBeDefined();
+    await expect(
+      Effect.runPromise(
+        store.saveSettings({
+          expectedRevision: 1,
+          settings: { ...emptyHookSettings(), enabled: true, definitions: [definition] },
+        }),
+      ),
+    ).rejects.toBeDefined();
     expect(store.snapshot().revision).toBe(2);
     expect(store.snapshot().settings.enabled).toBe(false);
   });
@@ -67,11 +98,15 @@ describe.sequential("local lifecycle hooks", () => {
   it("runs once for a duplicate and sends only lifecycle metadata to the injected executor", async () => {
     const terminal = deferred<HookRun>();
     const requests: HookEvent[] = [];
-    const { store, engine } = await setup(async (request) => {
-      requests.push(request.event);
-      return completed;
-    },
-      (run) => { if (run.status === "completed") terminal.resolve(run); });
+    const { store, engine } = await setup(
+      async (request) => {
+        requests.push(request.event);
+        return completed;
+      },
+      (run) => {
+        if (run.status === "completed") terminal.resolve(run);
+      },
+    );
     await Effect.runPromise(engine.onEvent(event));
     await terminal.promise;
     await Effect.runPromise(engine.onEvent(event));
@@ -86,16 +121,23 @@ describe.sequential("local lifecycle hooks", () => {
     const release = deferred<HookCommandResult>();
     const secondTerminal = deferred<void>();
     let calls = 0;
-    const { store, engine } = await setup(async () => {
-      calls++;
-      started.resolve();
-      return release.promise;
-    }, (run) => { if (run.eventId === "event-2" && run.status === "interrupted") secondTerminal.resolve(); });
+    const { store, engine } = await setup(
+      async () => {
+        calls++;
+        started.resolve();
+        return release.promise;
+      },
+      (run) => {
+        if (run.eventId === "event-2" && run.status === "interrupted") secondTerminal.resolve();
+      },
+    );
     await Effect.runPromise(engine.onEvent(event));
     await started.promise;
     await Effect.runPromise(engine.onEvent({ ...event, id: "event-2" }));
     const snapshot = store.snapshot();
-    await Effect.runPromise(store.saveSettings({ expectedRevision: snapshot.revision, settings: { ...snapshot.settings, enabled: false } }));
+    await Effect.runPromise(
+      store.saveSettings({ expectedRevision: snapshot.revision, settings: { ...snapshot.settings, enabled: false } }),
+    );
     release.resolve(completed);
     await secondTerminal.promise;
     expect(calls).toBe(1);
@@ -105,10 +147,20 @@ describe.sequential("local lifecycle hooks", () => {
   it("cancels the active executor and persists interrupted instead of success", async () => {
     const started = deferred<void>();
     const terminal = deferred<HookRun>();
-    const { engine, store } = await setup((request) => new Promise((resolve) => {
-      request.signal.addEventListener("abort", () => resolve({ ...completed, status: "interrupted", exitCode: null }), { once: true });
-      started.resolve();
-    }), (run) => { if (run.status === "interrupted") terminal.resolve(run); });
+    const { engine, store } = await setup(
+      (request) =>
+        new Promise((resolve) => {
+          request.signal.addEventListener(
+            "abort",
+            () => resolve({ ...completed, status: "interrupted", exitCode: null }),
+            { once: true },
+          );
+          started.resolve();
+        }),
+      (run) => {
+        if (run.status === "interrupted") terminal.resolve(run);
+      },
+    );
     await Effect.runPromise(engine.onEvent(event));
     await started.promise;
     await Effect.runPromise(engine.cancelRun(store.snapshot().runs[0].id));
@@ -120,7 +172,9 @@ describe.sequential("local lifecycle hooks", () => {
     await Effect.runPromise(store.accept(event));
     let called = false;
     const recovered = new HookStore({ path });
-    const engine = new HookEngine({ store: recovered, workspaceForAgent: () => root,
+    const engine = new HookEngine({
+      store: recovered,
+      workspaceForAgent: () => root,
       executor: async () => {
         called = true;
         return completed;
@@ -134,8 +188,9 @@ describe.sequential("local lifecycle hooks", () => {
   });
 
   it("bounds combined output bytes after redaction", () => {
-    const output = safeHookOutput(`private-marker${"😀".repeat(HOOK_LIMITS.outputBytes)}`, "error",
-      (text) => text.replaceAll("private-marker", "[redacted]"));
+    const output = safeHookOutput(`private-marker${"😀".repeat(HOOK_LIMITS.outputBytes)}`, "error", (text) =>
+      text.replaceAll("private-marker", "[redacted]"),
+    );
     expect(output.stdout).not.toContain("private-marker");
     expect(Buffer.byteLength(output.stdout + output.stderr)).toBeLessThanOrEqual(HOOK_LIMITS.outputBytes);
     expect(output.truncated).toBe(true);
@@ -153,7 +208,9 @@ describe.sequential("local lifecycle hooks", () => {
     const disabled = { ...before.settings, enabled: false };
     await Effect.runPromise(store.saveSettings({ expectedRevision: before.revision, settings: disabled }));
     await expect(Effect.runPromise(store.resetHistory({ expectedRevision: 2 }))).rejects.toBeDefined();
-    await Effect.runPromise(store.updateRun({ ...accepted.run, status: "interrupted", finishedAt: new Date().toISOString() }));
+    await Effect.runPromise(
+      store.updateRun({ ...accepted.run, status: "interrupted", finishedAt: new Date().toISOString() }),
+    );
     await expect(Effect.runPromise(store.resetHistory({ expectedRevision: 1 }))).rejects.toBeDefined();
     const reset = await Effect.runPromise(store.resetHistory({ expectedRevision: 2 }));
     expect(reset.revision).toBe(3);
@@ -171,14 +228,17 @@ describe.sequential("local lifecycle hooks", () => {
   it("explicitly reopens a full ledger without changing definitions or enabling hooks", async () => {
     const path = join(root, "hooks.json");
     const settings = { ...emptyHookSettings(), definitions: [definition], agentEnabled: { "agent-one": false } };
-    await writeFile(path, JSON.stringify({
-      version: 1,
-      revision: 4,
-      settings,
-      runs: [],
-      seen: Array.from({ length: HOOK_LIMITS.dedupKeys }, (_, index) => index.toString(16).padStart(64, "0")),
-      ledgerFull: true,
-    }));
+    await writeFile(
+      path,
+      JSON.stringify({
+        version: 1,
+        revision: 4,
+        settings,
+        runs: [],
+        seen: Array.from({ length: HOOK_LIMITS.dedupKeys }, (_, index) => index.toString(16).padStart(64, "0")),
+        ledgerFull: true,
+      }),
+    );
     const store = new HookStore({ path });
     await Effect.runPromise(store.initialize());
     expect(store.snapshot().blockedReason).toBe("ledger-full");

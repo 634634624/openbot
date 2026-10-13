@@ -11,8 +11,8 @@ import {
   conversationPlanText,
   latestTurnAnswer,
 } from "@openbot/contracts/ipc";
-import { isString } from "@openbot/contracts/runtime-values";
 import type { HookEvent } from "@openbot/contracts/ipc-hooks";
+import { isString } from "@openbot/contracts/runtime-values";
 import { sourceText } from "@openbot/i18n/source";
 import { createOpenBotLogger } from "@openbot/logging";
 import { classifyFailure } from "@openbot/telemetry";
@@ -63,7 +63,9 @@ const logger = createOpenBotLogger("turn-lifecycle");
 
 /** Fixed-size, unambiguous identity also fits the IPC identifier limit for long provider ids. */
 function hookEventId(trigger: HookEvent["trigger"], agentId: string, turnId: string, itemId?: string): string {
-  return createHash("sha256").update(JSON.stringify([trigger, agentId, turnId, itemId ?? null])).digest("hex");
+  return createHash("sha256")
+    .update(JSON.stringify([trigger, agentId, turnId, itemId ?? null]))
+    .digest("hex");
 }
 
 export interface AgentBrowserHost extends AttentionBrowserHost, BrowserUploadTarget {
@@ -298,8 +300,14 @@ export class TurnLifecycle {
     for (const [turnId, turn] of this.#runningTurns) {
       if (turn.client !== client || this.#hookEndedTurns.has(turnId)) continue;
       this.#hookEndedTurns.add(turnId);
-      this.#hooks.emitHookEvent?.({ id: hookEventId("turn.failed", turn.agentId, turnId),
-        trigger: "turn.failed", agentId: turn.agentId, threadId: turn.publicThreadId, turnId, source: "agent" });
+      this.#hooks.emitHookEvent?.({
+        id: hookEventId("turn.failed", turn.agentId, turnId),
+        trigger: "turn.failed",
+        agentId: turn.agentId,
+        threadId: turn.publicThreadId,
+        turnId,
+        source: "agent",
+      });
     }
   }
 
@@ -376,8 +384,14 @@ export class TurnLifecycle {
           }).pipe(Effect.forkIn(this.#scope, { startImmediately: true }));
         }
         this.#hooks.emit({ type: "turn-started", agentId, threadId: publicThreadId, turnId, origin });
-        this.#hooks.emitHookEvent?.({ id: hookEventId("turn.started", agentId, turnId), trigger: "turn.started",
-          agentId, threadId: publicThreadId, turnId, source: "agent" });
+        this.#hooks.emitHookEvent?.({
+          id: hookEventId("turn.started", agentId, turnId),
+          trigger: "turn.started",
+          agentId,
+          threadId: publicThreadId,
+          turnId,
+          source: "agent",
+        });
         this.#conversation.emitConversation(snapshot, "turn.started", { turnId });
         return;
       }
@@ -635,11 +649,15 @@ export class TurnLifecycle {
     status: string,
   ) {
     const running = this.#runningTurns.get(turnId);
-    if (running && !this.#hookEndedTurns.has(turnId)) this.#hooks.emitHookEvent?.({
-      id: hookEventId(status === "completed" ? "turn.completed" : "turn.failed", agentId, turnId),
-      trigger: status === "completed" ? "turn.completed" : "turn.failed",
-      agentId, threadId: running.publicThreadId, turnId, source: "agent",
-    });
+    if (running && !this.#hookEndedTurns.has(turnId))
+      this.#hooks.emitHookEvent?.({
+        id: hookEventId(status === "completed" ? "turn.completed" : "turn.failed", agentId, turnId),
+        trigger: status === "completed" ? "turn.completed" : "turn.failed",
+        agentId,
+        threadId: running.publicThreadId,
+        turnId,
+        source: "agent",
+      });
     this.#runningTurns.delete(turnId);
     this.#hookEndedTurns.delete(turnId);
     const noUpdateCalled = this.#noUpdateTurns.delete(turnId);
@@ -942,9 +960,16 @@ export class TurnLifecycle {
     const running = this.#runningTurns.get(turnId);
     if (tool && running && !this.#hookEndedTurns.has(turnId) && isString(item.id)) {
       const trigger = completed ? "tool.completed" : "tool.started";
-      this.#hooks.emitHookEvent?.({ id: hookEventId(trigger, agentId, turnId, item.id), trigger,
-        agentId, threadId: running.publicThreadId, turnId, toolCallId: item.id,
-        toolName: tool.tool ?? getString(item, "name") ?? item.type, source: "agent" });
+      this.#hooks.emitHookEvent?.({
+        id: hookEventId(trigger, agentId, turnId, item.id),
+        trigger,
+        agentId,
+        threadId: running.publicThreadId,
+        turnId,
+        toolCallId: item.id,
+        toolName: tool.tool ?? getString(item, "name") ?? item.type,
+        source: "agent",
+      });
     }
     if (usage) this.#hooks.emitToolUsage({ ...usage, agentId, turnId });
     if (yield* this.#images.handleItem(agentId, threadId, turnId, item, completed)) return;

@@ -26,7 +26,6 @@ import type {
 // for the checker, and the runtime value is still `{ kind, channel }`.
 
 import type { ManagedProviderId } from "./agent-providers";
-import type { CancelHookRunInput, HookSnapshot, ResetHookHistoryInput, SaveHookSettingsInput } from "./ipc-hooks";
 import type { AppLanguagePreference, SetAppLanguagePreferenceInput } from "./app-language";
 import type { AppLogoColorPreference, SetAppLogoColorPreferenceInput } from "./app-logo-color";
 import type { BillingPortalRequest, BillingState } from "./billing";
@@ -216,6 +215,7 @@ import type {
   WebhookSecret,
 } from "./ipc-events";
 import type { GitHubConnectorRepositories, GitHubConnectorStatus } from "./ipc-github-connector";
+import type { CancelHookRunInput, HookSnapshot, ResetHookHistoryInput, SaveHookSettingsInput } from "./ipc-hooks";
 import type { HostAnalytics, HostAnalyticsInput } from "./ipc-host-analytics";
 import type { HostReleaseStatus } from "./ipc-host-release";
 import type {

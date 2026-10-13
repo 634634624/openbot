@@ -31,10 +31,14 @@ export function HookRunItem(props: { run: HookRun; onCancel?: (runId: string) =>
         <dd>{t(`hook.run.${props.run.status}`)}</dd>
         <dt>{t("hook.run.duration")}</dt>
         <dd>{duration()}</dd>
-        <Show when={props.run.startedAt}>{(started) => <>
-          <dt>{t("hook.run.started")}</dt>
-          <dd>{format.date(new Date(started()))}</dd>
-        </>}</Show>
+        <Show when={props.run.startedAt}>
+          {(started) => (
+            <>
+              <dt>{t("hook.run.started")}</dt>
+              <dd>{format.date(new Date(started()))}</dd>
+            </>
+          )}
+        </Show>
         <Show when={props.run.exitCode !== null}>
           <dt>{t("hook.run.exitCode")}</dt>
           <dd>{props.run.exitCode}</dd>
@@ -46,9 +50,18 @@ export function HookRunItem(props: { run: HookRun; onCancel?: (runId: string) =>
         <h4>{t("hook.run.stderr")}</h4>
         <pre class="hook-output">{sourceText(props.run.stderr)}</pre>
       </Show>
-      <Show when={props.run.truncated}><p>{t("hook.run.truncated")}</p></Show>
+      <Show when={props.run.truncated}>
+        <p>{t("hook.run.truncated")}</p>
+      </Show>
       <Show when={props.onCancel && (props.run.status === "queued" || props.run.status === "running")}>
-        <Button type="button" variant="secondary" disabled={props.disabled} onClick={() => props.onCancel?.(props.run.id)}>{t("hook.run.cancel")}</Button>
+        <Button
+          type="button"
+          variant="secondary"
+          disabled={props.disabled}
+          onClick={() => props.onCancel?.(props.run.id)}
+        >
+          {t("hook.run.cancel")}
+        </Button>
       </Show>
     </details>
   );

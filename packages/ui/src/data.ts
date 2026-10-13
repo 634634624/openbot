@@ -1,4 +1,3 @@
-import type { HookRun } from "@openbot/contracts/ipc-hooks";
 import type {
   AgentAccess,
   AgentExchangeSummary,
@@ -21,6 +20,7 @@ import type {
   RoutineRunConversationEvent,
   SkillConversationEvent,
 } from "@openbot/contracts/ipc";
+import type { HookRun } from "@openbot/contracts/ipc-hooks";
 
 /**
  * `error` is a message the renderer wrote itself, not one the provider sent: an action of the

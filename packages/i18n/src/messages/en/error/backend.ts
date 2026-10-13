@@ -10,7 +10,8 @@ export const messages = defineMessages("error.backend", {
   "error.backend.hooksPosixOnly": "Hook commands require a POSIX host.",
   "error.backend.hooksCommandStart": "The configured command could not start.",
   "error.backend.hooksCommandRun": "The configured command could not run.",
-  "error.backend.hooksRestartInterrupted": "The application restarted before this command settled. It was not run again.",
+  "error.backend.hooksRestartInterrupted":
+    "The application restarted before this command settled. It was not run again.",
   "error.backend.eventsUnavailable": "Events are not available on this host.",
   "error.backend.webhookRouteLimit": "A host can have at most {limit} webhook routines.",
   "error.backend.webhookSettingsInvalid": "Check the webhook settings and try again.",

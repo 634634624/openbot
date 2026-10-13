@@ -52,7 +52,6 @@ import {
   decodeWebhookSecret,
 } from "@openbot/contracts/ipc-events";
 import { contextBridge, ipcRenderer, webUtils } from "electron";
-import { decodeLocalHookSnapshot } from "./hooks-decoding";
 import {
   decodeAccountUsageFromMain,
   decodeAgent,
@@ -168,6 +167,7 @@ import {
   decodeDynamicIslandPreference,
   decodeDynamicIslandPresentation,
 } from "./dynamic-island-decoding";
+import { decodeLocalHookSnapshot } from "./hooks-decoding";
 import { decodeHostReleaseStatusFromMain } from "./host-release-decoding";
 import {
   decodeAddOrchestratorReply,
@@ -533,9 +533,15 @@ const openbotApi: OpenBotDesktopApi = {
     save: decodeLocalHookSnapshot,
     cancelRun: decodeLocalHookSnapshot,
     resetHistory: decodeLocalHookSnapshot,
-    changed: { drop: (value) => {
-      try { return decodeLocalHookSnapshot(value); } catch { return null; }
-    } },
+    changed: {
+      drop: (value) => {
+        try {
+          return decodeLocalHookSnapshot(value);
+        } catch {
+          return null;
+        }
+      },
+    },
   }),
   dynamicIsland: bridgeGroup(IPC_ENDPOINTS.dynamicIsland, {
     getPreference: decodeDynamicIslandPreference,

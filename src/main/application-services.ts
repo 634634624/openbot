@@ -1,15 +1,15 @@
 import { isManagedRuntimeProvider } from "@openbot/contracts/agent-providers";
+import type { HookEvent } from "@openbot/contracts/ipc-hooks";
 import { openPanelTransport, ReportQueue } from "@openbot/telemetry";
 import { fileReportStorage } from "@openbot/telemetry/node";
 import { Effect, Exit, Fiber, Scope } from "effect";
-import type { HookEvent } from "@openbot/contracts/ipc-hooks";
-import { HookEngine } from "../backend/hooks/hook-engine";
-import { HookStore } from "../backend/hooks/hook-store";
-import { toAgentRemovalFailed } from "../backend/agent/agent-removal";
-import { toHostedSiteOperationFailed } from "../backend/agent/hosted-site-coordinator";
 import { AgentDatabaseSupervisor } from "../backend/agent-data/agent-database-supervisor";
 import { AgentTables } from "../backend/agent-data/agent-tables";
 import { AgentRoutineStore } from "../backend/agent-routine-store";
+import { toAgentRemovalFailed } from "../backend/agent/agent-removal";
+import { toHostedSiteOperationFailed } from "../backend/agent/hosted-site-coordinator";
+import { HookEngine } from "../backend/hooks/hook-engine";
+import { HookStore } from "../backend/hooks/hook-store";
 import { DiscordConnectFailed, toDiscordConnectFailed } from "../backend/messaging/discord/discord-connect";
 import { SlackConnectFailed, toSlackConnectFailed } from "../backend/messaging/slack/slack-connect";
 import { routineFlowRoutines } from "../backend/routine-flows/routine-flow-routines";
@@ -68,10 +68,10 @@ import { sourceText } from "@openbot/i18n/source";
 import { createOpenBotLogger, toLogValue } from "@openbot/logging";
 import { REMOTE_ACCOUNT_CHECK_INTERVAL_MS } from "@openbot/team-client";
 import { app, type BrowserWindow, clipboard, nativeImage, safeStorage, screen, shell } from "electron";
-import { pasteCodeLoginSupported } from "../backend/agent/cli-code-login";
-import { toMcpGatewayFailed } from "../backend/agent/mcp-gateway";
 import { AgentLifecycleFailed, AgentService } from "../backend/agent-service";
 import { AgentStore } from "../backend/agent-store";
+import { pasteCodeLoginSupported } from "../backend/agent/cli-code-login";
+import { toMcpGatewayFailed } from "../backend/agent/mcp-gateway";
 import { BrowserHost } from "../backend/browser-host";
 import { runCauseEffect } from "../backend/effect-boundary";
 import { MailboxStore } from "../backend/mailbox-store";
@@ -1343,10 +1343,14 @@ export async function createApplicationServices({
   });
   const hookScope = Scope.makeUnsafe();
   const onHookEvent = (event: HookEvent): void => {
-    Effect.runFork(hookEngine.onEvent(event).pipe(
-      Effect.catch((failure) => Effect.sync(() => logger.warn("A local hook event failed.", { reason: failure.reason }))),
-      Effect.forkIn(hookScope, { startImmediately: true }),
-    ));
+    Effect.runFork(
+      hookEngine.onEvent(event).pipe(
+        Effect.catch((failure) =>
+          Effect.sync(() => logger.warn("A local hook event failed.", { reason: failure.reason })),
+        ),
+        Effect.forkIn(hookScope, { startImmediately: true }),
+      ),
+    );
   };
   const hooks = {
     snapshot: () => hookStore.snapshot(),
@@ -2157,9 +2161,13 @@ export async function createApplicationServices({
   const agentInitialization = new AgentInitializationGate(() =>
     Effect.gen(function* () {
       yield* Fiber.join(computerUseWarmUp);
-      yield* hookEngine.initialize().pipe(Effect.catch((failure) =>
-        Effect.sync(() => logger.warn("Local hooks could not initialize.", { reason: failure.reason })),
-      ));
+      yield* hookEngine
+        .initialize()
+        .pipe(
+          Effect.catch((failure) =>
+            Effect.sync(() => logger.warn("Local hooks could not initialize.", { reason: failure.reason })),
+          ),
+        );
       service.off("hookEvent", onHookEvent);
       service.on("hookEvent", onHookEvent);
       yield* service.initialize({ heldRoutines: takeRoutineHold(routineHoldFile, (message) => logger.warn(message)) });
