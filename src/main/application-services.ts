@@ -1,7 +1,10 @@
 import { isManagedRuntimeProvider } from "@openbot/contracts/agent-providers";
 import { openPanelTransport, ReportQueue } from "@openbot/telemetry";
 import { fileReportStorage } from "@openbot/telemetry/node";
-import { Effect, Fiber } from "effect";
+import { Effect, Exit, Fiber, Scope } from "effect";
+import type { HookEvent } from "@openbot/contracts/ipc-hooks";
+import { HookEngine } from "../backend/hooks/hook-engine";
+import { HookStore } from "../backend/hooks/hook-store";
 import { toAgentRemovalFailed } from "../backend/agent/agent-removal";
 import { toHostedSiteOperationFailed } from "../backend/agent/hosted-site-coordinator";
 import { AgentDatabaseSupervisor } from "../backend/agent-data/agent-database-supervisor";
@@ -329,6 +332,7 @@ const TEARDOWN_ORDER = {
   githubConnector: 107,
   // Before the agent service, so no script starts a run while the service stops.
   automation: 108,
+  hooks: 108.5,
   storageUsage: 109,
   service: 110,
   mcpOAuth: 111,
@@ -372,6 +376,12 @@ export interface ApplicationServiceContext {
 /** Everything the entry point wires up, registers IPC handlers against, and shuts down. */
 export interface ApplicationServices {
   service: AgentService;
+  hooks: {
+    snapshot: HookStore["snapshot"];
+    saveSettings: HookStore["saveSettings"];
+    resetHistory: HookStore["resetHistory"];
+    cancelRun: HookEngine["cancelRun"];
+  };
   routineFlows: RoutineFlowsHandle;
   providerRuntimes: ProviderRuntimeManager;
   providerCredentials: ProviderCredentialStore;
@@ -1320,6 +1330,35 @@ export async function createApplicationServices({
     tables,
   });
   teardown.push(TEARDOWN_ORDER.service, "the agent service", () => runCauseEffect(service.stop()));
+  const hookStore = new HookStore({
+    path: join(app.getPath("userData"), "openbot-hooks-v1.json"),
+    changed: (snapshot) => sendToRenderer(windows.getMainWindow(), IPC_ENDPOINTS.hooks.changed, snapshot),
+  });
+  const hookEngine = new HookEngine({
+    store: hookStore,
+    workspaceForAgent: (agentId) => store.list().find((agent) => agent.id === agentId)?.workspacePath ?? null,
+    redact: (text) => service.redactHookOutput(text),
+    runChanged: (run) => service.recordHookRun(run),
+    failure: (reason) => logger.warn("A local hook operation failed.", { reason }),
+  });
+  const hookScope = Scope.makeUnsafe();
+  const onHookEvent = (event: HookEvent): void => {
+    Effect.runFork(hookEngine.onEvent(event).pipe(
+      Effect.catch((failure) => Effect.sync(() => logger.warn("A local hook event failed.", { reason: failure.reason }))),
+      Effect.forkIn(hookScope, { startImmediately: true }),
+    ));
+  };
+  const hooks = {
+    snapshot: () => hookStore.snapshot(),
+    saveSettings: hookStore.saveSettings.bind(hookStore),
+    resetHistory: hookStore.resetHistory.bind(hookStore),
+    cancelRun: hookEngine.cancelRun.bind(hookEngine),
+  };
+  teardown.push(TEARDOWN_ORDER.hooks, "the local hook engine", async () => {
+    service.off("hookEvent", onHookEvent);
+    await Effect.runPromise(hookEngine.shutdown());
+    await Effect.runPromise(Scope.close(hookScope, Exit.void));
+  });
   // Listens only while an agent allows local scripts; see `AutomationServer`.
   const automation = new AutomationServer({
     root: store.automationRoot,
@@ -2118,6 +2157,11 @@ export async function createApplicationServices({
   const agentInitialization = new AgentInitializationGate(() =>
     Effect.gen(function* () {
       yield* Fiber.join(computerUseWarmUp);
+      yield* hookEngine.initialize().pipe(Effect.catch((failure) =>
+        Effect.sync(() => logger.warn("Local hooks could not initialize.", { reason: failure.reason })),
+      ));
+      service.off("hookEvent", onHookEvent);
+      service.on("hookEvent", onHookEvent);
       yield* service.initialize({ heldRoutines: takeRoutineHold(routineHoldFile, (message) => logger.warn(message)) });
       yield* eventsRuntime.start();
       yield* automation.sync();
@@ -2283,6 +2327,7 @@ export async function createApplicationServices({
 
   return {
     service,
+    hooks,
     routineFlows: routineFlowRuntime,
     providerRuntimes,
     providerCredentials,

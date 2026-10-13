@@ -34,6 +34,7 @@ import { screen } from "@solidjs/testing-library";
 import { vi } from "vitest";
 import { type AnalyticsEventName, type DesktopAnalyticsEvents, desktopAnalytics } from "./analytics";
 import { createMockChannels } from "./preview/mock-channels";
+import { createMockHooks } from "./preview/mock-hooks";
 
 /** Shared by every harness helper, so `expect(trackAnalytics)` works without re-importing the spy. */
 export const trackAnalytics =
@@ -561,6 +562,7 @@ function isGroupName(name: string): name is IpcGroupName {
 }
 
 export function installOpenbotStub(): void {
+  const hooks = createMockHooks();
   for (const bridge of Object.values(eventBridges)) bridge.reset();
   trackAnalytics.mockClear();
   installAnalyticsSpies();
@@ -1265,6 +1267,13 @@ export function installOpenbotStub(): void {
       openFile: vi.fn().mockResolvedValue(undefined),
       openLocation: vi.fn().mockResolvedValue(undefined),
     },
+    hooks: stubGroup("hooks", {
+      get: vi.fn(hooks.get),
+      save: vi.fn(hooks.save),
+      cancelRun: vi.fn(hooks.cancelRun),
+      resetHistory: vi.fn(hooks.resetHistory),
+      onChanged: vi.fn(hooks.onChanged),
+    }),
     // The custom providers context lists on mount, so every harnessed mount reaches this group.
     customProviders: stubGroup("customProviders", {
       list: vi.fn().mockResolvedValue([]),

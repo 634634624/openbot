@@ -51,6 +51,23 @@ beforeEach(() => {
   bridge.invoke.mockReset();
 });
 
+it("decodes local Hooks replies and drops malformed pushed history", async () => {
+  const snapshot = { localOnly: true, revision: 0, blockedReason: null, runs: [],
+    settings: { enabled: false, agentEnabled: {}, agentOverrides: {}, definitions: [] } };
+  bridge.invoke.mockResolvedValue(snapshot);
+  await expect(api().hooks.resetHistory({ expectedRevision: 0 })).resolves.toEqual(snapshot);
+  expect(bridge.invoke).toHaveBeenLastCalledWith(IPC_ENDPOINTS.hooks.resetHistory.channel, { expectedRevision: 0 });
+  bridge.invoke.mockResolvedValue({ ...snapshot, localOnly: false });
+  await expect(api().hooks.get()).rejects.toThrow("Invalid Hooks snapshot from main.");
+  const listener = vi.fn();
+  const unsubscribe = api().hooks.onChanged(listener);
+  send(IPC_ENDPOINTS.hooks.changed.channel, { ...snapshot, revision: -1 });
+  expect(listener).not.toHaveBeenCalled();
+  send(IPC_ENDPOINTS.hooks.changed.channel, snapshot);
+  expect(listener).toHaveBeenCalledWith(snapshot);
+  unsubscribe();
+});
+
 it("sends at most one input, and none when the caller passes none", async () => {
   bridge.invoke.mockResolvedValue({ text: "Hello" });
   const input = { audio: new Uint8Array([1, 2]) };

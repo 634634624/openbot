@@ -26,6 +26,7 @@ import type {
 // for the checker, and the runtime value is still `{ kind, channel }`.
 
 import type { ManagedProviderId } from "./agent-providers";
+import type { CancelHookRunInput, HookSnapshot, ResetHookHistoryInput, SaveHookSettingsInput } from "./ipc-hooks";
 import type { AppLanguagePreference, SetAppLanguagePreferenceInput } from "./app-language";
 import type { AppLogoColorPreference, SetAppLogoColorPreferenceInput } from "./app-logo-color";
 import type { BillingPortalRequest, BillingState } from "./billing";
@@ -1257,6 +1258,13 @@ export const IPC_ENDPOINTS = {
     revokeSession: request<string, void>()("host:revoke-session"),
     event: event<HostStatus>()("host:event"),
   },
+  hooks: {
+    get: request<undefined, HookSnapshot>()("hooks:get"),
+    save: request<SaveHookSettingsInput, HookSnapshot>()("hooks:save"),
+    cancelRun: request<CancelHookRunInput, HookSnapshot>()("hooks:cancel-run"),
+    resetHistory: request<ResetHookHistoryInput, HookSnapshot>()("hooks:reset-history"),
+    changed: event<HookSnapshot>()("hooks:changed"),
+  },
   events: {
     getStatus: scopedQuery<EventStatus, "required">()("events:get-status"),
     listRoutines: scopedRequest<ListEventRoutinesInput, EventRoutine[], "required">()("events:list-routines"),
@@ -1335,6 +1343,7 @@ export const IPC_GROUP_PATHS = {
   agentImport: "agentImport",
   plugins: "plugins",
   host: "host",
+  hooks: "hooks",
   events: "events",
   remoteDesktop: "remoteDesktop",
 } as const satisfies { readonly [Group in keyof IpcEndpoints]: string | null };

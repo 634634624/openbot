@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   type AgentEvent,
   type AgentSummary,
@@ -11,6 +12,7 @@ import {
   latestTurnAnswer,
 } from "@openbot/contracts/ipc";
 import { isString } from "@openbot/contracts/runtime-values";
+import type { HookEvent } from "@openbot/contracts/ipc-hooks";
 import { sourceText } from "@openbot/i18n/source";
 import { createOpenBotLogger } from "@openbot/logging";
 import { classifyFailure } from "@openbot/telemetry";
@@ -59,6 +61,11 @@ import { USAGE_LIMIT_METHOD, type UsageLimitGate } from "./usage-limit-gate";
 
 const logger = createOpenBotLogger("turn-lifecycle");
 
+/** Fixed-size, unambiguous identity also fits the IPC identifier limit for long provider ids. */
+function hookEventId(trigger: HookEvent["trigger"], agentId: string, turnId: string, itemId?: string): string {
+  return createHash("sha256").update(JSON.stringify([trigger, agentId, turnId, itemId ?? null])).digest("hex");
+}
+
 export interface AgentBrowserHost extends AttentionBrowserHost, BrowserUploadTarget {
   onChanged(listener: (tabs: BrowserTab[], activeTabId: string | null) => void): () => void;
   onControlChanged(listener: (state: BrowserControlState) => void): () => void;
@@ -74,6 +81,7 @@ export interface AgentBrowserHost extends AttentionBrowserHost, BrowserUploadTar
 }
 
 export interface TurnHooks {
+  emitHookEvent?(event: HookEvent): void;
   emitFailure?(failure: FailureSignal): void;
   emit(event: AgentEvent): void;
   emitError(code: string, error: unknown, agentId?: string, context?: FailureContext): void;
@@ -147,6 +155,7 @@ export class TurnLifecycle {
   readonly #failedTurns = new Map<string, string>();
   readonly #observedCompactions = new Map<string, string>();
   readonly #itemTurns = new Map<string, string>();
+  readonly #hookEndedTurns = new Set<string>();
   #scope = Scope.makeUnsafe();
   readonly #turnAssociations = new Map<string, Deferred.Deferred<void, TurnOperationFailed>>();
   /**
@@ -168,6 +177,7 @@ export class TurnLifecycle {
       client: AgentClient;
       agentId: string;
       threadId: string;
+      publicThreadId: string;
       startedAt: number;
       sentAt: number | null;
       firstOutputAt: number | null;
@@ -256,6 +266,7 @@ export class TurnLifecycle {
     this.#refusedRetries.clear();
     this.#lastEventAt.clear();
     this.#itemTurns.clear();
+    this.#hookEndedTurns.clear();
     this.#observedCompactions.clear();
   }).bind(this);
 
@@ -271,7 +282,6 @@ export class TurnLifecycle {
   ) {
     for (const [turnId, turn] of this.#runningTurns) {
       if (turn.client !== client) continue;
-      this.#runningTurns.delete(turnId);
       this.#attention.clearForTurn(turn.threadId, turnId);
       if (this.#observedCompactions.get(turn.threadId) === turnId) this.#observedCompactions.delete(turn.threadId);
       this.#compaction.abandonCompaction(turn.threadId);
@@ -282,6 +292,16 @@ export class TurnLifecycle {
       );
     }
   }).bind(this);
+
+  /** Crash recovery owns delivery settlement; command hooks still receive the true lost turn. */
+  providerLost(client: AgentClient): void {
+    for (const [turnId, turn] of this.#runningTurns) {
+      if (turn.client !== client || this.#hookEndedTurns.has(turnId)) continue;
+      this.#hookEndedTurns.add(turnId);
+      this.#hooks.emitHookEvent?.({ id: hookEventId("turn.failed", turn.agentId, turnId),
+        trigger: "turn.failed", agentId: turn.agentId, threadId: turn.publicThreadId, turnId, source: "agent" });
+    }
+  }
 
   readonly handleNotification = Effect.fn("TurnLifecycle.handleNotification")(function* (
     this: TurnLifecycle,
@@ -324,6 +344,7 @@ export class TurnLifecycle {
         const turnId = getString(turn, "id");
         if (!turnId) return;
         if (this.#compaction.claimTurn(agentId, threadId, turnId)) return;
+        if (this.#runningTurns.has(turnId)) return;
         this.#compaction.beginTurn(threadId);
         // The provider started this turn itself. A delivery that is starting now waits for its own turn.
         const unprompted = isRecord(params) && params.unprompted === true;
@@ -333,6 +354,7 @@ export class TurnLifecycle {
           client: source,
           agentId,
           threadId,
+          publicThreadId: this.#conversation.publicThreadId(agentId, threadId),
           startedAt: Date.now(),
           sentAt: Number.isFinite(sentAt) ? sentAt : null,
           firstOutputAt: null,
@@ -354,6 +376,8 @@ export class TurnLifecycle {
           }).pipe(Effect.forkIn(this.#scope, { startImmediately: true }));
         }
         this.#hooks.emit({ type: "turn-started", agentId, threadId: publicThreadId, turnId, origin });
+        this.#hooks.emitHookEvent?.({ id: hookEventId("turn.started", agentId, turnId), trigger: "turn.started",
+          agentId, threadId: publicThreadId, turnId, source: "agent" });
         this.#conversation.emitConversation(snapshot, "turn.started", { turnId });
         return;
       }
@@ -611,7 +635,13 @@ export class TurnLifecycle {
     status: string,
   ) {
     const running = this.#runningTurns.get(turnId);
+    if (running && !this.#hookEndedTurns.has(turnId)) this.#hooks.emitHookEvent?.({
+      id: hookEventId(status === "completed" ? "turn.completed" : "turn.failed", agentId, turnId),
+      trigger: status === "completed" ? "turn.completed" : "turn.failed",
+      agentId, threadId: running.publicThreadId, turnId, source: "agent",
+    });
     this.#runningTurns.delete(turnId);
+    this.#hookEndedTurns.delete(turnId);
     const noUpdateCalled = this.#noUpdateTurns.delete(turnId);
     if (running) {
       // `waitMs` is OpenBot's part of a slow reply: the queue (a usage-limit hold included), the
@@ -908,6 +938,14 @@ export class TurnLifecycle {
     completed: boolean,
   ) {
     const usage = completed ? toolUsage(item) : null;
+    const tool = toolUsage(item);
+    const running = this.#runningTurns.get(turnId);
+    if (tool && running && !this.#hookEndedTurns.has(turnId) && isString(item.id)) {
+      const trigger = completed ? "tool.completed" : "tool.started";
+      this.#hooks.emitHookEvent?.({ id: hookEventId(trigger, agentId, turnId, item.id), trigger,
+        agentId, threadId: running.publicThreadId, turnId, toolCallId: item.id,
+        toolName: tool.tool ?? getString(item, "name") ?? item.type, source: "agent" });
+    }
     if (usage) this.#hooks.emitToolUsage({ ...usage, agentId, turnId });
     if (yield* this.#images.handleItem(agentId, threadId, turnId, item, completed)) return;
     const toolProgress = toolProgressText(item, completed);

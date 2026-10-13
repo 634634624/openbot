@@ -23,7 +23,7 @@ import type { SidebarPinnedItem } from "./sidebar-pins";
  * What the main area shows for the chat picked in the list: its conversation, or its routines. The
  * list itself is the same in both.
  */
-export type SidebarView = "agents" | "routines";
+export type SidebarView = "agents" | "routines" | "hooks";
 
 export interface SidebarProps {
   /** The switch over the list is shown only when the caller handles `onViewChange`. */

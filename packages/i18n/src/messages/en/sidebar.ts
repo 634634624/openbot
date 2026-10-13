@@ -22,6 +22,7 @@ export const messages = defineMessages("sidebar", {
   "sidebar.view.label": "Sidebar view",
   "sidebar.view.agents": "Agents",
   "sidebar.view.routines": "Routines",
+  "sidebar.view.hooks": "Hooks",
   "sidebar.section.layoutUnsupported": "This host does not support sidebar layout changes.",
   "sidebar.section.actions": "Section actions",
   "sidebar.section.moveUp": "Move up",

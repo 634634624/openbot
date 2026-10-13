@@ -59,6 +59,7 @@ import { customProviderIpcHandlers } from "./ipc/custom-provider-handlers";
 import { registerIpcGroups } from "./ipc/define-ipc-group";
 import { dynamicIslandIpcHandlers } from "./ipc/dynamic-island-handlers";
 import { eventsIpcHandlers } from "./ipc/events-handlers";
+import { hooksIpcHandlers } from "./ipc/hooks-handlers";
 import { githubConnectorIpcHandlers } from "./ipc/github-connector-handlers";
 import { hostAdminIpcHandlers } from "./ipc/host-admin-handlers";
 import { hostedServerIpcHandlers } from "./ipc/hosted-server-handlers";
@@ -428,6 +429,7 @@ function attachWindowsSessionEndHandlers(window: BrowserWindow): void {
 
 function registerIpcHandlers({
   service,
+  hooks,
   signInRelayClient,
   relayedMessagingInstalls,
   providerRuntimes,
@@ -494,6 +496,7 @@ function registerIpcHandlers({
   const getMainWindow = () => windowHolder.current;
 
   registerIpcGroups({
+    ...hooksIpcHandlers({ hooks, agentIds: () => service.listAgents().map((agent) => agent.id) }),
     ...appIpcHandlers({
       service,
       mailbox,

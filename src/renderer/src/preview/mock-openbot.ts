@@ -124,6 +124,8 @@ import { createMockMessaging } from "./mock-messaging";
 import { createMockOnePasswordConnector } from "./mock-onepassword-connector";
 import { createMockProviderRuntimes, type MockProviderRuntimeOptions } from "./mock-provider-runtimes";
 import { mockRoutineCalendar } from "./mock-routine-calendar";
+import type { HookSnapshot } from "@openbot/contracts/ipc-hooks";
+import { createMockHooks } from "./mock-hooks";
 import { createMockRoutineFeed } from "./mock-routine-feed";
 import { mockRoutineFlows } from "./mock-routine-flows";
 import { applySidebarLayoutAction } from "./mock-sidebar-layout";
@@ -142,6 +144,7 @@ export interface MockOpenBotOptions
     MockSkillsOptions,
     MockHostUpdateOptions {
   appInfo?: AppInfo;
+  hooks?: HookSnapshot;
   analyticsPreference?: AnalyticsPreference;
   languagePreference?: AppLanguagePreference;
   setupState?: AppSetupState;
@@ -628,6 +631,7 @@ export function createMockOpenBot(options: MockOpenBotOptions = {}): MockOpenBot
       return () => logoColorListeners.delete(listener);
     },
     onOpenSettings: () => () => undefined,
+    hooks: createMockHooks(options.hooks),
     dynamicIsland: {
       getPreference: async () => clone(dynamicIslandPreference),
       setPreference: async (preference) => {

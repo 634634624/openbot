@@ -7,7 +7,44 @@ import {
   skillConversationEventItemType,
 } from "@openbot/contracts/ipc";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { agentProfilesEqual, toAgentMessage, toAgentMessages, toAgentProfile } from "./app-message-projection";
+import { agentMessagesEqual, agentProfilesEqual, messageHookRun, toAgentMessage, toAgentMessages, toAgentProfile } from "./app-message-projection";
+import { HOOK_FIXTURE_RUN } from "./features/hooks/hooks-fixtures";
+
+describe("hook firing projection", () => {
+  const item: ConversationMessage = {
+    id: `hook-run:${HOOK_FIXTURE_RUN.id}`,
+    author: "system",
+    source: "system",
+    itemType: "hook-run",
+    text: JSON.stringify(HOOK_FIXTURE_RUN),
+    createdAt: "2026-10-13T10:00:00.000Z",
+    status: "streaming",
+  };
+
+  it("restores host firing metadata from a persisted conversation item", () => {
+    expect(toAgentMessage(item).hookRun).toEqual(HOOK_FIXTURE_RUN);
+  });
+
+  it("detects terminal output updates even when the ID and visible name stay unchanged", () => {
+    const terminal = {
+      ...HOOK_FIXTURE_RUN,
+      status: "completed",
+      finishedAt: "2026-10-13T10:00:00.250Z",
+      stdout: "Fixture complete.",
+      exitCode: 0,
+    };
+    expect(agentMessagesEqual(
+      toAgentMessage(item),
+      toAgentMessage({ ...item, status: "completed", text: JSON.stringify(terminal) }),
+    )).toBe(false);
+  });
+
+  it("rejects malformed and user-authored firing payloads", () => {
+    expect(messageHookRun({ ...item, text: "{" })).toBeNull();
+    expect(messageHookRun({ ...item, author: "user" })).toBeNull();
+    expect(messageHookRun({ ...item, text: JSON.stringify({ ...HOOK_FIXTURE_RUN, status: "unknown" }) })).toBeNull();
+  });
+});
 
 describe("toAgentProfile", () => {
   it("preserves marketplace installation metadata for the renderer", () => {

@@ -1,3 +1,4 @@
+import type { HookRun } from "@openbot/contracts/ipc-hooks";
 import type {
   AgentAccess,
   AgentExchangeSummary,
@@ -144,6 +145,7 @@ export interface MessageReactionSummary {
 }
 
 export interface AgentMessage {
+  hookRun?: HookRun;
   id: string;
   turnId?: string;
   author: "you" | "agent";
