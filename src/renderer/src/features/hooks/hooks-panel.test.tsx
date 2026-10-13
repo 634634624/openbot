@@ -76,7 +76,8 @@ describe("HooksPanel", () => {
     setState((value) => { value.snapshot.revision++; });
     await fireEvent.click(screen.getByRole("button", { name: "Save hook" }));
 
-    expect(screen.getByRole("alert")).toHaveTextContent("Your draft is kept");
+    // Solid publishes the conflict state after the submit handler; await the visible outcome.
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("Your draft is kept"));
     expect(screen.getByRole("textbox", { name: "Name" })).toHaveValue("Workspace audit");
     expect(props.onSave).not.toHaveBeenCalled();
   });

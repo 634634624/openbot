@@ -3,7 +3,7 @@ import { HOOK_LIMITS, type HookEvent } from "@openbot/contracts/ipc-hooks";
 import { sourceText } from "@openbot/i18n/source";
 import { redactText } from "@openbot/logging";
 
-export interface HookCommandRequest {
+interface HookCommandRequest {
   command: string;
   timeoutMs: number;
   cwd: string;
