@@ -7,7 +7,14 @@ import {
   skillConversationEventItemType,
 } from "@openbot/contracts/ipc";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { agentMessagesEqual, agentProfilesEqual, messageHookRun, toAgentMessage, toAgentMessages, toAgentProfile } from "./app-message-projection";
+import {
+  agentMessagesEqual,
+  agentProfilesEqual,
+  messageHookRun,
+  toAgentMessage,
+  toAgentMessages,
+  toAgentProfile,
+} from "./app-message-projection";
 import { HOOK_FIXTURE_RUN } from "./features/hooks/hooks-fixtures";
 
 describe("hook firing projection", () => {
@@ -33,10 +40,12 @@ describe("hook firing projection", () => {
       stdout: "Fixture complete.",
       exitCode: 0,
     };
-    expect(agentMessagesEqual(
-      toAgentMessage(item),
-      toAgentMessage({ ...item, status: "completed", text: JSON.stringify(terminal) }),
-    )).toBe(false);
+    expect(
+      agentMessagesEqual(
+        toAgentMessage(item),
+        toAgentMessage({ ...item, status: "completed", text: JSON.stringify(terminal) }),
+      ),
+    ).toBe(false);
   });
 
   it("rejects malformed and user-authored firing payloads", () => {

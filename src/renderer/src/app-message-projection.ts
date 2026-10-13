@@ -9,8 +9,8 @@ import {
   routineRunConversationEvent,
   skillConversationEvent,
 } from "@openbot/contracts/ipc";
-import { markdownPreviewText } from "@openbot/contracts/markdown-preview-text";
 import { isHookRun, type HookRun } from "@openbot/contracts/ipc-hooks";
+import { markdownPreviewText } from "@openbot/contracts/markdown-preview-text";
 import { cleanAgentMessageText } from "@openbot/team-client/agent-message-text";
 import type {
   AgentDeliveryMarkerStatus,
@@ -19,8 +19,8 @@ import type {
   AgentProfile,
   ChatActionMarkerModel,
 } from "@openbot/ui/data";
-import { formatChatTimestamp } from "@openbot/ui/features/conversation/chat-timestamp";
 import type { TaskListItem } from "@openbot/ui/features/conversation/TaskList";
+import { formatChatTimestamp } from "@openbot/ui/features/conversation/chat-timestamp";
 import { currentText } from "@openbot/ui/text";
 import { isRoutineEventItem } from "./features/conversation/conversation-read-state";
 
@@ -62,7 +62,13 @@ export function toAgentMessage(message: ConversationMessage, ownerAgentId?: stri
     id: message.id,
     turnId: message.turnId,
     author: message.author === "user" ? "you" : "agent",
-    body: hookRun ? hookRun.hookName : message.itemType === "hook-run" ? currentText().t("hook.run.unavailable") : message.author === "user" ? message.text : cleanAgentMessageText(message.text),
+    body: hookRun
+      ? hookRun.hookName
+      : message.itemType === "hook-run"
+        ? currentText().t("hook.run.unavailable")
+        : message.author === "user"
+          ? message.text
+          : cleanAgentMessageText(message.text),
     hookRun: hookRun ?? undefined,
     time: formatMessageTime(message.createdAt),
     createdAt: message.createdAt,
@@ -101,9 +107,11 @@ export function toAgentMessage(message: ConversationMessage, ownerAgentId?: stri
 export function messageHookRun(message: ConversationMessage): HookRun | null {
   if (message.itemType !== "hook-run" || message.author !== "system" || message.source !== "system") return null;
   try {
-    const value: unknown = JSON.parse(message.text);
+    const value = JSON.parse(message.text);
     return isHookRun(value) ? value : null;
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }
 
 /**

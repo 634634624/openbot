@@ -5,13 +5,54 @@
   padding: var(--openbot-space-6);
   color: var(--openbot-text-primary);
 }
-.hooks-panel h1, .hooks-panel h2, .hooks-panel h4 { margin-block: var(--openbot-space-3); }
-.hook-toolbar, .hook-master-switches { display: flex; flex-wrap: wrap; align-items: center; gap: var(--openbot-space-3); }
-.hook-editor { display: grid; gap: var(--openbot-space-3); padding-block: var(--openbot-space-4); }
-.hook-definition, .hook-run-item { padding: var(--openbot-space-3); margin-block: var(--openbot-space-2); border: thin solid var(--openbot-border); border-radius: var(--openbot-radius-md); }
-.hook-run-item summary, .hook-definition summary { cursor: pointer; overflow-wrap: anywhere; }
-.hook-details { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: var(--openbot-space-2); }
-.hook-details dt { color: var(--openbot-text-secondary); }
-.hook-details dd { margin: 0; overflow-wrap: anywhere; }
-.hook-output { white-space: pre-wrap; overflow-wrap: anywhere; max-height: calc(var(--openbot-space-8) * 8); overflow: auto; font-size: var(--openbot-text-sm); }
-.hook-warning { color: var(--openbot-text-secondary); }
+.hooks-panel h1,
+.hooks-panel h2,
+.hooks-panel h4 {
+  margin-block: var(--openbot-space-3);
+}
+.hook-toolbar,
+.hook-master-switches {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--openbot-space-3);
+}
+.hook-editor {
+  display: grid;
+  gap: var(--openbot-space-3);
+  padding-block: var(--openbot-space-4);
+}
+.hook-definition,
+.hook-run-item {
+  padding: var(--openbot-space-3);
+  margin-block: var(--openbot-space-2);
+  border: thin solid var(--openbot-border);
+  border-radius: var(--openbot-radius-md);
+}
+.hook-run-item summary,
+.hook-definition summary {
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.hook-details {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--openbot-space-2);
+}
+.hook-details dt {
+  color: var(--openbot-text-secondary);
+}
+.hook-details dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.hook-output {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: calc(var(--openbot-space-8) * 8);
+  overflow: auto;
+  font-size: var(--openbot-text-sm);
+}
+.hook-warning {
+  color: var(--openbot-text-secondary);
+}

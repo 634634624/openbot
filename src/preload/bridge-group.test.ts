@@ -52,8 +52,13 @@ beforeEach(() => {
 });
 
 it("decodes local Hooks replies and drops malformed pushed history", async () => {
-  const snapshot = { localOnly: true, revision: 0, blockedReason: null, runs: [],
-    settings: { enabled: false, agentEnabled: {}, agentOverrides: {}, definitions: [] } };
+  const snapshot = {
+    localOnly: true,
+    revision: 0,
+    blockedReason: null,
+    runs: [],
+    settings: { enabled: false, agentEnabled: {}, agentOverrides: {}, definitions: [] },
+  };
   bridge.invoke.mockResolvedValue(snapshot);
   await expect(api().hooks.resetHistory({ expectedRevision: 0 })).resolves.toEqual(snapshot);
   expect(bridge.invoke).toHaveBeenLastCalledWith(IPC_ENDPOINTS.hooks.resetHistory.channel, { expectedRevision: 0 });

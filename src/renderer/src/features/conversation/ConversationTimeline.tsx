@@ -12,26 +12,26 @@ import { ChatSearch } from "@openbot/ui/features/conversation/ChatSearch";
 import { ChatVisual } from "@openbot/ui/features/conversation/ChatVisual";
 import { ContextCompactionMarker, type ContextCompactionView } from "@openbot/ui/features/conversation/ContextUsage";
 import { BrowserTakeoverCard } from "@openbot/ui/features/conversation/ConversationPrompts";
-import { dayMarkerLabel } from "@openbot/ui/features/conversation/chat-day-markers";
 import { ScrollToLatestButton } from "@openbot/ui/features/conversation/MessageNavigation";
 import { MessageActions } from "@openbot/ui/features/conversation/MessageRendering";
 import { PendingSendStatus } from "@openbot/ui/features/conversation/PendingSendStatus";
 import { TaskList } from "@openbot/ui/features/conversation/TaskList";
-import { HookRunItem } from "@openbot/ui/features/hooks/HookRunItem";
 import { UnreadMessagesBanner, UnreadMessagesDivider } from "@openbot/ui/features/conversation/UnreadMessages";
+import { dayMarkerLabel } from "@openbot/ui/features/conversation/chat-day-markers";
+import { HookRunItem } from "@openbot/ui/features/hooks/HookRunItem";
 import { teamMemberName } from "@openbot/ui/features/team/TeamPersonAvatar";
 import { useText } from "@openbot/ui/text";
 import { createMemo, createSignal, For, Loading, lazy, onCleanup, Show, untrack } from "solid-js";
 import { planItems, planTitle } from "../../app-message-projection";
 import { deviceSendShortcut } from "../../send-shortcut-preference";
+import { MarketplaceSuggestionChatCard, marketplaceSuggestionKnown } from "./MarketplaceSuggestionChatCard";
+import { RoutineChatCard } from "./RoutineChatCard";
 import { groupedMessageIds } from "./agent-message-timeline";
 import { continuesSenderRun } from "./chat-grouping";
 import { chatVisualPageUrl } from "./chat-visual-url";
 import { conversationRuntime } from "./conversation-runtime";
 import { useConversationViewScope } from "./conversation-scope";
 import type { ConversationProps } from "./conversation-types";
-import { MarketplaceSuggestionChatCard, marketplaceSuggestionKnown } from "./MarketplaceSuggestionChatCard";
-import { RoutineChatCard } from "./RoutineChatCard";
 import { PENDING_SEND_ID_PREFIX, pendingSendRetrySafe } from "./stores/pending-send-store";
 
 /**
@@ -397,15 +397,36 @@ export function ConversationTimeline() {
                 });
                 if (untrack(() => initialMessage.hookRun)) {
                   return (
-                    <div data-index={virtualRow.index} ref={messageVirtualizer.measureElement} class="virtual-chat-row"
-                      style={{ transform: messageVirtualizer.isVirtualized() ? `translateY(${virtualRow.start - messageVirtualizer.scrollMargin()}px)` : "none" }}>
-                      <Show when={dayMarker()}>{(label) => <div class="time-marker"><span>{label()}</span></div>}</Show>
-                      <Show when={message()?.id === unreadBoundaryMessageId()}>
-                        <UnreadMessagesDivider elementRef={(element) => { setUnreadMessagesDividerElement(element); scheduleUnreadDividerVisibilityUpdate(); }} />
+                    <div
+                      data-index={virtualRow.index}
+                      ref={messageVirtualizer.measureElement}
+                      class="virtual-chat-row"
+                      style={{
+                        transform: messageVirtualizer.isVirtualized()
+                          ? `translateY(${virtualRow.start - messageVirtualizer.scrollMargin()}px)`
+                          : "none",
+                      }}
+                    >
+                      <Show when={dayMarker()}>
+                        {(label) => (
+                          <div class="time-marker">
+                            <span>{label()}</span>
+                          </div>
+                        )}
                       </Show>
-                      <ChatRowBoundary><article data-chat-search-message={message()?.id} aria-label={message()?.hookRun?.hookName}>
-                        <Show when={message()?.hookRun}>{(run) => <HookRunItem run={run()} />}</Show>
-                      </article></ChatRowBoundary>
+                      <Show when={message()?.id === unreadBoundaryMessageId()}>
+                        <UnreadMessagesDivider
+                          elementRef={(element) => {
+                            setUnreadMessagesDividerElement(element);
+                            scheduleUnreadDividerVisibilityUpdate();
+                          }}
+                        />
+                      </Show>
+                      <ChatRowBoundary>
+                        <article data-chat-search-message={message()?.id} aria-label={message()?.hookRun?.hookName}>
+                          <Show when={message()?.hookRun}>{(run) => <HookRunItem run={run()} />}</Show>
+                        </article>
+                      </ChatRowBoundary>
                     </div>
                   );
                 }

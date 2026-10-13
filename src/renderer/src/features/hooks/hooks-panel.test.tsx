@@ -1,8 +1,8 @@
 import type { HookRun } from "@openbot/contracts/ipc-hooks";
-import { HooksPanel, type HooksPanelProps } from "@openbot/ui/features/hooks/HooksPanel";
 import { HookRunItem } from "@openbot/ui/features/hooks/HookRunItem";
+import { HooksPanel, type HooksPanelProps } from "@openbot/ui/features/hooks/HooksPanel";
 import { fireEvent, render, screen, waitFor } from "@solidjs/testing-library";
-import { createStore } from "solid-js";
+import { createStore, flush } from "solid-js";
 import { describe, expect, it, vi } from "vitest";
 import { HOOK_FIXTURE_AGENTS, HOOK_FIXTURE_RUN, HOOK_FIXTURE_SNAPSHOT } from "./hooks-fixtures";
 
@@ -43,14 +43,16 @@ describe("HooksPanel", () => {
     expect(screen.getByRole("switch", { name: "Enabled" })).not.toBeChecked();
     await fireEvent.click(screen.getByRole("button", { name: "Save hook" }));
 
-    await waitFor(() => expect(props.onSave).toHaveBeenCalledWith(
-      expect.objectContaining({
-        definitions: expect.arrayContaining([
-          expect.objectContaining({ name: "Audit", enabled: false, command: "fixture command" }),
-        ]),
-      }),
-      HOOK_FIXTURE_SNAPSHOT.revision,
-    ));
+    await waitFor(() =>
+      expect(props.onSave).toHaveBeenCalledWith(
+        expect.objectContaining({
+          definitions: expect.arrayContaining([
+            expect.objectContaining({ name: "Audit", enabled: false, command: "fixture command" }),
+          ]),
+        }),
+        HOOK_FIXTURE_SNAPSHOT.revision,
+      ),
+    );
     expect(props.onCancelRun).not.toHaveBeenCalled();
   });
 
@@ -61,11 +63,13 @@ describe("HooksPanel", () => {
     render(() => <HooksPanel {...props} />);
     await fireEvent.click(screen.getByRole("switch", { name: "Enable Workspace audit for this agent" }));
 
-    expect(props.onSave).toHaveBeenCalledWith(expect.objectContaining({
-      enabled: false,
-      definitions: snapshot.settings.definitions,
-      agentOverrides: { "fixture-agent": { "fixture-global-hook": false } },
-    }));
+    expect(props.onSave).toHaveBeenCalledWith(
+      expect.objectContaining({
+        enabled: false,
+        definitions: snapshot.settings.definitions,
+        agentOverrides: { "fixture-agent": { "fixture-global-hook": false } },
+      }),
+    );
   });
 
   it("retains a stale draft and refuses to overwrite a newer revision", async () => {
@@ -73,12 +77,19 @@ describe("HooksPanel", () => {
     const props = panelProps();
     render(() => <HooksPanel {...props} snapshot={state.snapshot} />);
     await fireEvent.click(screen.getByRole("button", { name: "Edit Workspace audit" }));
-    setState((value) => { value.snapshot.revision++; });
+    await fireEvent.input(screen.getByRole("textbox", { name: "Name" }), {
+      target: { value: "Unsaved audit name" },
+    });
+    setState((value) => {
+      value.snapshot.revision++;
+    });
+    // Commit the incoming snapshot before the next user event (Solid 2 queues store writes).
+    flush();
     await fireEvent.click(screen.getByRole("button", { name: "Save hook" }));
 
-    // Solid publishes the conflict state after the submit handler; await the visible outcome.
+    // The rejected save must keep the actual edit, not only the original definition.
     await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("Your draft is kept"));
-    expect(screen.getByRole("textbox", { name: "Name" })).toHaveValue("Workspace audit");
+    expect(screen.getByRole("textbox", { name: "Name" })).toHaveValue("Unsaved audit name");
     expect(props.onSave).not.toHaveBeenCalled();
   });
 
@@ -89,12 +100,19 @@ describe("HooksPanel", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Edit Retained command" }));
     await fireEvent.click(screen.getByRole("button", { name: "Save hook" }));
 
-    await waitFor(() => expect(props.onSave).toHaveBeenCalledWith(
-      expect.objectContaining({ definitions: expect.arrayContaining([
-        expect.objectContaining({ id: "fixture-orphan-hook", scope: { kind: "agent", agentId: "fixture-deleted-agent" } }),
-      ]) }),
-      HOOK_FIXTURE_SNAPSHOT.revision,
-    ));
+    await waitFor(() =>
+      expect(props.onSave).toHaveBeenCalledWith(
+        expect.objectContaining({
+          definitions: expect.arrayContaining([
+            expect.objectContaining({
+              id: "fixture-orphan-hook",
+              scope: { kind: "agent", agentId: "fixture-deleted-agent" },
+            }),
+          ]),
+        }),
+        HOOK_FIXTURE_SNAPSHOT.revision,
+      ),
+    );
   });
 
   it("blocks history reset while any firing is active", () => {
@@ -125,7 +143,9 @@ describe("HookRunItem", () => {
       };
     });
 
-    await waitFor(() => expect(screen.getByText(/Workspace audit · Turn completed · Completed · 250 ms/)).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByText(/Workspace audit · Turn completed · Completed · 250 ms/)).toBeInTheDocument(),
+    );
     expect(screen.getByText("Fixture complete.")).toBeInTheDocument();
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
   });

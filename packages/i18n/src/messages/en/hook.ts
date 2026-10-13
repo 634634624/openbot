@@ -4,17 +4,21 @@ export const messages = defineMessages("hook", {
   "hook.title": "Hooks",
   "hook.description": "OpenBot-managed lifecycle hooks. Provider-native hooks are not imported or controlled here.",
   "hook.remote": "Hooks are available only on this computer. Remote servers do not support this interface.",
-  "hook.warning": "Hooks run local commands as your user account, outside the model sandbox. The command is fixed text; event JSON arrives on stdin. Enable only commands you trust.",
-  "hook.conflict": "Settings changed while you were editing. Your draft is kept. Cancel this edit and reopen the latest hook before saving.",
+  "hook.warning":
+    "Hooks run local commands as your user account, outside the model sandbox. The command is fixed text; event JSON arrives on stdin. Enable only commands you trust.",
+  "hook.conflict":
+    "Settings changed while you were editing. Your draft is kept. Cancel this edit and reopen the latest hook before saving.",
   "hook.delete": "Delete hook",
   "hook.deleteTitle": "Delete {name}?",
-  "hook.deleteDescription": "This removes its configuration and agent overrides. Recorded firing history stays available.",
+  "hook.deleteDescription":
+    "This removes its configuration and agent overrides. Recorded firing history stays available.",
   "hook.global": "All hooks",
   "hook.agent": "Agent hooks",
   "hook.chooseAgent": "Choose agent",
   "hook.master": "Enable hooks on this computer",
   "hook.agentMaster": "Enable hooks for {name}",
-  "hook.masterOff": "The computer master switch is off. No new hook commands will start; already-running commands continue until stopped.",
+  "hook.masterOff":
+    "The computer master switch is off. No new hook commands will start; already-running commands continue until stopped.",
   "hook.agentOff": "No new hook commands will start for this agent; already-running commands continue until stopped.",
   "hook.loading": "Loading hooks…",
   "hook.loadFailed": "Could not load hooks.",
@@ -52,8 +56,10 @@ export const messages = defineMessages("hook", {
   "hook.history.empty": "No firings in this scope.",
   "hook.history.reset": "Reset firing history",
   "hook.history.resetTitle": "Reset hook history?",
-  "hook.history.resetDescription": "This clears recent firings and event deduplication records. Existing chat records and hook settings remain. Reset runs no commands; a later duplicate event may run again. Keep the computer master off until you are ready to enable hooks.",
-  "hook.history.resetRequirement": "Turn off the computer master and wait for queued or running commands to finish before resetting history.",
+  "hook.history.resetDescription":
+    "This clears recent firings and event deduplication records. Existing chat records and hook settings remain. Reset runs no commands; a later duplicate event may run again. Keep the computer master off until you are ready to enable hooks.",
+  "hook.history.resetRequirement":
+    "Turn off the computer master and wait for queued or running commands to finish before resetting history.",
   "hook.history.resetFailed": "Could not reset hook history.",
   "hook.run.details": "Firing details for {name}",
   "hook.run.result": "Result",

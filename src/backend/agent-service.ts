@@ -98,12 +98,18 @@ import {
   type QueueSteerFallback,
   workspaceAccessEnforced,
 } from "@openbot/contracts/ipc";
+import type { HookEvent, HookRun } from "@openbot/contracts/ipc-hooks";
 import { ContextResetBusyError } from "@openbot/contracts/team-protocol/context-reset-v1";
 import type { QueueEditRequest } from "@openbot/contracts/team-protocol/queue-edit-v1";
 import { sourceText } from "@openbot/i18n/source";
 import { createOpenBotLogger } from "@openbot/logging";
 import { classifyFailure } from "@openbot/telemetry";
 import { Deferred, Effect, Exit, Fiber, Result, Schema, Scope, Semaphore } from "effect";
+import type { AgentProvider } from "./agent-client";
+import type { AgentTables } from "./agent-data/agent-tables";
+import type { AgentStore } from "./agent-store";
+import { AgentWaitStore } from "./agent-waits/agent-wait-store";
+import { AgentWaits } from "./agent-waits/agent-waits";
 import { AgentMemories } from "./agent/agent-memories";
 import { AgentRemoval, type AgentRemovalFailed } from "./agent/agent-removal";
 import type { ApprovalAutomationPolicy } from "./agent/approval-automation";
@@ -155,13 +161,7 @@ import { isRequestTimeout, providerForAgent, providerLabel, type ToolUsageSignal
 import { ThreadLifecycle } from "./agent/thread-lifecycle";
 import { toToolOperationFailed } from "./agent/tool-operation";
 import { type AgentBrowserHost, TurnLifecycle } from "./agent/turn-lifecycle";
-import type { HookEvent, HookRun } from "@openbot/contracts/ipc-hooks";
 import { toUsageReadFailed, UsageLimitGate } from "./agent/usage-limit-gate";
-import type { AgentProvider } from "./agent-client";
-import type { AgentTables } from "./agent-data/agent-tables";
-import type { AgentStore } from "./agent-store";
-import { AgentWaitStore } from "./agent-waits/agent-wait-store";
-import { AgentWaits } from "./agent-waits/agent-waits";
 import { automationRunCommand } from "./automation-command";
 import { toChannelOperationError } from "./channel-effects";
 import { ChannelRoutineScheduler } from "./channel-routine-scheduler";
@@ -3142,11 +3142,21 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     const id = `hook-run:${run.id}`;
     const existing = this.#store.database.readConversationMessages(run.agentId, run.threadId, [id])[0];
     this.#conversation.upsertSystemItem(run.agentId, run.threadId, {
-      id, ...(run.turnId ? { turnId: run.turnId } : {}), author: "system", source: "system",
-      itemType: "hook-run", text: JSON.stringify(run),
+      id,
+      ...(run.turnId ? { turnId: run.turnId } : {}),
+      author: "system",
+      source: "system",
+      itemType: "hook-run",
+      text: JSON.stringify(run),
       createdAt: existing?.createdAt ?? run.startedAt ?? new Date().toISOString(),
-      status: run.status === "queued" || run.status === "running" ? "streaming"
-        : run.status === "completed" ? "completed" : run.status === "interrupted" ? "interrupted" : "failed",
+      status:
+        run.status === "queued" || run.status === "running"
+          ? "streaming"
+          : run.status === "completed"
+            ? "completed"
+            : run.status === "interrupted"
+              ? "interrupted"
+              : "failed",
     });
   }
 
