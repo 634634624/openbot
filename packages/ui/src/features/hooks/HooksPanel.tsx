@@ -19,6 +19,7 @@ import {
 } from "@openbot/ui";
 import { useText } from "@openbot/ui/text";
 import { createStore, For, Show } from "solid-js";
+import { HOOK_TRIGGER_LABELS } from "./hook-labels";
 import { HookRunItem } from "./HookRunItem";
 
 export interface HooksPanelProps {
@@ -65,7 +66,7 @@ function HookChoice(props: {
       optionValue="id"
       optionTextValue="label"
       value={props.options.find((option) => option.id === props.value) ?? null}
-      disabled={props.disabled}
+      disabled={props.disabled ?? false}
       placeholder={props.label}
       onChange={(option) => {
         if (option) props.onChange(option.id);
@@ -278,7 +279,11 @@ export function HooksPanel(props: HooksPanelProps) {
         </Show>
         <Show when={props.snapshot}>
           <Show when={props.snapshot?.blockedReason}>
-            {(reason) => <p role="alert">{t(`hook.blocked.${reason()}`)}</p>}
+            {(reason) => (
+              <p role="alert">
+                {reason() === "corrupt" ? t("hook.blocked.corrupt") : t("hook.blocked.ledger-full")}
+              </p>
+            )}
           </Show>
           <div class="hook-master-switches">
             <Switch
@@ -343,7 +348,7 @@ export function HooksPanel(props: HooksPanelProps) {
                 <HookChoice
                   label={t("hook.trigger")}
                   value={editor.draft?.trigger ?? "turn.completed"}
-                  options={TRIGGERS.map((id) => ({ id, label: t(`hook.trigger.${id}`) }))}
+                  options={TRIGGERS.map((id) => ({ id, label: t(HOOK_TRIGGER_LABELS[id]) }))}
                   disabled={props.saving}
                   onChange={(value) => {
                     const trigger = TRIGGERS.find((item) => item === value);
@@ -455,7 +460,7 @@ export function HooksPanel(props: HooksPanelProps) {
                 <article class="hook-definition">
                   <div class="hook-toolbar">
                     <strong>{hook.name}</strong>
-                    <span>{t(`hook.trigger.${hook.trigger}`)}</span>
+                    <span>{t(HOOK_TRIGGER_LABELS[hook.trigger])}</span>
                     <span>
                       {hook.scope.kind === "global"
                         ? t("hook.scope.global")

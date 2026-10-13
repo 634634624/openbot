@@ -50,7 +50,7 @@ async function setup(executor: HookCommandExecutor, runChanged?: (run: HookRun) 
     store,
     executor,
     workspaceForAgent: (id) => (id === event.agentId ? root : null),
-    runChanged,
+    ...(runChanged ? { runChanged } : {}),
   });
   engines.push(engine);
   await Effect.runPromise(engine.initialize());

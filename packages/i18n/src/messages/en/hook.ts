@@ -60,8 +60,6 @@ export const messages = defineMessages("hook", {
     "This clears recent firings and event deduplication records. Existing chat records and hook settings remain. Reset runs no commands; a later duplicate event may run again. Keep the computer master off until you are ready to enable hooks.",
   "hook.history.resetRequirement":
     "Turn off the computer master and wait for queued or running commands to finish before resetting history.",
-  "hook.history.resetFailed": "Could not reset hook history.",
-  "hook.run.details": "Firing details for {name}",
   "hook.run.result": "Result",
   "hook.run.duration": "Duration",
   "hook.run.durationValue": "{duration} ms",
