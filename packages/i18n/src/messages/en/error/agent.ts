@@ -1,6 +1,16 @@
 import { defineMessages } from "../../../message";
 
 export const messages = defineMessages("error.agent", {
+  "error.agent.helperHistoryLimit": "Helper history is full. Remove an old helper from its history before starting another.",
+  "error.agent.helpersDisabled": "Temporary helpers are disabled on this host.",
+  "error.agent.helperParentRequired": "Only a persistent local agent can run a helper.",
+  "error.agent.helperNotOwned": "This helper does not belong to the calling agent.",
+  "error.agent.helperFixed": "A helper accepts one job and cannot change profiles or create ongoing work.",
+  "error.agent.helperChannel": "Start helpers from the agent's own conversation.",
+  "error.agent.helperCancelled": "The helper job was cancelled.",
+  "error.agent.helperNoResult": "The helper ended without a result.",
+  "error.agent.helperRestarted": "The application restarted before this helper finished. Its job was not resumed.",
+  "error.agent.helperParentBusy": "Stop this agent's active helpers before deleting it.",
   "error.agent.historyUnavailable":
     "History is unavailable for this request. Read recent history again, or use channel_history for channel work.",
   "error.agent.toolRequestInvalid":

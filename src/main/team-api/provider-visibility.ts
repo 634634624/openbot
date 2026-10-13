@@ -31,7 +31,7 @@ function isPeerHiddenId(value: TeamProtocolV1JsonObject, protocol: number, listK
 
 /** A protocol view never changes the host's stored agents or provider sessions. */
 export function hiddenProviderAgentIds(agents: readonly AgentSummary[], protocol: number): Set<string> {
-  return new Set(agents.filter((agent) => isPeerHiddenProvider(agent.provider, protocol)).map((agent) => agent.id));
+  return new Set(agents.filter((agent) => (agent.helper !== undefined || isPeerHiddenProvider(agent.provider, protocol))).map((agent) => agent.id));
 }
 
 export function legacyProviderView(value: unknown, hiddenIds: ReadonlySet<string>): TeamProtocolV1JsonValue {

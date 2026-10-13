@@ -26,6 +26,7 @@ import { isRoutineEventItem } from "./features/conversation/conversation-read-st
 export function toAgentProfile(stored: AgentSummary): AgentProfile {
   return {
     id: stored.id,
+    helper: stored.helper,
     name: stored.name,
     title: stored.title,
     description: stored.description,
@@ -171,6 +172,7 @@ export function toAgentMessages(messages: ConversationMessage[], ownerAgentId?: 
 
 export function agentProfilesEqual(left: AgentProfile, right: AgentProfile): boolean {
   return (
+    JSON.stringify(left.helper) === JSON.stringify(right.helper) &&
     left.id === right.id &&
     left.name === right.name &&
     left.title === right.title &&

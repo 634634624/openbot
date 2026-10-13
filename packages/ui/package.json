@@ -323,6 +323,7 @@
     "./features/import/agent-import.css": "./src/features/import/agent-import.css",
     "./features/conversation/AgentSessionSettings": "./src/features/conversation/AgentSessionSettings.tsx",
     "./features/conversation/AgentSettingsPanel": "./src/features/conversation/AgentSettingsPanel.tsx",
+    "./features/conversation/HelperActivity": "./src/features/conversation/HelperActivity.tsx",
     "./features/conversation/ConversationHeader": "./src/features/conversation/ConversationHeader.tsx"
   },
   "dependencies": {

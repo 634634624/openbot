@@ -1248,6 +1248,7 @@ export async function createApplicationServices({
     computerUsePermissionHelp.close();
   });
   const service: AgentService = new AgentService({
+    allowTemporaryHelpers: true,
     store,
     mailbox,
     browser,

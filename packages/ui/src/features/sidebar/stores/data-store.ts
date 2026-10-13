@@ -52,7 +52,7 @@ export function createSidebarDataStore(deps: {
     for (const ref of chatPinnedItems()) {
       if (ref.kind === "agent") {
         const agent = agentById().get(ref.id);
-        if (agent) items.push(resolve(ref, agent, { ref, chat: { kind: "agent", id: agent.id, agent } }));
+        if (agent && !agent.helper) items.push(resolve(ref, agent, { ref, chat: { kind: "agent", id: agent.id, agent } }));
       }
       if (ref.kind === "channel") {
         const channel = channelById().get(ref.id);
@@ -63,7 +63,7 @@ export function createSidebarDataStore(deps: {
     return items;
   });
   const listedAgents = createMemo(() =>
-    props.agents.filter((agent) => !pinnedKeys().has(sidebarPinnedItemKey({ kind: "agent", id: agent.id }))),
+    props.agents.filter((agent) => !agent.helper && !pinnedKeys().has(sidebarPinnedItemKey({ kind: "agent", id: agent.id }))),
   );
   /**
    * Agents that wait for the user leave their section for the "Needs you" group, the same way a

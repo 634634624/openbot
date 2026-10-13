@@ -66,7 +66,48 @@ function isMarketplaceSource(value: unknown): value is NonNullable<AgentSummary[
   );
 }
 
+/** Saved local job state. Released Team API payloads do not carry this field. */
+export interface AgentHelperJob {
+  jobId: string;
+  parentAgentId: string;
+  parentAgentName: string;
+  parentThreadId: string;
+  createdAt: string;
+  completedAt: string | null;
+  result: string;
+  spawnKey: string;
+  role: string;
+  claim: string;
+  acceptance: string;
+  scope: string;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  originMessageId: string | null;
+  resultMessageId: string | null;
+  cancelRequested: boolean;
+}
+
+export function isAgentHelperJob(value: unknown): value is AgentHelperJob {
+  if (!isDynamicRecord(value)) return false;
+  return (
+    typeof value.cancelRequested === "boolean" &&
+    isIdentifier(value.jobId) && isIdentifier(value.parentAgentId) &&
+    isIdentifier(value.parentThreadId) && isIdentifier(value.spawnKey) &&
+    isBoundedString(value.createdAt, 40) &&
+    (value.completedAt === null || isBoundedString(value.completedAt, 40)) &&
+    isBoundedString(value.result, INPUT_LIMITS.messageText) &&
+    isBoundedString(value.parentAgentName, INPUT_LIMITS.agentName) &&
+    isBoundedString(value.role, INPUT_LIMITS.agentTitle) &&
+    isBoundedString(value.claim, INPUT_LIMITS.messageText) &&
+    isBoundedString(value.acceptance, INPUT_LIMITS.messageText) &&
+    isBoundedString(value.scope, INPUT_LIMITS.messageText) &&
+    ["queued", "running", "completed", "failed", "cancelled"].includes(String(value.status)) &&
+    (value.originMessageId === null || isIdentifier(value.originMessageId)) &&
+    (value.resultMessageId === null || isIdentifier(value.resultMessageId))
+  );
+}
+
 export interface AgentSummary {
+  helper?: AgentHelperJob;
   id: string;
   name: string;
   title: string;
@@ -118,6 +159,7 @@ export interface AgentSummary {
 export function isAgentSummary(value: unknown): value is AgentSummary {
   if (!isDynamicRecord(value)) return false;
   return (
+    (value.helper === undefined || isAgentHelperJob(value.helper)) &&
     isIdentifier(value.id) &&
     isBoundedString(value.name, INPUT_LIMITS.agentName) &&
     isBoundedString(value.title, INPUT_LIMITS.agentTitle) &&

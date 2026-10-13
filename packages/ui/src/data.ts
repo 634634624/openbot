@@ -180,6 +180,7 @@ export interface AgentMessage {
 }
 
 export interface AgentProfile {
+  helper?: AgentSummary["helper"];
   id: string;
   name: string;
   title: string;

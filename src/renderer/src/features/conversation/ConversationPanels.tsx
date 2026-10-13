@@ -277,7 +277,7 @@ export function ConversationPanels(panelProps: { onOpenUsage?: (trigger: HTMLBut
         </Portal>
       </Show>
 
-      <Show when={settingsOpen() && props.agent}>
+      <Show when={settingsOpen() && !props.agent?.helper && props.agent}>
         {(agent) => (
           <Loading>
             <AgentSettingsPanel

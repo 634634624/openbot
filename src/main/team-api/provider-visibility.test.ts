@@ -1,7 +1,8 @@
 // @vitest-environment node
 
+import type { AgentSummary } from "@openbot/contracts/ipc";
 import { describe, expect, it } from "vitest";
-import { hiddenAgentView, legacyProviderView } from "./provider-visibility";
+import { hiddenAgentView, hiddenProviderAgentIds, legacyProviderView } from "./provider-visibility";
 
 describe("provider visibility", () => {
   it("hides custom ACP agents and their provider before protocol 5, and keeps an endpoint saved as acp", () => {
@@ -72,4 +73,16 @@ describe("provider visibility", () => {
     expect(hiddenAgentView(payload, new Set(), 5)).toEqual(hidden);
     expect(hiddenAgentView(payload, new Set(), 6)).toEqual(payload);
   });
+  it("keeps local helper profiles off released protocol rosters", () => {
+    const agents = [
+      { id: "parent", provider: "codex" },
+      { id: "helper", provider: "codex", helper: { parentAgentId: "parent" } },
+    ] as AgentSummary[];
+    for (const protocol of [4, 5, 6, 7] as const) {
+      const hidden = hiddenProviderAgentIds(agents, protocol);
+      expect(hidden).toEqual(new Set(["helper"]));
+      expect(hiddenAgentView({ agents }, hidden, protocol)).toEqual({ agents: [agents[0]] });
+    }
+  });
+
 });

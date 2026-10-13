@@ -34,6 +34,7 @@ import { codexSandboxPolicy, workspaceWritableRoots } from "./workspace-sandbox"
 export const REMOVED_ENDPOINT_MESSAGE = sourceText("error.agent.endpointRemoved");
 
 export interface DrainHooks {
+  helperFailed?(agentId: string, reason: string): Effect.Effect<void, DeliveryStartFailed>;
   emitError(code: string, error: unknown, agentId?: string): void;
   isStopping(): boolean;
   /**
@@ -369,6 +370,9 @@ export class DrainScheduler {
         this.#mailboxSync.emitQueue(delivery.recipientAgentId);
       }
       const agent = yield* this.#store.getOrCreate(delivery.recipientAgentId).pipe(toDeliveryStartFailed);
+      if (agent.helper && (agent.helper.originMessageId !== delivery.messageId ||
+        !["queued", "running"].includes(agent.helper.status)))
+        throw new Error(sourceText("error.agent.helperFixed"));
       requestedModel = agent.model;
       // The endpoint was removed while this agent was busy, so no other model could be given to it
       // then. The old process would still answer on the removed endpoint, with the credentials it
@@ -486,7 +490,7 @@ export class DrainScheduler {
                 // A teammate message that wants no answer tells the model to write nothing, so an empty
                 // turn is the expected result and not a provider that swallowed its error.
                 answerOptional:
-                  delivery.sender.kind === "agent" && delivery.expectsReply === false && !delivery.replyToMessageId,
+                  !agent.helper && delivery.sender.kind === "agent" && delivery.expectsReply === false && !delivery.replyToMessageId,
                 input: inputForThread(providerThreadId),
                 cwd: agent.workspacePath,
                 runtimeWorkspaceRoots: workspaceWritableRoots(agent, this.#store.sharedRoot),
@@ -591,6 +595,7 @@ export class DrainScheduler {
             }
           }
           yield* this.#mailbox.markTerminal(delivery.id, "failed", reason).pipe(toDeliveryStartFailed);
+          if (this.#hooks.helperFailed) yield* this.#hooks.helperFailed(delivery.recipientAgentId, reason);
           // The provider did not read the answers that were to start with it, so they wait for the next turn.
           for (const { delivery: companion } of batch) {
             if (companion.id !== delivery.id)

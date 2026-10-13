@@ -910,7 +910,7 @@ export function createConversationViewScope(props: ConversationProps) {
     },
     ({ agentId, panel, request }) => {
       if (agentId !== lastPanelAgentId) resetPanelsForAgent(agentId, panel);
-      if (!request || agentId !== request.agentId || request.nonce === lastHandledSettingsRequestNonce) return;
+      if (props.agent?.helper || !request || agentId !== request.agentId || request.nonce === lastHandledSettingsRequestNonce) return;
       lastHandledSettingsRequestNonce = request.nonce;
       if (request.routine) openRoutineSettings(request.routine);
       else setActiveRightPanel("settings", agentId);

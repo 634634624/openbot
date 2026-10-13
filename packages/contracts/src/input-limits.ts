@@ -110,3 +110,7 @@ export const AVATAR_IMAGE_LIMITS = {
   storedBytes: 512 * 1024,
   outputPixels: 512,
 } as const;
+
+/** Local job history is separate from the released persistent-agent roster limit. */
+export const TEMPORARY_HELPER_LIMIT = 1_000;
+export const LOCAL_AGENT_RECORD_LIMIT = INPUT_LIMITS.agents + TEMPORARY_HELPER_LIMIT;

@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { agentProviderDescriptor } from "@openbot/contracts/agent-providers";
 import { sortConversationMessages } from "@openbot/contracts/conversation-order";
-import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
+import { INPUT_LIMITS, TEMPORARY_HELPER_LIMIT } from "@openbot/contracts/input-limits";
 import type {
   AgentAnalyticsInput,
   AgentEvent,
@@ -118,8 +118,10 @@ import { ConversationRuntime } from "./agent/conversation-runtime";
 import { CustomEndpoints, toEndpointChangeFailed } from "./agent/custom-endpoints";
 import { agentNamesById, displayMessageReferences } from "./agent/delivery-content";
 import { DeltaBuffer } from "./agent/delta-buffer";
-import { DrainScheduler } from "./agent/drain-scheduler";
+import { DrainScheduler, DeliveryStartFailed } from "./agent/drain-scheduler";
 import { DuplicationGate, toAgentDuplicationFailed } from "./agent/duplication-gate";
+import { HelperJobs, helperActive, helperBrief, spawnHelperToolSchema, type SpawnHelperInput } from "./agent/helper-jobs";
+import { requestedToolModel, requireReasoningEffort } from "./agent/model-tools";
 import type { FailureContext, FailureSignal } from "./agent/failure-signal";
 import { type AgentHostedSites, HostedSiteCoordinator } from "./agent/hosted-site-coordinator";
 import { ImageGenRuntime } from "./agent/image-gen-runtime";
@@ -212,6 +214,8 @@ interface AgentServiceEvents {
 }
 
 export interface AgentServiceOptions {
+  /** Desktop composition enables helpers. Remote hosts must opt in explicitly. */
+  allowTemporaryHelpers?: boolean;
   store: AgentStore;
   mailbox: MailboxStore;
   browser: AgentBrowserHost;
@@ -332,6 +336,9 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
   readonly #boot: BootRecovery;
   readonly #deltas: DeltaBuffer;
   readonly #turn: TurnLifecycle;
+  readonly #helpers: HelperJobs;
+  readonly #helperCreation = Semaphore.makeUnsafe(1);
+  readonly #allowTemporaryHelpers: boolean;
   readonly #compaction: ContextCompaction;
   readonly #duplication: DuplicationGate;
   readonly #removal: AgentRemoval;
@@ -348,6 +355,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
 
   constructor(options: AgentServiceOptions) {
     super();
+    this.#allowTemporaryHelpers = options.allowTemporaryHelpers === true;
     const {
       store,
       mailbox,
@@ -744,7 +752,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       },
     });
     this.channels = new ChannelService(store.database, mailbox, {
-      agents: () => this.listAgents(),
+      agents: () => this.listAgents().filter((agent) => !agent.helper),
       generate: (lead, prompt) =>
         Effect.gen({ self: this }, function* () {
           yield* this.#providers.ensureProvider(lead.provider);
@@ -930,6 +938,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
         redactMcp: (text) => this.#mcp.redact(text),
         isStopping: () => this.#stopping,
         servesModel: (model) => this.#endpoints.serves(model),
+        helperFailed: (id, reason) => this.#helpers.settle(id, "failed", reason).pipe(Effect.mapError((failure) => new DeliveryStartFailed({ cause: failure.cause }))),
         requeueChannelDelivery: (deliveryId) => this.#requeueChannelDelivery(deliveryId),
       },
     });
@@ -958,6 +967,9 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
         channelAssignment: (deliveryId) => this.channels.store.assignmentForDelivery(deliveryId),
       },
     });
+    this.#helpers = new HelperJobs(store, mailbox, this.#mailboxSync, this.#conversation,
+      () => this.#emit({ type: "agents-changed", agents: this.listAgents() }),
+      (id) => this.#drain.scheduleDrain(id), (text) => this.#mcp.redact(text));
     this.#turn = new TurnLifecycle({
       store,
       mailbox,
@@ -986,6 +998,14 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
         requeueChannelDelivery: (deliveryId) => this.#requeueChannelDelivery(deliveryId),
         quietRoutineDelivery: (deliveryId) => this.#routines.quietRunForDelivery(deliveryId),
         takeRoutinePreview: (deliveryId) => this.#routines.takePreviewBeforeRun(deliveryId),
+        helperStarted: (id) => Effect.gen({ self: this }, function* () {
+          yield* this.#helpers.started(id).pipe(toTurnOperationFailed);
+          const agent = this.#store.list().find((entry) => entry.id === id);
+          const turnId = this.#conversation.workingSnapshot(id)?.activeTurnId;
+          if (agent?.helper?.cancelRequested && turnId)
+            yield* this.interrupt(id, turnId).pipe(toTurnOperationFailed);
+        }),
+        helperSettled: (id, status, text) => this.#helpers.settle(id, status, text).pipe(toTurnOperationFailed),
       },
     });
     this.#removal = new AgentRemoval({
@@ -1035,6 +1055,8 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
         listAgents: () => this.listAgents(),
         listModels: () => this.listModels(),
         preferredProvider: () => this.preferredProvider(),
+        spawnHelper: (parentId, threadId, key, input) => this.spawnHelper(parentId, threadId, key, input).pipe(toToolOperationFailed),
+        cancelHelper: (parentId, jobId) => this.cancelHelper(parentId, jobId).pipe(toToolOperationFailed),
         createAgent: (input, configure) =>
           this.createAgent(
             input,
@@ -1104,7 +1126,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
    * the layout is reconciled, which would silently drop where the user put a channel.
    */
   sidebarChatIds(): Set<string> {
-    const ids = new Set(this.listAgents().map((agent) => agent.id));
+    const ids = new Set(this.listAgents().filter((agent) => !agent.helper).map((agent) => agent.id));
     for (const channelId of this.channels.store.ids()) ids.add(channelId);
     return ids;
   }
@@ -1263,10 +1285,14 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
   }
 
   createRoutine(input: CreateRoutineInput, options: RoutineMutationOptions = {}): Routine {
+    if (this.#store.list().find((agent) => agent.id === input.agentId)?.helper)
+      throw new Error(sourceText("error.agent.helperFixed"));
     return this.#routines.create(input, options);
   }
 
   updateRoutine(input: UpdateRoutineInput, options: RoutineMutationOptions = {}): Routine {
+    if (this.#store.list().find((agent) => agent.id === input.agentId)?.helper)
+      throw new Error(sourceText("error.agent.helperFixed"));
     return this.#routines.update(input, options);
   }
 
@@ -1652,6 +1678,8 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     configure?: (agent: AgentSummary) => Effect.Effect<AgentSummary, AgentLifecycleFailed>,
     profileOperationId?: string,
     sender?: ConversationMessageSender,
+    deliverInitial?: (agent: AgentSummary, text: string) => Effect.Effect<void, AgentLifecycleFailed>,
+    helperSetup?: Pick<AgentSummary, "helper" | "access" | "computerUse" | "title">,
   ) {
     const initialMessage = yield* lifecycleStep("validate initial message", () => {
       const text = input.initialMessage.trim();
@@ -1661,7 +1689,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       return text;
     });
     let agent = yield* this.#store
-      .createAgent(input, profileOperationId)
+      .createAgent(input, profileOperationId, helperSetup)
       .pipe(
         Effect.mapError((failure) => new AgentLifecycleFailed({ operation: "create agent", cause: failure.cause })),
       );
@@ -1670,13 +1698,25 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
         yield* this.#prepareAgentWorkspace(agent);
         agent = yield* this.#assignNewAgentModel(agent, input, true);
         if (configure) agent = yield* configure(agent);
-        yield* this.sendMessage({ agentId: agent.id, text: initialMessage, attachmentDraftIds: [] }, sender);
+        if (deliverInitial) yield* deliverInitial(agent, initialMessage);
+        else yield* this.sendMessage({ agentId: agent.id, text: initialMessage, attachmentDraftIds: [] }, sender);
         return this.#store.list().find((candidate) => candidate.id === agent.id) ?? agent;
       }).pipe(
         Effect.catchDefect((cause) => Effect.fail(new AgentLifecycleFailed({ operation: "create agent", cause }))),
       ),
     );
     if (Result.isSuccess(result)) return result.success;
+    const dispatched = this.#store.list().find((entry) => entry.id === agent.id);
+    if (dispatched?.helper) {
+      // Once the job identity exists, preserve it even if setup or dispatch fails.
+      this.#mailbox.blockAgentDeliveries(agent.id);
+      for (const id of this.#mailbox.queuedDeliveryIds(agent.id))
+        yield* this.#mailbox.cancel(agent.id, id).pipe(Effect.mapError((failure) =>
+          new AgentLifecycleFailed({ operation: "cancel failed helper setup", cause: failure.cause })));
+      yield* this.#helpers.settle(agent.id, "failed", String(result.failure.cause)).pipe(
+        Effect.mapError((failure) => new AgentLifecycleFailed({ operation: "record failed helper setup", cause: failure.cause })));
+      return yield* result.failure;
+    }
     const rollback = yield* Effect.result(this.#removal.deleteData(agent));
     this.#emit({ type: "agents-changed", agents: this.listAgents() });
     return yield* new AgentLifecycleFailed({
@@ -1689,6 +1729,89 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
         : result.failure.cause,
     });
   }, Effect.uninterruptible).bind(this);
+
+  spawnHelper(parentAgentId: string, parentThreadId: string, spawnKey: string, input: SpawnHelperInput) {
+    return this.#helperCreation.withPermit(this.#spawnHelper(parentAgentId, parentThreadId, spawnKey, input));
+  }
+
+  readonly #spawnHelper = Effect.fn("AgentService.spawnHelper")(function* (
+    this: AgentService, parentAgentId: string, parentThreadId: string, spawnKey: string, input: SpawnHelperInput,
+  ) {
+    const args = yield* lifecycleStep("validate helper", () => {
+      if (!this.#allowTemporaryHelpers) throw new Error(sourceText("error.agent.helpersDisabled"));
+      const parent = this.#store.list().find((agent) => agent.id === parentAgentId);
+      if (!parent || parent.helper) throw new Error(sourceText("error.agent.helperParentRequired"));
+      return { parent, brief: spawnHelperToolSchema.parse(input) };
+    });
+    const { parent, brief } = args;
+    const previous = this.#store.list().find((entry) => entry.helper?.spawnKey === spawnKey && entry.helper.parentAgentId === parentAgentId);
+    if (previous) return previous;
+    yield* lifecycleStep("check helper capacity", () => {
+      if (this.#store.list().filter((entry) => entry.helper).length >= TEMPORARY_HELPER_LIMIT)
+        throw new Error(sourceText("error.agent.helperHistoryLimit"));
+    });
+    const model = yield* lifecycleStep("choose helper model", () => {
+      const named = requestedToolModel(brief, this.listModels());
+      const inherited = named ?? requestedToolModel({ provider: parent.provider, model: parent.model }, this.listModels());
+      if (!inherited) throw new Error(sourceText("error.agent.modelUnavailable"));
+      if (brief.reasoningEffort) requireReasoningEffort(inherited, brief.reasoningEffort);
+      return inherited;
+    });
+    const jobId = randomUUID();
+    return yield* this.createAgent({
+      name: brief.name,
+      description: `Role: ${brief.role}. ${brief.personality ?? ""} Complete one job. Report evidence and limits in your final answer. Do not take another task. Your final answer is returned automatically to your parent.`,
+      avatarSeed: randomUUID(), avatarHue: parent.avatarHue,
+      initialMessage: helperBrief(brief),
+      provider: model.provider, model: model.id,
+      reasoningEffort: brief.reasoningEffort ??
+        (!brief.provider && !brief.model && model.supportedReasoningEfforts.includes(parent.reasoningEffort)
+          ? parent.reasoningEffort : model.defaultReasoningEffort),
+    }, undefined, undefined, undefined, (agent, text) => Effect.gen({ self: this }, function* () {
+      const receipt = yield* this.#mailbox.enqueue({ sender: { kind: "agent", agentId: parentAgentId },
+        recipientAgentIds: [agent.id], text, expectsReply: false, idempotencyKey: `helper-origin:${jobId}` });
+      if (agent.helper) yield* this.#store.setHelperJob(agent.id, { ...agent.helper, originMessageId: receipt.messageId });
+      this.#mailbox.blockAgentDeliveries(agent.id);
+      for (const id of [parentAgentId, agent.id]) {
+        const snapshot = this.#conversation.ensureSnapshot(id, this.#store.list().find((entry) => entry.id === id)?.threadId ?? null);
+        this.#mailboxSync.syncMailboxMessages(snapshot);
+        this.#conversation.emitConversation(snapshot);
+      }
+      this.#helpers.publish(agent.id);
+      this.#mailboxSync.emitQueue(agent.id);
+      this.#emit({ type: "agents-changed", agents: this.listAgents() });
+      this.#drain.scheduleDrain(agent.id);
+    }).pipe(Effect.mapError((failure) => new AgentLifecycleFailed({ operation: "dispatch helper", cause: failure.cause }))), {
+      access: workspaceAccessEnforced(parent) ? "workspace" : "full",
+      computerUse: parent.computerUse ?? true, title: brief.role,
+      helper: {
+        jobId, parentAgentId, parentThreadId, spawnKey, parentAgentName: parent.name, role: brief.role,
+        createdAt: new Date().toISOString(), completedAt: null, result: "",
+        claim: brief.claim, acceptance: brief.acceptance, scope: brief.scope,
+        status: "queued", originMessageId: null, resultMessageId: null, cancelRequested: false,
+      },
+    });
+  }).bind(this);
+
+  cancelHelper(parentId: string, jobId: string) {
+    return this.#helperCreation.withPermit(this.#cancelHelper(parentId, jobId));
+  }
+
+  readonly #cancelHelper = Effect.fn("AgentService.cancelHelper")(function* (this: AgentService, parentId: string, jobId: string) {
+    const agent = this.#store.list().find((entry) => entry.helper?.jobId === jobId && entry.helper.parentAgentId === parentId);
+    if (!agent?.helper) throw new Error(sourceText("error.agent.helperNotOwned"));
+    if (!helperActive(agent.helper)) return agent;
+    yield* this.#store.setHelperJob(agent.id, { ...agent.helper, cancelRequested: true }).pipe(
+      Effect.mapError((failure) => new AgentLifecycleFailed({ operation: "request helper cancellation", cause: failure.cause })));
+    const active = this.#conversation.workingSnapshot(agent.id)?.activeTurnId;
+    if (active) yield* this.interrupt(agent.id, active);
+    for (const id of this.#mailbox.queuedDeliveryIds(agent.id))
+      yield* this.#mailbox.cancel(agent.id, id).pipe(Effect.mapError((failure) => new AgentLifecycleFailed({ operation: "cancel helper", cause: failure.cause })));
+    // Starting deliveries settle on their lifecycle event; never dispose a possibly running job.
+    if (!active && !this.#mailbox.unresolvedDeliveries().some(({ delivery }) => delivery.recipientAgentId === agent.id))
+      yield* this.#helpers.settle(agent.id, "cancelled", sourceText("error.agent.helperCancelled")).pipe(Effect.mapError((failure) => new AgentLifecycleFailed({ operation: "cancel helper", cause: failure.cause })));
+    return this.#store.list().find((entry) => entry.id === agent.id) ?? agent;
+  }).bind(this);
 
   #assignNewAgentModel(agent: AgentSummary, input: Omit<CreateAgentInput, "initialMessage">, needsModel: boolean) {
     return this.#endpoints
@@ -1819,6 +1942,8 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     sourceAgentId: string,
     operationId: string = randomUUID(),
   ): Effect.Effect<AgentSummary, AgentLifecycleFailed> {
+    if (this.#store.list().find((agent) => agent.id === sourceAgentId)?.helper)
+      return Effect.fail(new AgentLifecycleFailed({ operation: "duplicate helper", cause: new Error(sourceText("error.agent.helperFixed")) }));
     return this.#duplication
       .duplicate(sourceAgentId, operationId)
       .pipe(
@@ -1858,6 +1983,8 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
   setAgentSessionSetting(
     input: SetAgentSessionSettingInput,
   ): Effect.Effect<AgentSessionSettings, AgentLifecycleFailed> {
+    if (this.#store.list().find((agent) => agent.id === input.agentId)?.helper)
+      return Effect.fail(new AgentLifecycleFailed({ operation: "change helper settings", cause: new Error(sourceText("error.agent.helperFixed")) }));
     return this.#sessionSettings
       .set(input)
       .pipe(
@@ -1870,6 +1997,8 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
   resetAgentSessionSetting(
     input: ResetAgentSessionSettingInput,
   ): Effect.Effect<AgentSessionSettings, AgentLifecycleFailed> {
+    if (this.#store.list().find((agent) => agent.id === input.agentId)?.helper)
+      return Effect.fail(new AgentLifecycleFailed({ operation: "change helper settings", cause: new Error(sourceText("error.agent.helperFixed")) }));
     return this.#sessionSettings
       .reset(input)
       .pipe(
@@ -1881,6 +2010,8 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
 
   /** `initiatingAgentId` is set when an agent, not the user, asks for the change. */
   updateAgent(input: UpdateAgentInput, initiatingAgentId?: string): Effect.Effect<AgentSummary, AgentLifecycleFailed> {
+    if (this.#store.list().find((agent) => agent.id === input.agentId)?.helper)
+      return Effect.fail(new AgentLifecycleFailed({ operation: "updateAgent", cause: new Error(sourceText("error.agent.helperFixed")) }));
     return this.#endpoints
       .runExclusive(() => this.#applyAgentUpdate(input, initiatingAgentId))
       .pipe(Effect.mapError((failure) => new AgentLifecycleFailed({ operation: "updateAgent", cause: failure.cause })));
@@ -2017,6 +2148,8 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     agentId: string,
     image: AvatarImageInput | null,
   ) {
+    if (this.#store.list().find((agent) => agent.id === agentId)?.helper)
+      return yield* new AgentLifecycleFailed({ operation: "change helper avatar", cause: new Error(sourceText("error.agent.helperFixed")) });
     const agent = yield* this.#store
       .setAvatar(agentId, image)
       .pipe(Effect.mapError((failure) => new AgentLifecycleFailed({ operation: "set avatar", cause: failure.cause })));
@@ -2151,6 +2284,9 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
   }
 
   deleteAgent(agentId: string): Effect.Effect<void, AgentLifecycleFailed> {
+    if (this.#store.list().some((entry) => entry.helper && helperActive(entry.helper) &&
+      (entry.helper.parentAgentId === agentId || entry.id === agentId)))
+      return Effect.fail(new AgentLifecycleFailed({ operation: "delete agent", cause: new Error(sourceText("error.agent.helperParentBusy")) }));
     return this.#removal
       .delete(agentId)
       .pipe(Effect.mapError((failure) => new AgentLifecycleFailed({ operation: "deleteAgent", cause: failure.cause })));
@@ -2205,6 +2341,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       this.#initialized = true;
       this.#memoryHold.start();
     });
+    yield* this.#helpers.recover().pipe(Effect.mapError((failure) => new AgentLifecycleFailed({ operation: "recover helpers", cause: failure.cause })));
     yield* this.#providers
       .start()
       .pipe(Effect.mapError((error) => new AgentLifecycleFailed({ operation: "start providers", cause: error.cause })));
@@ -2680,6 +2817,8 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
   }
 
   cancelQueuedMessage(agentId: string, deliveryId: string): Effect.Effect<void, AgentLifecycleFailed> {
+    const helper = this.#store.list().find((agent) => agent.id === agentId)?.helper;
+    if (helper) return this.cancelHelper(helper.parentAgentId, helper.jobId).pipe(Effect.asVoid);
     return this.#queue
       .cancel(agentId, deliveryId)
       .pipe(
@@ -2796,6 +2935,8 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     sender?: ConversationMessageSender,
     timezone?: string,
   ): Effect.fn.Return<QueuedMessageReceipt, AgentLifecycleFailed> {
+    if (this.#store.list().find((agent) => agent.id === input.agentId)?.helper)
+      return yield* new AgentLifecycleFailed({ operation: "send message", cause: new Error(sourceText("error.agent.helperFixed")) });
     if (!input.clientMessageId) return yield* this.#sendUserMessage(input, sender, timezone);
     const idempotencyKey = `user-send:${createHash("sha256")
       .update(JSON.stringify([sender?.id ?? null, input.agentId, input.clientMessageId]))

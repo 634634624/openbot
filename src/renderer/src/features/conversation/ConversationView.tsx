@@ -1,3 +1,4 @@
+import { HelperActivity } from "@openbot/ui/features/conversation/HelperActivity";
 import { MessageSelectionActions } from "@openbot/ui/features/conversation/SelectionActions";
 import { useText } from "@openbot/ui/text";
 import { createEffect, Show } from "solid-js";
@@ -51,7 +52,7 @@ export function ConversationView(props: ConversationProps) {
         ]}
         style={`--settings-panel-width: ${settingsPanelWidth()}px; --browser-panel-width: ${browserPanelWidth()}px`}
         onDragEnter={(event) => {
-          if (!props.globalOverlayOpen && event.dataTransfer?.types.includes("Files")) setDropActive(true);
+          if (!props.agent?.helper && !props.globalOverlayOpen && event.dataTransfer?.types.includes("Files")) setDropActive(true);
         }}
         onDragOver={(event) => {
           if (!props.globalOverlayOpen && event.dataTransfer?.types.includes("Files")) event.preventDefault();
@@ -63,12 +64,12 @@ export function ConversationView(props: ConversationProps) {
           event.preventDefault();
           setDropActive(false);
           // The desktop preload imports a dropped file; a client with its own runtime imports it here.
-          if (props.runtime?.importFiles) void props.runtime.importFiles([...(event.dataTransfer?.files ?? [])]);
+          if (!props.agent?.helper && props.runtime?.importFiles) void props.runtime.importFiles([...(event.dataTransfer?.files ?? [])]);
         }}
       >
         <MessageSelectionActions
           contextKey={props.agent?.id}
-          disabled={!props.agent || !agentReady() || submitting()}
+          disabled={!props.agent || Boolean(props.agent.helper) || !agentReady() || submitting()}
           onSend={sendSelectionInstruction}
         />
         <Show when={dropActive()}>
@@ -76,10 +77,20 @@ export function ConversationView(props: ConversationProps) {
         </Show>
         <ConversationHeader />
         {props.notice}
+        <HelperActivity
+          agent={props.agent}
+          agents={props.agents}
+          onSelect={props.onSelectAgent}
+          onStop={props.activeTurnId ? props.onStop : undefined}
+          onCancelQueued={props.queue?.deliveries.some((delivery) => delivery.status === "queued") ? () => {
+            const delivery = props.queue?.deliveries.find((entry) => entry.status === "queued");
+            if (delivery) props.onCancelQueuedMessage(delivery.id);
+          } : undefined}
+        />
 
         <ConversationTimeline />
 
-        <ConversationComposer />
+        <Show when={!props.agent?.helper}><ConversationComposer /></Show>
 
         <ConversationPanels onOpenUsage={props.onOpenUsage} />
       </main>

@@ -548,6 +548,35 @@ export class ConversationRuntime {
     this.#retainPublishedSnapshot(snapshot);
   }
 
+  upsertHelperItem(agentId: string, threadId: string, message: ConversationMessage): void {
+    if (this.#forgottenExecutionThreads.has(threadId)) return;
+    if (!this.#store.database.connection.prepare(
+      "SELECT 1 FROM projection_threads WHERE thread_id = ? AND agent_id = ?",
+    ).get(threadId, agentId)) return;
+    const cached = this.#snapshots.get(agentId);
+    const snapshot = cached?.threadId === threadId ? cached : this.#executionSnapshots.get(threadId);
+    if (snapshot) {
+      if (snapshot.agentId !== agentId) throw new Error("Helper thread belongs to another agent.");
+      const index = snapshot.messages.findIndex((item) => item.id === message.id);
+      if (index < 0) snapshot.messages.push(message);
+      else snapshot.messages[index] = message;
+      this.emitConversation(snapshot, "conversation.helper-job-updated", { runId: message.id });
+      return;
+    }
+    // Read exactly the supplied thread. ensureSnapshot intentionally falls back to the active chat.
+    const page = this.#store.database.readConversationPage(agentId, threadId, { type: "latest" }, 100);
+    if (page.threadId !== threadId) return;
+    const revision = this.#store.database.persistConversationChanges({
+      agentId, threadId, activeTurnId: page.activeTurnId,
+      changedMessages: [message], removedMessageIds: [],
+      eventType: "conversation.helper-job-updated", detail: { runId: message.id },
+    });
+    const messages = page.messages.filter((item) => item.id !== message.id);
+    messages.push(message);
+    sortConversationMessages(messages);
+    this.publishConversation({ agentId, threadId, activeTurnId: page.activeTurnId, revision, messages });
+  }
+
   #retainPublishedSnapshot(snapshot: ConversationSnapshot): void {
     if (snapshot.threadId && this.#executionSnapshots.has(snapshot.threadId))
       this.#setExecutionSnapshot(snapshot.threadId, snapshot);

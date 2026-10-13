@@ -3,7 +3,7 @@
 // their rules, which is what lets each guard live beside the type it validates.
 
 import { type AgentProviderId, isAgentProvider } from "./agent-providers";
-import { INPUT_LIMITS } from "./input-limits";
+import { INPUT_LIMITS, LOCAL_AGENT_RECORD_LIMIT } from "./input-limits";
 import { type AgentRuntimeSnapshot, isAgentRuntimeSnapshot } from "./ipc-agent-runtime";
 import type { AccountUsage, AgentStatus } from "./ipc-agent-status";
 import { type AgentWaitsSnapshot, isAgentWaitsSnapshot } from "./ipc-agent-waits";
@@ -129,7 +129,7 @@ export function isAgentEvent(value: unknown): value is AgentEvent {
       return isDynamicRecord(value.usage);
     case "agents-changed":
       return (
-        Array.isArray(value.agents) && value.agents.length <= INPUT_LIMITS.agents && value.agents.every(isAgentSummary)
+        Array.isArray(value.agents) && value.agents.length <= LOCAL_AGENT_RECORD_LIMIT && value.agents.every(isAgentSummary)
       );
     case "memories-changed":
       return isString(value.agentId) && value.agentId.length > 0 && value.agentId.length <= INPUT_LIMITS.identifier;

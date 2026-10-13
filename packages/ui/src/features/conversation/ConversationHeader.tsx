@@ -46,8 +46,9 @@ export function ConversationHeader(props: ConversationHeaderProps) {
               type="button"
               class="conversation-title no-drag"
               aria-label={t("conversation.header.settings")}
-              onPointerEnter={props.onSettingsIntent}
-              onFocus={props.onSettingsIntent}
+              disabled={Boolean(agent().helper)}
+              onPointerEnter={agent().helper ? undefined : props.onSettingsIntent}
+              onFocus={agent().helper ? undefined : props.onSettingsIntent}
               onClick={props.onOpenSettings}
             >
               <AgentAvatar agent={agent()} />
@@ -64,7 +65,7 @@ export function ConversationHeader(props: ConversationHeaderProps) {
         </Show>
       </div>
       <div class="conversation-header-actions no-drag">
-        <Show when={props.agent}>
+        <Show when={props.agent && !props.agent.helper}>
           <ProviderModelPicker {...props.modelPicker} />
         </Show>
         <Show when={props.remoteControl}>

@@ -12,6 +12,7 @@ import type { AgentProfile } from "../../data";
 import { useText } from "../../text";
 import { AgentAvatar } from "../agents/AgentAvatar";
 import { agentAccessLockLabel } from "../agents/agent-access";
+import { SidebarHelperList } from "./SidebarHelperList";
 import { SidebarAgentContextMenu } from "./SidebarAgentContextMenu";
 import { SidebarAgentIndicator, SidebarWaitIcon } from "./SidebarAgentIndicator";
 import {
@@ -154,7 +155,8 @@ export function SidebarAgentRow(rowProps: { agent: AgentProfile; waiting?: boole
     </ContextMenu.Root>
   );
   return (
-    /* biome-ignore lint/a11y/noStaticElementInteractions: Native drag belongs to the wrapper around the accessible button. */
+    <>
+    {/* biome-ignore lint/a11y/noStaticElementInteractions: Native drag belongs to the wrapper around the accessible button. */}
     <div
       class={[
         "sidebar-agent-item",
@@ -203,5 +205,7 @@ export function SidebarAgentRow(rowProps: { agent: AgentProfile; waiting?: boole
         )}
       </Show>
     </div>
+    <SidebarHelperList parentId={rowProps.agent.id} />
+    </>
   );
 }

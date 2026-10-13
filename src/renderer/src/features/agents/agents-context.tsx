@@ -124,7 +124,7 @@ const Agents = createSimpleContext({
 
     const activeAgent = createMemo(() => {
       if (activeDirectMember()) return undefined;
-      return agentList().find((agent) => agent.id === activeAgentId()) ?? agentList()[0];
+      return agentList().find((agent) => agent.id === activeAgentId()) ?? agentList().find((agent) => !agent.helper);
     });
 
     function setActiveAgentId(value: string | ((current: string) => string)): void {
@@ -170,7 +170,7 @@ const Agents = createSimpleContext({
       setActiveAgentId((current) => {
         // Validate the saved choice before it can trigger conversation requests.
         const preferred = current || savedAgentId;
-        return profiles.some((agent) => agent.id === preferred) ? preferred : (profiles[0]?.id ?? "");
+        return profiles.some((agent) => agent.id === preferred) ? preferred : (profiles.find((agent) => !agent.helper)?.id ?? "");
       });
       if (profiles.length === 0 && !agentSetupOpen()) {
         setAgentSetupDraft(createFirstAgentDraft());

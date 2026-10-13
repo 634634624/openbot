@@ -27,6 +27,7 @@ import {
   type AgentReasoningEffort,
   type AgentSessionSettingOverrides,
   type AgentSummary,
+  type AgentHelperJob,
   type AvatarImageInput,
   type BusyMessageMode,
   type CreateAgentInput,
@@ -36,6 +37,7 @@ import {
   decodeSaveAgentProfileResult,
   defaultProviderModel,
   isAgentAccess,
+  isAgentHelperJob,
   isAgentModel,
   isAgentSessionSettingOverrides,
   isAgentSessionSettingResets,
@@ -280,17 +282,19 @@ export class AgentStore {
     return this.#state.agents.map((agent) => ({ ...agent }));
   }
 
-  createAgent(input: Omit<CreateAgentInput, "initialMessage">, profileOperationId?: string) {
-    return this.#creationQueue.withPermit(this.#createAgent(input, profileOperationId));
+  createAgent(input: Omit<CreateAgentInput, "initialMessage">, profileOperationId?: string,
+    helperSetup?: Pick<AgentSummary, "helper" | "access" | "computerUse" | "title">) {
+    return this.#creationQueue.withPermit(this.#createAgent(input, profileOperationId, helperSetup));
   }
 
   #createAgent = Effect.fn("AgentStore.createAgent")(function* (
     this: AgentStore,
     input: Omit<CreateAgentInput, "initialMessage">,
     profileOperationId?: string,
+    helperSetup?: Pick<AgentSummary, "helper" | "access" | "computerUse" | "title">,
   ): Effect.fn.Return<AgentSummary, StoredStateFailure> {
     try {
-      if (this.#state.agents.length >= INPUT_LIMITS.agents) {
+      if (!helperSetup?.helper && this.#state.agents.filter((agent) => !agent.helper).length >= INPUT_LIMITS.agents) {
         throw new Error(sourceText("error.agent.hostLimit", { limit: INPUT_LIMITS.agents }));
       }
       const name = requiredText(input.name, "Agent name", INPUT_LIMITS.agentName);
@@ -298,6 +302,9 @@ export class AgentStore {
       if (!isAvatarSeed(input.avatarSeed)) throw new Error("Invalid avatar seed.");
       if (input.avatarHue !== null && !isAvatarHue(input.avatarHue)) throw new Error("Invalid avatar hue.");
       const record = this.#createRecord(`agent-${randomUUID()}`, name, "", description);
+      if (helperSetup?.helper) {
+        Object.assign(record, helperSetup, { allowAutomation: false, notifications: false });
+      }
       record.avatarSeed = input.avatarSeed;
       record.avatarHue = input.avatarHue;
       if (profileOperationId) yield* this.#profileCreationRecovery.begin(record.id, profileOperationId);
@@ -330,7 +337,7 @@ export class AgentStore {
       if (this.#database.commandResult(duplicationCommandId(operationId)) !== undefined) {
         throw new Error("This agent duplication operation is already committed.");
       }
-      if (this.#state.agents.length >= INPUT_LIMITS.agents) {
+      if (this.#state.agents.filter((agent) => !agent.helper).length >= INPUT_LIMITS.agents) {
         throw new Error(sourceText("error.agent.hostLimit", { limit: INPUT_LIMITS.agents }));
       }
       const source = this.#requireAgent(sourceId);
@@ -403,7 +410,7 @@ export class AgentStore {
                 stagedWorkspace,
                 record.workspacePath,
               );
-              if (this.#state.agents.length >= INPUT_LIMITS.agents) {
+              if (this.#state.agents.filter((agent) => !agent.helper).length >= INPUT_LIMITS.agents) {
                 throw new Error(sourceText("error.agent.hostLimit", { limit: INPUT_LIMITS.agents }));
               }
               record.name = duplicateAgentName(source.name, this.#state.agents);
@@ -607,6 +614,24 @@ export class AgentStore {
   }
 
   /** `initiatingAgentId` names the agent that asked for the change, for the audit entry of a model change. */
+
+  /** Internal local job state; it is not an editable profile field. */
+  setHelperJob = Effect.fn("AgentStore.setHelperJob")(function* (
+    this: AgentStore, id: string, helper: AgentHelperJob,
+  ) {
+    return yield* storedSync(() => {
+      const agent = this.#requireAgent(id);
+      const previous = agent.helper;
+      agent.helper = structuredClone(helper);
+      try { this.#persist("agent.helper-updated"); }
+      catch (error) {
+        if (previous) agent.helper = previous;
+        else delete agent.helper;
+        throw error;
+      }
+      return { ...agent };
+    });
+  });
 
   updateAgent = Effect.fn("AgentStore.updateAgent")(function* (
     this: AgentStore,
@@ -859,7 +884,7 @@ export class AgentStore {
         yield* storedIO(() => mkdir(existing.workspacePath, { recursive: true, mode: 0o700 }));
         return { ...existing };
       }
-      if (this.#state.agents.length >= INPUT_LIMITS.agents) {
+      if (this.#state.agents.filter((agent) => !agent.helper).length >= INPUT_LIMITS.agents) {
         throw new Error(sourceText("error.agent.hostLimit", { limit: INPUT_LIMITS.agents }));
       }
 
@@ -1690,6 +1715,8 @@ function readStoredAgent(value: unknown): ReadStoredAgent | UnreadableStoredAgen
   if (!isString(id) || !isValidAgentId(id)) return { unreadable: "id", id: null };
   if (!isString(value.workspacePath)) return { unreadable: "workspacePath", id };
   if (value.threadId !== null && !isString(value.threadId)) return { unreadable: "threadId", id };
+  // A corrupt job must never become a persistent agent with unrestricted task intake.
+  if (value.helper !== undefined && !isAgentHelperJob(value.helper)) return { unreadable: "profile", id };
 
   const repaired: string[] = [];
   const reset = <T>(field: string, fallback: T): T => {
@@ -1735,6 +1762,7 @@ function readStoredAgent(value: unknown): ReadStoredAgent | UnreadableStoredAgen
       ? value.sessionSettingOverrides
       : reset("sessionSettingOverrides", undefined);
   const agent: PersistedStoredAgent = {
+    ...(value.helper === undefined ? {} : { helper: value.helper }),
     id,
     name: isString(value.name) ? value.name : reset("name", titleFromId(id)),
     title: isString(value.title) ? value.title : reset("title", ""),

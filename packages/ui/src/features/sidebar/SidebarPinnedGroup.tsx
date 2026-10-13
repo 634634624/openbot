@@ -12,6 +12,7 @@ import { Badge, buttonVariants, ContextMenu } from "@openbot/ui";
 import { For, Match, Show, Switch } from "solid-js";
 import { useText } from "../../text";
 import { ChannelAvatar } from "../channels/ChannelAvatar";
+import { SidebarHelperList } from "./SidebarHelperList";
 import { SidebarAgentContextMenu } from "./SidebarAgentContextMenu";
 import { SidebarPinnedAvatar } from "./SidebarAgentIndicator";
 import { SidebarChannelContextMenu } from "./SidebarChannelContextMenu";
@@ -89,6 +90,7 @@ export function SidebarPinnedGroup() {
                   data-pinned-key={key()}
                   draggable="true"
                   onDragStart={(event) => {
+                    if ((event.target as HTMLElement).closest(".sidebar-helper-list")) { event.preventDefault(); return; }
                     startNativeItemDragging(event, {
                       className: "sidebar-pinned-drag-preview",
                       data: key(),
@@ -97,7 +99,7 @@ export function SidebarPinnedGroup() {
                   }}
                   onDragEnd={stopSidebarDragging}
                   onKeyDown={(event) => {
-                    if (!event.altKey) return;
+                    if ((event.target as HTMLElement).closest(".sidebar-helper-list") || !event.altKey) return;
                     if (event.key === "ArrowLeft") {
                       event.preventDefault();
                       movePinnedItem(key(), -1);
@@ -186,6 +188,7 @@ export function SidebarPinnedGroup() {
                       </Match>
                     </Switch>
                   </ContextMenu.Root>
+                  <Show when={item.chat.kind === "agent"}><SidebarHelperList parentId={item.chat.id} /></Show>
                 </li>
               );
             }}

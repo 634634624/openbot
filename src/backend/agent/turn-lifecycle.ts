@@ -74,6 +74,8 @@ export interface AgentBrowserHost extends AttentionBrowserHost, BrowserUploadTar
 }
 
 export interface TurnHooks {
+  helperStarted?(id: string): Effect.Effect<void, TurnOperationFailed>;
+  helperSettled?(id: string, status: "completed" | "failed" | "cancelled", text: string): Effect.Effect<void, TurnOperationFailed>;
   emitFailure?(failure: FailureSignal): void;
   emit(event: AgentEvent): void;
   emitError(code: string, error: unknown, agentId?: string, context?: FailureContext): void;
@@ -353,6 +355,7 @@ export class TurnLifecycle {
             if (this.#turnAssociations.get(turnId) === association) this.#turnAssociations.delete(turnId);
           }).pipe(Effect.forkIn(this.#scope, { startImmediately: true }));
         }
+        if (this.#hooks.helperStarted) yield* this.#hooks.helperStarted(agentId);
         this.#hooks.emit({ type: "turn-started", agentId, threadId: publicThreadId, turnId, origin });
         this.#conversation.emitConversation(snapshot, "turn.started", { turnId });
         return;
@@ -772,6 +775,12 @@ export class TurnLifecycle {
       origin: deliveries[0]?.delivery.sender.kind ?? "unknown",
       ...(quiet ? { quiet: true as const } : {}),
     });
+    if (this.#store.list().find((agent) => agent.id === agentId)?.helper) {
+      if (this.#hooks.helperSettled) yield* this.#hooks.helperSettled(agentId,
+        outcome === "completed" ? "completed" : outcome === "failed" ? "failed" : "cancelled",
+        latestAssistant?.text || failure || sourceText("error.agent.helperNoResult"));
+      return;
+    }
     if (shouldCompact) yield* this.#compaction.request(agentId, threadId);
     else this.#hooks.scheduleDrain(agentId);
   }, Effect.uninterruptible);

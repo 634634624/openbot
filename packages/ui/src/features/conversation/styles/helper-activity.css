@@ -1,0 +1,12 @@
+.helper-activity {
+  margin: var(--openbot-space-2) var(--openbot-space-4);
+  padding: var(--openbot-space-2) var(--openbot-space-3);
+  border: 1px solid var(--openbot-border);
+  border-radius: var(--openbot-radius-md);
+  font-size: var(--openbot-text-sm);
+  max-height: calc(var(--openbot-space-8) * 8);
+  overflow: auto;
+}
+.helper-activity > strong, .helper-activity > span, .helper-activity > small { display: block; }
+.helper-activity pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.helper-activity ul { list-style: none; padding: 0; }

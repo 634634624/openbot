@@ -1,6 +1,22 @@
 import { defineMessages } from "../../message";
 
 export const messages = defineMessages("agent", {
+  "agent.helper.runs": "{parent} runs {helper}",
+  "agent.helper.record": "{parent} runs {helper} ({role}) · {status}\n{result}",
+  "agent.helper.history": "Helpers",
+  "agent.helper.open": "Open {name}",
+  "agent.helper.readOnly": "One job. This helper's history remains available after it ends.",
+  "agent.helper.queued": "Queued",
+  "agent.helper.running": "Running",
+  "agent.helper.completed": "Completed",
+  "agent.helper.failed": "Failed",
+  "agent.helper.cancelled": "Cancelled",
+  "agent.helper.stop": "Stop helper",
+  "agent.helper.cancel": "Cancel queued helper",
+  "agent.helper.return": "Return to {name}",
+  "agent.helper.brief": "Job brief and acceptance criteria",
+  "agent.helper.result": "Result",
+  "agent.helper.model": "{provider} · {model}",
   "agent.access.workspaceOnly": "Workspace only",
   "agent.setup.nameFallback": "New agent",
   "agent.setup.titleAdditional": "Create a new agent",

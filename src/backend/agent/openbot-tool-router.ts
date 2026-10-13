@@ -50,6 +50,7 @@ import type { ConversationRuntime } from "./conversation-runtime";
 import { handleDataTool } from "./data-tools";
 import { responseAttachmentMessageId, visualReplyFileName, visualReplyMessageId } from "./delivery-content";
 import type { DrainScheduler } from "./drain-scheduler";
+import { spawnHelperToolSchema, type SpawnHelperInput } from "./helper-jobs";
 import { HistoryTools } from "./history-tools";
 import type { HostedSiteCoordinator } from "./hosted-site-coordinator";
 import { isHostedSiteMutationTool } from "./hosted-site-events";
@@ -86,6 +87,8 @@ export interface OpenBotToolRouterHooks {
   listAgents(): AgentSummary[];
   listModels(): AgentModelOption[];
   preferredProvider(): AgentProvider;
+  spawnHelper(parentId: string, threadId: string, key: string, input: SpawnHelperInput): Effect.Effect<AgentSummary, ToolOperationFailed>;
+  cancelHelper(parentId: string, jobId: string): Effect.Effect<AgentSummary, ToolOperationFailed>;
   createAgent(
     input: CreateAgentInput,
     configure?: (agent: AgentSummary) => Effect.Effect<AgentSummary, ToolOperationFailed>,
@@ -502,6 +505,12 @@ export class OpenBotToolRouter {
     const senderAgentId = this.#conversation.agentForThread(params.threadId);
     if (!senderAgentId) throw new Error("The sending OpenBot agent is unknown.");
 
+    const caller = this.#requireAgent(senderAgentId);
+    if (caller.helper && (PROFILE_TOOL_NAMES.has(params.tool) && params.tool !== "read_agent" && params.tool !== "list_models" ||
+      ["spawn_helper", "cancel_helper", "send_message", "interrupt_agent", "await_event", "close_wait"].includes(params.tool) ||
+      params.tool.includes("routine") || params.tool.startsWith("channel_") || params.tool.includes("section")))
+      return openBotToolFailure(sourceText("error.agent.helperFixed"));
+
     if (LOCAL_SKILL_TOOL_DEFINITIONS.some((tool) => tool.name === params.tool)) {
       const reportFailure = (error: unknown) =>
         Effect.sync(() => {
@@ -620,7 +629,7 @@ export class OpenBotToolRouter {
     if (params.tool === "list_agents") {
       // A delivery that is starting holds no turn yet, and a channel turn runs on a thread of its own.
       const unresolved = new Set(this.#mailbox.unresolvedDeliveries().map(({ delivery }) => delivery.recipientAgentId));
-      const agents = this.#hooks.listAgents().map((agent) => {
+      const agents = this.#hooks.listAgents().filter((agent) => !agent.helper || agent.helper.status === "queued" || agent.helper.status === "running").map((agent) => {
         const deliveries = this.#mailbox.listQueue(agent.id).deliveries;
         const queuedMessages = deliveries.filter((delivery) => delivery.status === "queued").length;
         const working = this.#hooks.runsTurn(agent.id) || unresolved.has(agent.id);
@@ -633,6 +642,7 @@ export class OpenBotToolRouter {
         );
         return {
           id: agent.id,
+          ...(agent.helper ? { helper: agent.helper } : {}),
           name: agent.name,
           title: agent.title,
           description: agent.description,
@@ -659,6 +669,16 @@ export class OpenBotToolRouter {
       return { success: true, contentItems: [{ type: "inputText", text: redactText(JSON.stringify(payload)) }] };
     }
 
+    if (params.tool === "spawn_helper") {
+      if (channelId) return openBotToolFailure(sourceText("error.agent.helperChannel"));
+      const args = spawnHelperToolSchema.parse(params.arguments);
+      const helper = yield* this.#hooks.spawnHelper(senderAgentId, executionThreadId, toolCallIdempotencyKey(params), args);
+      return openBotToolResult({ helper });
+    }
+    if (params.tool === "cancel_helper") {
+      const args = z.object({ jobId: z.string().min(1).max(INPUT_LIMITS.identifier) }).strict().parse(params.arguments);
+      return openBotToolResult({ helper: yield* this.#hooks.cancelHelper(senderAgentId, args.jobId) });
+    }
     if (params.tool === "create_agent") return yield* this.#createAgent(params, senderAgentId);
 
     if (params.tool === "update_profile") return yield* this.#updateProfile(params, senderAgentId);
@@ -1062,6 +1082,7 @@ export class OpenBotToolRouter {
       const knownIds = new Set(this.#hooks.listAgents().map((agent) => agent.id));
       for (const recipient of recipientValues) {
         if (!knownIds.has(recipient)) throw new Error(`Unknown OpenBot agent: ${recipient}`);
+        if (this.#requireAgent(recipient).helper) throw new Error(sourceText("error.agent.helperFixed"));
       }
       const paths = params.arguments.paths ?? [];
       if (!Array.isArray(paths) || !paths.every((item) => isString(item))) {

@@ -1,4 +1,4 @@
-import { INPUT_LIMITS } from "./input-limits";
+import { INPUT_LIMITS, LOCAL_AGENT_RECORD_LIMIT } from "./input-limits";
 import { type AvatarHue, isAvatarHue, isAvatarSeed } from "./ipc-agent-identity";
 import {
   type AgentApproval,
@@ -210,13 +210,13 @@ export function isAgentRuntimeSnapshot(value: unknown): value is AgentRuntimeSna
   return (
     (value.contextStates === undefined ||
       (Array.isArray(value.contextStates) &&
-        value.contextStates.length <= INPUT_LIMITS.agents &&
+        value.contextStates.length <= LOCAL_AGENT_RECORD_LIMIT &&
         value.contextStates.every(isAgentContextState))) &&
     Array.isArray(value.agents) &&
-    value.agents.length <= INPUT_LIMITS.agents &&
+    value.agents.length <= LOCAL_AGENT_RECORD_LIMIT &&
     value.agents.every(isAgentRuntimeRosterEntry) &&
     Array.isArray(value.activeTurns) &&
-    value.activeTurns.length <= INPUT_LIMITS.agents &&
+    value.activeTurns.length <= LOCAL_AGENT_RECORD_LIMIT &&
     value.activeTurns.every(
       (turn) =>
         isDynamicRecord(turn) && isIdentifier(turn.agentId) && isIdentifier(turn.threadId) && isIdentifier(turn.turnId),
@@ -225,7 +225,7 @@ export function isAgentRuntimeSnapshot(value: unknown): value is AgentRuntimeSna
     value.work.length <= AGENT_RUNTIME_WORKING_ITEMS_LIMIT + AGENT_RUNTIME_ATTENTION_LIMIT &&
     value.work.every(isRuntimeWorkItem) &&
     Array.isArray(value.latestMessages) &&
-    value.latestMessages.length <= INPUT_LIMITS.agents &&
+    value.latestMessages.length <= LOCAL_AGENT_RECORD_LIMIT &&
     value.latestMessages.every(
       (message) =>
         isDynamicRecord(message) &&
@@ -247,13 +247,13 @@ export function isAgentRuntimeSnapshot(value: unknown): value is AgentRuntimeSna
     value.pendingPrompts.length + value.pendingApprovals.length + value.pendingBrowserTakeovers.length <=
       AGENT_RUNTIME_ATTENTION_LIMIT &&
     Array.isArray(value.failedTurns) &&
-    value.failedTurns.length <= INPUT_LIMITS.agents &&
+    value.failedTurns.length <= LOCAL_AGENT_RECORD_LIMIT &&
     value.failedTurns.every(
       (turn) => isDynamicRecord(turn) && isIdentifier(turn.agentId) && isIdentifier(turn.turnId),
     ) &&
     (value.usageLimits === undefined ||
       (Array.isArray(value.usageLimits) &&
-        value.usageLimits.length <= INPUT_LIMITS.agents &&
+        value.usageLimits.length <= LOCAL_AGENT_RECORD_LIMIT &&
         value.usageLimits.every(
           (limit) =>
             isDynamicRecord(limit) &&
