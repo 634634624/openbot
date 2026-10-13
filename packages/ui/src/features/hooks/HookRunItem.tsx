@@ -2,6 +2,7 @@ import type { HookRun } from "@openbot/contracts/ipc-hooks";
 import { Button } from "@openbot/ui";
 import { useText } from "@openbot/ui/text";
 import { Show } from "solid-js";
+import { HOOK_RUN_LABELS, HOOK_TRIGGER_LABELS } from "./hook-labels";
 
 /** A saved firing updates in place as its status changes. Viewing it never reruns its command. */
 export function HookRunItem(props: { run: HookRun; onCancel?: (runId: string) => void; disabled?: boolean }) {
@@ -19,16 +20,16 @@ export function HookRunItem(props: { run: HookRun; onCancel?: (runId: string) =>
       <summary>
         {t("hook.run.summary", {
           name: props.run.hookName,
-          trigger: t(`hook.trigger.${props.run.trigger}`),
-          result: t(`hook.run.${props.run.status}`),
+          trigger: t(HOOK_TRIGGER_LABELS[props.run.trigger]),
+          result: t(HOOK_RUN_LABELS[props.run.status]),
           duration: duration(),
         })}
       </summary>
       <dl class="hook-details">
         <dt>{t("hook.trigger")}</dt>
-        <dd>{t(`hook.trigger.${props.run.trigger}`)}</dd>
+        <dd>{t(HOOK_TRIGGER_LABELS[props.run.trigger])}</dd>
         <dt>{t("hook.run.result")}</dt>
-        <dd>{t(`hook.run.${props.run.status}`)}</dd>
+        <dd>{t(HOOK_RUN_LABELS[props.run.status])}</dd>
         <dt>{t("hook.run.duration")}</dt>
         <dd>{duration()}</dd>
         <Show when={props.run.startedAt}>
