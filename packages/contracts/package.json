@@ -31,6 +31,7 @@
     "./markdown-preview-text": "./src/markdown-preview-text.ts",
     "./agent-memory-context": "./src/agent-memory-context.ts",
     "./ipc": "./src/ipc.ts",
+    "./ipc-hooks": "./src/ipc-hooks.ts",
     "./ipc-events": "./src/ipc-events.ts",
     "./ipc-skills": "./src/ipc-skills.ts",
     "./mobile-connect": "./src/mobile-connect.ts",

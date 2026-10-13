@@ -1,6 +1,16 @@
 import { defineMessages } from "../../../message";
 
 export const messages = defineMessages("error.backend", {
+  "error.backend.hooksInvalid": "Check the hook settings and try again.",
+  "error.backend.hooksAgentMissing": "The selected agent is no longer available.",
+  "error.backend.hooksSaveFailed": "The hook settings could not be saved. Refresh the settings and try again.",
+  "error.backend.hooksResetFailed": "The hook history could not be reset. Refresh the history and try again.",
+  "error.backend.hooksCancelFailed": "The hook run could not be cancelled. Refresh the history and try again.",
+  "error.backend.hooksStale": "Hook settings changed. Reload them before saving.",
+  "error.backend.hooksPosixOnly": "Hook commands require a POSIX host.",
+  "error.backend.hooksCommandStart": "The configured command could not start.",
+  "error.backend.hooksCommandRun": "The configured command could not run.",
+  "error.backend.hooksRestartInterrupted": "The application restarted before this command settled. It was not run again.",
   "error.backend.eventsUnavailable": "Events are not available on this host.",
   "error.backend.webhookRouteLimit": "A host can have at most {limit} webhook routines.",
   "error.backend.webhookSettingsInvalid": "Check the webhook settings and try again.",

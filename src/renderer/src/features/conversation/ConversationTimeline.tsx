@@ -17,6 +17,7 @@ import { ScrollToLatestButton } from "@openbot/ui/features/conversation/MessageN
 import { MessageActions } from "@openbot/ui/features/conversation/MessageRendering";
 import { PendingSendStatus } from "@openbot/ui/features/conversation/PendingSendStatus";
 import { TaskList } from "@openbot/ui/features/conversation/TaskList";
+import { HookRunItem } from "@openbot/ui/features/hooks/HookRunItem";
 import { UnreadMessagesBanner, UnreadMessagesDivider } from "@openbot/ui/features/conversation/UnreadMessages";
 import { teamMemberName } from "@openbot/ui/features/team/TeamPersonAvatar";
 import { useText } from "@openbot/ui/text";
@@ -51,6 +52,7 @@ function markerOnlyMessage(message: AgentMessage): boolean {
 function rowDrawsTime(message: AgentMessage): boolean {
   return (
     !markerOnlyMessage(message) &&
+    !message.hookRun &&
     !message.questionPrompt &&
     message.kind !== "plan" &&
     chatVisualReply(message) === null
@@ -393,6 +395,20 @@ export function ConversationTimeline() {
                   const previous = previousMessage();
                   return previous !== undefined && markerRowEndsWithMarker(previous);
                 });
+                if (untrack(() => initialMessage.hookRun)) {
+                  return (
+                    <div data-index={virtualRow.index} ref={messageVirtualizer.measureElement} class="virtual-chat-row"
+                      style={{ transform: messageVirtualizer.isVirtualized() ? `translateY(${virtualRow.start - messageVirtualizer.scrollMargin()}px)` : "none" }}>
+                      <Show when={dayMarker()}>{(label) => <div class="time-marker"><span>{label()}</span></div>}</Show>
+                      <Show when={message()?.id === unreadBoundaryMessageId()}>
+                        <UnreadMessagesDivider elementRef={(element) => { setUnreadMessagesDividerElement(element); scheduleUnreadDividerVisibilityUpdate(); }} />
+                      </Show>
+                      <ChatRowBoundary><article data-chat-search-message={message()?.id} aria-label={message()?.hookRun?.hookName}>
+                        <Show when={message()?.hookRun}>{(run) => <HookRunItem run={run()} />}</Show>
+                      </article></ChatRowBoundary>
+                    </div>
+                  );
+                }
                 if (markerOnly) {
                   return (
                     <div

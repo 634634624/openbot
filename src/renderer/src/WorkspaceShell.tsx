@@ -11,6 +11,7 @@ import { useConversation } from "./features/conversation/conversation-context";
 import { useDirectMessages } from "./features/conversation/direct-messages-context";
 import { WorkspaceConversation } from "./features/conversation/WorkspaceConversation";
 import { WorkspaceDirectConversation } from "./features/conversation/WorkspaceDirectConversation";
+import { WorkspaceHooks } from "./features/hooks/WorkspaceHooks";
 import { WorkspaceServerOnboarding } from "./features/onboarding/WorkspaceServerOnboarding";
 import { useRemoteDesktop } from "./features/remote-desktop/remote-desktop-context";
 import { WorkspaceRoutineFlows } from "./features/routine-flows/WorkspaceRoutineFlows";
@@ -240,14 +241,17 @@ export function WorkspaceShell(props: { account: () => CentralAuthUser }) {
         <WorkspaceAgentSetup />
       </Show>
       {/* Keyed by id: each presence snapshot is a new member object, and remounting would clear the draft. */}
-      <Show when={activePeopleEnabled() && !agentSetupOpen() && !channelOpen() && activeDirectMember()?.id} keyed>
+      <Show when={layout.sidebarView() !== "hooks" && activePeopleEnabled() && !agentSetupOpen() && !channelOpen() && activeDirectMember()?.id} keyed>
         <Show when={activeDirectMember()}>{(member) => <WorkspaceDirectConversation member={member()} />}</Show>
       </Show>
-      <Show when={!agentSetupOpen() && !channelOpen() && !activeDirectMember() && layout.sidebarView() !== "routines"}>
+      <Show when={!agentSetupOpen() && !channelOpen() && !activeDirectMember() && layout.sidebarView() === "agents"}>
         <WorkspaceConversation account={props.account} />
       </Show>
       <Show when={!agentSetupOpen() && !channelOpen() && !activeDirectMember() && layout.sidebarView() === "routines"}>
         <WorkspaceRoutineFlows />
+      </Show>
+      <Show when={!agentSetupOpen() && !channelOpen() && layout.sidebarView() === "hooks"}>
+        <WorkspaceHooks />
       </Show>
       <Show when={!agentSetupOpen() && channelOpen()}>
         <WorkspaceChannelConversation />

@@ -78,14 +78,14 @@ export function WorkspaceSidebar(props: { peopleEnabled: boolean }) {
   /* Channels reach the sidebar as data, not as a list of their own: they sit in the layout's
    * sections beside the agents, so the sidebar has to be able to order and group them. The Routines
    * view lists only agents: a channel has no routine canvas. */
-  const channelsListed = () => channels.supported() && layout.sidebarView() !== "routines";
+  const channelsListed = () => channels.supported() && layout.sidebarView() === "agents";
   const visibleChannels = createMemo(() =>
     channelsListed() ? channels.state.channels.filter((channel) => !channel.archived) : [],
   );
   /* A channel can open while the Routines view is on: from search, a notification, or a selection
    * restored at start. Its row must be in the list, so the list goes back to the agents view. */
   createEffect(
-    () => layout.sidebarView() === "routines" && channels.state.selectedId !== null,
+    () => layout.sidebarView() !== "agents" && channels.state.selectedId !== null,
     (channelOpenInRoutines) => {
       if (channelOpenInRoutines) layout.setSidebarView("agents");
     },
@@ -149,7 +149,8 @@ export function WorkspaceSidebar(props: { peopleEnabled: boolean }) {
       view={layout.sidebarView()}
       onViewChange={(view) => {
         // An open channel would stay in the middle with no row in the list.
-        if (view === "routines") channels.close();
+        if (view !== "agents") channels.close();
+        if (view === "hooks" && activeAgent()) selectAgent(activeAgent()?.id ?? "");
         layout.setSidebarView(view);
       }}
       serverName={activeServer()?.name ?? "Local"}
@@ -190,7 +191,7 @@ export function WorkspaceSidebar(props: { peopleEnabled: boolean }) {
       onReorderPinned={reorderPinnedSidebarItems}
       onReorderPeople={reorderSidebarPeople}
       onSelectAgent={selectAgent}
-      onSelectPerson={(memberId) => void selectDirectMember(memberId)}
+      onSelectPerson={(memberId) => { if (layout.sidebarView() === "hooks") layout.setSidebarView("agents"); void selectDirectMember(memberId); }}
       onPreloadDirectConversation={props.peopleEnabled ? () => void DirectConversation.preload() : undefined}
       onCreateAgent={() => {
         channels.close();

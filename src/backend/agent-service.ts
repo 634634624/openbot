@@ -155,6 +155,7 @@ import { isRequestTimeout, providerForAgent, providerLabel, type ToolUsageSignal
 import { ThreadLifecycle } from "./agent/thread-lifecycle";
 import { toToolOperationFailed } from "./agent/tool-operation";
 import { type AgentBrowserHost, TurnLifecycle } from "./agent/turn-lifecycle";
+import type { HookEvent, HookRun } from "@openbot/contracts/ipc-hooks";
 import { toUsageReadFailed, UsageLimitGate } from "./agent/usage-limit-gate";
 import type { AgentProvider } from "./agent-client";
 import type { AgentTables } from "./agent-data/agent-tables";
@@ -205,6 +206,7 @@ export type { RoutineMutationOptions } from "./agent/routine-scheduler";
 export type { ResolvedSharedFile } from "./workspace-paths";
 
 interface AgentServiceEvents {
+  hookEvent: [event: HookEvent];
   failure: [failure: FailureSignal];
   event: [event: AgentEvent];
   /** Finished tool steps for the local host's product analytics. Never forwarded to a client. */
@@ -507,6 +509,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
             for (const agent of this.#store.list()) this.#drain.scheduleDrain(agent.id);
           }).pipe(toProviderOperationFailed),
         onProviderLost: (client) => {
+          this.#turn.providerLost(client);
           this.#boot.orphanDeliveriesOf(client.provider, (agentId) => this.#providers.runsOnOwnProcess(agentId));
           this.#compaction.dispose();
           this.#attention.clearPrompts(client);
@@ -523,6 +526,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
           }),
         onAgentClientLost: (agentId, client) =>
           Effect.gen({ self: this }, function* () {
+            this.#turn.providerLost(client);
             this.#attention.clearPrompts(client);
             this.#attention.clearBrowserTakeovers(client);
             this.#attention.clearApprovals(client);
@@ -982,6 +986,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
         listAgents: () => this.listAgents(),
         redactMcp: (text) => this.#mcp.redact(text),
         emitToolUsage: (usage) => this.emit("toolUsage", usage),
+        emitHookEvent: (event) => this.emit("hookEvent", event),
         turnModel: (agentId, turnId) => this.#drain.modelForTurn(agentId, turnId),
         requeueChannelDelivery: (deliveryId) => this.#requeueChannelDelivery(deliveryId),
         quietRoutineDelivery: (deliveryId) => this.#routines.quietRunForDelivery(deliveryId),
@@ -3129,6 +3134,24 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     recordAgentRestartActivity(event);
     if (this.channels?.event(event) || this.messaging?.event(event, this.#scope)) return;
     this.emit("event", event);
+  }
+
+  /** App metadata only: never sends a provider prompt or schedules an agent turn. */
+  recordHookRun(run: HookRun): void {
+    if (!run.threadId || !this.#store.list().some((agent) => agent.id === run.agentId)) return;
+    const id = `hook-run:${run.id}`;
+    const existing = this.#store.database.readConversationMessages(run.agentId, run.threadId, [id])[0];
+    this.#conversation.upsertSystemItem(run.agentId, run.threadId, {
+      id, ...(run.turnId ? { turnId: run.turnId } : {}), author: "system", source: "system",
+      itemType: "hook-run", text: JSON.stringify(run),
+      createdAt: existing?.createdAt ?? run.startedAt ?? new Date().toISOString(),
+      status: run.status === "queued" || run.status === "running" ? "streaming"
+        : run.status === "completed" ? "completed" : run.status === "interrupted" ? "interrupted" : "failed",
+    });
+  }
+
+  redactHookOutput(text: string): string {
+    return this.#mcp.redact(text);
   }
 
   /** Removes live provider state for an execution thread before its durable rows are deleted. */

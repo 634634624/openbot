@@ -10,6 +10,7 @@ import {
   skillConversationEvent,
 } from "@openbot/contracts/ipc";
 import { markdownPreviewText } from "@openbot/contracts/markdown-preview-text";
+import { isHookRun, type HookRun } from "@openbot/contracts/ipc-hooks";
 import { cleanAgentMessageText } from "@openbot/team-client/agent-message-text";
 import type {
   AgentDeliveryMarkerStatus,
@@ -50,6 +51,7 @@ export function toAgentProfile(stored: AgentSummary): AgentProfile {
 }
 
 export function toAgentMessage(message: ConversationMessage, ownerAgentId?: string): AgentMessage {
+  const hookRun = messageHookRun(message);
   const exchangeSenderId = message.senderAgentId ?? message.exchange?.senderAgentId;
   const routineEvent = routineConversationEvent(message);
   const routineRunEvent = routineRunConversationEvent(message);
@@ -60,7 +62,8 @@ export function toAgentMessage(message: ConversationMessage, ownerAgentId?: stri
     id: message.id,
     turnId: message.turnId,
     author: message.author === "user" ? "you" : "agent",
-    body: message.author === "user" ? message.text : cleanAgentMessageText(message.text),
+    body: hookRun ? hookRun.hookName : message.itemType === "hook-run" ? currentText().t("hook.run.unavailable") : message.author === "user" ? message.text : cleanAgentMessageText(message.text),
+    hookRun: hookRun ?? undefined,
     time: formatMessageTime(message.createdAt),
     createdAt: message.createdAt,
     streaming: message.status === "streaming",
@@ -92,6 +95,15 @@ export function toAgentMessage(message: ConversationMessage, ownerAgentId?: stri
                 ? "Stopped"
                 : undefined,
   };
+}
+
+/** Only the host's system item can carry a hook firing. Text is decoded before it reaches UI. */
+export function messageHookRun(message: ConversationMessage): HookRun | null {
+  if (message.itemType !== "hook-run" || message.author !== "system" || message.source !== "system") return null;
+  try {
+    const value: unknown = JSON.parse(message.text);
+    return isHookRun(value) ? value : null;
+  } catch { return null; }
 }
 
 /**
@@ -232,6 +244,7 @@ export function agentMessagesEqual(left: AgentMessage, right: AgentMessage): boo
     JSON.stringify(left.questionPrompt) === JSON.stringify(right.questionPrompt) &&
     JSON.stringify(left.exchange) === JSON.stringify(right.exchange) &&
     JSON.stringify(left.routine) === JSON.stringify(right.routine) &&
+    JSON.stringify(left.hookRun) === JSON.stringify(right.hookRun) &&
     JSON.stringify(left.actionMarker) === JSON.stringify(right.actionMarker) &&
     JSON.stringify(left.items) === JSON.stringify(right.items) &&
     JSON.stringify(left.itemIds) === JSON.stringify(right.itemIds) &&

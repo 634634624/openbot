@@ -17,6 +17,7 @@ export * from "./ipc-agent-status";
 export * from "./ipc-agent-templates";
 export * from "./ipc-agent-waits";
 export * from "./ipc-agents";
+export * from "./ipc-hooks";
 export * from "./ipc-app-auth";
 export * from "./ipc-approvals";
 export * from "./ipc-attachments";
