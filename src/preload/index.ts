@@ -52,7 +52,7 @@ import {
   decodeWebhookSecret,
 } from "@openbot/contracts/ipc-events";
 import { contextBridge, ipcRenderer, webUtils } from "electron";
-import { decodeHookSnapshotFromMain } from "./hooks-decoding";
+import { decodeLocalHookSnapshot } from "./hooks-decoding";
 import {
   decodeAccountUsageFromMain,
   decodeAgent,
@@ -529,12 +529,12 @@ const openbotApi: OpenBotDesktopApi = {
     cancelProviderCodeLogin: decodeAgentStatusFromMain,
   }),
   hooks: bridgeGroup(IPC_ENDPOINTS.hooks, {
-    get: decodeHookSnapshotFromMain,
-    save: decodeHookSnapshotFromMain,
-    cancelRun: decodeHookSnapshotFromMain,
-    resetHistory: decodeHookSnapshotFromMain,
+    get: decodeLocalHookSnapshot,
+    save: decodeLocalHookSnapshot,
+    cancelRun: decodeLocalHookSnapshot,
+    resetHistory: decodeLocalHookSnapshot,
     changed: { drop: (value) => {
-      try { return decodeHookSnapshotFromMain(value); } catch { return null; }
+      try { return decodeLocalHookSnapshot(value); } catch { return null; }
     } },
   }),
   dynamicIsland: bridgeGroup(IPC_ENDPOINTS.dynamicIsland, {

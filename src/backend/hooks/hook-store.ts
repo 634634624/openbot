@@ -34,7 +34,7 @@ export interface HookStoreOptions {
   path: string;
   changed?: (snapshot: HookSnapshot) => void;
 }
-export interface AcceptedHook {
+interface AcceptedHook {
   run: HookRun;
   definition: HookDefinition;
 }
