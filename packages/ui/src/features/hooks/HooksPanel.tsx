@@ -219,7 +219,11 @@ export function HooksPanel(props: HooksPanelProps) {
       });
   };
   return (
-    <section class="hooks-panel" aria-label={t("hook.title")} aria-busy={props.loading || props.saving}>
+    <section
+      class="hooks-panel"
+      aria-label={t("hook.title")}
+      aria-busy={props.loading || props.saving ? "true" : "false"}
+    >
       <header>
         <h1>{t("hook.title")}</h1>
         <p>{t("hook.description")}</p>
@@ -328,7 +332,7 @@ export function HooksPanel(props: HooksPanelProps) {
                   aria-label={t("hook.name")}
                   placeholder={t("hook.name")}
                   value={editor.draft?.name ?? ""}
-                  maxLength={HOOK_LIMITS.name}
+                  maxlength={HOOK_LIMITS.name}
                   disabled={props.saving}
                   onValueChange={(value) =>
                     setEditor((state) => {
@@ -384,7 +388,7 @@ export function HooksPanel(props: HooksPanelProps) {
                   aria-label={t("hook.command")}
                   placeholder={t("hook.command")}
                   value={editor.draft?.command ?? ""}
-                  maxLength={HOOK_LIMITS.command}
+                  maxlength={HOOK_LIMITS.command}
                   disabled={props.saving}
                   onValueChange={(value) =>
                     setEditor((state) => {
