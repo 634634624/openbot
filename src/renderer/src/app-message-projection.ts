@@ -9,7 +9,7 @@ import {
   routineRunConversationEvent,
   skillConversationEvent,
 } from "@openbot/contracts/ipc";
-import { isHookRun, type HookRun } from "@openbot/contracts/ipc-hooks";
+import { type HookRun, isHookRun } from "@openbot/contracts/ipc-hooks";
 import { markdownPreviewText } from "@openbot/contracts/markdown-preview-text";
 import { cleanAgentMessageText } from "@openbot/team-client/agent-message-text";
 import type {
