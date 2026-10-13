@@ -113,7 +113,7 @@ describe.sequential("local lifecycle hooks", () => {
     await Effect.runPromise(engine.onEvent({ ...event, id: "hook-emitted", source: "hook" }));
     expect(requests).toEqual([event]);
     expect(store.snapshot().runs).toHaveLength(1);
-    expect(store.snapshot().runs[0].threadId).toBe(event.threadId);
+    expect(store.snapshot().runs[0]?.threadId).toBe(event.threadId);
   });
 
   it("does not start a queued command after the master is disabled", async () => {
@@ -163,7 +163,9 @@ describe.sequential("local lifecycle hooks", () => {
     );
     await Effect.runPromise(engine.onEvent(event));
     await started.promise;
-    await Effect.runPromise(engine.cancelRun(store.snapshot().runs[0].id));
+    const run = store.snapshot().runs[0];
+    if (!run) throw new Error("Expected a running hook to cancel");
+    await Effect.runPromise(engine.cancelRun(run.id));
     expect((await terminal.promise).status).toBe("interrupted");
   });
 
@@ -184,7 +186,7 @@ describe.sequential("local lifecycle hooks", () => {
     await Effect.runPromise(engine.initialize());
     await Effect.runPromise(engine.onEvent(event));
     expect(called).toBe(false);
-    expect(recovered.snapshot().runs[0].status).toBe("interrupted");
+    expect(recovered.snapshot().runs[0]?.status).toBe("interrupted");
   });
 
   it("bounds combined output bytes after redaction", () => {
@@ -204,6 +206,7 @@ describe.sequential("local lifecycle hooks", () => {
     });
     await expect(Effect.runPromise(store.resetHistory({ expectedRevision: 1 }))).rejects.toBeDefined();
     const [accepted] = await Effect.runPromise(store.accept(event));
+    if (!accepted) throw new Error("Expected an accepted hook run");
     const before = store.snapshot();
     const disabled = { ...before.settings, enabled: false };
     await Effect.runPromise(store.saveSettings({ expectedRevision: before.revision, settings: disabled }));

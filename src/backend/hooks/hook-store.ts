@@ -52,7 +52,8 @@ export function hookApplies(settings: HookSettings, hook: HookDefinition, event:
   const overrides = Object.hasOwn(settings.agentOverrides, event.agentId)
     ? settings.agentOverrides[event.agentId]
     : undefined;
-  return overrides && Object.hasOwn(overrides, hook.id) ? overrides[hook.id] : hook.enabled;
+  if (overrides && Object.hasOwn(overrides, hook.id)) return overrides[hook.id] ?? hook.enabled;
+  return hook.enabled;
 }
 function validStored(value: unknown): value is StoredHooks {
   return (
