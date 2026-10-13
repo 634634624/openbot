@@ -32,20 +32,12 @@ describe("hook firing projection", () => {
     expect(toAgentMessage(item).hookRun).toEqual(HOOK_FIXTURE_RUN);
   });
 
-  it("detects terminal output updates even when the ID and visible name stay unchanged", () => {
-    const terminal = {
-      ...HOOK_FIXTURE_RUN,
-      status: "completed",
-      finishedAt: "2026-10-13T10:00:00.250Z",
-      stdout: "Fixture complete.",
-      exitCode: 0,
-    };
-    expect(
-      agentMessagesEqual(
-        toAgentMessage(item),
-        toAgentMessage({ ...item, status: "completed", text: JSON.stringify(terminal) }),
-      ),
-    ).toBe(false);
+  it("detects hook-only output updates while every other message field stays unchanged", () => {
+    const message = toAgentMessage(item);
+    const unchanged = { ...message, hookRun: { ...HOOK_FIXTURE_RUN } };
+    const updated = { ...message, hookRun: { ...HOOK_FIXTURE_RUN, stdout: "Fixture output." } };
+    expect(agentMessagesEqual(message, unchanged)).toBe(true);
+    expect(agentMessagesEqual(message, updated)).toBe(false);
   });
 
   it("rejects malformed and user-authored firing payloads", () => {

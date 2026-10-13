@@ -284,9 +284,20 @@ export class TurnLifecycle {
   ) {
     for (const [turnId, turn] of this.#runningTurns) {
       if (turn.client !== client) continue;
+      this.#runningTurns.delete(turnId);
       this.#attention.clearForTurn(turn.threadId, turnId);
       if (this.#observedCompactions.get(turn.threadId) === turnId) this.#observedCompactions.delete(turn.threadId);
       this.#compaction.abandonCompaction(turn.threadId);
+      // Observe the captured turn without changing the existing completion bookkeeping.
+      if (!this.#hookEndedTurns.has(turnId))
+        this.#hooks.emitHookEvent?.({
+          id: hookEventId("turn.failed", turn.agentId, turnId),
+          trigger: "turn.failed",
+          agentId: turn.agentId,
+          threadId: turn.publicThreadId,
+          turnId,
+          source: "agent",
+        });
       yield* this.#completeTurn(turn.agentId, turn.threadId, turnId, "interrupted").pipe(
         Effect.catch((failure) =>
           Effect.sync(() => this.#hooks.emitError("turn_completion_failed", failure.cause, turn.agentId)),
@@ -352,7 +363,6 @@ export class TurnLifecycle {
         const turnId = getString(turn, "id");
         if (!turnId) return;
         if (this.#compaction.claimTurn(agentId, threadId, turnId)) return;
-        if (this.#runningTurns.has(turnId)) return;
         this.#compaction.beginTurn(threadId);
         // The provider started this turn itself. A delivery that is starting now waits for its own turn.
         const unprompted = isRecord(params) && params.unprompted === true;
