@@ -19,8 +19,8 @@ import type {
   AgentProfile,
   ChatActionMarkerModel,
 } from "@openbot/ui/data";
-import type { TaskListItem } from "@openbot/ui/features/conversation/TaskList";
 import { formatChatTimestamp } from "@openbot/ui/features/conversation/chat-timestamp";
+import type { TaskListItem } from "@openbot/ui/features/conversation/TaskList";
 import { currentText } from "@openbot/ui/text";
 import { isRoutineEventItem } from "./features/conversation/conversation-read-state";
 

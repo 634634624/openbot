@@ -14,6 +14,7 @@ vi.mock("electron", () => ({
       registrations.set(channel, listener),
   },
 }));
+
 import { registerIpcGroup } from "./define-ipc-group";
 import { hooksIpcHandlers } from "./hooks-handlers";
 

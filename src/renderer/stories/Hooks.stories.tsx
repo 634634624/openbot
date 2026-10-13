@@ -1,8 +1,8 @@
 import { HookRunItem } from "@openbot/ui/features/hooks/HookRunItem";
 import { HooksPanel } from "@openbot/ui/features/hooks/HooksPanel";
 import { createStore } from "solid-js";
-import type { Meta, StoryObj } from "storybook-solidjs-vite";
 import { fn } from "storybook/test";
+import type { Meta, StoryObj } from "storybook-solidjs-vite";
 import { HOOK_FIXTURE_AGENTS, HOOK_FIXTURE_RUN, HOOK_FIXTURE_SNAPSHOT } from "../src/features/hooks/hooks-fixtures";
 
 const meta = {
