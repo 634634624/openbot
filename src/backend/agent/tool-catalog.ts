@@ -18,6 +18,7 @@ export const BUILTIN_TOOL_CATALOG = [OPENBOT_DYNAMIC_TOOLS, ...BROWSER_DYNAMIC_T
 );
 
 const DIRECT_NAMES = new Set([
+  "session_checkpoint",
   "ask_user",
   "attach_files_to_response",
   "list_agents",

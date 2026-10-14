@@ -371,11 +371,12 @@ export class ThreadLifecycle {
     agent: AgentSummary,
     client: AgentClient,
     publicThreadId: string,
-    reason?: "configuration-change" | "missing-session",
+    reason?: "configuration-change" | "missing-session" | "context-rollover",
+    checkpoint?: string,
   ) {
     return yield* Effect.acquireUseRelease(
       Effect.sync(() => this.holdRuntimeRefresh(agent.id)),
-      () => this.#startProviderThread(agent, client, publicThreadId, reason),
+      () => this.#startProviderThread(agent, client, publicThreadId, reason, checkpoint),
       (release) => Effect.sync(release),
     );
   }, Effect.uninterruptible).bind(this);
@@ -385,7 +386,8 @@ export class ThreadLifecycle {
     agent: AgentSummary,
     client: AgentClient,
     publicThreadId: string,
-    reason?: "configuration-change" | "missing-session",
+    reason?: "configuration-change" | "missing-session" | "context-rollover",
+    checkpoint?: string,
   ) {
     // One reading of the MCP set for the request and for the manifest below. Read twice, a change
     // that lands while the provider answers would be recorded as what this session was given, and
@@ -449,9 +451,11 @@ export class ThreadLifecycle {
           );
         }
         // The handoff reads the store synchronously. A failure there must also clean up this session.
-        const handoff = yield* this.buildProviderHandoff(agent.id, publicThreadId).pipe(
-          Effect.catchDefect((cause) => Effect.fail(new ThreadOperationFailed({ cause }))),
-        );
+        const handoff =
+          checkpoint ??
+          (yield* this.buildProviderHandoff(agent.id, publicThreadId).pipe(
+            Effect.catchDefect((cause) => Effect.fail(new ThreadOperationFailed({ cause }))),
+          ));
         if (handoff) {
           yield* threadIo(() =>
             mkdir(join(this.#store.database.userDataPath, "provider-handoffs"), { recursive: true, mode: 0o700 }),
@@ -490,6 +494,32 @@ export class ThreadLifecycle {
     this.#conversation.ensureSnapshot(agent.id, publicThreadId);
     return externalThreadId;
   });
+
+  /** Replaces only an idle personal provider session; the visible thread and its history stay. */
+  readonly rolloverThread = Effect.fn("ThreadLifecycle.rolloverThread")(function* (
+    this: ThreadLifecycle,
+    agent: AgentSummary,
+    client: AgentClient,
+    oldSessionId: string,
+    checkpoint: string,
+  ) {
+    if (
+      !agent.threadId ||
+      this.#conversation.workingSnapshot(agent.id)?.activeTurnId ||
+      this.#pendingStarts.has(agent.id)
+    )
+      return yield* new ThreadOperationFailed({ cause: new Error("Session rollover requires an idle agent.") });
+    const session = this.#store.database.activeProviderSession(agent.threadId, agent.provider);
+    if (session?.externalSessionId !== oldSessionId)
+      return yield* new ThreadOperationFailed({ cause: new Error("Session rollover checkpoint is stale.") });
+    const replacement = yield* this.startProviderThread(agent, client, agent.threadId, "context-rollover", checkpoint);
+    this.#conversation.unbindThread(oldSessionId);
+    this.#conversation.unloadThread(oldSessionId);
+    this.#compaction.forgetThread(oldSessionId);
+    this.#pendingHandoffs.delete(oldSessionId);
+    yield* this.#releaseProviderSession(oldSessionId, client);
+    return replacement;
+  }, Effect.uninterruptible).bind(this);
 
   private handoffPath(sessionId: string): string {
     return join(

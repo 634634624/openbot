@@ -474,7 +474,8 @@ export class ConversationRuntime {
       return execution;
     }
     const cached = this.#snapshots.get(agentId);
-    if (cached && (!threadId || cached.threadId === threadId)) return cached;
+    // Provider identifiers map to the same visible chat; preserve its active writer.
+    if (cached && (!publicId || cached.threadId === publicId)) return cached;
     const agent = this.#store.list().find((candidate) => candidate.id === agentId);
     const publicThreadId = agent?.threadId ?? threadId;
     const page = this.#store.database.readConversationPage(agentId, publicThreadId, { type: "latest" }, 100);
@@ -550,9 +551,12 @@ export class ConversationRuntime {
 
   upsertHelperItem(agentId: string, threadId: string, message: ConversationMessage): void {
     if (this.#forgottenExecutionThreads.has(threadId)) return;
-    if (!this.#store.database.connection.prepare(
-      "SELECT 1 FROM projection_threads WHERE thread_id = ? AND agent_id = ?",
-    ).get(threadId, agentId)) return;
+    if (
+      !this.#store.database.connection
+        .prepare("SELECT 1 FROM projection_threads WHERE thread_id = ? AND agent_id = ?")
+        .get(threadId, agentId)
+    )
+      return;
     const cached = this.#snapshots.get(agentId);
     const snapshot = cached?.threadId === threadId ? cached : this.#executionSnapshots.get(threadId);
     if (snapshot) {
@@ -567,9 +571,13 @@ export class ConversationRuntime {
     const page = this.#store.database.readConversationPage(agentId, threadId, { type: "latest" }, 100);
     if (page.threadId !== threadId) return;
     const revision = this.#store.database.persistConversationChanges({
-      agentId, threadId, activeTurnId: page.activeTurnId,
-      changedMessages: [message], removedMessageIds: [],
-      eventType: "conversation.helper-job-updated", detail: { runId: message.id },
+      agentId,
+      threadId,
+      activeTurnId: page.activeTurnId,
+      changedMessages: [message],
+      removedMessageIds: [],
+      eventType: "conversation.helper-job-updated",
+      detail: { runId: message.id },
     });
     const messages = page.messages.filter((item) => item.id !== message.id);
     messages.push(message);

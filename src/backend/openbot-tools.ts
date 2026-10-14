@@ -7,8 +7,8 @@ import {
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import { z } from "zod";
 import { interruptAgentToolSchema } from "./agent/agent-interrupt-tool";
-import { spawnHelperToolSchema } from "./agent/helper-jobs";
 import { DATA_TOOL_DEFINITIONS } from "./agent/data-tools";
+import { spawnHelperToolSchema } from "./agent/helper-jobs";
 import { HISTORY_TOOL_DEFINITIONS } from "./agent/history-tools";
 import { MEMORY_RECALL_TOOL_DEFINITIONS } from "./agent/memory-tool-inputs";
 import {
@@ -18,6 +18,7 @@ import {
   updateProfileToolSchema,
 } from "./agent/profile-tools";
 import { ROUTINE_NO_UPDATE_TOOL } from "./agent/routine-quiet-runs";
+import { sessionCheckpointSchema } from "./agent/session-checkpoint";
 import {
   assignAgentSectionToolSchema,
   createSectionToolSchema,
@@ -85,6 +86,12 @@ export const htmlPreviewToolSchema = z.object({
 
 /** Shared declarations for Codex, Grok, and Claude. Service handlers enforce execution rules. */
 export const OPENBOT_TOOL_DEFINITIONS: readonly OpenBotToolDefinition[] = [
+  {
+    name: "session_checkpoint",
+    description:
+      "Save a bounded current-task checkpoint before ending an open work round. Include current constraints, cancellations, authority, verified evidence, pending owners, paths, and one next action. No secrets or full transcript. OpenBot can continue in a fresh provider session after this turn ends.",
+    shape: sessionCheckpointSchema.shape,
+  },
   ...CHANNEL_TOOL_DEFINITIONS,
   ...HISTORY_TOOL_DEFINITIONS,
   ...DATA_TOOL_DEFINITIONS,
@@ -193,12 +200,14 @@ export const OPENBOT_TOOL_DEFINITIONS: readonly OpenBotToolDefinition[] = [
   },
   {
     name: "cancel_helper",
-    description: "Cancel one helper you started. Its result and history stay available. The helper stops when its active provider turn acknowledges cancellation.",
+    description:
+      "Cancel one helper you started. Its result and history stay available. The helper stops when its active provider turn acknowledges cancellation.",
     shape: { jobId: z.string().min(1).max(INPUT_LIMITS.identifier) },
   },
   {
     name: "spawn_helper",
-    description: "Run one named local helper job. Send only the explicit claim, acceptance criteria and scope. No parent history is copied. The helper cannot create teammates, change profiles, schedule routines or accept another job. History stays after completion. This tool is disabled on remote hosts.",
+    description:
+      "Run one named local helper job. Send only the explicit claim, acceptance criteria and scope. No parent history is copied. The helper cannot create teammates, change profiles, schedule routines or accept another job. History stays after completion. This tool is disabled on remote hosts.",
     shape: spawnHelperToolSchema.shape,
   },
   {

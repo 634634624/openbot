@@ -50,7 +50,7 @@ import type { ConversationRuntime } from "./conversation-runtime";
 import { handleDataTool } from "./data-tools";
 import { responseAttachmentMessageId, visualReplyFileName, visualReplyMessageId } from "./delivery-content";
 import type { DrainScheduler } from "./drain-scheduler";
-import { spawnHelperToolSchema, type SpawnHelperInput } from "./helper-jobs";
+import { type SpawnHelperInput, spawnHelperToolSchema } from "./helper-jobs";
 import { HistoryTools } from "./history-tools";
 import type { HostedSiteCoordinator } from "./hosted-site-coordinator";
 import { isHostedSiteMutationTool } from "./hosted-site-events";
@@ -73,6 +73,7 @@ import {
 import { ROUTINE_NO_UPDATE_TOOL } from "./routine-quiet-runs";
 import type { RoutineScheduler } from "./routine-scheduler";
 import { type OpenBotToolResponse, openBotToolFailure, openBotToolResult } from "./routine-tools";
+import type { SessionRollover } from "./session-rollover";
 import { type AgentSidebar, handleSidebarTool } from "./sidebar-tools";
 import { LOCAL_SKILL_TOOL_DEFINITIONS, type LocalSkillTools, runLocalSkillTool } from "./skill-tools";
 import { isDynamicToolCall } from "./thread-items";
@@ -87,7 +88,12 @@ export interface OpenBotToolRouterHooks {
   listAgents(): AgentSummary[];
   listModels(): AgentModelOption[];
   preferredProvider(): AgentProvider;
-  spawnHelper(parentId: string, threadId: string, key: string, input: SpawnHelperInput): Effect.Effect<AgentSummary, ToolOperationFailed>;
+  spawnHelper(
+    parentId: string,
+    threadId: string,
+    key: string,
+    input: SpawnHelperInput,
+  ): Effect.Effect<AgentSummary, ToolOperationFailed>;
   cancelHelper(parentId: string, jobId: string): Effect.Effect<AgentSummary, ToolOperationFailed>;
   createAgent(
     input: CreateAgentInput,
@@ -127,6 +133,7 @@ export interface OpenBotToolRouterOptions {
   memories: AgentMemories;
   waits: AgentWaits;
   drain: DrainScheduler;
+  rollover: SessionRollover;
   tables: AgentTables | null;
   sidebarLayout: AgentSidebar | null;
   localSkillTools?: () => LocalSkillTools;
@@ -160,6 +167,7 @@ export class OpenBotToolRouter {
   readonly #memories: AgentMemories;
   readonly #waits: AgentWaits;
   readonly #drain: DrainScheduler;
+  readonly #rollover: SessionRollover;
   readonly #tables: AgentTables | null;
   readonly #sidebarLayout: AgentSidebar | null;
   readonly #localSkillTools?: () => LocalSkillTools;
@@ -189,6 +197,7 @@ export class OpenBotToolRouter {
     this.#memories = options.memories;
     this.#waits = options.waits;
     this.#drain = options.drain;
+    this.#rollover = options.rollover;
     this.#tables = options.tables;
     this.#sidebarLayout = options.sidebarLayout;
     this.#localSkillTools = options.localSkillTools;
@@ -359,7 +368,8 @@ export class OpenBotToolRouter {
                 if (!(error instanceof z.ZodError)) logger.warn("An OpenBot tool failed.", { tool, error: message });
                 return openBotToolFailure(message);
               });
-            const correctable = PROFILE_TOOL_NAMES.has(tool) || tool === "attach_files_to_response";
+            const correctable =
+              PROFILE_TOOL_NAMES.has(tool) || tool === "attach_files_to_response" || tool === "session_checkpoint";
             const response = this.#handleOpenBotTool(toolRequest.params).pipe(
               Effect.catch((failure) => (correctable ? correctableFailure(failure.cause) : Effect.fail(failure))),
               Effect.catchDefect((defect) => (correctable ? correctableFailure(defect) : Effect.die(defect))),
@@ -505,10 +515,23 @@ export class OpenBotToolRouter {
     const senderAgentId = this.#conversation.agentForThread(params.threadId);
     if (!senderAgentId) throw new Error("The sending OpenBot agent is unknown.");
 
+    if (params.tool === "session_checkpoint") {
+      const result = yield* this.#rollover
+        .save(senderAgentId, params.threadId, params.turnId, params.arguments)
+        .pipe(toToolOperationFailed);
+      return openBotToolResult(result);
+    }
     const caller = this.#requireAgent(senderAgentId);
-    if (caller.helper && (PROFILE_TOOL_NAMES.has(params.tool) && params.tool !== "read_agent" && params.tool !== "list_models" ||
-      ["spawn_helper", "cancel_helper", "send_message", "interrupt_agent", "await_event", "close_wait"].includes(params.tool) ||
-      params.tool.includes("routine") || params.tool.startsWith("channel_") || params.tool.includes("section")))
+    if (
+      caller.helper &&
+      ((PROFILE_TOOL_NAMES.has(params.tool) && params.tool !== "read_agent" && params.tool !== "list_models") ||
+        ["spawn_helper", "cancel_helper", "send_message", "interrupt_agent", "await_event", "close_wait"].includes(
+          params.tool,
+        ) ||
+        params.tool.includes("routine") ||
+        params.tool.startsWith("channel_") ||
+        params.tool.includes("section"))
+    )
       return openBotToolFailure(sourceText("error.agent.helperFixed"));
 
     if (LOCAL_SKILL_TOOL_DEFINITIONS.some((tool) => tool.name === params.tool)) {
@@ -629,29 +652,32 @@ export class OpenBotToolRouter {
     if (params.tool === "list_agents") {
       // A delivery that is starting holds no turn yet, and a channel turn runs on a thread of its own.
       const unresolved = new Set(this.#mailbox.unresolvedDeliveries().map(({ delivery }) => delivery.recipientAgentId));
-      const agents = this.#hooks.listAgents().filter((agent) => !agent.helper || agent.helper.status === "queued" || agent.helper.status === "running").map((agent) => {
-        const deliveries = this.#mailbox.listQueue(agent.id).deliveries;
-        const queuedMessages = deliveries.filter((delivery) => delivery.status === "queued").length;
-        const working = this.#hooks.runsTurn(agent.id) || unresolved.has(agent.id);
-        const activeTurnId = this.#conversation.workingSnapshot(agent.id)?.activeTurnId ?? null;
-        const { startedAt, lastEventAt } = this.#hooks.turnActivity(agent.id, activeTurnId);
-        // A restart loses the provider clock, so the newest message for the agent stands in for it.
-        const lastActivity = deliveries.reduce(
-          (latest, delivery) => Math.max(latest, Date.parse(delivery.createdAt) || 0),
-          Math.max(lastEventAt ?? 0, startedAt ?? 0),
-        );
-        return {
-          id: agent.id,
-          ...(agent.helper ? { helper: agent.helper } : {}),
-          name: agent.name,
-          title: agent.title,
-          description: agent.description,
-          status: working ? "working" : queuedMessages > 0 ? "queued" : "ready",
-          queuedMessages,
-          ...(working && startedAt !== null ? { turnStartedAt: new Date(startedAt).toISOString() } : {}),
-          ...(lastActivity > 0 ? { lastActivityAt: new Date(lastActivity).toISOString() } : {}),
-        };
-      });
+      const agents = this.#hooks
+        .listAgents()
+        .filter((agent) => !agent.helper || agent.helper.status === "queued" || agent.helper.status === "running")
+        .map((agent) => {
+          const deliveries = this.#mailbox.listQueue(agent.id).deliveries;
+          const queuedMessages = deliveries.filter((delivery) => delivery.status === "queued").length;
+          const working = this.#hooks.runsTurn(agent.id) || unresolved.has(agent.id);
+          const activeTurnId = this.#conversation.workingSnapshot(agent.id)?.activeTurnId ?? null;
+          const { startedAt, lastEventAt } = this.#hooks.turnActivity(agent.id, activeTurnId);
+          // A restart loses the provider clock, so the newest message for the agent stands in for it.
+          const lastActivity = deliveries.reduce(
+            (latest, delivery) => Math.max(latest, Date.parse(delivery.createdAt) || 0),
+            Math.max(lastEventAt ?? 0, startedAt ?? 0),
+          );
+          return {
+            id: agent.id,
+            ...(agent.helper ? { helper: agent.helper } : {}),
+            name: agent.name,
+            title: agent.title,
+            description: agent.description,
+            status: working ? "working" : queuedMessages > 0 ? "queued" : "ready",
+            queuedMessages,
+            ...(working && startedAt !== null ? { turnStartedAt: new Date(startedAt).toISOString() } : {}),
+            ...(lastActivity > 0 ? { lastActivityAt: new Date(lastActivity).toISOString() } : {}),
+          };
+        });
       return openBotToolResult({ agents });
     }
 
@@ -672,11 +698,19 @@ export class OpenBotToolRouter {
     if (params.tool === "spawn_helper") {
       if (channelId) return openBotToolFailure(sourceText("error.agent.helperChannel"));
       const args = spawnHelperToolSchema.parse(params.arguments);
-      const helper = yield* this.#hooks.spawnHelper(senderAgentId, executionThreadId, toolCallIdempotencyKey(params), args);
+      const helper = yield* this.#hooks.spawnHelper(
+        senderAgentId,
+        executionThreadId,
+        toolCallIdempotencyKey(params),
+        args,
+      );
       return openBotToolResult({ helper });
     }
     if (params.tool === "cancel_helper") {
-      const args = z.object({ jobId: z.string().min(1).max(INPUT_LIMITS.identifier) }).strict().parse(params.arguments);
+      const args = z
+        .object({ jobId: z.string().min(1).max(INPUT_LIMITS.identifier) })
+        .strict()
+        .parse(params.arguments);
       return openBotToolResult({ helper: yield* this.#hooks.cancelHelper(senderAgentId, args.jobId) });
     }
     if (params.tool === "create_agent") return yield* this.#createAgent(params, senderAgentId);

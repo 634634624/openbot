@@ -190,6 +190,12 @@ export class ContextCompaction {
     budget.pending = true;
   }
 
+  /** Local 80% policy; estimated or missing usage cannot trigger a fresh session. */
+  rolloverPressure(threadId: string): boolean {
+    const usage = this.#display.get(threadId)?.usage;
+    return Boolean(usage && !usage.estimated && usage.usedTokens / usage.windowTokens >= CONTEXT_COMPACTION_THRESHOLD);
+  }
+
   contextInputCharacters(threadId: string): number {
     const budget = this.#budgets.get(threadId);
     return budget ? Math.min(120_000, Math.floor(budget.contextWindow * 2)) : 120_000;

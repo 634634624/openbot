@@ -77,6 +77,7 @@ describe.sequential("ContextCompaction: pressure, threshold and failure", () => 
       .map((message) => message.method);
     expect(lifecycle.slice(0, 3)).toEqual(["turn/start", "thread/compact/start", "turn/start"]);
     expect(lifecycle.filter((method) => method === "thread/compact/start")).toHaveLength(1);
+    await waitFor(() => events.filter((event) => event.type === "turn-started").length === 2);
     expect(events.filter((event) => event.type === "turn-started")).toHaveLength(2);
     expect(
       events.some(

@@ -1,3 +1,4 @@
+import { messages as agent } from "./agent";
 import { messages as errorAgent } from "./error/agent";
 import { messages as errorApp } from "./error/app";
 import { messages as errorAttachment } from "./error/attachment";
@@ -31,6 +32,12 @@ import { messages as statusUpdate } from "./status/update";
 
 /** Text the main process, a host or the team client sends as English and a screen translates. */
 export const source = {
+  "agent.helper.record": agent["agent.helper.record"],
+  "agent.helper.queued": agent["agent.helper.queued"],
+  "agent.helper.running": agent["agent.helper.running"],
+  "agent.helper.completed": agent["agent.helper.completed"],
+  "agent.helper.failed": agent["agent.helper.failed"],
+  "agent.helper.cancelled": agent["agent.helper.cancelled"],
   ...errorKind,
   ...errorReference,
   ...errorApp,

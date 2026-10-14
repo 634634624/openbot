@@ -1,26 +1,28 @@
-import type { AgentSummary } from "@openbot/contracts/ipc";
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
+import type { AgentSummary } from "@openbot/contracts/ipc";
 import { sourceText } from "@openbot/i18n/source";
 import { Effect, Semaphore } from "effect";
 import { z } from "zod";
 import type { AgentStore } from "../agent-store";
 import type { MailboxStore } from "../mailbox-store";
-import { createAgentToolSchema } from "./profile-tools";
-import type { MailboxSync } from "./mailbox-sync";
 import type { ConversationRuntime } from "./conversation-runtime";
+import type { MailboxSync } from "./mailbox-sync";
+import { createAgentToolSchema } from "./profile-tools";
 
 const boundedBrief = z.string().trim().min(1).max(20_000);
-export const spawnHelperToolSchema = z.object({
-  name: createAgentToolSchema.shape.name,
-  role: z.string().trim().min(1).max(INPUT_LIMITS.agentTitle),
-  personality: z.string().trim().max(1000).optional(),
-  claim: boundedBrief,
-  acceptance: boundedBrief,
-  scope: boundedBrief,
-  provider: createAgentToolSchema.shape.provider,
-  model: createAgentToolSchema.shape.model,
-  reasoningEffort: createAgentToolSchema.shape.reasoningEffort,
-}).strict();
+export const spawnHelperToolSchema = z
+  .object({
+    name: createAgentToolSchema.shape.name,
+    role: z.string().trim().min(1).max(INPUT_LIMITS.agentTitle),
+    personality: z.string().trim().max(1000).optional(),
+    claim: boundedBrief,
+    acceptance: boundedBrief,
+    scope: boundedBrief,
+    provider: createAgentToolSchema.shape.provider,
+    model: createAgentToolSchema.shape.model,
+    reasoningEffort: createAgentToolSchema.shape.reasoningEffort,
+  })
+  .strict();
 export type SpawnHelperInput = z.infer<typeof spawnHelperToolSchema>;
 
 export function helperBrief(input: SpawnHelperInput): string {
@@ -31,8 +33,13 @@ export function helperActive(helper: NonNullable<AgentSummary["helper"]>): boole
   return helper.status === "queued" || helper.status === "running";
 }
 
-const helperStatusKeys = { queued: "agent.helper.queued", running: "agent.helper.running",
-  completed: "agent.helper.completed", failed: "agent.helper.failed", cancelled: "agent.helper.cancelled" } as const;
+const helperStatusKeys = {
+  queued: "agent.helper.queued",
+  running: "agent.helper.running",
+  completed: "agent.helper.completed",
+  failed: "agent.helper.failed",
+  cancelled: "agent.helper.cancelled",
+} as const;
 
 /** Owns durable job outcomes and idempotent result delivery; never deletes a workspace. */
 export class HelperJobs {
@@ -52,12 +59,21 @@ export class HelperJobs {
     const helper = agent?.helper;
     if (!agent || !helper) return;
     this.conversation.upsertHelperItem(helper.parentAgentId, helper.parentThreadId, {
-      id: `helper-job:${helper.jobId}`, author: "system", source: "system",
-      status: "completed", createdAt: helper.createdAt, itemType: "helper-job",
-      text: this.redact(sourceText("agent.helper.record", {
-        parent: helper.parentAgentName, helper: agent.name, role: helper.role,
-        status: sourceText(helperStatusKeys[helper.status]), result: helper.result,
-      })),
+      id: `helper-job:${helper.jobId}`,
+      author: "system",
+      source: "system",
+      status: "completed",
+      createdAt: helper.createdAt,
+      itemType: "helper-job",
+      text: this.redact(
+        sourceText("agent.helper.record", {
+          parent: helper.parentAgentName,
+          helper: agent.name,
+          role: helper.role,
+          status: sourceText(helperStatusKeys[helper.status]),
+          result: helper.result,
+        }),
+      ),
     });
   }
 
@@ -74,14 +90,20 @@ export class HelperJobs {
   }
 
   readonly #settle = Effect.fn("HelperJobs.settle")(function* (
-    this: HelperJobs, id: string, status: "completed" | "failed" | "cancelled", text: string,
+    this: HelperJobs,
+    id: string,
+    status: "completed" | "failed" | "cancelled",
+    text: string,
   ) {
     let agent = this.store.list().find((entry) => entry.id === id);
     if (!agent?.helper) return;
     if (helperActive(agent.helper)) {
       const result = this.redact(text).slice(0, INPUT_LIMITS.messageText - 1000);
       agent = yield* this.store.setHelperJob(id, {
-        ...agent.helper, status: agent.helper.cancelRequested ? "cancelled" : status, result, completedAt: new Date().toISOString(),
+        ...agent.helper,
+        status: agent.helper.cancelRequested ? "cancelled" : status,
+        result,
+        completedAt: new Date().toISOString(),
       });
     }
     this.publish(id);
@@ -96,7 +118,9 @@ export class HelperJobs {
     const receipt = yield* this.mailbox.enqueue({
       sender: { kind: "agent", agentId: agent.id },
       recipientAgentIds: [helper.parentAgentId],
-      text: this.redact(`Helper ${agent.name} (${helper.role}): ${helper.status}\nOrigin thread: ${helper.parentThreadId}\n${helper.result}`),
+      text: this.redact(
+        `Helper ${agent.name} (${helper.role}): ${helper.status}\nOrigin thread: ${helper.parentThreadId}\n${helper.result}`,
+      ),
       replyToMessageId: helper.originMessageId,
       expectsReply: false,
       idempotencyKey: `helper-result:${helper.jobId}`,

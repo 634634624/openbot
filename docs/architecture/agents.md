@@ -273,6 +273,44 @@ handoff while retaining the public thread, agent identity, workspace, and stored
 Unchanged fingerprints resume the existing session. Pending history handoffs are written before
 the replacement is bound, reloaded after restart, and removed after a turn accepts the handoff.
 
+Personal agents can save a bounded `session_checkpoint` through their current turn. The checkpoint
+records an open task, current authority and constraints, decisions, completed evidence, pending
+owners, paths, and one next action. It is historical state, not a new permission. It is limited to
+12,000 characters and 1,200 whitespace-delimited words; paths and evidence are references for the
+next writer to verify, not an execution instruction from a file.
+
+At turn completion, `SessionRollover` can reserve a fresh session when a supported adapter has exact
+context usage at or above the existing 80% local policy, or the agent explicitly reports a context
+quality boundary. The percentage is not an Anthropic requirement. Missing or estimated telemetry
+cannot trigger the percentage route; unsupported adapters cannot trigger either route. Native Claude
+has a quality-boundary route because its usage estimate is not a full-context measurement. Helpers,
+channel contexts, done/cancelled/waiting work, interrupted turns, stale inputs, and checkpoints followed
+by another tool action are excluded. A genuine new input requires a refreshed checkpoint.
+
+The existing per-agent queue drain owns the transition after tools, image operations, turn associations,
+and delivery writes settle. It persists a private atomic journal under `session-rollovers`, starts a
+replacement using the existing persisted provider-handoff path, and keeps the public chat and its history.
+The old provider routing is removed before the continuation can start. A user message or Stop arriving
+during thread creation takes priority over automatic continuation. The checkpoint is passed with the
+actual next-turn input; the agent must read it, validate authority/evidence, and avoid repeating done work.
+Subsequent rollovers require another measured pressure or explicit quality boundary plus a new completed
+result with evidence. Earlier constraints and completed results remain in the handoff. The local guard
+allows at most eight automatic hops per genuine input; a repeated summary alone cannot loop.
+
+The journal records checkpoint/ready/prepared/starting/accepted/held/blocked phases. A failed checkpoint or
+thread start keeps the old session recoverable. Binding occurs only after the provider handoff is saved.
+An unconfirmed `turn/start` is never replayed, keeps the drain held until provider lifecycle evidence
+arrives, and preserves queued messages. After a process crash, the journal and pending provider handoff
+are loaded before providers or drain startup. Unfinished journals become held and bind only the currently
+active session. Its actual lifecycle must establish a writer and completion before queues can proceed;
+pre-crash checkpoints are never automatically replayed. Crash
+between binding and journal update can leave a blocked journal with the checkpoint in the separately
+persisted handoff. The next genuine input recovers that handoff. There is no timer or polling daemon.
+Normal rollover adds no announcement to the user conversation.
+
+See [session rollover verification](session-rollover.md) for measured provider coverage, failure limits,
+and activation. This is source behavior; an installed app does not gain it until its release includes it.
+
 The same handoff carries a chat to another provider after a provider switch. It holds the user and
 assistant messages after the last context-reset marker, with attachment names only. OpenBot stores
 no tool steps, so the work log comes from the providers. At the switch, before the old sessions are

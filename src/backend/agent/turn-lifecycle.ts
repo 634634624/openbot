@@ -44,6 +44,7 @@ import { PLAN_UPDATED_METHOD, planFromNotification } from "./plan-updates";
 import { isBalanceDiagnostic, isPlanLimitDiagnostic, isUsageLimitDiagnostic } from "./provider-diagnostics";
 import type { ProviderRuntime } from "./provider-runtime";
 import { isNoUpdateAnswer, settleQuietRoutineTurn } from "./routine-quiet-runs";
+import type { SessionRollover } from "./session-rollover";
 import { ThreadFileHistory } from "./thread-file-history";
 import {
   isForeignReasoningError,
@@ -75,7 +76,11 @@ export interface AgentBrowserHost extends AttentionBrowserHost, BrowserUploadTar
 
 export interface TurnHooks {
   helperStarted?(id: string): Effect.Effect<void, TurnOperationFailed>;
-  helperSettled?(id: string, status: "completed" | "failed" | "cancelled", text: string): Effect.Effect<void, TurnOperationFailed>;
+  helperSettled?(
+    id: string,
+    status: "completed" | "failed" | "cancelled",
+    text: string,
+  ): Effect.Effect<void, TurnOperationFailed>;
   emitFailure?(failure: FailureSignal): void;
   emit(event: AgentEvent): void;
   emitError(code: string, error: unknown, agentId?: string, context?: FailureContext): void;
@@ -116,6 +121,7 @@ export interface TurnLifecycleOptions {
   attention: AttentionRegistry;
   browser: AgentBrowserHost;
   compaction: ContextCompaction;
+  rollover: SessionRollover;
   images: ImageGenRuntime;
   deltas: DeltaBuffer;
   usageLimits: UsageLimitGate;
@@ -141,6 +147,7 @@ export class TurnLifecycle {
   readonly #attention: AttentionRegistry;
   readonly #browser: AgentBrowserHost;
   readonly #compaction: ContextCompaction;
+  readonly #rollover: SessionRollover;
   readonly #images: ImageGenRuntime;
   readonly #deltas: DeltaBuffer;
   readonly #usageLimits: UsageLimitGate;
@@ -199,6 +206,7 @@ export class TurnLifecycle {
     this.#attention = options.attention;
     this.#browser = options.browser;
     this.#compaction = options.compaction;
+    this.#rollover = options.rollover;
     this.#images = options.images;
     this.#deltas = options.deltas;
     this.#usageLimits = options.usageLimits;
@@ -344,6 +352,7 @@ export class TurnLifecycle {
         const publicThreadId = this.#conversation.publicThreadId(agentId, threadId);
         const snapshot = this.#conversation.ensureSnapshot(agentId, publicThreadId);
         snapshot.activeTurnId = turnId;
+        this.#rollover.observedTurn(agentId, threadId);
         this.#failedTurns.delete(agentId);
         const origin = starting?.sender.kind ?? "unknown";
         if (!unprompted) {
@@ -366,6 +375,12 @@ export class TurnLifecycle {
         const turnId = getString(params, "turnId");
         const item = getRecord(params, "item");
         if (!turnId || !item) return;
+        if (
+          notification.method === "item/started" &&
+          ["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall"].includes(String(item.type)) &&
+          item.tool !== "session_checkpoint"
+        )
+          this.#rollover.actedAfterCheckpoint(turnId);
         this.fileHistory.record(
           agentId,
           this.#conversation.publicThreadId(agentId, threadId),
@@ -647,10 +662,9 @@ export class TurnLifecycle {
     this.#memories.finishTurn(turnId, status);
     // A refused session is closed below, and a spent plan would refuse the summary turn too, so
     // neither is compacted.
-    const shouldCompact = !refused && !limited && this.#compaction.reserve(agentId, threadId);
+
     this.#browser.endControl(this.#conversation.publicThreadId(agentId, threadId), turnId);
     const snapshot = this.#conversation.ensureSnapshot(agentId, threadId);
-    snapshot.activeTurnId = null;
     const deliveries = this.#mailbox.findDeliveriesByTurn(agentId, turnId);
     // A channel task is not run again: an unfinished turn pauses it, and its Resume opens the new session.
     const retry =
@@ -660,6 +674,7 @@ export class TurnLifecycle {
       !this.#conversation.isExecutionThread(snapshot.threadId) &&
       deliveries.every(({ delivery }) => !this.#refusedRetries.has(delivery.id));
     if (retry) {
+      snapshot.activeTurnId = null;
       yield* this.#retryRefusedTurn(agentId, threadId, turnId, snapshot, deliveries);
       return;
     }
@@ -679,6 +694,7 @@ export class TurnLifecycle {
     // The limit belongs to the model the turn ran on, which the agent may have left since.
     const model = this.#hooks.turnModel(agentId, turnId);
     if (requeue) {
+      snapshot.activeTurnId = null;
       yield* this.#requeueTurn(agentId, threadId, turnId, snapshot, deliveries);
       // After the requeue, so a routine set to skip finds its run back in the queue.
       yield* this.#usageLimits.reached(agentId, resetsAt, model);
@@ -757,6 +773,16 @@ export class TurnLifecycle {
         this.#hooks.emit({ type: "agents-changed", agents: this.#hooks.listAgents() });
       }
     }
+    const rollover = yield* this.#rollover.finishTurn(agentId, threadId, turnId, outcome).pipe(
+      Effect.catch((failure) =>
+        Effect.sync(() => {
+          this.#hooks.emitError("session_checkpoint_failed", failure.cause, agentId);
+          return false;
+        }),
+      ),
+    );
+    const shouldCompact = !rollover && !refused && !limited && this.#compaction.reserve(agentId, threadId);
+    snapshot.activeTurnId = null;
     this.#conversation.emitConversation(snapshot, "turn.completed", { turnId, status: outcome });
     if (deliveries.length > 0) {
       try {
@@ -776,9 +802,12 @@ export class TurnLifecycle {
       ...(quiet ? { quiet: true as const } : {}),
     });
     if (this.#store.list().find((agent) => agent.id === agentId)?.helper) {
-      if (this.#hooks.helperSettled) yield* this.#hooks.helperSettled(agentId,
-        outcome === "completed" ? "completed" : outcome === "failed" ? "failed" : "cancelled",
-        latestAssistant?.text || failure || sourceText("error.agent.helperNoResult"));
+      if (this.#hooks.helperSettled)
+        yield* this.#hooks.helperSettled(
+          agentId,
+          outcome === "completed" ? "completed" : outcome === "failed" ? "failed" : "cancelled",
+          latestAssistant?.text || failure || sourceText("error.agent.helperNoResult"),
+        );
       return;
     }
     if (shouldCompact) yield* this.#compaction.request(agentId, threadId);
@@ -1013,7 +1042,8 @@ export class TurnOperationFailed extends Schema.TaggedError<TurnOperationFailed>
   cause: Schema.Defect(),
 }) {}
 
-const { sync: turnStep, rewrap: toTurnOperationFailed } = causeHelpers(TurnOperationFailed);
+const { sync: turnStep } = causeHelpers(TurnOperationFailed);
+export const { rewrap: toTurnOperationFailed } = causeHelpers(TurnOperationFailed);
 
 /**
  * Whether running the turn again would repeat this item: a tool step, or answer text. Thinking and

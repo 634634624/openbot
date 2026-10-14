@@ -23,6 +23,7 @@ import type { ProfileSave } from "./profile-save";
 import { isPlanLimitDiagnostic } from "./provider-diagnostics";
 import type { ProviderRuntime } from "./provider-runtime";
 import type { RoutineScheduler } from "./routine-scheduler";
+import type { SessionRollover } from "./session-rollover";
 import { sessionSettingsOverrides } from "./session-settings";
 import { isMissingProviderSessionError, isRequestTimeout, providerForAgent } from "./thread-items";
 import type { ThreadLifecycle } from "./thread-lifecycle";
@@ -62,6 +63,7 @@ export interface DrainSchedulerOptions {
   duplication: DuplicationGate;
   profileSave: ProfileSave;
   compaction: ContextCompaction;
+  rollover: SessionRollover;
   routines: RoutineScheduler;
   threads: ThreadLifecycle;
   memory: MemoryHold;
@@ -90,6 +92,7 @@ export class DrainScheduler {
   readonly #duplication: DuplicationGate;
   readonly #profileSave: ProfileSave;
   readonly #compaction: ContextCompaction;
+  readonly #rollover: SessionRollover;
   readonly #routines: RoutineScheduler;
   readonly #threads: ThreadLifecycle;
   readonly #memory: MemoryHold;
@@ -129,6 +132,7 @@ export class DrainScheduler {
     this.#duplication = options.duplication;
     this.#profileSave = options.profileSave;
     this.#compaction = options.compaction;
+    this.#rollover = options.rollover;
     this.#routines = options.routines;
     this.#threads = options.threads;
     this.#memory = options.memory;
@@ -154,6 +158,7 @@ export class DrainScheduler {
   /** The clauses of this agent's own state. `#heldByMachine` adds the memory and the turn slots. */
   mayDrain(agentId: string): boolean {
     return (
+      this.#rollover.mayDrain(agentId) &&
       !this.#settingsHolds.has(agentId) &&
       !this.#conversation.workingSnapshot(agentId)?.activeTurnId &&
       (this.#channels?.mayDrain(agentId) ?? true) &&
@@ -292,6 +297,7 @@ export class DrainScheduler {
     yield* Effect.gen({ self: this }, function* () {
       const snapshot = this.#conversation.workingSnapshot(agentId);
       if (snapshot?.activeTurnId) return;
+      if (yield* this.#rollover.attempt(agentId)) return;
       const context = this.#mailbox.nextQueued(agentId);
       if (!context) return;
       const agent = this.#store.list().find((candidate) => candidate.id === agentId);
@@ -370,8 +376,10 @@ export class DrainScheduler {
         this.#mailboxSync.emitQueue(delivery.recipientAgentId);
       }
       const agent = yield* this.#store.getOrCreate(delivery.recipientAgentId).pipe(toDeliveryStartFailed);
-      if (agent.helper && (agent.helper.originMessageId !== delivery.messageId ||
-        !["queued", "running"].includes(agent.helper.status)))
+      if (
+        agent.helper &&
+        (agent.helper.originMessageId !== delivery.messageId || !["queued", "running"].includes(agent.helper.status))
+      )
         throw new Error(sourceText("error.agent.helperFixed"));
       requestedModel = agent.model;
       // The endpoint was removed while this agent was busy, so no other model could be given to it
@@ -490,7 +498,10 @@ export class DrainScheduler {
                 // A teammate message that wants no answer tells the model to write nothing, so an empty
                 // turn is the expected result and not a provider that swallowed its error.
                 answerOptional:
-                  !agent.helper && delivery.sender.kind === "agent" && delivery.expectsReply === false && !delivery.replyToMessageId,
+                  !agent.helper &&
+                  delivery.sender.kind === "agent" &&
+                  delivery.expectsReply === false &&
+                  !delivery.replyToMessageId,
                 input: inputForThread(providerThreadId),
                 cwd: agent.workspacePath,
                 runtimeWorkspaceRoots: workspaceWritableRoots(agent, this.#store.sharedRoot),
