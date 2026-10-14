@@ -306,6 +306,11 @@ active session. Its actual lifecycle must establish a writer and completion befo
 pre-crash checkpoints are never automatically replayed. Crash
 between binding and journal update can leave a blocked journal with the checkpoint in the separately
 persisted handoff. The next genuine input recovers that handoff. There is no timer or polling daemon.
+Matching terminal continuation events persist settlement even without a new checkpoint, so known
+finished writers do not become held on restart. Original deliveries remain running across an eligible
+boundary and move to the next writer. Final settlement retains requester/result ownership, no-reply
+and explicit-reply deduplication, and routine run/quiet-preview settlement. An in-flight start response
+is a barrier before terminal settlement; unknown starts retain their hold.
 Normal rollover adds no announcement to the user conversation.
 
 See [session rollover verification](session-rollover.md) for measured provider coverage, failure limits,

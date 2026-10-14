@@ -156,7 +156,7 @@ import { type AgentClientFactory, ProviderRuntime, toProviderOperationFailed } f
 import { QueueControls } from "./agent/queue-controls";
 import { type RoutineMutationOptions, RoutineScheduler, toRoutineOperationFailed } from "./agent/routine-scheduler";
 import { buildRuntimeSnapshot } from "./agent/runtime-snapshot";
-import { SessionRollover } from "./agent/session-rollover";
+import { SessionRollover, SessionRolloverFailed } from "./agent/session-rollover";
 import { SessionSettings } from "./agent/session-settings";
 import type { AgentSidebar } from "./agent/sidebar-tools";
 import type { LocalSkillTools } from "./agent/skill-tools";
@@ -934,6 +934,10 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       threads: this.#threads,
       providers: this.#providers,
       memory: this.#memoryHold,
+      settleDeliveries: (agentId, deliveries, status) =>
+        this.#turn
+          .abandonRollover(agentId, deliveries, status)
+          .pipe(Effect.mapError((failure) => new SessionRolloverFailed({ cause: failure.cause }))),
       redact: (text) => this.#mcp.redact(text),
       emitError: (code, error, agentId) => this.#emitError(code, error, agentId),
     });

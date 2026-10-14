@@ -132,6 +132,47 @@ budget and must report remaining work. This is a finite local safety policy, not
 autonomous task completion. A model can still misdescribe semantic progress; the bound prevents
 endless rollover, not invented facts. Helpers and execution/channel chats are excluded.
 
+## Terminal settlement and request ownership repair
+
+Oracle's independent review of `fb878f0` found two gaps beyond the original 72 checks. A terminal
+continuation without another checkpoint left an accepted journal that became held on restart.
+A delegated request ended before rollover, so its final continuation had no requester association.
+Those earlier tests and the real three-session run remain evidence for that revision and their
+covered cases. They do not establish acceptance of these two paths.
+
+Matching completed, interrupted, and failed continuation events now persist a blocked journal.
+An in-flight start response is a completion barrier: terminal settlement waits for that response
+or its failure, then settles the known writer. A newer checkpoint from that writer is retained.
+Unknown starts still hold; startup does not infer terminal state or replay them.
+
+Deliveries remain running across an eligible boundary. The journal records their IDs and up to
+nine owning turn IDs. The next accepted writer takes the original delivery association. Only final
+settlement ends the request and permits the existing automatic result relay. `expectsReply:false`
+and explicit results in any earlier segment suppress that relay. Duplicate terminal events cannot
+send another result. Creation failure ends retained deliveries as failed; a Stop, changed settings,
+or a newer queued message that supersedes creation ends them as interrupted. Queue precedence reads
+all queued IDs because a retained running delivery can make a new message temporarily ineligible
+for normal dispatch. Receipt-only start association does not write the journal and cannot overwrite
+its accepted state.
+
+Routine runs use the same retained delivery. Run status stays running through the boundary and
+becomes succeeded only after final completion. Scheduled quiet turns retain their preview record
+until the final no-update settlement. These paths use temporary test databases and injected provider
+protocol events; no live routines or new provider spend are involved.
+
+`session-rollover.oracle-review.test.ts` integrates Oracle's four probes and adds requester/no-reply,
+explicit linked and unlinked reply deduplication, Stop/new-input precedence, failed and superseded
+creation, manual/scheduled/quiet routine settlement, and provider completion/checkpoint before the
+start response. The focused repair logs and receipts are under `.openbot-build/rollover/repair-*`.
+The repaired revision passes 118 tests across eight files, including 18 Oracle repair probes,
+and the node typecheck. An existing routine test also exposed a late `turn/start` response
+resurrecting an already finished writer; the scheduler now checks terminal delivery settlement
+before publishing that response as active. The association barrier settles during shutdown.
+The original real-provider evidence remains bound to `fb878f0`; this repair has no new live-provider
+acceptance claim. Journal and mailbox writes are separate durable operations, so this is not a claim
+of an atomic final-result outbox across every process-death point. Unknown writer recovery remains
+conservative and does not blindly replay a final result.
+
 ## Activation and rollback
 
 Installed/enabled: **no**. The official installed 0.38.2 app is untouched; this source checkout is

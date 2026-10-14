@@ -359,10 +359,17 @@ export class TurnLifecycle {
           const association = Deferred.makeUnsafe<void, TurnOperationFailed>();
           this.#turnAssociations.set(turnId, association);
           yield* Effect.gen({ self: this }, function* () {
-            const exit = yield* Effect.exit(this.#associateStartedTurn(agentId, turnId, snapshot));
+            const exit = yield* Effect.exit(
+              Effect.gen({ self: this }, function* () {
+                yield* this.#rollover
+                  .associateTurn(agentId, threadId, turnId)
+                  .pipe(Effect.mapError((failure) => new TurnOperationFailed({ cause: failure.cause })));
+                yield* this.#associateStartedTurn(agentId, turnId, snapshot);
+              }).pipe(Effect.uninterruptible),
+            );
             yield* Deferred.done(association, exit);
             if (this.#turnAssociations.get(turnId) === association) this.#turnAssociations.delete(turnId);
-          }).pipe(Effect.forkIn(this.#scope, { startImmediately: true }));
+          }).pipe(Effect.uninterruptible, Effect.forkIn(this.#scope, { startImmediately: true }));
         }
         if (this.#hooks.helperStarted) yield* this.#hooks.helperStarted(agentId);
         this.#hooks.emit({ type: "turn-started", agentId, threadId: publicThreadId, turnId, origin });
@@ -724,14 +731,23 @@ export class TurnLifecycle {
     if (deliveries.some((delivery) => delivery.delivery.sender.kind === "agent")) {
       dropPlaceholderAnswers(snapshot, turnId);
     }
+    const rollover = yield* this.#rollover.finishTurn(agentId, threadId, turnId, outcome).pipe(
+      Effect.catch((failure) =>
+        Effect.sync(() => {
+          this.#hooks.emitError("session_checkpoint_failed", failure.cause, agentId);
+          return false;
+        }),
+      ),
+    );
     // Only a turn that ran nothing but scheduled routine runs: a person who wrote in the same turn,
     // or who started a Test, script or webhook run, waits for the answer.
     const quiet =
+      !rollover &&
       outcome === "completed" &&
       this.#quietRoutineTurn(snapshot.threadId, deliveries) &&
       settleQuietRoutineTurn(snapshot, turnId, noUpdateCalled);
     const latestAssistant = latestTurnAnswer(snapshot.messages, turnId);
-    if (deliveries.length > 0) {
+    if (deliveries.length > 0 && !rollover) {
       const terminal = outcome === "failed" ? "failed" : outcome === "interrupted" ? "interrupted" : "completed";
       for (const delivery of deliveries) {
         this.#refusedRetries.delete(delivery.delivery.id);
@@ -753,7 +769,7 @@ export class TurnLifecycle {
     }
     // Each run start saved the earlier preview; a quiet turn puts back the oldest one, unless
     // something else changed the preview since. Every turn takes its entries, so none stays behind.
-    const savedPreviews = deliveries.flatMap(({ delivery }) =>
+    const savedPreviews = (rollover ? [] : deliveries).flatMap(({ delivery }) =>
       delivery.sender.kind === "routine" ? (this.#hooks.takeRoutinePreview(delivery.id) ?? []) : [],
     );
     // A routine run that answered only the no-update marker, also a Test run that shows it in the
@@ -773,14 +789,6 @@ export class TurnLifecycle {
         this.#hooks.emit({ type: "agents-changed", agents: this.#hooks.listAgents() });
       }
     }
-    const rollover = yield* this.#rollover.finishTurn(agentId, threadId, turnId, outcome).pipe(
-      Effect.catch((failure) =>
-        Effect.sync(() => {
-          this.#hooks.emitError("session_checkpoint_failed", failure.cause, agentId);
-          return false;
-        }),
-      ),
-    );
     const shouldCompact = !rollover && !refused && !limited && this.#compaction.reserve(agentId, threadId);
     snapshot.activeTurnId = null;
     this.#conversation.emitConversation(snapshot, "turn.completed", { turnId, status: outcome });
@@ -813,6 +821,21 @@ export class TurnLifecycle {
     if (shouldCompact) yield* this.#compaction.request(agentId, threadId);
     else this.#hooks.scheduleDrain(agentId);
   }, Effect.uninterruptible);
+
+  /** Ends retained request ownership when creation fails or a Stop/new input supersedes continuation. */
+  readonly abandonRollover = Effect.fn("TurnLifecycle.abandonRollover")(function* (
+    this: TurnLifecycle,
+    agentId: string,
+    deliveries: readonly DeliveryContext[],
+    status: "interrupted" | "failed",
+  ) {
+    for (const { delivery } of deliveries) {
+      yield* this.#mailbox.markTerminal(delivery.id, status).pipe(toTurnOperationFailed);
+      if (delivery.sender.kind === "routine") this.#hooks.takeRoutinePreview(delivery.id);
+      if (delivery.sender.kind === "agent") this.#hooks.scheduleDrain(delivery.sender.agentId);
+    }
+    if (deliveries.length) this.#mailboxSync.emitQueue(agentId);
+  });
 
   /**
    * Queues the deliveries of a turn once more, after the provider refused the session's history.
@@ -916,6 +939,12 @@ export class TurnLifecycle {
     )
       return;
 
+    if (
+      yield* this.#rollover
+        .hasExplicitResult(agentId, turnId, recipientAgentId)
+        .pipe(Effect.mapError((failure) => new TurnOperationFailed({ cause: failure.cause })))
+    )
+      return;
     yield* this.#mailbox
       .enqueue({
         sender: { kind: "agent", agentId },

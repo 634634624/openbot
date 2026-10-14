@@ -530,7 +530,13 @@ export class DrainScheduler {
       // The provider has accepted the turn. Publish the active turn before the first mailbox write
       // can yield: queue reconciliation may run while delivery rows change, and an idle cached
       // snapshot with a running delivery is a stale state for clients.
-      snapshot.activeTurnId = response.turn.id;
+      const terminalBeforeResponse = batch.every(({ delivery: item }) => {
+        const current = this.#mailbox.getDelivery(item.id)?.delivery;
+        return current?.turnId === response.turn.id && ["completed", "failed", "interrupted"].includes(current.status);
+      });
+      // Lifecycle events can precede the RPC response. A settled writer must not become active again.
+      if (!terminalBeforeResponse) snapshot.activeTurnId = response.turn.id;
+      else if (snapshot.activeTurnId === response.turn.id) snapshot.activeTurnId = null;
       confirmedTurnId = response.turn.id;
       this.#turnModels.set(agent.id, { turnId: response.turn.id, model: agent.model });
       for (const item of batch)
